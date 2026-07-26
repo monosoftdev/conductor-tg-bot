@@ -1,0 +1,687 @@
+"""Durability and dispatch tests for Telegram voice notes."""
+
+from __future__ import annotations
+
+import asyncio
+import io
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from ctb.bot.handlers.common import MOBILE_REPLY_INSTRUCTION
+from ctb.bot.keyboards import NonceStore
+from ctb.bot.middleware.routing import Route
+from ctb.conductor.models import PostMessageResult, PostState, SqlResult
+from ctb.db.connection import Database, now_ms
+from ctb.db.repo import prompts as prompts_repo
+from ctb.db.repo import sessions as sessions_repo
+from ctb.db.repo import voice_inputs as voice_repo
+from ctb.db.repo import workspaces as workspaces_repo
+from ctb.settings import Settings
+from ctb.voice import service as voice_service_module
+from ctb.voice.provider import Transcription
+from ctb.voice.service import VoiceEnqueueStatus, VoiceService
+
+
+class FakeBot:
+    def __init__(self) -> None:
+        self.downloads = 0
+        self.messages: list[dict[str, Any]] = []
+        self.edits: list[dict[str, Any]] = []
+
+    async def get_file(self, _file_id: str) -> object:
+        return SimpleNamespace(file_path="voice/file.oga", file_size=9)
+
+    async def download_file(self, _path: str, *, destination: io.BytesIO) -> io.BytesIO:
+        self.downloads += 1
+        destination.write(b"OggS-test")
+        destination.seek(0)
+        return destination
+
+    async def send_message(self, **kwargs: Any) -> object:
+        self.messages.append(kwargs)
+        return SimpleNamespace(message_id=len(self.messages))
+
+    async def edit_message_text(self, **kwargs: Any) -> object:
+        self.edits.append(kwargs)
+        return SimpleNamespace(message_id=kwargs["message_id"])
+
+
+class FakeProvider:
+    def __init__(self, text: str = "Fix the flaky test") -> None:
+        self.text = text
+        self.calls = 0
+
+    async def transcribe(
+        self,
+        audio: bytes,
+        *,
+        filename: str,
+        mime_type: str,
+        keyterms: list[str],
+    ) -> Transcription:
+        del audio, filename, mime_type, keyterms
+        self.calls += 1
+        return Transcription(self.text, language="en")
+
+    async def aclose(self) -> None:
+        return None
+
+
+class FakeClient:
+    def __init__(self) -> None:
+        self.posts: list[tuple[str, str, str]] = []
+        self.queries: list[str] = []
+
+    async def post_message(
+        self, session_id: str, text: str, message_id: str
+    ) -> PostMessageResult:
+        self.posts.append((session_id, text, message_id))
+        return PostMessageResult(message_id=message_id, state=PostState.QUEUED)
+
+    async def sql(self, query: str) -> SqlResult:
+        self.queries.append(query)
+        return SqlResult(rows=[], row_count=0)
+
+
+class FakeSupervisor:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, object]] = []
+
+    async def dispatch(self, session_id: str, evidence: object) -> object:
+        self.calls.append((session_id, evidence))
+        return object()
+
+
+def make_service(
+    settings: Settings,
+    db: Database,
+    *,
+    bot: FakeBot | None = None,
+    provider: FakeProvider | None = None,
+    client: FakeClient | None = None,
+    supervisor: FakeSupervisor | None = None,
+) -> VoiceService:
+    return VoiceService(
+        settings,
+        db,
+        bot or FakeBot(),  # type: ignore[arg-type]
+        client or FakeClient(),  # type: ignore[arg-type]
+        supervisor or FakeSupervisor(),  # type: ignore[arg-type]
+        NonceStore(),
+        provider or FakeProvider(),
+    )
+
+
+def voice_message(*, size: int = 100, duration: int = 12, thread_id: int = 7) -> Any:
+    return SimpleNamespace(
+        voice=SimpleNamespace(
+            file_id="file-1",
+            file_unique_id="unique-1",
+            duration=duration,
+            file_size=size,
+        ),
+        chat=SimpleNamespace(id=-1001, type="supergroup"),
+        message_id=55,
+        message_thread_id=thread_id,
+        from_user=SimpleNamespace(id=1001),
+    )
+
+
+async def test_replayed_update_keeps_one_job_and_operation_id(
+    db: Database, settings_factory: Any
+) -> None:
+    settings = settings_factory(voice_enabled=True)
+    service = make_service(settings, db)
+    message = voice_message()
+    route = Route(
+        chat_id=-1001,
+        thread_id=7,
+        kind="topic",
+        session=None,
+    )
+
+    first = await service.enqueue(message, route)  # type: ignore[arg-type]
+    row1 = await voice_repo.get(db, -1001, 55)
+    second = await service.enqueue(message, route)  # type: ignore[arg-type]
+    row2 = await voice_repo.get(db, -1001, 55)
+
+    assert first is VoiceEnqueueStatus.ACCEPTED
+    assert second is VoiceEnqueueStatus.DUPLICATE
+    assert row1 is not None and row2 is not None
+    assert row1.action_id == row2.action_id
+    assert await db.fetch_val("SELECT COUNT(*) FROM voice_inputs") == 1
+
+
+async def test_uploaded_audio_preserves_filename_and_mime(
+    db: Database, settings_factory: Any
+) -> None:
+    settings = settings_factory(voice_enabled=True)
+    service = make_service(settings, db)
+    message = voice_message()
+    message.voice = None
+    message.audio = SimpleNamespace(
+        file_id="audio-1",
+        file_unique_id="audio-unique",
+        file_name="standup.m4a",
+        mime_type="audio/mp4",
+        duration=20,
+        file_size=1_000,
+    )
+
+    status = await service.enqueue(
+        message,  # type: ignore[arg-type]
+        Route(chat_id=-1001, thread_id=7, kind="topic"),
+    )
+
+    row = await voice_repo.get(db, -1001, 55)
+    assert status is VoiceEnqueueStatus.ACCEPTED
+    assert row is not None
+    assert row.file_name == "standup.m4a"
+    assert row.mime_type == "audio/mp4"
+
+
+async def test_size_and_duration_reject_before_download(
+    db: Database, settings_factory: Any
+) -> None:
+    settings = settings_factory(
+        voice_enabled=True,
+        voice_max_duration_seconds=30,
+        voice_max_file_bytes=1_000,
+    )
+    bot = FakeBot()
+    service = make_service(settings, db, bot=bot)
+    route = Route(chat_id=-1001, thread_id=7, kind="topic")
+
+    large = await service.enqueue(
+        voice_message(size=1_001),
+        route,  # type: ignore[arg-type]
+    )
+    long = await service.enqueue(
+        voice_message(size=100, duration=31),
+        route,  # type: ignore[arg-type]
+    )
+
+    assert large is VoiceEnqueueStatus.TOO_LARGE
+    assert long is VoiceEnqueueStatus.TOO_LONG
+    assert bot.downloads == 0
+    assert await db.fetch_val("SELECT COUNT(*) FROM voice_inputs") == 0
+
+
+async def test_voice_prompt_uses_snapshot_id_once_and_mobile_instruction(
+    db: Database, settings_factory: Any
+) -> None:
+    settings = settings_factory(voice_enabled=True, voice_mode="prompts")
+    await sessions_repo.upsert(
+        db,
+        "session-voice",
+        chat_id=-1001,
+        thread_id=7,
+        is_bound=True,
+        title="voice target",
+    )
+    bot = FakeBot()
+    provider = FakeProvider("Fix the flaky test")
+    client = FakeClient()
+    service = make_service(settings, db, bot=bot, provider=provider, client=client)
+    row, _ = await voice_repo.create(
+        db,
+        chat_id=-1001,
+        tg_message_id=55,
+        thread_id=7,
+        user_id=1001,
+        file_id="file-1",
+        file_unique_id="unique-1",
+        file_name=None,
+        mime_type="audio/ogg",
+        duration_seconds=12,
+        file_size=100,
+        route_kind="topic",
+        route_session_id="session-voice",
+        route_workspace_id=None,
+        provider="elevenlabs",
+        model="scribe_v2",
+        action_id="voice-operation-1",
+    )
+    claimed = await voice_repo.claim_next(db)
+    assert claimed is not None
+    await service.attach_ack(row.chat_id, row.tg_message_id, 9001)
+
+    await service._process(claimed)
+
+    completed = await voice_repo.get(db, row.chat_id, row.tg_message_id)
+    prompt = await prompts_repo.get(db, "voice-operation-1")
+    assert completed is not None and completed.state == "completed"
+    assert provider.calls == 1
+    assert bot.downloads == 1
+    assert len(client.posts) == 1
+    assert client.posts[0][2] == "voice-operation-1"
+    assert MOBILE_REPLY_INSTRUCTION in client.posts[0][1]
+    assert bot.messages == []
+    assert bot.edits[-1]["message_id"] == 9001
+    assert "Fix the flaky test" in bot.edits[-1]["text"]
+    assert prompt is not None and prompt.message_id == completed.action_id
+    assert await voice_repo.claim_next(db) is None
+
+
+async def test_general_voice_searches_and_never_posts(
+    db: Database, settings_factory: Any
+) -> None:
+    settings = settings_factory(voice_enabled=True, voice_mode="prompts")
+    bot = FakeBot()
+    client = FakeClient()
+    service = make_service(settings, db, bot=bot, client=client)
+    row, _ = await voice_repo.create(
+        db,
+        chat_id=-1001,
+        tg_message_id=56,
+        thread_id=1,
+        user_id=1001,
+        file_id="file-1",
+        file_unique_id="unique-1",
+        file_name=None,
+        mime_type="audio/ogg",
+        duration_seconds=8,
+        file_size=100,
+        route_kind="general",
+        route_session_id=None,
+        route_workspace_id=None,
+        provider="elevenlabs",
+        model="scribe_v2",
+        action_id="voice-operation-general",
+    )
+    claimed = await voice_repo.claim_next(db)
+    assert claimed is not None
+
+    await service._process(claimed)
+
+    completed = await voice_repo.get(db, row.chat_id, row.tg_message_id)
+    assert completed is not None and completed.state == "completed"
+    assert len(client.queries) == 1
+    assert client.posts == []
+    assert "No matches" in str(bot.messages[-1]["text"])
+
+
+async def test_recovery_reuses_conductor_message_id(
+    db: Database, settings_factory: Any
+) -> None:
+    settings = settings_factory(voice_enabled=True, voice_mode="prompts")
+    await sessions_repo.upsert(db, "session-voice")
+    client = FakeClient()
+    service = make_service(settings, db, client=client)
+    row, _ = await voice_repo.create(
+        db,
+        chat_id=1001,
+        tg_message_id=57,
+        thread_id=0,
+        user_id=1001,
+        file_id="file-1",
+        file_unique_id="unique-1",
+        file_name=None,
+        mime_type="audio/ogg",
+        duration_seconds=8,
+        file_size=100,
+        route_kind="dm",
+        route_session_id="session-voice",
+        route_workspace_id=None,
+        provider="elevenlabs",
+        model="scribe_v2",
+        action_id="stable-voice-operation",
+    )
+    claimed = await voice_repo.claim_next(db)
+    assert claimed is not None
+    await service._process(claimed)
+
+    # Simulate a crash after the Conductor POST but before the voice job's
+    # completion write. Recovery can re-POST, but only with the identical id.
+    await db.execute(
+        """
+        UPDATE voice_inputs
+           SET state = 'dispatching', completed_at = NULL
+         WHERE chat_id = ? AND tg_message_id = ?
+        """,
+        (row.chat_id, row.tg_message_id),
+    )
+    recovery = await voice_repo.recover_stale(db)
+    assert recovery.requeued == 1 and recovery.abandoned == ()
+    recovered = await voice_repo.claim_next(db)
+    assert recovered is not None
+    await service._process(recovered)
+
+    assert [post[2] for post in client.posts] == [
+        "stable-voice-operation",
+        "stable-voice-operation",
+    ]
+    assert (
+        await db.fetch_val(
+            "SELECT COUNT(*) FROM outbound_prompts WHERE message_id = ?",
+            ("stable-voice-operation",),
+        )
+        == 1
+    )
+
+
+async def test_exact_spoken_stop_uses_the_supervisor(
+    db: Database, settings_factory: Any
+) -> None:
+    settings = settings_factory(voice_enabled=True, voice_mode="commands")
+    await sessions_repo.upsert(db, "session-stop")
+    supervisor = FakeSupervisor()
+    client = FakeClient()
+    service = make_service(
+        settings,
+        db,
+        provider=FakeProvider("command stop"),
+        client=client,
+        supervisor=supervisor,
+    )
+    row, _ = await voice_repo.create(
+        db,
+        chat_id=1001,
+        tg_message_id=58,
+        thread_id=0,
+        user_id=1001,
+        file_id="file-1",
+        file_unique_id="unique-1",
+        file_name=None,
+        mime_type="audio/ogg",
+        duration_seconds=5,
+        file_size=100,
+        route_kind="dm",
+        route_session_id="session-stop",
+        route_workspace_id=None,
+        provider="elevenlabs",
+        model="scribe_v2",
+        action_id="voice-stop-operation",
+    )
+    claimed = await voice_repo.claim_next(db)
+    assert claimed is not None
+
+    await service._process(claimed)
+
+    assert len(supervisor.calls) == 1
+    assert supervisor.calls[0][0] == "session-stop"
+    assert client.posts == []
+    completed = await voice_repo.get(db, row.chat_id, row.tg_message_id)
+    assert completed is not None and completed.state == "completed"
+
+
+async def test_spoken_done_only_creates_named_confirmation(
+    db: Database, settings_factory: Any
+) -> None:
+    settings = settings_factory(voice_enabled=True, voice_mode="commands")
+    await workspaces_repo.upsert(db, "workspace-done", name="api/fix")
+    bot = FakeBot()
+    service = make_service(
+        settings,
+        db,
+        bot=bot,
+        provider=FakeProvider("command done"),
+    )
+    row, _ = await voice_repo.create(
+        db,
+        chat_id=1001,
+        tg_message_id=59,
+        thread_id=0,
+        user_id=1001,
+        file_id="file-1",
+        file_unique_id="unique-1",
+        file_name=None,
+        mime_type="audio/ogg",
+        duration_seconds=5,
+        file_size=100,
+        route_kind="dm",
+        route_session_id=None,
+        route_workspace_id="workspace-done",
+        provider="elevenlabs",
+        model="scribe_v2",
+        action_id="voice-done-operation",
+    )
+    claimed = await voice_repo.claim_next(db)
+    assert claimed is not None
+
+    await service._process(claimed)
+
+    assert bot.messages[-1]["text"] == "Archive <b>api/fix</b>?"
+    assert bot.messages[-1]["reply_markup"] is not None
+    workspace = await workspaces_repo.get(db, "workspace-done")
+    assert workspace is not None and workspace.status != "archived"
+    completed = await voice_repo.get(db, row.chat_id, row.tg_message_id)
+    assert completed is not None and completed.state == "completed"
+
+
+# ── an optional feature must not be able to take the bot down ────────────────
+
+
+async def seed(
+    db: Database,
+    *,
+    tg_message_id: int,
+    state: str = "received",
+    attempts: int = 0,
+    transcript: str | None = None,
+    updated_at: int | None = None,
+    completed_at: int | None = None,
+) -> None:
+    """Insert one voice job directly in the state a crash would have left."""
+    await voice_repo.create(
+        db,
+        chat_id=1001,
+        tg_message_id=tg_message_id,
+        thread_id=0,
+        user_id=1001,
+        file_id=f"file-{tg_message_id}",
+        file_unique_id=f"unique-{tg_message_id}",
+        file_name=None,
+        mime_type="audio/ogg",
+        duration_seconds=5,
+        file_size=100,
+        route_kind="dm",
+        route_session_id=None,
+        route_workspace_id=None,
+        provider="elevenlabs",
+        model="scribe_v2",
+        action_id=f"operation-{tg_message_id}",
+    )
+    await db.execute(
+        """
+        UPDATE voice_inputs
+           SET state = ?, attempts = ?, transcript = ?,
+               updated_at = COALESCE(?, updated_at), completed_at = ?
+         WHERE chat_id = ? AND tg_message_id = ?
+        """,
+        (state, attempts, transcript, updated_at, completed_at, 1001, tg_message_id),
+    )
+
+
+async def boom(*_args: Any, **_kwargs: Any) -> Any:
+    raise RuntimeError("database is locked")
+
+
+@pytest.mark.parametrize(
+    ("enabled", "configured"),
+    ((False, True), (True, False), (False, False)),
+)
+async def test_unavailable_voice_starts_no_workers_and_polls_nothing(
+    db: Database, settings_factory: Any, enabled: bool, configured: bool
+) -> None:
+    """Off or keyless, voice must cost zero tasks and zero SQLite traffic."""
+    settings = settings_factory(voice_enabled=enabled)
+    bot = FakeBot()
+    service = VoiceService(
+        settings,
+        db,
+        bot,  # type: ignore[arg-type]
+        FakeClient(),  # type: ignore[arg-type]
+        FakeSupervisor(),  # type: ignore[arg-type]
+        NonceStore(),
+        FakeProvider() if configured else None,
+    )
+    await seed(db, tg_message_id=70)
+    before = len(asyncio.all_tasks())
+
+    task = asyncio.create_task(service.run())
+    for _ in range(10):
+        await asyncio.sleep(0.001)
+
+    assert not task.done()
+    assert [t.get_name() for t in asyncio.all_tasks() if "voice" in t.get_name()] == []
+    assert len(asyncio.all_tasks()) == before + 1  # only run() itself
+    untouched = await voice_repo.get(db, 1001, 70)
+    assert untouched is not None and untouched.state == "received"
+    assert untouched.attempts == 0  # claim_next was never called
+    assert bot.downloads == 0
+
+    await service.stop()
+    await asyncio.wait_for(task, timeout=1)
+
+
+async def test_a_claim_error_keeps_the_worker_loop_alive(
+    db: Database, settings_factory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = settings_factory(voice_enabled=True, voice_max_concurrent=1)
+    service = make_service(settings, db)
+    calls = 0
+
+    async def failing_claim(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        return await boom(*args, **kwargs)
+
+    monkeypatch.setattr(voice_repo, "claim_next", failing_claim)
+    monkeypatch.setattr(voice_service_module, "_ERROR_BACKOFF_SECONDS", 0.001)
+
+    task = asyncio.create_task(service.run())
+    for _ in range(50):
+        await asyncio.sleep(0.001)
+        if calls > 2:
+            break
+
+    assert calls > 2
+    assert not task.done()
+
+    await service.stop()
+    await asyncio.wait_for(task, timeout=1)
+
+
+async def test_a_locked_database_during_fail_does_not_stop_the_service(
+    db: Database, settings_factory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The audit's headline: ``fail()`` ran inside the worker's own handler."""
+    settings = settings_factory(voice_enabled=True, voice_max_concurrent=1)
+    bot = FakeBot()
+
+    async def no_file(_file_id: str) -> object:
+        raise RuntimeError("Telegram is down")
+
+    monkeypatch.setattr(bot, "get_file", no_file)
+    monkeypatch.setattr(voice_repo, "fail", boom)
+    monkeypatch.setattr(voice_service_module, "_ERROR_BACKOFF_SECONDS", 0.001)
+    service = make_service(settings, db, bot=bot)
+    await seed(db, tg_message_id=71)
+
+    task = asyncio.create_task(service.run())
+    for _ in range(50):
+        await asyncio.sleep(0.001)
+        if task.done():
+            break
+
+    assert not task.done()
+
+    await service.stop()
+    await asyncio.wait_for(task, timeout=1)
+
+
+async def test_a_maintenance_prune_error_does_not_stop_the_service(
+    db: Database, settings_factory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = settings_factory(voice_enabled=True, voice_max_concurrent=1)
+    service = make_service(settings, db)
+    prunes = 0
+
+    async def failing_prune(*args: Any, **kwargs: Any) -> Any:
+        nonlocal prunes
+        prunes += 1
+        return await boom(*args, **kwargs)
+
+    monkeypatch.setattr(voice_repo, "prune_terminal", failing_prune)
+    monkeypatch.setattr(voice_service_module, "_MAINTENANCE_SECONDS", 0.001)
+
+    task = asyncio.create_task(service.run())
+    for _ in range(50):
+        await asyncio.sleep(0.001)
+        if prunes > 2:
+            break
+
+    assert prunes > 2  # boot prune plus repeated hourly prunes
+    assert not task.done()
+
+    await service.stop()
+    await asyncio.wait_for(task, timeout=1)
+
+
+async def test_recover_stale_gives_up_after_three_attempts(db: Database) -> None:
+    await seed(db, tg_message_id=72, state="transcribing", attempts=2)
+    await seed(db, tg_message_id=73, state="transcribing", attempts=3)
+    await seed(db, tg_message_id=74, state="dispatching", attempts=9, transcript="hi")
+
+    recovery = await voice_repo.recover_stale(db)
+
+    assert recovery.requeued == 1
+    assert {row.tg_message_id for row in recovery.abandoned} == {73, 74}
+    survivor = await voice_repo.get(db, 1001, 72)
+    assert survivor is not None and survivor.state == "received"
+    for tg_message_id in (73, 74):
+        abandoned = await voice_repo.get(db, 1001, tg_message_id)
+        assert abandoned is not None and abandoned.state == "failed"
+        assert abandoned.last_error == "Gave up after 3 attempts."
+    # A row that has been given up on is not re-claimed, so it cannot be billed.
+    assert await voice_repo.claim_next(db) is not None
+    assert await voice_repo.claim_next(db) is None
+
+
+async def test_a_crash_looping_note_is_abandoned_and_reported(
+    db: Database, settings_factory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Boot → claim → crash, three times, then the loop stops costing money."""
+    settings = settings_factory(voice_enabled=True)
+    bot = FakeBot()
+    provider = FakeProvider()
+
+    async def oom(_file_id: str) -> object:
+        raise MemoryError
+
+    monkeypatch.setattr(bot, "get_file", oom)
+    service = make_service(settings, db, bot=bot, provider=provider)
+    await seed(db, tg_message_id=75)
+
+    for _ in range(5):
+        await service._recover()
+        claimed = await voice_repo.claim_next(db)
+        if claimed is None:
+            break
+        with pytest.raises(MemoryError):
+            await service._process(claimed)  # the row stays 'transcribing'
+
+    row = await voice_repo.get(db, 1001, 75)
+    assert row is not None and row.state == "failed"
+    assert row.attempts == 3
+    assert provider.calls == 0
+    assert "🎙 Failed" in str(bot.messages[-1]["text"])
+
+
+async def test_retention_covers_failed_and_waiting_rows(db: Database) -> None:
+    """Every terminal state still holds a transcript, so all of them expire."""
+    old = now_ms() - 30 * 86_400_000
+    await seed(db, tg_message_id=80, state="completed", completed_at=old)
+    await seed(db, tg_message_id=81, state="failed", updated_at=old)
+    await seed(db, tg_message_id=82, state="waiting_for_user", updated_at=old)
+    await seed(db, tg_message_id=83, state="failed")  # fresh, still actionable
+    await seed(db, tg_message_id=84, state="received", updated_at=old)
+
+    pruned = await voice_repo.prune_terminal(db, before=now_ms() - 86_400_000)
+
+    remaining = await db.fetch_all("SELECT tg_message_id FROM voice_inputs")
+    assert pruned == 3
+    assert sorted(int(row["tg_message_id"]) for row in remaining) == [83, 84]

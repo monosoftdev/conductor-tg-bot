@@ -1,72 +1,175 @@
-# Handoff — 2026-07-25
+# Handoff — 2026-07-26
 
-## Where we are
+## Current state
 
-Phase 0 is written but **has never been run against the live API**. Nothing else is implemented.
+The full planned repository is implemented and ready for the first Railway
+deployment/live phone pass.
 
-Done:
-- Repo scaffold, `Dockerfile`, `railway.toml` (`numReplicas=1`, `/data` volume, `overlapSeconds=0`).
-- `scripts/probe_transcript.py` — the Phase 0 probe. Lint-clean, CLI smoke-tested.
-- `tests/test_probe_shapes.py` — 14 passing, no network needed.
-- `docs/PLAN.md` — the full approved design.
+Implemented:
 
-Not started: everything in `src/ctb/`. The directory is empty on purpose — the build order is
-probe → client → db → `turn/machine` → poller → delivery → bot, and the probe's results set the
-constants for the two stages after it.
+- Conductor client with explicit User-Agent, retry policy, token bucket,
+  concurrency cap, circuit breaker, fatal auth handling, and API event sink.
+- SQLite/WAL schema, migrations, repository layer, 64 KB content cap,
+  retention helpers, delivery claims, and singleton lease.
+- Pure turn machine covering queued-idle, fast turns, persistent `error`,
+  draining, cancellation, cursor-only fallback, and restart.
+- Replay-safe transcript cursor, first-bind seek, offset repair, atomic
+  cursor/message/delivery advance, and identical-ID prompt recovery.
+- Per-session adaptive pollers and lease-gated supervisor with crash backoff.
+- Defensive renderer, UTF-16 chunking, HTML fallback, document overflow,
+  durable outbox, and edit-in-place status cards.
+- Allowlisted aiogram application, DB-backed FSM, forum topics, daily/power/admin
+  commands, safe callback nonces, and `/new` wizard.
+- Structured runtime lifecycle, health server, Dockerfile, and Railway config.
+- Mobile output policy: prompts ask for outcome-first, concise replies; bot
+  chrome is short; tool noise stays in the status card.
+- Mobile decisions: strict `Choices:` blocks become styled one-tap replies,
+  with the recommended option first; prompt reactions move from 👀 to 👍.
+- Topic-safe navigation: stable icon colors distinguish workspaces, General
+  `/s` opens topics, and in-topic `/s` cannot cross workspace boundaries.
+- Telegram voice notes and audio attachments: authenticated size/duration
+  checks, in-memory download, ElevenLabs Scribe v2 adapter, strict multilingual
+  wake-phrase parser, durable route snapshots, stable action IDs, restart
+  recovery, retry controls, and health counters. Ordinary speech uses the same
+  mobile prompt policy; General remains search-only.
 
-## Next action
+## Verification
 
-```bash
-export CONDUCTOR_API_KEY=...          # https://app.conductor.build/users/api-keys
-.venv/bin/python scripts/probe_transcript.py dump --auto
-```
+Offline:
 
-`dump` is read-only. It discovers recent sessions via the SQL view, pages full transcripts to
-`probe-out/transcripts.jsonl`, and writes `probe-out/shape_report.md` — the `type` histogram and the
-recursive `content` structure per type. That alone unblocks the renderer.
+- Ruff format/check: clean.
+- Pyright: zero errors.
+- Pytest: 1,537 tests passing.
+- Docker image builds from the checked-in files.
+- Production image smoke:
+  - runs as non-root UID 10001;
+  - applies migrations `001` and `002`;
+  - starts Telegram, outbox, status cards, voice, supervisor, and health tasks;
+  - acquires the singleton lease;
+  - serves `GET /health` successfully.
 
-Then, against a **scratch** session (this one sends real prompts and costs tokens):
+**The smoke test does not prove `/data` is writable on Railway.** Docker seeds a
+named volume from the image, ownership included, so the write always succeeds
+locally; Railway mounts an empty root-owned volume over the same path and UID
+10001 cannot open the database. `RAILWAY_RUN_UID=0` is the fix, and the image
+now fails fast with `FATAL: cannot write /data …` instead of a bare
+`sqlite3.OperationalError` crash-loop. No offline test can cover this.
 
-```bash
-.venv/bin/python scripts/probe_transcript.py assume --session <SCRATCH_SESSION_ID>
-```
+The smoke run used fake credentials. It previously received a Telegram 401 and
+kept serving a green `/health`; that is now a hard failure (see below).
 
-## The result that could invalidate the plan
+## Probe facts carried into code
 
-**Assumption test #7 — does re-POSTing the same `messageId` dedupe?**
+- Re-POSTing the same prompt `messageId` dedupes server-side (verified twice).
+- The prompt ID is `content.id` on its user echo and `content.turnId` on every
+  message in the turn. It is not the transcript envelope ID.
+- Unknown/foreign `after=` IDs return 404 with no replay.
+- `sessionIndex` is monotonic but not gap-free. Gaps never imply message loss.
+- `POST /sessions` accepts a caller-supplied `sessionId`; only workspace create
+  needs nonce reconciliation.
+- Session status has a persistent third value, `error`; it is never treated as
+  “keep waiting until idle.”
+- `GET /me` lives at the API root, outside `/v0`.
 
-The whole crash-safety model is: write the `outbound_prompts` row → POST → on any ambiguous failure
-(timeout, reset, 5xx) retry forever with the same id. That rests on `messageId` being an idempotency
-key, which is *inferred from the parameter name*, not documented anywhere.
+Raw probe output remains gitignored in `probe-out/`.
 
-If the duplicate POST produces two prompts, that design is invalid and the recovery path has to be
-rethought before any of Phase 1 gets written. The probe prints this explicitly:
+## Reliability repairs made during final integration
 
-> `7 re-POST with same messageId deduped: N user-echo messages carry the marker. If this is 2, the
-> idempotency-key design is INVALID.`
+- Newly created sessions are seeded at cursor `-1` before their first prompt,
+  preventing a fast first answer from being skipped as historical content.
+- New-workspace prompts are saved immediately and POSTed only after the
+  workspace reports `ready`.
+- Workspace creates derive a stable reconciliation nonce from the Telegram
+  update, so an update replay checks the API/cache instead of issuing a second
+  workspace POST; session creates remain caller-ID idempotent.
+- Boot re-POSTs every recoverable prompt-ledger row from any cached machine
+  state; recovery does not depend on a prior `SUBMIT_PENDING` state write.
+- Retryable Telegram failures remain pending indefinitely; only definite
+  permanent errors are parked as failed.
+- `/stop` dispatches `Cancel` through the live poller instead of calling the API
+  behind the state machine.
+- Every status-card button is nonce-backed and has a production callback.
+- `TELEGRAM_CHAT_ID` is enforced for group updates while owner/allowlisted DMs
+  remain available.
+- Transcript and expired-wizard retention runs on boot and daily while the
+  singleton lease is held.
+- Daily `VACUUM INTO` snapshots retain seven copies on the volume; owner
+  `/backup` creates and downloads a fresh copy.
+- Fatal Conductor authentication stops pollers and durably alerts the owner
+  once.
+- Machine actions fan out to status cards, durable notices, and real Telegram
+  topic renames.
+- Topic rename runs before its marker is persisted; unbind runs only after the
+  final notice/topic action still has routing context.
+- Ambiguous and unreachable prompt POSTs remain pending for identical-ID retry
+  instead of being marked failed.
+- Quiet/off chats send silent pushes; the 30-minute focus window promotes the
+  most recently prompted topic, while errors remain loud.
+- `/mode` is now the topic control panel, `/board` is capped and scannable,
+  `/s` prioritizes active/recent work, and `/help` explains the fast loop.
+- Every archive path now requires named two-tap confirmation, including
+  timeout/status-card actions.
+- Voice acknowledgements are edited into their result instead of adding a
+  second bot bubble.
+- Safe status controls remain usable for 15 minutes after a phone interruption;
+  destructive confirmation still expires after 60 seconds.
+- `/notify` is button-driven, completed confirmations edit in place, and the
+  `/new` wizard reuses its single card for the final workspace link.
+- The non-root image owns `/data`, and `.dockerignore` excludes secrets,
+  transcripts, SQLite files, tests, and repository metadata from build context.
 
-Also worth reading closely in the output:
+## Deploy-risk pass (first-hour failures)
 
-- **Test 4** — `after=<garbage id>`. If it silently returns a full replay instead of 4xx, the
-  `sessionIndex` filter in `turn/cursor.py` is the only thing standing between a cursor glitch and
-  re-posting an entire transcript to Telegram.
-- **Test 1** — whether our POSTed `messageId` shows up as a transcript `message.id`. This defines
-  "this prompt has been witnessed", which is what stops a turn finalizing early. If it fails, fall
-  back to the `index_at_post` snapshot comparison (already designed in `docs/PLAN.md`).
-- **D1/D3** — the timing trace. D3 counts how many `idle` polls arrive *before* the turn starts,
-  i.e. exactly how badly a naive "idle means done" poller would misfire. These numbers replace the
-  guessed constants (`QUEUED` cadence, `DRAIN_CONFIRMS`, `QUIET_FINALIZE`) in `docs/PLAN.md`.
+Fixed after an audit reproduced these against the built image:
 
-## After the probe
+- **A transient 403 no longer latches the bot dead.** `client._request` reset
+  `_auth_failures` only never; the supervisor treats `auth_failures > 0` as
+  fatal and cancels every poller, so one proxy hiccup silently ended all
+  delivery while commands kept answering. Any 2xx now clears the counter (a
+  genuinely bad key never gets one). *Still latched: `supervisor._auth_fatal`,
+  set when a poller crashes with `AuthFatal`, is never cleared — see blockers.*
+- **A rejected `TELEGRAM_BOT_TOKEN` fails the deploy.** `run_polling` used to
+  swallow `TelegramUnauthorizedError` and back off forever: green Railway
+  deploy, healthy `/health`, a bot that answers nothing. It now propagates,
+  with a log line naming `getMe` as the check.
+- **`/health` reports Telegram.** `TelegramHealth` in `health.py` counts polling
+  restarts that escape aiogram's own reader; any successful Bot API call clears
+  it. Three in a row is the `telegram_polling` degradation (HTTP 200).
+- **Missing configuration reports in one round.** `ALLOWED_TELEGRAM_USER_IDS`
+  is now a required field checked in a *field* validator, alongside blank
+  checks for both secrets, so all three arrive in a single message instead of
+  one crash per variable. Blank `TELEGRAM_CHAT_ID=`/`ELEVENLABS_API_KEY=` (what
+  `cp .env.example .env` leaves behind) now mean "unset" instead of failing
+  validation.
+- **`/health` detail is loopback-only without `HEALTH_TOKEN`.** Railway's edge
+  reaches the container from a private address, so the old private/loopback
+  gate published DB path, session ids and the last 20 API calls on any
+  generated domain.
+- **The volume trap is documented, not just detected.** README has a numbered
+  "Before your first deploy" list led by `RAILWAY_RUN_UID=0`; the container
+  preflights `DB_PATH`'s directory and says what to set.
+- `.env.example` and README now match reality: exactly three required vars,
+  `HEALTH_TOKEN`/`HEALTH_PORT` documented, and the false claim that `/setup`
+  writes `TELEGRAM_CHAT_ID` removed (nothing prints a chat id — leave it unset).
+- `/setup` and `/health` are in the BotFather command menu, so the command
+  README tells you to run is offered when you type `/`.
 
-1. Commit a curated subset of `probe-out/transcripts.jsonl` to `tests/fixtures/` — these become the
-   renderer's test corpus. Review before committing; it's real transcript text.
-2. Update `docs/PLAN.md`'s timing constants with measured values.
-3. Record the assumption results in this file, then start `src/ctb/conductor/client.py`.
+## Remaining live-only work
 
-## Environment notes
+The following cannot be proven offline:
 
-- `probe-out/` is gitignored. It contains real transcript content.
-- Python 3.13.13 venv at `.venv/`. `python3` on this Mac is 3.12 — use `~/.local/bin/python3.13`.
-- If run inside a Conductor **cloud** workspace, `CONDUCTOR_API_KEY` and `CONDUCTOR_API_URL` are
-  already in the environment (workspace-scoped). Locally you must export your own.
+1. Deploy to Railway with a real `/data` volume and real secrets.
+2. Run the seven phone tests in `README.md`, especially redeploy mid-turn.
+3. Re-probe a sleeping workspace (probe assumption 8 remains unmeasured).
+4. Curate real tool-heavy/error/cancelled transcripts when the org has them;
+   current non-trivial renderer fixtures are explicitly labelled synthetic.
+5. Watch `/health` for real Conductor/Telegram 429s and tune the conservative
+   request bucket if needed.
+6. Set `VOICE_ENABLED=true`, add `ELEVENLABS_API_KEY`, and validate at least 30
+   owner recordings before changing `VOICE_MODE` from `prompts` to `commands`.
+   Compare Scribe v2 against the challengers in `VOICE_CONTROL_PLAN.md` before
+   treating the provider choice as final.
+
+The prior org had no useful real transcript corpus, the Codex session failed
+with `Codex ChatGPT auth not found`, and the account reported
+`overageDisabledReason: out_of_credits`. Claude/Sonnet completed probe turns.

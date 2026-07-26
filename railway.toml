@@ -3,6 +3,11 @@ builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
 
 [deploy]
+# Service variables cannot be set from this file. Set them in the Railway UI —
+# and set RAILWAY_RUN_UID=0 first: the image runs as UID 10001 and the volume
+# mounts root-owned, so without it the container cannot open /data/ctb.db and
+# burns all ten restarts below. See README "Before your first deploy".
+#
 # Exactly one instance, always. Two would fight over Telegram's getUpdates
 # (409 Conflict) and the SQLite volume can only attach to one anyway. The
 # singleton lease in the DB is the belt to this braces.

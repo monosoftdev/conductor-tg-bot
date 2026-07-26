@@ -1,0 +1,800 @@
+"""Focused safety tests for the Telegram command surface."""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from ctb.bot.handlers import core as core_handlers
+from ctb.bot.handlers import prompts as prompt_handlers
+from ctb.bot.handlers.common import (
+    MOBILE_REPLY_INSTRUCTION,
+    CreateRequest,
+    augment_prompt,
+    create_and_bind,
+    create_and_bind_input,
+    react_received,
+    request_cancel,
+    submit_prompt,
+    tell,
+)
+from ctb.bot.handlers.core import (
+    ARCHIVE_CONSEQUENCE,
+    BOARD_VISIBLE,
+    FIND_VISIBLE,
+    board_lines,
+    find_query,
+    find_text,
+    normalize_find_term,
+    session_overview_lines,
+    status_icon,
+)
+from ctb.bot.handlers.power import switchable_sessions
+from ctb.bot.handlers.topics import TOPIC_ICON_COLORS, topic_icon_color
+from ctb.bot.keyboards import NonceStore
+from ctb.bot.middleware.routing import Route
+from ctb.conductor.models import (
+    PostMessageResult,
+    PostState,
+    SqlResult,
+    TranscriptMessage,
+    WorkspaceCreateResult,
+    WorkspacesPage,
+)
+from ctb.db.connection import Database
+from ctb.db.repo import chats as chats_repo
+from ctb.db.repo import prompts as prompts_repo
+from ctb.db.repo import sessions as sessions_repo
+from ctb.db.repo import workspaces as workspaces_repo
+from ctb.db.repo.chats import ChatRow
+from ctb.db.repo.sessions import SessionRow
+from ctb.db.repo.workspaces import WorkspaceRow
+from ctb.turn.cursor import quick_replies_for
+from ctb.turn.state import Cancel, TurnState
+
+
+class PromptClient:
+    def __init__(self) -> None:
+        self.posts: list[tuple[str, str, str]] = []
+
+    async def post_message(
+        self, session_id: str, text: str, message_id: str
+    ) -> PostMessageResult:
+        self.posts.append((session_id, text, message_id))
+        return PostMessageResult(message_id=message_id, state=PostState.QUEUED)
+
+
+class CancelSupervisor:
+    def __init__(self, result: object | None = object()) -> None:
+        self.result = result
+        self.calls: list[tuple[str, object]] = []
+
+    async def dispatch(self, session_id: str, evidence: object) -> object | None:
+        self.calls.append((session_id, evidence))
+        return self.result
+
+
+class _NullState:
+    """``abandon_wizard`` only asks whether a wizard is open."""
+
+    async def get_state(self) -> str | None:
+        return None
+
+    async def clear(self) -> None:
+        return None
+
+
+class _ForumBot:
+    """Just enough of ``Bot`` for ``forum_support`` plus ``create_forum_topic``."""
+
+    def __init__(
+        self, *, is_forum: bool = True, can_manage_topics: bool = True
+    ) -> None:
+        self._is_forum = is_forum
+        self._can_manage_topics = can_manage_topics
+        self.topics = 0
+
+    async def get_chat(self, _chat_id: int) -> Any:
+        return SimpleNamespace(type="supergroup", is_forum=self._is_forum)
+
+    async def get_me(self) -> Any:
+        return SimpleNamespace(id=42)
+
+    async def get_chat_member(self, _chat_id: int, _user_id: int) -> Any:
+        return SimpleNamespace(can_manage_topics=self._can_manage_topics)
+
+    async def create_forum_topic(self, **_: Any) -> Any:
+        self.topics += 1
+        return SimpleNamespace(message_thread_id=99)
+
+
+class _CountingClient:
+    """Counts the one call that costs money."""
+
+    def __init__(self) -> None:
+        self.creates = 0
+
+    async def list_project_workspaces(self, *_: Any, **__: Any) -> WorkspacesPage:
+        return WorkspacesPage(data=[], has_more=False)
+
+    async def create_workspace(self, **_: Any) -> WorkspaceCreateResult:
+        self.creates += 1
+        return WorkspaceCreateResult(
+            workspace_id="workspace-1",
+            session_id="session-new",
+            deep_link="https://example.test/open",
+        )
+
+
+_REQUEST = CreateRequest(
+    project_id="project-1",
+    project_name="api",
+    branch="main",
+    agent="claude",
+    model="sonnet",
+    effort="high",
+    prompt="Fix it",
+)
+
+
+def test_mobile_instruction_is_stable_and_not_duplicated() -> None:
+    once = augment_prompt("Fix the flaky test")
+    twice = augment_prompt(once)
+
+    assert once.endswith(MOBILE_REPLY_INSTRUCTION)
+    assert once == twice
+    assert once.startswith("Fix the flaky test\n\n")
+    assert "Choices:" in once
+
+
+def test_mobile_instruction_binds_narration_format_and_a_numeric_cap() -> None:
+    """The three adjectives were replaced by rules that can be obeyed."""
+    text = MOBILE_REPLY_INSTRUCTION
+
+    # A delimiter and an explicit override, so a long task cannot average it out.
+    assert text.startswith("===\n")
+    assert "overrides any conflicting" in text
+    # The narration between tool calls was 6 of the 9 bubbles in a real turn.
+    assert "no narration between tool calls" in text
+    assert "One message, at the end." in text
+    # Outcome first, no restatement, no step recap.
+    assert "Open with the outcome" in text
+    assert "never recap the steps" in text
+    # A measurable budget, not an adjective.
+    assert "6 lines and 80 words" in text
+    # Formats that wrap badly at ~34 chars are named and banned.
+    for banned in ("No headings", "no tables", "no bold labels"):
+        assert banned in text
+    # The chat already renders the diff lines.
+    assert "Do not list the files you changed" in text
+
+
+def test_mobile_instruction_keeps_the_quick_reply_contract_parsable() -> None:
+    """Rule 5's syntax is what ``quick_replies_for`` turns into buttons."""
+    reply = TranscriptMessage(
+        id="m-1",
+        session_id="session-1",
+        type="agent",
+        content={
+            "type": "agent",
+            "rawPayload": {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Ledger needs a store.\n\nChoices:\n"
+                            "1. SQLite\n2. Postgres\n",
+                        }
+                    ]
+                },
+            },
+        },
+    )
+
+    assert "that is exactly 'Choices:'" in MOBILE_REPLY_INSTRUCTION
+    assert "'1. ...', '2. ...'" in MOBILE_REPLY_INSTRUCTION
+    assert quick_replies_for(reply) == ("SQLite", "Postgres")
+
+
+@pytest.mark.parametrize(
+    "terse",
+    ["yes", "no", "1", "2.", "ok", "Do it", "Choose option 2: Postgres"],
+)
+def test_a_bare_pick_or_ack_does_not_carry_the_contract_again(terse: str) -> None:
+    """140 words of formatting rules bolted onto "yes" is 95% boilerplate."""
+    assert augment_prompt(terse) == terse.strip()
+
+
+@pytest.mark.parametrize("real", ["Fix it", "ship the fixture fix", "no tests fail?"])
+def test_a_real_instruction_always_carries_the_contract(real: str) -> None:
+    assert augment_prompt(real).endswith(MOBILE_REPLY_INSTRUCTION)
+
+
+async def test_prompt_reaction_is_the_zero_noise_ack() -> None:
+    class Bot:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        async def set_message_reaction(self, **kwargs: object) -> None:
+            self.calls.append(kwargs)
+
+    bot = Bot()
+    message = SimpleNamespace(
+        bot=bot,
+        chat=SimpleNamespace(id=-1001),
+        message_id=44,
+    )
+
+    assert await react_received(message)  # type: ignore[arg-type]
+    assert bot.calls[0]["message_id"] == 44
+    assert bot.calls[0]["reaction"][0].emoji == "👀"  # type: ignore[index,union-attr]
+
+
+async def test_cancel_goes_through_supervisor_machine() -> None:
+    supervisor = CancelSupervisor()
+
+    accepted = await request_cancel(
+        supervisor,  # type: ignore[arg-type]
+        "session-1",
+        requested_by=1001,
+    )
+
+    assert accepted
+    assert supervisor.calls == [("session-1", Cancel(requested_by=1001))]
+    assert not await request_cancel(None, "session-1", requested_by=1001)
+
+
+async def test_submit_persists_and_posts_same_augmented_body(db: Database) -> None:
+    await sessions_repo.upsert(db, "session-1")
+    client = PromptClient()
+
+    message_id, state = await submit_prompt(
+        db=db,
+        client=client,  # type: ignore[arg-type]
+        session_id="session-1",
+        text="Ship it",
+        chat_id=100,
+        thread_id=7,
+        tg_message_id=9,
+    )
+
+    stored = await prompts_repo.get(db, message_id)
+    assert stored is not None
+    assert stored.body == augment_prompt("Ship it")
+    assert client.posts == [("session-1", stored.body, message_id)]
+    assert state == "queued"
+
+
+def test_find_query_never_contains_raw_punctuation() -> None:
+    malicious = "needle'; DROP TABLE outbound_prompts; --"
+    normalized = normalize_find_term(malicious)
+    query = find_query(malicious)
+
+    assert "'" not in normalized
+    assert ";" not in normalized
+    assert query.count(";") == 0
+    assert malicious not in query
+    assert "LIMIT 20" in query
+
+
+def test_mobile_board_is_compact_and_scannable() -> None:
+    rows: list[dict[str, object]] = [
+        {
+            "workspace_id": f"w-{index}",
+            "workspace_name": f"workspace-{index}",
+            "workspace_state": "working" if index == 0 else "ready",
+            "model": "sonnet",
+        }
+        for index in range(BOARD_VISIBLE + 3)
+    ]
+    lines = board_lines(rows)
+    assert lines[0] == f"<b>Board · {BOARD_VISIBLE + 3} recent</b>"
+    assert lines[1].startswith("⚙️")
+    assert len(lines) == BOARD_VISIBLE + 2
+    assert lines[-1] == "<i>+3 more · use /s to switch</i>"
+
+
+def test_session_overview_is_a_concise_control_summary() -> None:
+    session = SessionRow(
+        id="session-123",
+        workspace_id="workspace-123",
+        title="Fix checkout",
+        agent="claude",
+        model="sonnet",
+        effort="high",
+        turn_state=str(TurnState.WORKING),
+    )
+    workspace = WorkspaceRow(
+        id="workspace-123",
+        name="api",
+        branch="feature/checkout",
+    )
+    lines = session_overview_lines(session, workspace, pending=2)
+    # Two lines, not four: the workspace/branch line only repeated the topic
+    # title bar, and the queue depth rides on the model line.
+    assert lines == [
+        "⚙️ <b>Fix checkout</b> · working",
+        "claude · sonnet/high · 2 pending",
+    ]
+    assert session_overview_lines(session, workspace) == [
+        "⚙️ <b>Fix checkout</b> · working",
+        "claude · sonnet/high",
+    ]
+    assert status_icon("error") == "⚠️"
+
+
+def test_agent_decision_contract_becomes_quick_replies_only_with_marker() -> None:
+    message = TranscriptMessage(
+        id="m-1",
+        session_id="session-1",
+        type="agent",
+        content={
+            "type": "agent",
+            "rawPayload": {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Recommendation: use SQLite.\n\nChoices:\n"
+                                "1. SQLite (recommended)\n"
+                                "2. Postgres\n"
+                            ),
+                        }
+                    ]
+                },
+            },
+        },
+    )
+    numbered_steps = message.model_copy(
+        update={
+            "content": {
+                **message.content,
+                "rawPayload": {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {"type": "text", "text": "Steps:\n1. Build\n2. Test"}
+                        ]
+                    },
+                },
+            }
+        }
+    )
+
+    assert quick_replies_for(message) == ("SQLite (recommended)", "Postgres")
+    assert quick_replies_for(numbered_steps) == ()
+
+
+def test_topic_color_is_stable_and_uses_telegrams_palette() -> None:
+    first = topic_icon_color("api/feature-checkout")
+    assert first == topic_icon_color("API/feature-checkout")
+    assert first in TOPIC_ICON_COLORS
+
+
+def test_topic_session_switch_cannot_cross_workspaces() -> None:
+    sessions = [
+        SessionRow(id="a", workspace_id="workspace-a"),
+        SessionRow(id="b", workspace_id="workspace-b"),
+    ]
+    topic = Route(
+        kind="topic",
+        chat=ChatRow(chat_id=-1001, thread_id=7, workspace_id="workspace-a"),
+    )
+    dm = Route(kind="dm")
+
+    assert [row.id for row in switchable_sessions(sessions, topic)] == ["a"]
+    assert [row.id for row in switchable_sessions(sessions, dm)] == ["a", "b"]
+
+
+async def test_general_plain_text_searches_and_never_posts(
+    db: Database, monkeypatch: Any
+) -> None:
+    calls: list[tuple[str, Any]] = []
+    bubbles: list[str] = []
+
+    async def fake_find(message: Any, text: str, **kwargs: Any) -> None:
+        calls.append((text, kwargs.get("reply_markup")))
+
+    async def fake_tell(_message: Any, text: str, **__: Any) -> None:
+        bubbles.append(text)
+
+    monkeypatch.setattr(prompt_handlers, "run_find", fake_find)
+    monkeypatch.setattr(prompt_handlers, "tell", fake_tell)
+    await sessions_repo.upsert(db, "session-1", title="api/fix-flaky")
+    await chats_repo.bind(
+        db, -1001, 7, workspace_id=None, session_id="session-1", kind="topic"
+    )
+    await chats_repo.touch_prompt(db, -1001, 7, focus_for_ms=1000)
+    message = SimpleNamespace(
+        text="search this",
+        chat=SimpleNamespace(id=-1001),
+        message_thread_id=None,
+        message_id=4,
+        from_user=SimpleNamespace(id=1001),
+    )
+
+    await prompt_handlers.plain_text(
+        message,  # type: ignore[arg-type]
+        Route(chat_id=-1001, kind="general"),
+        NonceStore(),
+        db=db,
+        client=None,
+    )
+
+    # One typed line, one bubble: the Send button rides on the search results
+    # instead of arriving as a second push, and it names its target.
+    assert [text for text, _ in calls] == ["search this"]
+    assert bubbles == []
+    markup = calls[0][1]
+    assert markup is not None
+    assert markup.inline_keyboard[0][0].text == "Send to api/fix-flaky"
+
+
+async def test_binary_attachment_is_never_silently_ignored(monkeypatch: Any) -> None:
+    replies: list[tuple[str, bool]] = []
+
+    async def fake_tell(_message: Any, text: str, **kwargs: Any) -> None:
+        replies.append((text, bool(kwargs.get("silent", True))))
+
+    monkeypatch.setattr(prompt_handlers, "tell", fake_tell)
+    await prompt_handlers.unsupported_attachment(SimpleNamespace())  # type: ignore[arg-type]
+
+    # Shorter, but still a push: the user believes they just sent something.
+    assert replies == [("📎 Not forwarded — text or voice only.", False)]
+
+
+async def test_new_session_is_seeded_before_first_prompt(
+    db: Database,
+) -> None:
+    class Client:
+        async def list_project_workspaces(self, *_: Any, **__: Any) -> WorkspacesPage:
+            return WorkspacesPage(data=[], has_more=False)
+
+        async def create_workspace(self, **_: Any) -> WorkspaceCreateResult:
+            return WorkspaceCreateResult(
+                workspace_id="workspace-1",
+                session_id="session-new",
+                deep_link="https://example.test/open",
+            )
+
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=1001, type="private"),
+        message_id=7,
+        message_thread_id=None,
+    )
+
+    await create_and_bind(
+        message=message,  # type: ignore[arg-type]
+        route=Route(chat_id=1001, kind="dm"),
+        request=CreateRequest(
+            project_id="project-1",
+            project_name="api",
+            branch="main",
+            agent="claude",
+            model="sonnet",
+            effort="high",
+            prompt="Fix it",
+        ),
+        db=db,
+        client=Client(),  # type: ignore[arg-type]
+    )
+
+    row = await sessions_repo.get(db, "session-new")
+    assert row is not None
+    assert row.seeded and row.cursor_session_index == -1
+    assert row.state.value == "WAKING"
+    pending = await prompts_repo.list_recoverable(db, session_id="session-new")
+    assert len(pending) == 1
+    assert pending[0].body == augment_prompt("Fix it")
+
+
+def test_general_topic_id_one_is_also_cockpit() -> None:
+    message = SimpleNamespace(
+        chat=SimpleNamespace(type="supergroup"),
+        message_thread_id=1,
+    )
+
+    assert prompt_handlers.is_general_cockpit(
+        message,  # type: ignore[arg-type]
+        Route(chat_id=-1001, thread_id=1, kind="topic"),
+    )
+
+
+async def test_find_is_five_one_line_rows_not_three_screens() -> None:
+    class SqlClient:
+        async def sql(self, _query: str) -> SqlResult:
+            return SqlResult(
+                rows=[
+                    {
+                        "workspace_name": f"api/fix-{index}",
+                        "preview": "the quick brown fox " * 20,
+                    }
+                    for index in range(12)
+                ],
+                row_count=12,
+            )
+
+    rendered = await find_text(SqlClient(), "fox")  # type: ignore[arg-type]
+    lines = rendered.split("\n")
+
+    # Header (only because there are more hits than shown) + five rows.
+    assert lines[0] == "<b>12 matches</b>"
+    assert len(lines) == FIND_VISIBLE + 1
+    assert all(line.count("\n") == 0 for line in lines)
+    assert lines[1].startswith("<b>api/fix-0</b> · the quick brown fox")
+    # 90 characters of preview, not 180, and no blank separator line.
+    assert len(lines[1]) < 130
+    assert "" not in lines
+
+
+async def test_find_drops_the_header_when_every_hit_is_shown() -> None:
+    class SqlClient:
+        async def sql(self, _query: str) -> SqlResult:
+            return SqlResult(
+                rows=[{"workspace_name": "api/fix", "preview": "hit"}], row_count=1
+            )
+
+    assert await find_text(SqlClient(), "hit") == "<b>api/fix</b> · hit"  # type: ignore[arg-type]
+
+
+async def test_board_sends_one_line_and_buttons_never_both_lists(
+    db: Database, monkeypatch: Any
+) -> None:
+    sent: list[tuple[str, Any]] = []
+
+    async def fake_tell(_message: Any, text: str, **kwargs: Any) -> None:
+        sent.append((text, kwargs.get("reply_markup")))
+
+    monkeypatch.setattr(core_handlers, "tell", fake_tell)
+    for index in range(3):
+        await workspaces_repo.upsert(
+            db,
+            f"workspace-{index}",
+            name=f"api/fix-{index}",
+            model="sonnet",
+            chat_id=-1001,
+            topic_id=100 + index,
+        )
+
+    async def fake_rows(*_: Any, **__: Any) -> list[dict[str, object]]:
+        return [
+            {
+                "workspace_id": f"workspace-{index}",
+                "workspace_name": f"api/fix-{index}",
+                "display_state": "working",
+                "model": "sonnet",
+            }
+            for index in range(3)
+        ]
+
+    monkeypatch.setattr(core_handlers, "board_rows", fake_rows)
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=-1001), message_thread_id=None, message_id=3
+    )
+
+    await core_handlers.board(
+        message,  # type: ignore[arg-type]
+        _NullState(),  # type: ignore[arg-type]
+        db=db,
+        client=_CountingClient(),  # type: ignore[arg-type]
+    )
+
+    text, markup = sent[0]
+    # The ten names used to be printed and then rendered as ten buttons.
+    assert text == "<b>3 live</b>"
+    assert markup is not None
+    labels = [row[0].text for row in markup.inline_keyboard]
+    assert labels == [f"⚙️ api/fix-{index} · sonnet" for index in range(3)]
+
+
+async def test_board_still_lists_a_workspace_that_has_no_topic_to_jump_to(
+    db: Database, monkeypatch: Any
+) -> None:
+    sent: list[tuple[str, Any]] = []
+
+    async def fake_tell(_message: Any, text: str, **kwargs: Any) -> None:
+        sent.append((text, kwargs.get("reply_markup")))
+
+    async def fake_rows(*_: Any, **__: Any) -> list[dict[str, object]]:
+        return [
+            {
+                "workspace_id": "workspace-orphan",
+                "workspace_name": "api/orphan",
+                "display_state": "working",
+                "model": "sonnet",
+            }
+        ]
+
+    monkeypatch.setattr(core_handlers, "tell", fake_tell)
+    monkeypatch.setattr(core_handlers, "board_rows", fake_rows)
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=-1001), message_thread_id=None, message_id=3
+    )
+
+    await core_handlers.board(
+        message,  # type: ignore[arg-type]
+        _NullState(),  # type: ignore[arg-type]
+        db=db,
+        client=_CountingClient(),  # type: ignore[arg-type]
+    )
+
+    text, markup = sent[0]
+    assert text == "<b>1 live</b>\n⚙️ <b>api/orphan</b>"
+    assert markup is None
+
+
+async def test_stop_acknowledges_with_a_reaction_not_a_bubble(
+    monkeypatch: Any,
+) -> None:
+    reactions: list[str] = []
+    bubbles: list[str] = []
+
+    class Bot:
+        async def set_message_reaction(self, **kwargs: Any) -> None:
+            reactions.append(kwargs["reaction"][0].emoji)
+
+    async def fake_tell(_message: Any, text: str, **__: Any) -> None:
+        bubbles.append(text)
+
+    monkeypatch.setattr(core_handlers, "tell", fake_tell)
+    message = SimpleNamespace(
+        bot=Bot(),
+        chat=SimpleNamespace(id=-1001),
+        message_id=12,
+        message_thread_id=7,
+        from_user=SimpleNamespace(id=1001),
+    )
+
+    await core_handlers.stop(
+        message,  # type: ignore[arg-type]
+        Route(
+            chat_id=-1001,
+            thread_id=7,
+            kind="topic",
+            chat=ChatRow(chat_id=-1001, thread_id=7, session_id="session-1"),
+        ),
+        _NullState(),  # type: ignore[arg-type]
+        supervisor=CancelSupervisor(),  # type: ignore[arg-type]
+    )
+
+    assert reactions == ["👀"]
+    assert bubbles == []
+
+
+async def test_stop_still_says_something_when_reactions_are_refused(
+    monkeypatch: Any,
+) -> None:
+    bubbles: list[str] = []
+
+    async def fake_tell(_message: Any, text: str, **__: Any) -> None:
+        bubbles.append(text)
+
+    monkeypatch.setattr(core_handlers, "tell", fake_tell)
+    message = SimpleNamespace(
+        bot=None,
+        chat=SimpleNamespace(id=-1001),
+        message_id=12,
+        message_thread_id=7,
+        from_user=SimpleNamespace(id=1001),
+    )
+
+    await core_handlers.stop(
+        message,  # type: ignore[arg-type]
+        Route(
+            chat_id=-1001,
+            thread_id=7,
+            kind="topic",
+            chat=ChatRow(chat_id=-1001, thread_id=7, session_id="session-1"),
+        ),
+        _NullState(),  # type: ignore[arg-type]
+        supervisor=CancelSupervisor(),  # type: ignore[arg-type]
+    )
+
+    assert bubbles == ["Stopping…"]
+
+
+async def test_a_failed_stop_is_the_one_thing_worth_a_push(monkeypatch: Any) -> None:
+    sent: list[tuple[str, bool]] = []
+
+    async def fake_tell(_message: Any, text: str, **kwargs: Any) -> None:
+        sent.append((text, bool(kwargs.get("silent", True))))
+
+    monkeypatch.setattr(core_handlers, "tell", fake_tell)
+    message = SimpleNamespace(
+        bot=None,
+        chat=SimpleNamespace(id=-1001),
+        message_id=12,
+        message_thread_id=7,
+        from_user=SimpleNamespace(id=1001),
+    )
+
+    await core_handlers.stop(
+        message,  # type: ignore[arg-type]
+        Route(
+            chat_id=-1001,
+            thread_id=7,
+            kind="topic",
+            chat=ChatRow(chat_id=-1001, thread_id=7, session_id="session-1"),
+        ),
+        _NullState(),  # type: ignore[arg-type]
+        supervisor=CancelSupervisor(result=None),  # type: ignore[arg-type]
+    )
+
+    assert sent == [("Stop unavailable — retry.", False)]
+
+
+async def test_command_replies_are_silent_by_default() -> None:
+    """Routine acks must not buzz the phone; ``send_html`` gets the flag."""
+    captured: list[dict[str, Any]] = []
+
+    class Bot:
+        async def send_message(self, **kwargs: Any) -> None:
+            captured.append(kwargs)
+
+    message = SimpleNamespace(
+        bot=Bot(), chat=SimpleNamespace(id=-1001), message_thread_id=7
+    )
+
+    await tell(message, "Renamed.")  # type: ignore[arg-type]
+    await tell(message, "Rename failed: nope", silent=False)  # type: ignore[arg-type]
+
+    assert captured[0]["disable_notification"] is True
+    assert captured[1]["disable_notification"] is None
+
+
+def test_archive_confirm_states_the_consequence_not_the_name() -> None:
+    """The name is already in the button, the topic title and the title bar."""
+    assert ARCHIVE_CONSEQUENCE == "Closes this topic. Restorable in Conductor."
+    assert "<b>" not in ARCHIVE_CONSEQUENCE
+
+
+async def test_new_checks_topic_permission_before_paying_for_a_workspace(
+    db: Database,
+) -> None:
+    """``POST /workspaces`` has no idempotency key: each retry would strand one."""
+    bot = _ForumBot(can_manage_topics=False)
+    client = _CountingClient()
+
+    with pytest.raises(RuntimeError) as error:
+        await create_and_bind_input(
+            bot=bot,  # type: ignore[arg-type]
+            chat_id=-1001,
+            chat_type="supergroup",
+            tg_message_id=5,
+            route=Route(chat_id=-1001, kind="general"),
+            request=_REQUEST,
+            db=db,
+            client=client,  # type: ignore[arg-type]
+        )
+
+    assert "No topic permission" in str(error.value)
+    assert "/setup" in str(error.value)
+    assert client.creates == 0
+    assert bot.topics == 0
+
+
+async def test_new_still_creates_the_workspace_when_topics_are_allowed(
+    db: Database,
+) -> None:
+    bot = _ForumBot()
+    client = _CountingClient()
+
+    created = await create_and_bind_input(
+        bot=bot,  # type: ignore[arg-type]
+        chat_id=-1001,
+        chat_type="supergroup",
+        tg_message_id=5,
+        route=Route(chat_id=-1001, kind="general"),
+        request=_REQUEST,
+        db=db,
+        client=client,  # type: ignore[arg-type]
+    )
+
+    assert client.creates == 1
+    assert bot.topics == 1
+    assert created.thread_id == 99

@@ -28,9 +28,10 @@ default client signatures (docs call out Python `urllib`). Errors are
 | `POST /v0/workspaces` | `{projectId\|repositoryUrl, branch?, name?, sessionName?, agent, model?, effort?, env?}` → `201 {workspaceId, sessionId, deepLink}`. **No idempotency key.** |
 | `GET /v0/workspaces/{id}` · `/rename` · `/archive` | archive is idempotent and restorable |
 | `GET /v0/workspaces/{id}/status` | `initializing\|ready\|sleeping\|archived\|deleted\|updating` + `lifecycleStep` |
-| `GET /v0/workspaces/{id}/sessions` · `POST /v0/sessions` | session carries `agent, model, effort, fastMode` |
+| `GET /v0/workspaces/{id}/sessions` · `POST /v0/sessions` | session carries `agent, model, effort, fastMode`; POST accepts a caller-supplied `sessionId` |
 | `POST /v0/sessions/{id}/messages` | `{message, messageId?}` → `{messageId, state: queued\|sent}`. **`messageId` is a caller-supplied idempotency key** |
 | `GET /v0/sessions/{id}/messages` | `{data:[{id, sessionId, sessionIndex, type, content, receivedAt}], offset, hasMore}`; `after=<messageId>` = exclusive incremental cursor, ascending `sessionIndex`; cannot combine with `offset` |
+| `GET /v0/messages/{messageId}` | fetch one transcript envelope by its server-assigned id |
 | `GET /v0/sessions/{id}/status` | `idle\|working\|error` + `errorMessage/lastError` |
 | `POST /v0/sessions/{id}/cancel` | → `{status, canceledQueuedMessages}`; async, poll until idle |
 | `POST /v0/sql` | read-only SELECT over **one view** `session_transcripts_view` |
@@ -102,9 +103,9 @@ with value types; 3 pretty-printed samples per type; string-leaf length percenti
 carry human prose vs machine payload.
 
 **C. Assumption tests — each printed PASS/FAIL:**
-1. Does the `messageId` returned by `POST .../messages` appear as a `message.id` in `GET .../messages`?
-   *(gates the "prompt witnessed" definition)*
-2. Is `sessionIndex` unique, monotonic, gap-free per session?
+1. Where does the POSTed `messageId` surface? *(Verified: `content.id` on the user echo and
+   `content.turnId` on every message in the turn; the envelope `id` is server-assigned.)*
+2. Is `sessionIndex` unique and monotonic? *(Verified: yes, but it is not gap-free.)*
 3. `after=<valid id>` — exclusive? ascending? respects `limit`? sets `hasMore` correctly?
 4. `after=<garbage id>` — 4xx, empty, or full replay? *(picks the fallback path)*
 5. `after=<id from another session>` — behaviour?
@@ -142,7 +143,7 @@ Evidence: `POST_OK`, `POST_AMBIGUOUS`, `STATUS(idle|working|error)`, `DELTA(n, m
 | 2 | IDLE | DELTA (agent content) | WORKING | out-of-band activity — you drove the session from the Mac; mirror it |
 | 3 | SUBMIT_PENDING | BOOT \| POST_AMBIGUOUS | QUEUED | **re-POST with the identical `messageId`** |
 | 4 | QUEUED | STATUS(working) | WORKING | `start_witnessed=true`; card → "started"; begin typing indicator |
-| 5 | QUEUED | DELTA(max_index > index_at_post) | WORKING | **covers the fast turn** — same tick then runs 12→15 |
+| 5 | QUEUED | DELTA(agent content or matching `turnId`) | WORKING | **covers the fast turn** — same tick then runs 12→15 |
 | 6 | QUEUED | STATUS(idle) | QUEUED | **the trap: `idle` is structurally ignored while `start_witnessed=false`** |
 | 7 | QUEUED | TIMER(90s, no delta, ws ready) | QUEUED | card → "queued behind another turn"; cadence → 10s |
 | 8 | QUEUED | TIMER(10 min, never started) | ERROR | "prompt never started" + Retry (new `messageId`) |
@@ -172,8 +173,9 @@ fixed 8s cadence, `WORKING` inferred from `last_delta_at < 45s`, finalize after 
 
 ### Cursor & dedup — `src/ctb/turn/cursor.py`
 
-- `cursor_session_index` (INTEGER) is the **real** cursor; `cursor_message_id` is an optimization for
-  `after=`.
+- `cursor_message_id` is the primary replayable `after=` cursor.
+  `cursor_session_index` is the monotonic replay/overlap guard and offset-repair boundary; gaps are
+  valid and never imply message loss.
 - **First bind = seek to end, never replay.** No count endpoint exists, so: exponential probe with
   `limit=1` at `offset = 0,1,2,4,8,…` until `hasMore == false`, then binary-search the boundary
   (~2·log₂N calls, once). Render only the single most recent agent message as a "now mirroring: …"
@@ -196,9 +198,10 @@ fixed 8s cadence, `WORKING` inferred from `last_delta_at < 45s`, finalize after 
   *before* any HTTP; POST; mark posted. Ambiguous outcome (timeout/reset/5xx) → retry with **the
   same `messageId`** forever with backoff. A crash between write and response is recovered on boot
   by rule 3.
-- **Asymmetry to respect:** `POST /workspaces` and `POST /sessions` have **no** idempotency key.
-  Never blind-retry them. Embed a nonce in the generated `name` (`tg-<chatid>-<nonce>`) and reconcile
-  via `GET /projects/{id}/workspaces` before deciding to re-create.
+- **Asymmetry to respect:** `POST /workspaces` has **no** idempotency key. Never blind-retry it.
+  Embed a nonce in the generated `name` (`tg-<chatid>-<nonce>`) and reconcile via
+  `GET /projects/{id}/workspaces` before deciding to re-create. `POST /sessions` accepts a
+  caller-supplied `sessionId`, which is always generated before the call and safely reused.
 
 ### Client — `src/ctb/conductor/client.py`
 
@@ -241,7 +244,7 @@ Postgres.
 Tables: `allowed_users`, `chats` (routing key **`(chat_id, thread_id)`**, defaults, verbosity),
 `workspaces` (cache + `deep_link` + topic id), `sessions` (cursor fields + turn-machine fields +
 `status_card_msg_id` + `poll_interval_ms`), `outbound_prompts` (`message_id` PK = the Conductor
-idempotency key, `index_at_post`, state), `transcript_messages` (PK `(session_id, message_id)`),
+idempotency key, state), `transcript_messages` (PK `(session_id, message_id)`),
 `deliveries` (PK `(session_id, message_id, part_index, chat_id)`, `state`, `claim_id`,
 `content_hash`), `wizard_state` (aiogram FSM, DB-backed so wizards survive restart),
 `singleton_lease`, `api_events` (ring buffer for `/health`), `unknown_content_types`.
@@ -419,8 +422,9 @@ Outbound throttle: one global send queue ~15 msg/min prioritizing (1) the topic 
 - **Reply-to override:** replying to any bot message routes to *that* message's session regardless of
   topic — the escape hatch when you notice mid-typing.
 - Confirm buttons **contain the name** (`[ Archive api/fix-flaky ]`) so a mis-tap is visibly wrong
-  before it's fatal. Callback payloads carry `(action, id, nonce)` with single-use 60s nonces, so a
-  stale button tapped tomorrow says "expired" instead of archiving something.
+  before it's fatal. Callback payloads carry `(action, id, nonce)` with
+  single-use nonces: destructive confirmation expires in 60 seconds, while
+  safe phone controls remain usable for 15 minutes. A stale button fails closed.
 - `/stop` is never confirmed — friction on cancel is worse than an accidental cancel.
 - Since `opus-5-1m/high` is your default, the heavy-cost confirm fires only on `effort ∈ {max, ultra}`.
   `/board` carries a running today's-turn counter instead of a hard budget.

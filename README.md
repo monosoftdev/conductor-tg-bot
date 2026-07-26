@@ -1,119 +1,214 @@
 # conductor-tg-bot
 
-Drive [Conductor](https://conductor.build) cloud coding agents from Telegram, from your phone.
-
-Type a message, the agent works, the answer gets pushed back to you. No desktop required.
+Drive Conductor cloud agents from Telegram. Each workspace gets a forum topic:
+send a prompt, watch one compact status card, and receive the answer on your
+phone.
 
 ## Status
 
-**Phase 0 — probe.** The renderer and poller can't be written until we've seen real API data.
-Nothing else is implemented yet.
+Ready for a first Railway deployment and live Telegram testing.
 
-## The constraint that shapes everything
+- Python 3.13, aiogram 3, httpx, SQLite/WAL
+- Telegram long polling; no public webhook
+- One Railway replica with a persistent `/data` volume
+- Durable prompt idempotency, transcript cursor, delivery outbox, and
+  singleton poller lease
+- New-workspace prompts are held durably until the workspace is ready
+- Transient Telegram failures retry without a terminal attempt cap
+- Defensive HTML rendering and UTF-16-safe Telegram chunking
+- Daily, power, and owner command surfaces
+- Durable Telegram voice-note and audio transcription with replay-safe actions
+- Mobile reply guidance automatically added to every Telegram prompt
 
-The Conductor v0 API has **no webhooks and no streaming**. The bot must poll. Everything in the
-design exists to make polling reliable enough that a reply is never lost, never duplicated, and
-never announced as "done" before it arrives.
+The transcript cursor is the source of truth. Session status only changes poll
+cadence and progress UX; it never gates delivery.
 
-The core rule:
+## Telegram setup
 
-> **The transcript cursor is the source of truth for content. `GET /status` is only a cadence knob
-> and a UX hint — it never gates delivery.**
+1. Create a bot with `@BotFather`.
+2. Create a private supergroup and enable Forum Topics.
+3. Add the bot as an administrator with permission to manage topics, pin
+   messages, delete messages, and send messages/documents.
+4. Add only trusted Telegram user IDs to
+   `ALLOWED_TELEGRAM_USER_IDS`. The first ID is the owner. This is the security
+   boundary.
+5. Start the bot and run `/setup` in the group. Wait for
+   `Ready · General is search-only; /new creates topics.` before the first
+   `/new` — `/new` creates the Conductor workspace before the topic, so a
+   missing Manage Topics permission strands a live cloud workspace per attempt.
+6. Leave `TELEGRAM_CHAT_ID` unset at first. It is a second fence on top of the
+   allowlist, `/setup` does not write it, nothing in the bot prints a chat id,
+   and a wrong value silently drops every group update. Add it later from the
+   Telegram web client URL if you want it.
+7. Keep `General` as the cockpit. Plain text there searches; it never becomes a
+   prompt without an explicit button tap.
 
-Every hazard (a queued prompt that reports `idle`, a turn that starts *and* finishes between two
-polls, a redeploy mid-turn) is a *status* problem. None are *cursor* problems, because
-`after=<messageId>` is monotonic and replayable. So delivery correctness runs unconditionally on
-every tick in every state, and the turn state machine only drives cadence, the typing indicator,
-and the status card. If the state machine is wrong you get a stale progress line — you never lose
-or double-see a reply.
+DMs work as a degraded, single-session fallback.
 
-## Phase 0: the probe
+## Daily control loop
 
-The OpenAPI spec types a transcript message's `content` as `{}` — completely untyped — and `type`
-as a bare string. Writing a renderer against that means guessing. `scripts/probe_transcript.py`
-answers it against the live API, and also tests eight load-bearing assumptions the poller design
-depends on.
+Use General as the cockpit and workspace topics as focused control rooms:
 
-```bash
-python3.13 -m venv .venv && .venv/bin/pip install -e '.[dev]'
-export CONDUCTOR_API_KEY=...     # https://app.conductor.build/users/api-keys
+1. `/new [project:] prompt` starts work and creates its topic.
+2. Send text, voice, or audio in that topic to continue.
+3. `/mode` shows the current session, branch, model, queue, and safe actions.
+4. `/board` gives a compact cross-workspace view; `/s` switches sessions.
+5. Stop from the pinned card or `/stop`; finish with `/done` plus confirmation.
 
-# READ-ONLY — dumps transcripts, reports content shapes, samples the SQL view
-.venv/bin/python scripts/probe_transcript.py dump --auto
+The pinned status card absorbs progress/tool noise. Final answers stay concise,
+outcome-first, and easy to scan on a phone. Prompts use 👀/👍 reactions instead
+of receipt bubbles, and agent decisions become one-tap numbered buttons with
+the recommended choice first.
 
-# WRITES — sends throwaway prompts to ONE scratch session you nominate
-.venv/bin/python scripts/probe_transcript.py assume --session <SCRATCH_SESSION_ID>
-```
+## Local development
 
-Output lands in `probe-out/` (gitignored — it contains real transcript text, which is your source
-code). The curated fixtures that get committed live in `tests/fixtures/`.
-
-### What `assume` is actually testing
-
-| # | Assumption | Why it matters |
-|---|---|---|
-| 1 | The `messageId` returned by `POST .../messages` appears as a transcript `message.id` | Defines "this prompt has been witnessed" |
-| 2 | `sessionIndex` is unique, monotonic, gap-free | It's the real cursor; `after=` is just an optimization |
-| 3 | `after=<id>` is exclusive, ascending, respects `limit`/`hasMore` | The incremental read path |
-| 4 | `after=<garbage id>` → 4xx, empty, or **full replay** | Picks the fallback path; a silent full replay would re-post an entire transcript to Telegram |
-| 5 | `after=<id from another session>` | Same |
-| 6 | `offset`/`hasMore` are stable during an active turn | Whether paging can be trusted mid-turn |
-| 7 | **Re-POSTing the same `messageId` dedupes** | The linchpin. The entire crash-safety design is "write the row, POST, retry forever with the same id". If this creates two prompts, that design is invalid |
-| 8 | POST to a sleeping workspace — wake, error, or hang? | Not automated; needs a sleeping workspace |
-
-Plus a timing trace (`/status` @1s, `/messages` @2s through a real turn) that produces the actual
-`POST→working` and `working→idle` latencies. Those numbers set the poller's constants instead of
-guesses — and the trace directly measures how many `idle` polls arrive *before* the turn starts,
-which is the trap the docs warn about:
-
-> *"Wait for `working` before trusting `idle`. A queued prompt hasn't started a turn yet, and the
-> session reports `idle` until it does."*
-
-## Design
-
-Full plan: `~/.claude/plans/i-want-to-create-linear-quokka.md`.
-
-- **Chat model** — a private Telegram supergroup with forum topics, one topic per workspace,
-  `General` as the cockpit. The address of a prompt is the topic your thumb is in, so there's no
-  "bound session" variable to lose track of. Routing key is `(chat_id, message_thread_id)`; DM
-  falls out as `thread_id = NULL`, a degraded single-session mode.
-- **Storage** — SQLite (WAL) on a Railway volume. A volume attaches to exactly one instance, which
-  prevents the two-replica overlap problem structurally rather than mitigating it.
-- **Formatting** — Telegram HTML, never MarkdownV2. MarkdownV2 needs 18 characters escaped
-  *including inside code spans*; agent output is nothing but those characters, and one miss is a
-  `400` and a lost reply.
-- **Idempotency** — the `outbound_prompts` row is written *before* any HTTP call, keyed by a
-  client-generated `uuid4()` that doubles as Conductor's idempotency key. `POST /workspaces` and
-  `POST /sessions` have **no** such key, so they are never blind-retried — they reconcile by
-  listing and matching a nonce embedded in the generated name.
-
-## Layout
-
-```
-scripts/probe_transcript.py   Phase 0 — run first
-src/ctb/
-  conductor/     API client: retry, token bucket, circuit breaker
-  turn/          machine.py is a pure (state, evidence) -> (state, actions) fn
-  delivery/      outbox, status card, the defensive renderer
-  bot/           aiogram handlers, wizards, keyboards
-tests/
-```
-
-Build order: probe → client → db → `turn/machine` (pure, fully tested against a fake) → poller →
-delivery → bot. The pure state machine tested against scripted failure sequences is where the
-reliability actually comes from; it gets written before any Telegram code.
-
-## Development
+Python 3.13 is required.
 
 ```bash
-.venv/bin/python -m pytest tests/ -q
-.venv/bin/python -m ruff format . && .venv/bin/python -m ruff check .
-.venv/bin/python -m pyright
+python3.13 -m venv .venv
+.venv/bin/pip install -e '.[dev]'
+cp .env.example .env
 ```
 
-## Secrets
+Set the three required values in `.env`:
 
-`TELEGRAM_BOT_TOKEN` and `CONDUCTOR_API_KEY` come from the environment only — never committed,
-never logged (structlog runs a mandatory scrubbing processor). Transcript content is your source
-code: content logging is off by default (`LOG_TRANSCRIPT_CONTENT=false`), stored content is capped
-at 64 KB/message, and `transcript_messages` is pruned after 30 days.
+```dotenv
+TELEGRAM_BOT_TOKEN=...
+CONDUCTOR_API_KEY=...
+ALLOWED_TELEGRAM_USER_IDS=123456789
+```
+
+Then run:
+
+```bash
+.venv/bin/python -m ctb
+```
+
+### Voice and audio
+
+The bot accepts Telegram mic-button voice notes and uploaded audio messages.
+Audio stays in memory only; the durable job stores the transcript and its
+snapshotted topic/session route.
+
+Enable ordinary spoken prompts with:
+
+```dotenv
+VOICE_ENABLED=true
+ELEVENLABS_API_KEY=...
+VOICE_MODE=prompts
+```
+
+Modes:
+
+- `shadow` — transcribe and preview; execute nothing.
+- `prompts` — submit ordinary topic/DM speech; General remains search-only.
+  Spoken commands are preview-only.
+- `commands` — also execute exact wake-phrase commands such as
+  “command stop” or “команда знайди SQLite”. `/done` still requires the named
+  confirmation button. There is no fuzzy command matching.
+
+The defaults cap audio at 180 seconds and Telegram's 20 MB bot-download limit.
+Keep `VOICE_LANGUAGE=auto` to preserve multilingual and code-switched speech.
+
+Health is served on `PORT` (default `8080`):
+
+```bash
+curl http://127.0.0.1:8080/health
+```
+
+## Railway deployment
+
+### Before your first deploy
+
+1. **Set `RAILWAY_RUN_UID=0`.** The image runs as UID 10001 and Railway mounts
+   a fresh *root-owned* volume over `/data`, so without this SQLite cannot open
+   the database and the service crash-loops. The container now fails with
+   `FATAL: cannot write /data …` instead of a bare `OperationalError`, but the
+   variable is the fix. A local `docker run` cannot reproduce this — Docker
+   seeds a named volume from image content, Railway does not.
+2. **Mount the volume at exactly `/data`.** Any other path silently writes to
+   ephemeral container disk and loses the cursors on every deploy.
+3. **Set all three required variables in one go** — the bot reports them
+   together, so a partial set just crashes again:
+   `TELEGRAM_BOT_TOKEN`, `CONDUCTOR_API_KEY`, `ALLOWED_TELEGRAM_USER_IDS`.
+4. **Verify the token first:** `curl "https://api.telegram.org/bot<TOKEN>/getMe"`.
+   A rejected token now fails the deploy loudly rather than retrying forever.
+5. **Set `HEALTH_TOKEN`** to a random string if you generate a public Railway
+   domain. Without it the detailed `/health` body is served to loopback only,
+   so a public domain sees the status summary and nothing identifying.
+6. Optional: `TELEGRAM_CHAT_ID` (leave unset at first), and for voice/audio
+   `VOICE_ENABLED=true` plus `ELEVENLABS_API_KEY`.
+
+### Deploy
+
+1. Create a Railway service from this private repository.
+2. Deploy with the checked-in `Dockerfile` and `railway.toml`.
+3. Confirm `/health` returns `{"status":"ok","ok":true,...}`.
+4. In Telegram, run `/setup`, then `/new <prompt>`, then `/health` — expect
+   `circuit closed` and `0 overdue`.
+
+Keep exactly one replica. SQLite, the volume, Telegram `getUpdates`, and the
+singleton lease all assume a single active service. `overlapSeconds=0` stops
+the old deployment before the new poller starts.
+
+## Commands
+
+Daily:
+
+- `/new [project:] prompt`
+- `/board`
+- `/stop`
+- `/find text`
+- `/mode`
+- `/done`
+
+Power:
+
+- `/s`, `/fork`, `/name`, `/open`, `/desk`, `/log`
+- `/notify`, `/defaults`, `/sql`, `/tidy`, `/setup`
+
+Owner:
+
+- `/allow`, `/deny`, `/health`, `/backup`
+
+## Quality gates
+
+```bash
+.venv/bin/ruff format --check src scripts tests
+.venv/bin/ruff check src scripts tests
+.venv/bin/pyright
+.venv/bin/pytest -q
+docker build -t conductor-tg-bot:local .
+```
+
+The local production-image smoke test verifies migrations, lease acquisition,
+all six long-lived services, and `/health`. It cannot verify volume
+permissions: Docker seeds a named volume from the image (ownership included),
+while Railway mounts an empty root-owned one. That is what `RAILWAY_RUN_UID=0`
+is for.
+
+## Live acceptance checklist
+
+Run these from a phone after the first deploy:
+
+1. `/new <prompt>` creates a topic and delivers one answer.
+2. `/stop` mid-turn reports stopped state and dropped queued prompts.
+3. Redeploy mid-turn; the answer arrives without a lost transcript message.
+4. Replace the Conductor key with a bad value; pollers stop without a retry
+   storm and `/health` reports the auth failure.
+5. Run three workspaces concurrently; answers stay in their own topics.
+6. `/find` returns a known historical phrase.
+7. `/done` archives the workspace and closes its topic.
+8. Send a voice note in a topic; its prompt reaches that topic's session once.
+9. Send audio in General; it searches and never submits a prompt.
+10. With `VOICE_MODE=commands`, “command stop” stops the current session and
+    “command done” only shows the archive confirmation.
+
+The renderer corpus currently contains probe-verified simple turns plus clearly
+labelled synthetic tool/diff/error shapes. Expand it with curated real
+tool-heavy transcripts after the account has such sessions.
+
+Full architecture and verification details are in
+[`docs/PLAN.md`](docs/PLAN.md). Probe findings are in
+[`docs/HANDOFF.md`](docs/HANDOFF.md). The final operator and architecture map is
+in [`docs/SYSTEM_OVERVIEW.md`](docs/SYSTEM_OVERVIEW.md).

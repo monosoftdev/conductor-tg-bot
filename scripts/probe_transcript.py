@@ -36,6 +36,7 @@ from collections import Counter, defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 try:
     import httpx
@@ -44,6 +45,11 @@ except ImportError:  # pragma: no cover - operator-facing
 
 API_URL = os.environ.get("CONDUCTOR_API_URL", "https://api.conductor.build/v0")
 API_KEY = os.environ.get("CONDUCTOR_API_KEY", "")
+
+# `/me` is the one endpoint that sits at the API root rather than under /v0, so it
+# needs an absolute URL — joining it onto the base gives /v0/me, which 404s.
+_API = urlsplit(API_URL)
+ME_URL = f"{_API.scheme}://{_API.netloc}/me"
 
 # The API sits behind a proxy that 403s some default client signatures (the docs
 # call out Python's urllib). Always send an explicit UA.
@@ -514,13 +520,37 @@ async def cmd_assume(p: Probe, session_id: str) -> None:
         else "no idle observed before working",
     )
 
-    # --- 1: does our messageId appear as a transcript message id?
-    ids = {m["id"] for m in new_msgs}
+    # --- 1: how does our POSTed messageId surface in the transcript?
+    # Not as the envelope `id` — that is server-assigned and composite
+    # (`<sessionId>:<seq>:<sub>`). It surfaces inside `content`: the user echo
+    # carries it as `content.id`, and every message of the turn it triggered
+    # carries it as `content.turnId`.
+    envelope_ids = {m["id"] for m in new_msgs}
+    echo_ids = {
+        (m.get("content") or {}).get("id")
+        for m in new_msgs
+        if m.get("type") == "userMessage"
+    }
+    turn_msgs = [
+        m for m in new_msgs if (m.get("content") or {}).get("turnId") == mid_key
+    ]
     r.add(
-        "1 POST messageId appears as a transcript message id",
-        mid_key in ids,
-        f"messageId={mid_key} {'found' if mid_key in ids else 'NOT found'} "
-        f"among {len(ids)} new message ids",
+        "1a POST messageId is NOT the envelope message id",
+        mid_key not in envelope_ids,
+        f"envelope ids are server-assigned composites, e.g. "
+        f"{next(iter(envelope_ids), None)!r}",
+    )
+    r.add(
+        "1b POST messageId surfaces as content.id on the user echo",
+        mid_key in echo_ids,
+        f"messageId={mid_key} {'found' if mid_key in echo_ids else 'NOT found'} "
+        f"among {len(echo_ids)} user-echo content ids",
+    )
+    r.add(
+        "1c content.turnId attributes turn output to the prompt",
+        len(turn_msgs) > 0 and len(turn_msgs) == len(new_msgs),
+        f"{len(turn_msgs)}/{len(new_msgs)} new messages carry "
+        f"content.turnId=={mid_key}",
     )
 
     # --- 7: did the duplicate POST produce two prompts?
@@ -593,7 +623,7 @@ async def main() -> None:
     ) as client:
         p = Probe(client)
 
-        me = await p.get("/me")
+        me = await p.get(ME_URL)
         print(f"Authenticated: {json.dumps(me)}\n")
         write("me.json", json.dumps(me, indent=2))
 

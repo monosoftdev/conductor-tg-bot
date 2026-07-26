@@ -32,8 +32,12 @@ lose or double-see a reply.
 
 - `POST /sessions/{id}/messages` takes a caller-supplied `messageId` — an idempotency key. Write the
   DB row *before* the HTTP call and retry ambiguous failures forever with the same id.
-- `POST /workspaces` and `POST /sessions` have **no** idempotency key. Never blind-retry them.
-  Reconcile via a nonce embedded in the generated workspace name.
+- `POST /workspaces` has **no** idempotency key. Never blind-retry it; reconcile via a nonce
+  embedded in the generated workspace name. `POST /sessions` accepts a caller-supplied
+  `sessionId`, so generate it before the call and reuse it on retries.
+- The prompt `messageId` is `content.id` on its user echo and `content.turnId` on every message in
+  that turn; it is not the server-assigned envelope `id`.
+- `sessionIndex` is monotonic but not gap-free. Never infer message loss from a gap.
 - Always send an explicit `User-Agent`. The API is behind a proxy that 403s some default client
   signatures.
 - `POST /v0/sql` reads exactly one view, `session_transcripts_view`. It is also the **only**
@@ -62,6 +66,11 @@ lose or double-see a reply.
 - **Transcript content is the user's source code.** `LOG_TRANSCRIPT_CONTENT=false` by default;
   stored content capped at 64 KB/message; `transcript_messages` pruned after 30 days.
   `probe-out/` is gitignored for the same reason.
+- **Voice leaves the perimeter.** With `VOICE_ENABLED=true`, every note's audio plus a few short
+  repo/session keyterms (workspace name, branch, topic, session title) is uploaded to ElevenLabs.
+  The bot sends `enable_logging=false`, but zero retention is enterprise-only — on any other tier
+  ElevenLabs keeps the audio and the transcript, and the request degrades to logged rather than
+  failing. Off by default; leave it off if that is not acceptable.
 - `/find` never concatenates user text into SQL — fixed template, escaped literal, char allowlist,
   hard `LIMIT`. The blast radius is every workspace's transcripts.
 - `scripts/probe_transcript.py assume` sends real prompts and costs real tokens. Scratch sessions
