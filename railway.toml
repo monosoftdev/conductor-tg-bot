@@ -1,0 +1,17 @@
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# Exactly one instance, always. Two would fight over Telegram's getUpdates
+# (409 Conflict) and the SQLite volume can only attach to one anyway. The
+# singleton lease in the DB is the belt to this braces.
+numReplicas = 1
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+
+# Stop the old instance before starting the new one, so a redeploy never has
+# two pollers live at once.
+overlapSeconds = 0

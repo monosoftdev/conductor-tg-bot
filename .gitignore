@@ -1,0 +1,23 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+
+# Local SQLite state
+*.db
+*.db-wal
+*.db-shm
+data/
+
+# Probe output contains real transcript content (your source code). Only the
+# curated, reviewed fixtures under tests/fixtures/ are committed.
+probe-out/
