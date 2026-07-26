@@ -9,8 +9,9 @@ none apply here.
 
 ## Read first
 
+- `docs/HANDOFF.md` — what's done, what's next, what's blocked. **Start here.**
+- `docs/ROADMAP.md` — the sequenced checklist, and what's deliberately out of scope.
 - `docs/PLAN.md` — the full approved design. Transition tables, DDL, UX, verification plan.
-- `docs/HANDOFF.md` — what's done, what's next, what's blocked.
 - `README.md` — the short version.
 
 ## The rule that decides everything
