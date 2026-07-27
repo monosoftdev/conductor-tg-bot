@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Collection
 from typing import Final
 
 from aiogram import F, Router
@@ -11,6 +12,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 
 from ctb.bot.app import register_router
+from ctb.bot.handlers.adopt import adopt_button
 from ctb.bot.handlers.common import (
     abandon_wizard,
     command_text,
@@ -63,6 +65,10 @@ BOARD_VISIBLE: Final = 10
 #: Five one-line hits fit one phone screen; anything past that is scrolling
 #: past the answer you already found.
 FIND_VISIBLE: Final = 5
+#: Un-adopted workspaces one scan considers — the same bound the view query
+#: uses. The *caller* caps what it shows and says how many it hid; nothing here
+#: truncates silently.
+ADOPTABLE_SCAN: Final = 20
 #: The confirm button already names the workspace. Say what tapping it does.
 ARCHIVE_CONSEQUENCE: Final = "Closes this topic. Restorable in Conductor."
 _ACTIVE_STATES: Final[frozenset[TurnState]] = frozenset(
@@ -208,6 +214,7 @@ async def new_workspace(
 async def board(
     message: Message,
     state: FSMContext,
+    nonces: NonceStore,
     db: Database | None = None,
     client: ConductorClient | None = None,
 ) -> None:
@@ -217,10 +224,9 @@ async def board(
     if not rows:
         await tell(message, "No live workspaces.")
         return
-    # A button already carries the name, the state icon and the jump link, so
-    # only rows that cannot become a button are also written out as text.
+    # Every row is a button. One that already has a topic jumps to it; one made
+    # on the laptop gets "+ Open …", which opens a topic for it here.
     buttons = []
-    unlinked: list[str] = []
     for row in rows[:BOARD_VISIBLE]:
         wid = str(row.get("workspace_id") or "")
         local = await workspaces_repo.get(database, wid) if wid else None
@@ -237,9 +243,21 @@ async def board(
         if target:
             suffix = f" · {model}" if model else ""
             buttons.append([url_button(f"{icon} {name}{suffix}", target)])
-        else:
-            unlinked.append(f"{icon} <b>{escape(name)}</b>")
-    lines = [f"<b>{len(rows)} live</b>", *unlinked]
+        elif wid:
+            buttons.append(
+                [
+                    adopt_button(
+                        workspace_id=wid,
+                        name=name,
+                        session_id=str(row.get("session_id") or "") or None,
+                        store=nonces,
+                        user_id=message.from_user.id if message.from_user else None,
+                        chat_id=message.chat.id,
+                        thread_id=message.message_thread_id or 0,
+                    )
+                ]
+            )
+    lines = [f"<b>{len(rows)} live</b>"]
     if len(rows) > BOARD_VISIBLE:
         lines.append(f"<i>+{len(rows) - BOARD_VISIBLE} more · /s</i>")
     await tell(
@@ -284,6 +302,90 @@ async def board_rows(
             for row in local[:20]
         ]
     return rows
+
+
+async def adoptable_rows(
+    database: Database,
+    client: ConductorClient | None,
+    *,
+    query: str = "",
+    exclude: Collection[str] = (),
+    limit: int = ADOPTABLE_SCAN,
+) -> list[dict[str, object]]:
+    """Org-wide workspaces that have no topic in this bot yet.
+
+    Never raises: ``/s`` still lists the topics it knows when ``POST /v0/sql``
+    is unavailable — :func:`board_rows` already falls back to the local cache,
+    and anything past that degrades to "no suggestions".
+    """
+    try:
+        rows = await board_rows(database, resolve_client(client))
+    except Exception:
+        return []
+    needle = query.strip().casefold()
+    seen = set(exclude)
+    out: list[dict[str, object]] = []
+    for row in rows:
+        wid = str(row.get("workspace_id") or "")
+        if not wid or wid in seen:
+            continue
+        local = await workspaces_repo.get(database, wid)
+        if local is not None and local.chat_id is not None and local.topic_id:
+            continue
+        name = str(row.get("workspace_name") or row.get("session_title") or wid[:8])
+        if needle and needle not in name.casefold() and needle not in wid.casefold():
+            continue
+        seen.add(wid)
+        out.append(row)
+        if len(out) >= limit:
+            break
+    return out
+
+
+@router.message(Command("attach"))
+async def attach_workspace(
+    message: Message,
+    state: FSMContext,
+    nonces: NonceStore,
+    db: Database | None = None,
+    client: ConductorClient | None = None,
+) -> None:
+    """Open a cloud workspace created outside Telegram."""
+    await abandon_wizard(state)
+    database = resolve_db(db)
+    rows = await adoptable_rows(
+        database,
+        client,
+        query=command_text(message),
+        limit=BOARD_VISIBLE,
+    )
+    if not rows:
+        await tell(message, "No unattached cloud workspace matches.")
+        return
+    buttons = []
+    for row in rows:
+        workspace_id = str(row.get("workspace_id") or "")
+        name = str(
+            row.get("workspace_name") or row.get("session_title") or workspace_id[:8]
+        )
+        buttons.append(
+            [
+                adopt_button(
+                    workspace_id=workspace_id,
+                    name=name,
+                    session_id=str(row.get("session_id") or "") or None,
+                    store=nonces,
+                    user_id=message.from_user.id if message.from_user else None,
+                    chat_id=message.chat.id,
+                    thread_id=message.message_thread_id or 0,
+                )
+            ]
+        )
+    await tell(
+        message,
+        "<b>Open laptop workspace</b> · continues from now",
+        reply_markup=keyboard(buttons),
+    )
 
 
 def board_lines(rows: list[dict[str, object]]) -> list[str]:

@@ -4,13 +4,20 @@ from __future__ import annotations
 
 import json
 import time
+from typing import Final
 
 from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
-from aiogram.types import BufferedInputFile, CallbackQuery, Message
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    InlineKeyboardButton,
+    Message,
+)
 
 from ctb.bot.app import register_router
+from ctb.bot.handlers.adopt import adopt_button
 from ctb.bot.handlers.common import (
     abandon_wizard,
     command_text,
@@ -22,7 +29,7 @@ from ctb.bot.handlers.common import (
     tell,
     workspace_name,
 )
-from ctb.bot.handlers.core import status_icon
+from ctb.bot.handlers.core import adoptable_rows, status_icon
 from ctb.bot.handlers.topics import (
     apply_marker,
     edit_html,
@@ -61,7 +68,7 @@ router = Router(name=__name__)
 register_router(router, order=30)
 
 _HELP = """<b>Phone loop</b>
-General · <code>/new</code>, <code>/board</code>, or search
+General · <code>/new</code>, <code>/attach</code>, <code>/board</code>, or search
 Topic · send text, voice, or audio
 Result · tap a numbered choice; ✓ is recommended
 
@@ -72,6 +79,9 @@ Result · tap a numbered choice; ✓ is recommended
 
 Stop from the pinned card. /done always confirms.
 Voice commands need “command” or “команда”."""
+
+#: Buttons ``/s`` shows in General before it says how many it hid.
+GENERAL_VISIBLE: Final = 12
 
 _SWITCH_ACTIVE = frozenset(
     {
@@ -144,6 +154,7 @@ async def switch_session(
     state: FSMContext,
     nonces: NonceStore,
     db: Database | None = None,
+    client: ConductorClient | None = None,
 ) -> None:
     await abandon_wizard(state)
     database = resolve_db(db)
@@ -153,11 +164,23 @@ async def switch_session(
         for row in await sessions_repo.list_all(database)
         if row.state is not TurnState.DEAD
     ]
+    workspaces = {
+        row.id: row
+        for row in await workspaces_repo.list_all(database, include_archived=False)
+    }
     if query:
         sessions = [
             row
             for row in sessions
-            if query in row.id.casefold() or query in (row.title or "").casefold()
+            if query in row.id.casefold()
+            or query in (row.title or "").casefold()
+            or (
+                row.workspace_id in workspaces
+                and (
+                    query in workspace_name(workspaces[row.workspace_id]).casefold()
+                    or query in (workspaces[row.workspace_id].branch or "").casefold()
+                )
+            )
         ]
     sessions.sort(
         key=lambda row: (
@@ -166,15 +189,11 @@ async def switch_session(
         ),
         reverse=True,
     )
-    workspaces = {
-        row.id: row
-        for row in await workspaces_repo.list_all(database, include_archived=False)
-    }
     in_general = message.chat.type in {"group", "supergroup"} and (
         message.message_thread_id or 0
     ) in {0, 1}
     if in_general:
-        rows = []
+        entries: list[InlineKeyboardButton] = []
         seen: set[str] = set()
         for session in sessions:
             workspace_id = session.workspace_id or ""
@@ -188,23 +207,42 @@ async def switch_session(
                 else None
             )
             if target:
-                rows.append(
-                    [
-                        url_button(
-                            f"{status_icon(session.state)} {workspace_name(workspace)}",
-                            target,
-                        )
-                    ]
+                entries.append(
+                    url_button(
+                        f"{status_icon(session.state)} {workspace_name(workspace)}",
+                        target,
+                    )
                 )
-            if len(rows) >= 12:
-                break
-        if not rows:
-            await tell(message, "No matching workspace topics.")
+        # "I know its name" also has to reach a workspace made on the laptop,
+        # which has no topic and therefore no local session to switch to.
+        for row in await adoptable_rows(database, client, query=query, exclude=seen):
+            workspace_id = str(row.get("workspace_id") or "")
+            entries.append(
+                adopt_button(
+                    workspace_id=workspace_id,
+                    name=str(
+                        row.get("workspace_name")
+                        or row.get("session_title")
+                        or workspace_id[:8]
+                    ),
+                    session_id=str(row.get("session_id") or "") or None,
+                    store=nonces,
+                    user_id=message.from_user.id if message.from_user else None,
+                    chat_id=message.chat.id,
+                    thread_id=route.thread_id,
+                )
+            )
+        if not entries:
+            await tell(message, "No workspace matches.")
             return
+        shown = entries[:GENERAL_VISIBLE]
+        lines = ["<b>Open workspace</b> · + opens a laptop one here"]
+        if len(entries) > len(shown):
+            lines.append(f"<i>+{len(entries) - len(shown)} more · /s name</i>")
         await tell(
             message,
-            "<b>Open workspace</b> · switching stays inside its topic",
-            reply_markup=keyboard(rows),
+            "\n".join(lines),
+            reply_markup=keyboard([[item] for item in shown]),
         )
         return
     sessions = switchable_sessions(sessions, route)
@@ -644,6 +682,7 @@ async def sql_command(
 ) -> None:
     await abandon_wizard(state)
     if not is_owner:
+        await tell(message, "Owner only.")
         return
     query = command_text(message).strip()
     folded = query.casefold()

@@ -104,6 +104,7 @@ __all__ = [
     "find_workspace_by_nonce",
     "new_nonce",
     "nonce_of",
+    "pick_preview",
     "plan_deliveries",
     "preview_text",
     "quick_replies_for",
@@ -556,6 +557,11 @@ class SeekResult:
     preview: TranscriptMessage | None = None
     preview_text: str = ""
     skipped: bool = False
+    #: The trailing messages the preview window already read, oldest first.
+    #: **Read-only.** They were fetched to pick a preview line, they are not
+    #: recorded and they create no ``deliveries`` rows — the cursor is at the
+    #: end, so as far as delivery is concerned they are history.
+    tail: tuple[TranscriptMessage, ...] = ()
 
 
 async def seek_to_end(
@@ -600,12 +606,14 @@ async def seek_to_end(
     )
 
     preview = message
+    tail: tuple[TranscriptMessage, ...] = ()
     if preview_window > 1:
         window, extra = await _tail_window(
             client, session_id, offset, window=preview_window
         )
         requests += extra
-        preview = _pick_preview(window) or message
+        tail = tuple(window)
+        preview = pick_preview(window) or message
 
     _log.info(
         "cursor.seeded",
@@ -622,6 +630,7 @@ async def seek_to_end(
         requests=requests,
         preview=preview,
         preview_text=preview_text(preview),
+        tail=tail,
     )
 
 
@@ -634,8 +643,12 @@ async def _tail_window(
     return list(page.data), 1
 
 
-def _pick_preview(messages: Sequence[TranscriptMessage]) -> TranscriptMessage | None:
-    """The most recent message worth showing as "now mirroring: …"."""
+def pick_preview(messages: Sequence[TranscriptMessage]) -> TranscriptMessage | None:
+    """The most recent message worth showing as "now mirroring: …".
+
+    Also the answer half of the adoption snapshot card — same question, same
+    answer, so it is asked in exactly one place.
+    """
     for message in reversed(messages):
         if message.is_assistant_text:
             return message

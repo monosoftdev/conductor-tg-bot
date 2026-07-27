@@ -27,6 +27,11 @@ Implemented:
   with the recommended option first; prompt reactions move from 👀 to 👍.
 - Topic-safe navigation: stable icon colors distinguish workspaces, General
   `/s` opens topics, and in-topic `/s` cannot cross workspace boundaries.
+- Adoption of workspaces created outside Telegram: `/board` and General `/s`
+  render a topicless workspace as `+ Open <name>`; one tap opens its topic,
+  binds the most recently active session, seeks the cursor to the end, and
+  posts the last exchange as a one-off read-only card that creates no
+  `deliveries` rows. Re-tapping jumps to the existing topic.
 - Telegram voice notes and audio attachments: authenticated size/duration
   checks, in-memory download, ElevenLabs Scribe v2 adapter, strict multilingual
   wake-phrase parser, durable route snapshots, stable action IDs, restart
@@ -39,7 +44,7 @@ Offline:
 
 - Ruff format/check: clean.
 - Pyright: zero errors.
-- Pytest: 1,537 tests passing.
+- Pytest: 1,649 tests passing.
 - Docker image builds from the checked-in files.
 - Production image smoke:
   - runs as non-root UID 10001;
@@ -122,12 +127,13 @@ Raw probe output remains gitignored in `probe-out/`.
 
 Fixed after an audit reproduced these against the built image:
 
-- **A transient 403 no longer latches the bot dead.** `client._request` reset
-  `_auth_failures` only never; the supervisor treats `auth_failures > 0` as
-  fatal and cancels every poller, so one proxy hiccup silently ended all
-  delivery while commands kept answering. Any 2xx now clears the counter (a
-  genuinely bad key never gets one). *Still latched: `supervisor._auth_fatal`,
-  set when a poller crashes with `AuthFatal`, is never cleared — see blockers.*
+- **A transient 403 no longer latches the bot dead.** `client._request`
+  previously never reset `_auth_failures`; the supervisor treats
+  `auth_failures > 0` as fatal and cancels every poller, so one proxy hiccup
+  silently ended all delivery while commands kept answering. Any 2xx now
+  clears the counter (a genuinely bad key never gets one). The supervisor's
+  own `AuthFatal` latch follows that recovery signal as well, so a concurrent
+  successful request restarts the pollers without a redeploy.
 - **A rejected `TELEGRAM_BOT_TOKEN` fails the deploy.** `run_polling` used to
   swallow `TelegramUnauthorizedError` and back off forever: green Railway
   deploy, healthy `/health`, a bot that answers nothing. It now propagates,
@@ -153,6 +159,17 @@ Fixed after an audit reproduced these against the built image:
   writes `TELEGRAM_CHAT_ID` removed (nothing prints a chat id — leave it unset).
 - `/setup` and `/health` are in the BotFather command menu, so the command
   README tells you to run is offered when you type `/`.
+- **Allowed-user updates no longer disappear silently.** Unknown commands,
+  future payloads, edited prompts, expired callbacks, non-owner owner commands,
+  and unexpected handler exceptions all produce a bounded phone reply. Service
+  events and unauthorized users remain intentionally silent.
+- **Interactive replies tolerate brief Telegram faults.** Commands retry
+  network/5xx/`retry_after` failures three times; durable transcript output
+  continues to use the indefinitely retrying outbox.
+- **Laptop cloud work is controllable from the phone.** `/attach`, `/board`,
+  and General `/s` expose one-tap adoption. Concurrent taps, deleted topics,
+  ambiguous topic checks, partial DB bindings, cross-chat bindings, seek
+  failures, and multiple sessions have explicit recovery behavior and tests.
 
 ## Remaining live-only work
 

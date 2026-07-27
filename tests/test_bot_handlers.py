@@ -6,8 +6,9 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from aiogram.exceptions import TelegramBadRequest
-from aiogram.methods import CreateForumTopic
+from aiogram.enums import ContentType
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
+from aiogram.methods import CreateForumTopic, SendMessage
 
 from ctb.bot.handlers import core as core_handlers
 from ctb.bot.handlers import prompts as prompt_handlers
@@ -37,6 +38,7 @@ from ctb.bot.handlers.power import switchable_sessions
 from ctb.bot.handlers.topics import (
     TOPIC_ICON_COLORS,
     TopicCreateError,
+    send_html,
     telegram_reason,
     topic_icon_color,
 )
@@ -512,6 +514,92 @@ async def test_binary_attachment_is_never_silently_ignored(monkeypatch: Any) -> 
     assert replies == [("📎 Not forwarded — text or voice only.", False)]
 
 
+async def test_unknown_commands_and_future_payloads_always_answer(
+    monkeypatch: Any,
+) -> None:
+    replies: list[tuple[str, bool]] = []
+
+    async def fake_tell(_message: Any, text: str, **kwargs: Any) -> None:
+        replies.append((text, bool(kwargs.get("silent", True))))
+
+    monkeypatch.setattr(prompt_handlers, "tell", fake_tell)
+    await prompt_handlers.unsupported_message(
+        SimpleNamespace(content_type=ContentType.TEXT)  # type: ignore[arg-type]
+    )
+    await prompt_handlers.unsupported_message(
+        SimpleNamespace(content_type=ContentType.UNKNOWN)  # type: ignore[arg-type]
+    )
+
+    assert replies == [
+        ("Unknown command · use /help.", False),
+        ("📎 Not forwarded — text or voice only.", False),
+    ]
+
+
+async def test_service_messages_do_not_create_bot_noise(monkeypatch: Any) -> None:
+    replies: list[str] = []
+
+    async def fake_tell(_message: Any, text: str, **_kwargs: Any) -> None:
+        replies.append(text)
+
+    monkeypatch.setattr(prompt_handlers, "tell", fake_tell)
+    await prompt_handlers.unsupported_message(
+        SimpleNamespace(content_type=ContentType.FORUM_TOPIC_CREATED)  # type: ignore[arg-type]
+    )
+
+    assert replies == []
+
+
+async def test_edit_and_stale_callback_never_fail_silently(monkeypatch: Any) -> None:
+    replies: list[tuple[str, bool]] = []
+    answers: list[tuple[str, bool]] = []
+
+    async def fake_tell(_message: Any, text: str, **kwargs: Any) -> None:
+        replies.append((text, bool(kwargs.get("silent", True))))
+
+    async def answer(text: str, **kwargs: Any) -> None:
+        answers.append((text, bool(kwargs.get("show_alert"))))
+
+    monkeypatch.setattr(prompt_handlers, "tell", fake_tell)
+    await prompt_handlers.edited_text(SimpleNamespace())  # type: ignore[arg-type]
+    await prompt_handlers.unknown_callback(
+        SimpleNamespace(answer=answer)  # type: ignore[arg-type]
+    )
+
+    assert replies == [
+        ("Edit not resent · send the correction as a new message.", False)
+    ]
+    assert answers == [("Expired control · run /mode for fresh buttons.", True)]
+
+
+async def test_command_reply_retries_a_transient_telegram_failure(
+    monkeypatch: Any,
+) -> None:
+    calls = 0
+    sleeps: list[float] = []
+
+    class Bot:
+        async def send_message(self, **_kwargs: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise TelegramNetworkError(
+                    method=SendMessage(chat_id=-1001, text="x"),
+                    message="connection reset",
+                )
+            return SimpleNamespace(message_id=7)
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr("ctb.bot.handlers.topics.asyncio.sleep", fake_sleep)
+    result = await send_html(Bot(), -1001, "ok")  # type: ignore[arg-type]
+
+    assert result is not None and result.message_id == 7
+    assert calls == 2
+    assert sleeps == [0.2]
+
+
 async def test_new_session_is_seeded_before_first_prompt(
     db: Database,
 ) -> None:
@@ -638,12 +726,16 @@ async def test_board_sends_one_line_and_buttons_never_both_lists(
 
     monkeypatch.setattr(core_handlers, "board_rows", fake_rows)
     message = SimpleNamespace(
-        chat=SimpleNamespace(id=-1001), message_thread_id=None, message_id=3
+        chat=SimpleNamespace(id=-1001),
+        message_thread_id=None,
+        message_id=3,
+        from_user=SimpleNamespace(id=1001),
     )
 
     await core_handlers.board(
         message,  # type: ignore[arg-type]
         _NullState(),  # type: ignore[arg-type]
+        NonceStore(),
         db=db,
         client=_CountingClient(),  # type: ignore[arg-type]
     )
@@ -656,9 +748,10 @@ async def test_board_sends_one_line_and_buttons_never_both_lists(
     assert labels == [f"⚙️ api/fix-{index} · sonnet" for index in range(3)]
 
 
-async def test_board_still_lists_a_workspace_that_has_no_topic_to_jump_to(
+async def test_board_offers_one_tap_adoption_for_a_topicless_workspace(
     db: Database, monkeypatch: Any
 ) -> None:
+    """A laptop-made workspace used to render as dead text. Now it opens."""
     sent: list[tuple[str, Any]] = []
 
     async def fake_tell(_message: Any, text: str, **kwargs: Any) -> None:
@@ -668,6 +761,7 @@ async def test_board_still_lists_a_workspace_that_has_no_topic_to_jump_to(
         return [
             {
                 "workspace_id": "workspace-orphan",
+                "session_id": "session-orphan",
                 "workspace_name": "api/orphan",
                 "display_state": "working",
                 "model": "sonnet",
@@ -676,20 +770,33 @@ async def test_board_still_lists_a_workspace_that_has_no_topic_to_jump_to(
 
     monkeypatch.setattr(core_handlers, "tell", fake_tell)
     monkeypatch.setattr(core_handlers, "board_rows", fake_rows)
+    store = NonceStore()
     message = SimpleNamespace(
-        chat=SimpleNamespace(id=-1001), message_thread_id=None, message_id=3
+        chat=SimpleNamespace(id=-1001),
+        message_thread_id=None,
+        message_id=3,
+        from_user=SimpleNamespace(id=1001),
     )
 
     await core_handlers.board(
         message,  # type: ignore[arg-type]
         _NullState(),  # type: ignore[arg-type]
+        store,
         db=db,
         client=_CountingClient(),  # type: ignore[arg-type]
     )
 
     text, markup = sent[0]
-    assert text == "<b>1 live</b>\n⚙️ <b>api/orphan</b>"
-    assert markup is None
+    assert text == "<b>1 live</b>"
+    assert markup is not None
+    tap = markup.inline_keyboard[0][0]
+    assert tap.text == "+ Open api/orphan"
+    # Nonce-backed, and it carries the newest session so adoption does not
+    # have to guess which one the board was talking about.
+    ticket = store.peek(tap.callback_data.rsplit(":", 1)[-1])
+    assert ticket is not None
+    assert ticket.action == "adopt"
+    assert ticket.target == "workspace-orphan\nsession-orphan"
 
 
 async def test_stop_acknowledges_with_a_reaction_not_a_bubble(

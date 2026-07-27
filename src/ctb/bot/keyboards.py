@@ -130,6 +130,8 @@ class Action(StrEnum):
     CONFIRM = "ok"
     CANCEL = "cancel"
     JUMP = "jump"
+    #: Open a workspace that already exists in Conductor as a topic here.
+    ADOPT = "adopt"
     DIFF = "diff"
     CHANGE = "change"
     DEFAULTS = "defaults"
@@ -788,6 +790,7 @@ def _style_for(action: Action | str) -> str | None:
         Action.SEND.value,
         Action.PICK.value,
         Action.PAGE.value,
+        Action.ADOPT.value,
     }:
         return "primary"
     return None

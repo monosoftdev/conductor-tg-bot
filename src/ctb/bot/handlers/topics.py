@@ -24,13 +24,20 @@ This module has no router. It is imported by the handlers that do.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import re
 from dataclasses import dataclass
 from typing import Any, Final
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramBadRequest,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramServerError,
+)
 from aiogram.types import InlineKeyboardMarkup, Message
 
 from ctb.conductor.client import ConductorClient, get_client
@@ -77,6 +84,10 @@ log = get_logger(__name__)
 
 #: Telegram's own cap on a forum topic name.
 TOPIC_NAME_LIMIT: Final = 128
+#: Interactive command replies retry briefly. Durable transcript output uses
+#: the outbox's unbounded recovery path instead.
+COMMAND_SEND_ATTEMPTS: Final = 3
+COMMAND_RETRY_AFTER_CAP_S: Final = 5.0
 #: Telegram's complete allowed palette for regular forum-topic icons.
 TOPIC_ICON_COLORS: Final[tuple[int, ...]] = (
     0x6FB9F0,
@@ -226,16 +237,34 @@ async def send_html(
     }
     if reply_to_message_id is not None:
         kwargs["reply_to_message_id"] = reply_to_message_id
+
+    async def send(text: str, *, plain: bool = False) -> Message:
+        for attempt in range(COMMAND_SEND_ATTEMPTS):
+            try:
+                if plain:
+                    return await bot.send_message(text=text, parse_mode=None, **kwargs)
+                return await bot.send_message(text=text, **kwargs)
+            except TelegramRetryAfter as exc:
+                if attempt + 1 >= COMMAND_SEND_ATTEMPTS:
+                    raise
+                await asyncio.sleep(
+                    min(max(float(exc.retry_after), 0.0), COMMAND_RETRY_AFTER_CAP_S)
+                    + 0.1
+                )
+            except (TelegramNetworkError, TelegramServerError):
+                if attempt + 1 >= COMMAND_SEND_ATTEMPTS:
+                    raise
+                await asyncio.sleep(0.2 * (2**attempt))
+        raise RuntimeError("unreachable command-send retry state")
+
     try:
-        return await bot.send_message(text=html, **kwargs)
+        return await send(html)
     except TelegramBadRequest as exc:
         if not is_entity_error(exc):
             log.warning("topics.send_failed", chat_id=chat_id, error=str(exc))
             return None
         try:
-            return await bot.send_message(
-                text=strip_html(html), parse_mode=None, **kwargs
-            )
+            return await send(strip_html(html), plain=True)
         except TelegramAPIError as retry_exc:
             log.warning(
                 "topics.send_retry_failed", chat_id=chat_id, error=str(retry_exc)

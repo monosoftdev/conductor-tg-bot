@@ -53,7 +53,12 @@ Use General as the cockpit and workspace topics as focused control rooms:
 2. Send text, voice, or audio in that topic to continue.
 3. `/mode` shows the current session, branch, model, queue, and safe actions.
 4. `/board` gives a compact cross-workspace view; `/s` switches sessions.
-5. Stop from the pinned card or `/stop`; finish with `/done` plus confirmation.
+5. A Conductor cloud workspace created on the laptop shows up there as
+   `+ Open <name>`; `/attach name` finds it directly. Tapping opens a topic,
+   binds the newest session, and posts the last exchange as a read-only
+   snapshot; the cursor starts at the end, so nothing is replayed. A
+   Mac-local-only workspace is outside Railway's reach.
+6. Stop from the pinned card or `/stop`; finish with `/done` plus confirmation.
 
 The pinned status card absorbs progress/tool noise. Final answers stay concise,
 outcome-first, and easy to scan on a phone. Prompts use 👀/👍 reactions instead
@@ -156,6 +161,7 @@ the old deployment before the new poller starts.
 Daily:
 
 - `/new [project:] prompt`
+- `/attach [name]`
 - `/board`
 - `/stop`
 - `/find text`
@@ -203,6 +209,9 @@ Run these from a phone after the first deploy:
 9. Send audio in General; it searches and never submits a prompt.
 10. With `VOICE_MODE=commands`, “command stop” stops the current session and
     “command done” only shows the archive confirmation.
+11. Create a workspace on the laptop, then tap `+ Open <name>` in `/board`: one
+    topic appears, the snapshot card shows the last exchange, and the next line
+    typed there reaches that session.
 
 The renderer corpus currently contains probe-verified simple turns plus clearly
 labelled synthetic tool/diff/error shapes. Expand it with curated real
@@ -211,4 +220,6 @@ tool-heavy transcripts after the account has such sessions.
 Full architecture and verification details are in
 [`docs/PLAN.md`](docs/PLAN.md). Probe findings are in
 [`docs/HANDOFF.md`](docs/HANDOFF.md). The final operator and architecture map is
-in [`docs/SYSTEM_OVERVIEW.md`](docs/SYSTEM_OVERVIEW.md).
+in [`docs/SYSTEM_OVERVIEW.md`](docs/SYSTEM_OVERVIEW.md). The failure contract
+and fault matrix are in
+[`docs/RELIABILITY_AUDIT.md`](docs/RELIABILITY_AUDIT.md).
