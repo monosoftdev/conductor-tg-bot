@@ -118,6 +118,34 @@ class NewWorkspace(StatesGroup):
     prompt = State()
 
 
+#: What ``wizard_state.state_key`` holds while the card reads "Send the first
+#: prompt." The voice path has no aiogram FSM filter, so it matches on this.
+PROMPT_STATE_KEY: Final = NewWorkspace.prompt.state
+
+
+def request_from_wizard(
+    data: Mapping[str, Any], text: str, *, settings: Settings
+) -> CreateRequest | None:
+    """The wizard's answers plus this prompt, or ``None`` if it lost its project.
+
+    Shared so a spoken prompt and a typed one cannot resolve defaults
+    differently — that divergence is what sent a transcript to ``/find``.
+    """
+    projects = data.get("projects")
+    project_id = str(data.get("project_id") or "")
+    if not project_id or not isinstance(projects, Mapping):
+        return None
+    return CreateRequest(
+        project_id=project_id,
+        project_name=str(projects.get(project_id) or project_id[:8]),
+        branch=str(data.get("branch") or settings.default_branch or DEFAULT_BRANCH),
+        agent=str(data.get("agent") or settings.default_agent),
+        model=str(data.get("model") or settings.default_model),
+        effort=str(data.get("effort") or settings.default_effort),
+        prompt=text.strip(),
+    )
+
+
 def new_wizard_id() -> str:
     """Identifies one run of the wizard, so an older run's button is refused."""
     return secrets.token_urlsafe(_WID_BYTES)
@@ -568,23 +596,13 @@ async def typed_prompt(
         message.message_thread_id or NO_THREAD_ID,
         user_id=message.from_user.id if message.from_user else 0,
     )
-    projects = data.get("projects")
-    project_id = str(data.get("project_id") or "")
-    if not project_id or not isinstance(projects, dict):
+    request = request_from_wizard(data, message.text or "", settings=settings)
+    if request is None:
         await state.clear()
         await tell(
             message, "Wizard expired. Run <code>/new</code> again.", silent=False
         )
         return
-    request = CreateRequest(
-        project_id=project_id,
-        project_name=str(projects.get(project_id) or project_id[:8]),
-        branch=str(data.get("branch") or settings.default_branch or DEFAULT_BRANCH),
-        agent=str(data.get("agent") or settings.default_agent),
-        model=str(data.get("model") or settings.default_model),
-        effort=str(data.get("effort") or settings.default_effort),
-        prompt=(message.text or "").strip(),
-    )
     try:
         created = await create_and_bind(
             message=message,

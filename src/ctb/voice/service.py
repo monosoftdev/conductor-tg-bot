@@ -43,6 +43,7 @@ from ctb.db.repo import chats as chats_repo
 from ctb.db.repo import prompts as prompts_repo
 from ctb.db.repo import sessions as sessions_repo
 from ctb.db.repo import voice_inputs as voice_repo
+from ctb.db.repo import wizard as wizard_repo
 from ctb.db.repo import workspaces as workspaces_repo
 from ctb.db.repo.voice_inputs import VoiceInputRow
 from ctb.delivery.render.html import escape
@@ -448,6 +449,13 @@ class VoiceService:
         return await self._prompt(row, intent.text)
 
     async def _prompt(self, row: VoiceInputRow, text: str) -> bool:
+        # A wizard waiting on "Send the first prompt." outranks everything
+        # below. Typed text reaches it because aiogram routes on FSM state
+        # first; voice never passes through aiogram, so without this check the
+        # transcript fell through to General's search-only rule and the answer
+        # to the question the bot had just asked was run as a /find.
+        if await self._finish_wizard(row, text):
+            return True
         if row.route_kind == "general":
             rendered = await find_text(self.client, text)
             await self._send(
@@ -593,6 +601,46 @@ class VoiceService:
             )
             return True
         await self._send(row, "Unknown voice command.")
+        return True
+
+    async def _finish_wizard(self, row: VoiceInputRow, text: str) -> bool:
+        """Answer an open ``/new`` wizard with this transcript.
+
+        ``False`` means no wizard is waiting for a prompt in this seat, and the
+        caller should route the note normally.
+        """
+        from ctb.bot.wizards.new_workspace import PROMPT_STATE_KEY, request_from_wizard
+
+        wizard = await wizard_repo.get(
+            self.db, row.chat_id, row.thread_id, user_id=row.user_id
+        )
+        if wizard is None or wizard.state_key != PROMPT_STATE_KEY:
+            return False
+        request = request_from_wizard(wizard.data, text, settings=self.settings)
+        if request is None:
+            return False
+        chat = await chats_repo.get(self.db, row.chat_id, row.thread_id)
+        route = Route(
+            chat_id=row.chat_id,
+            thread_id=row.thread_id,
+            kind=row.route_kind,
+            chat=chat,
+        )
+        created = await create_and_bind_input(
+            bot=self.bot,
+            chat_id=row.chat_id,
+            chat_type="private" if row.route_kind == "dm" else "supergroup",
+            tg_message_id=row.tg_message_id,
+            route=route,
+            request=request,
+            db=self.db,
+            client=self.client,
+            action_id=row.action_id,
+        )
+        await wizard_repo.clear(
+            self.db, row.chat_id, row.thread_id, user_id=row.user_id
+        )
+        await self._send(row, f"→ <b>{escape(created.label)}</b>")
         return True
 
     async def _send_failure(self, row: VoiceInputRow, error: str) -> None:

@@ -12,11 +12,13 @@ import pytest
 from ctb.bot.handlers.common import MOBILE_REPLY_INSTRUCTION
 from ctb.bot.keyboards import NonceStore
 from ctb.bot.middleware.routing import Route
+from ctb.bot.wizards import new_workspace
 from ctb.conductor.models import PostMessageResult, PostState, SqlResult
 from ctb.db.connection import Database, now_ms
 from ctb.db.repo import prompts as prompts_repo
 from ctb.db.repo import sessions as sessions_repo
 from ctb.db.repo import voice_inputs as voice_repo
+from ctb.db.repo import wizard as wizard_repo
 from ctb.db.repo import workspaces as workspaces_repo
 from ctb.settings import Settings
 from ctb.voice import service as voice_service_module
@@ -744,3 +746,47 @@ async def test_the_worker_takes_the_next_note_after_one_hangs(
 
 def _route() -> Route:
     return Route(chat_id=-1001, thread_id=7, kind="topic")
+
+
+async def test_a_voice_note_answers_an_open_wizard_instead_of_searching(
+    db: Database, settings_factory: Any, monkeypatch: Any
+) -> None:
+    """The live failure: the wizard asked, voice answered, /find replied.
+
+    Typed text reaches the wizard because aiogram routes on FSM state before
+    any handler runs. Voice never passes through aiogram, so in General the
+    transcript hit the search-only rule — the answer to the question the bot
+    had *just asked* was run as a query, and reported "No matches."
+    """
+    settings = settings_factory(voice_enabled=True)
+    client = FakeClient()
+    service = make_service(settings, db, client=client)
+
+    created: list[Any] = []
+
+    async def fake_create(**kwargs: Any) -> Any:
+        created.append(kwargs["request"])
+        return SimpleNamespace(
+            label="api/dev", thread_id=42, deep_link=None, workspace_id="w1"
+        )
+
+    monkeypatch.setattr(voice_service_module, "create_and_bind_input", fake_create)
+    await wizard_repo.set_state(
+        db,
+        -1001,
+        0,
+        user_id=1001,
+        state_key=new_workspace.PROMPT_STATE_KEY,
+        data={"projects": {"p1": "api"}, "project_id": "p1", "branch": "dev"},
+    )
+
+    message = voice_message(thread_id=0)
+    await service.enqueue(message, Route(chat_id=-1001, kind="general"))
+    await service._tick(0)
+
+    assert client.queries == [], "a wizard answer is never a search"
+    assert len(created) == 1, "the wizard was completed instead"
+    assert created[0].branch == "dev", "answers given before the prompt survive"
+    assert created[0].prompt == "Fix the flaky test", "the transcript is the prompt"
+    # And the wizard is finished, so the next note routes normally.
+    assert await wizard_repo.get(db, -1001, 0, user_id=1001) is None
