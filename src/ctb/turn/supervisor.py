@@ -12,8 +12,8 @@ from typing import Final, cast
 from ctb.conductor.client import ConductorClient
 from ctb.conductor.errors import AuthFatal
 from ctb.db.backup import create_backup
-from ctb.db.connection import Database
-from ctb.db.repo import lease, sessions, transcript, wizard
+from ctb.db.connection import Database, now_ms
+from ctb.db.repo import deliveries, lease, sessions, transcript, wizard
 from ctb.logging import get_logger
 from ctb.turn.session_poller import ActionSink, SessionPoller
 from ctb.turn.state import Evidence
@@ -235,6 +235,14 @@ class Supervisor:
         try:
             removed_transcript = await transcript.prune(self.db)
             removed_wizards = await wizard.prune_expired(self.db)
+            # Terminal deliveries had no retention at all, so one permanent
+            # Telegram refusal left /health reading "degraded" for the life of
+            # the database — a past event reported forever as a live problem.
+            removed_deliveries = await deliveries.prune_terminal(
+                self.db,
+                before=now_ms()
+                - deliveries.TERMINAL_RETENTION_DAYS * 24 * 60 * 60 * 1000,
+            )
             backup = await create_backup(self.db)
         except Exception as exc:
             # Retention is important, but a transient maintenance failure must
@@ -246,6 +254,7 @@ class Supervisor:
             "supervisor.maintenance_complete",
             transcript_rows=removed_transcript,
             wizard_rows=removed_wizards,
+            delivery_rows=removed_deliveries,
             backup=str(backup),
         )
 

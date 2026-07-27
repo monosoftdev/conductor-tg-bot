@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, replace
-from typing import Any, Self
+from typing import Any, Final, Self
 
 import aiosqlite
 
@@ -511,3 +511,52 @@ async def delete_for_session(db: Database, session_id: str) -> int:
     return await db.execute(
         "DELETE FROM deliveries WHERE session_id = ?", (session_id,)
     )
+
+
+#: Terminal rows kept for this long. Long enough to explain a failure the next
+#: morning, short enough that ``/health`` stops reporting it as a live problem.
+TERMINAL_RETENTION_DAYS: Final = 7
+
+
+async def prune_terminal(db: Database, *, before: int) -> int:
+    """Drop rows that will never move again.
+
+    ``failed`` had no retention at all, so one permanent Telegram refusal left
+    ``/health`` reading *degraded* for the life of the database — a past event
+    reported forever as a present condition. ``sent`` and ``skipped`` go with
+    it: the boot re-send guard only ever compares against the row it is about
+    to resend, never one from last week.
+    """
+    return await db.execute(
+        """
+        DELETE FROM deliveries
+         WHERE state IN ('sent', 'skipped', 'failed')
+           AND updated_at < ?
+        """,
+        (before,),
+    )
+
+
+async def failure_digest(db: Database) -> dict[str, object]:
+    """What actually failed, so ``/health`` can say more than a count."""
+    row = await db.fetch_one(
+        """
+        SELECT COUNT(*) AS n, MAX(updated_at) AS newest
+          FROM deliveries WHERE state = 'failed'
+        """
+    )
+    count = as_int(row["n"]) if row is not None else 0
+    if not count:
+        return {"count": 0, "newest_ms": 0, "reason": ""}
+    detail = await db.fetch_one(
+        """
+        SELECT last_error FROM deliveries
+         WHERE state = 'failed' AND last_error IS NOT NULL
+         ORDER BY updated_at DESC LIMIT 1
+        """
+    )
+    return {
+        "count": count,
+        "newest_ms": as_int(row["newest"]) if row is not None else 0,
+        "reason": as_str(detail["last_error"]) if detail is not None else "",
+    }
