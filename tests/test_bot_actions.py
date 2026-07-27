@@ -58,7 +58,9 @@ async def _bound(db: Database) -> None:
     )
 
 
-async def test_sink_fans_out_cards_notice_and_topic_marker(db: Database, system_db: Database) -> None:
+async def test_sink_fans_out_cards_notice_and_topic_marker(
+    db: Database, system_db: Database
+) -> None:
     await _bound(db)
     recorder = Recorder()
     bot = Bot()
@@ -93,7 +95,8 @@ async def test_sink_fans_out_cards_notice_and_topic_marker(db: Database, system_
 
 
 async def test_quiet_notice_is_silent_and_deduped_by_stable_key(
-    db: Database, system_db: Database,
+    db: Database,
+    system_db: Database,
 ) -> None:
     await _bound(db)
     recorder = Recorder()
@@ -119,7 +122,8 @@ async def test_quiet_notice_is_silent_and_deduped_by_stable_key(
 
 
 async def test_finalize_turns_prompt_receipt_into_completion_reaction(
-    db: Database, system_db: Database,
+    db: Database,
+    system_db: Database,
 ) -> None:
     await _bound(db)
     prompt = await prompts.create(

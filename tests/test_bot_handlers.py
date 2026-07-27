@@ -85,6 +85,7 @@ from ctb.turn.cursor import quick_replies_for
 from ctb.turn.state import Cancel, TurnState
 from tests.pg import BOOTSTRAP_TENANT_ID
 
+
 def fake_tenant(
     client: Any = None,
     *,
@@ -109,7 +110,6 @@ def fake_tenant(
         row=TenantRow(id=BOOTSTRAP_TENANT_ID, slug=slug, name=slug, status="active"),
         _client=client,
     )
-
 
 
 class PromptClient:
@@ -1300,7 +1300,7 @@ async def _branch_buttons(
         _wizard_message(),  # type: ignore[arg-type]
         _WizardState({"branch": branch}),  # type: ignore[arg-type]
         NonceStore(),
-        settings_factory(default_branch=configured),
+        TenantSettings(default_branch=configured),
     )
     return [
         item.text
@@ -1408,7 +1408,7 @@ async def _mint_branch_card(
         _wizard_message(),  # type: ignore[arg-type]
         state,
         store,
-        settings,
+        TenantSettings(),
     )
     button = next(
         item for row in cards[0].inline_keyboard for item in row if item.text == "dev"
@@ -1648,7 +1648,6 @@ async def test_defaults_can_set_and_show_the_branch(
 async def _run_setup(bot: Any, db: Database, monkeypatch: Any) -> list[str]:
     """Drive ``/setup`` in an already-bound group and return what it said."""
     from ctb.bot.handlers import registration as registration_handlers
-
     from ctb.db.repo import tenancy as tenancy_repo
     from ctb.runtime import system_database
 
@@ -1709,7 +1708,9 @@ async def test_setup_deletes_the_topic_it_probed_with(
 
     sent = await _run_setup(bot, db, monkeypatch)
 
-    assert sent == ["Ready ·\nGeneral is search-only; <code>/new</code> creates topics."]
+    assert sent == [
+        "Ready ·\nGeneral is search-only; <code>/new</code> creates topics."
+    ]
     assert bot.topics == 1, "the probe really created a topic"
     # 99 is the id the stub hands back from create_forum_topic — so this asserts
     # it deleted the very topic it made, not merely that it deleted something.

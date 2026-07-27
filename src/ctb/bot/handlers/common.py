@@ -337,8 +337,8 @@ async def create_and_bind(
     message: Message,
     route: Route,
     request: CreateRequest,
+    client: ConductorClient,
     db: Database | None = None,
-    client: ConductorClient | None = None,
 ) -> CreatedBinding:
     bot = getattr(message, "bot", None)
     if bot is None and message.chat.type != "private":
@@ -364,10 +364,15 @@ async def create_and_bind_input(
     route: Route,
     request: CreateRequest,
     db: Database | None = None,
-    client: ConductorClient | None = None,
+    client: ConductorClient,
     action_id: str | None = None,
 ) -> CreatedBinding:
-    """Create/bind from typed or voice input without manufacturing an update."""
+    """Create/bind from typed or voice input without manufacturing an update.
+
+    ``client`` is the *tenant's* client, passed explicitly: there is no
+    process-wide fallback to reach for, which is what makes a cross-organisation
+    create impossible to write by accident.
+    """
     database = resolve_db(db)
     conductor = client
     validate_pairing(request.agent, request.model, request.effort)

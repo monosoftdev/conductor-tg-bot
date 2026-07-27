@@ -571,7 +571,6 @@ async def test_a_second_429_pauses_that_chat_and_requeues_the_batch(
     assert await outbox.run_once() >= 1
 
 
-
 # ── pacing ───────────────────────────────────────────────────────────────────
 
 

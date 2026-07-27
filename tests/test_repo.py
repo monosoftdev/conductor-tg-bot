@@ -1221,9 +1221,7 @@ async def test_a_tenant_is_created_with_its_first_owner(system_db: Database) -> 
 
 
 async def test_members_are_added_promoted_and_removed(system_db: Database) -> None:
-    tenant = await tenancy.create(
-        system_db, slug="duo", name="Duo", owner_user_id=1
-    )
+    tenant = await tenancy.create(system_db, slug="duo", name="Duo", owner_user_id=1)
     # The co-founder path: one more row, same group, same Conductor key.
     await tenancy.add_member(system_db, tenant.id, 2, role="member")
     assert [m.user_id for m in await tenancy.list_members(system_db, tenant.id)] == [
@@ -1241,9 +1239,7 @@ async def test_members_are_added_promoted_and_removed(system_db: Database) -> No
 
 async def test_the_last_owner_cannot_be_removed(system_db: Database) -> None:
     """Otherwise a workspace can be orphaned with no way back in."""
-    tenant = await tenancy.create(
-        system_db, slug="solo", name="Solo", owner_user_id=7
-    )
+    tenant = await tenancy.create(system_db, slug="solo", name="Solo", owner_user_id=7)
     await tenancy.add_member(system_db, tenant.id, 8, role="member")
     assert await tenancy.remove_member(system_db, tenant.id, 7) is False
     assert await tenancy.member(system_db, tenant.id, 7) is not None
@@ -1365,4 +1361,3 @@ async def test_issuing_a_token_invalidates_the_previous_one(
         )
         is not None
     )
-

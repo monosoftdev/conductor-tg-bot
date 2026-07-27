@@ -328,7 +328,9 @@ async def test_a_crash_after_sending_resends_rather_than_losing(
     assert (await states(db, session.session_id))["sending"] == 1
 
     # Boot: orphans are re-claimed, because a lost reply is worse than a repeat.
-    recovery = await deliveries.recover_orphaned(db, claim_id="worker-b", orphan_after_ms=0)
+    recovery = await deliveries.recover_orphaned(
+        db, claim_id="worker-b", orphan_after_ms=0
+    )
     assert len(recovery.claimed) == 1
     assert recovery.skipped == ()
     for row in recovery.claimed:
@@ -373,7 +375,9 @@ async def test_recovery_skips_a_payload_already_on_the_wire(
     )
     await deliveries.claim(db, claim_id="worker-a")
 
-    recovery = await deliveries.recover_orphaned(db, claim_id="worker-b", orphan_after_ms=0)
+    recovery = await deliveries.recover_orphaned(
+        db, claim_id="worker-b", orphan_after_ms=0
+    )
 
     assert recovery.claimed == ()
     assert len(recovery.skipped) == 1
@@ -446,9 +450,7 @@ async def test_two_pollers_on_one_database_never_duplicate_a_delivery(
 
 async def test_only_one_supervisor_holds_the_lease(system_db: Database) -> None:
     """Defence in depth: the overlap should not even get as far as polling."""
-    other = await Database(
-        system_db.dsn, min_size=1, max_size=2, system=True
-    ).connect()
+    other = await Database(system_db.dsn, min_size=1, max_size=2, system=True).connect()
     try:
         first = await lease.acquire(system_db, holder="instance-a")
         second = await lease.acquire(other, holder="instance-b")

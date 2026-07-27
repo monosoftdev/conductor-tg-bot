@@ -121,8 +121,6 @@ async def help_command(message: Message, state: FSMContext) -> None:
     await tell(message, _HELP)
 
 
-
-
 @router.message(Command("s"))
 async def switch_session(
     message: Message,

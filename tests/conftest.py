@@ -22,8 +22,8 @@ from ctb.crypto import SecretBox
 from ctb.settings import Settings, reset_settings, set_settings
 from tests.pg import (  # noqa: F401 - fixtures are used by name
     BOOTSTRAP_TENANT_ID,
-    TEST_MASTER_KEYS,
     OTHER_TENANT_ID,
+    TEST_MASTER_KEYS,
     app_dsn,
     db,
     pg_reset,
@@ -112,8 +112,6 @@ def settings(settings_factory: Callable[..., Settings]) -> Iterator[Settings]:
     set_settings(value)
     yield value
     reset_settings()
-
-
 
 
 class FakeClock:

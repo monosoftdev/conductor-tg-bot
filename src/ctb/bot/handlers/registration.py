@@ -343,9 +343,7 @@ async def set_key(
     system = system_database()
     box = secret_box()
     fingerprint = box.fingerprint(value)
-    current = (
-        tenant.row.elevenlabs_key_fp if speech else tenant.row.conductor_key_fp
-    )
+    current = tenant.row.elevenlabs_key_fp if speech else tenant.row.conductor_key_fp
     await _delete(message)
 
     if current == fingerprint:
@@ -395,9 +393,7 @@ async def set_key(
 
 
 @router.message(Command("revoke"))
-async def revoke(
-    message: Message, tenant: TenantContext, state: FSMContext
-) -> None:
+async def revoke(message: Message, tenant: TenantContext, state: FSMContext) -> None:
     """Forget the stored key. Polling stops; nothing else is touched."""
     await abandon_wizard(state)
     if not tenant.is_owner:

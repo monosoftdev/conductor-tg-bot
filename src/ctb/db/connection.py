@@ -36,7 +36,7 @@ import uuid
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from contextvars import ContextVar, Token
-from typing import Any, Final, Self
+from typing import Any, Final, LiteralString, Self, cast
 
 from psycopg import AsyncConnection
 from psycopg.rows import dict_row, tuple_row
@@ -268,7 +268,7 @@ class Database:
     async def execute(self, sql: str, params: Params = _EMPTY) -> int:
         """Run one statement. Returns ``rowcount`` (-1 when not applicable)."""
         async with self._acquire() as conn:
-            cursor = await conn.execute(to_pyformat(sql), tuple(params))
+            cursor = await conn.execute(_query(sql), tuple(params))
             return cursor.rowcount
 
     async def execute_script(self, script: str) -> None:
@@ -278,16 +278,16 @@ class Database:
         to interpolate, which is exactly the migration case.
         """
         async with self._acquire() as conn:
-            await conn.execute(script)  # type: ignore[arg-type]
+            await conn.execute(_script(script))
 
     async def fetch_one(self, sql: str, params: Params = _EMPTY) -> Row | None:
         async with self._acquire() as conn:
-            cursor = await conn.execute(to_pyformat(sql), tuple(params))
+            cursor = await conn.execute(_query(sql), tuple(params))
             return await cursor.fetchone()
 
     async def fetch_all(self, sql: str, params: Params = _EMPTY) -> list[Row]:
         async with self._acquire() as conn:
-            cursor = await conn.execute(to_pyformat(sql), tuple(params))
+            cursor = await conn.execute(_query(sql), tuple(params))
             return list(await cursor.fetchall())
 
     async def fetch_val(
@@ -300,7 +300,7 @@ class Database:
             self._acquire() as conn,
             conn.cursor(row_factory=tuple_row) as cursor,
         ):
-            await cursor.execute(to_pyformat(sql), tuple(params))
+            await cursor.execute(_query(sql), tuple(params))
             row = await cursor.fetchone()
         if not row:
             return default
@@ -311,6 +311,19 @@ async def _reset_connection(conn: AsyncConnection[Row]) -> None:
     """Belt and braces: nothing half-done goes back into the pool."""
     if not conn.closed:
         await conn.rollback()
+
+
+def _query(sql: str) -> LiteralString:
+    """psycopg types its query parameter as ``LiteralString`` to discourage
+    string-built SQL. Every statement here is a module-level literal or built
+    by :func:`ctb.db.repo._util.update_sql` from literal column names, so the
+    cast is the honest way to say "checked elsewhere" rather than a bypass.
+    """
+    return cast(LiteralString, to_pyformat(sql))
+
+
+def _script(sql: str) -> LiteralString:
+    return cast(LiteralString, sql)
 
 
 def _task_id() -> int:

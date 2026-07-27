@@ -13,13 +13,14 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator, Callable
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
 
 from ctb.conductor.client import ConductorClient
 from ctb.conductor.errors import ApiError, AuthFatal, RateLimited
+from ctb.conductor.pool import ClientPool
 from ctb.db.connection import Database, set_database
 from ctb.db.errors import DatabaseError
 from ctb.db.repo import deliveries as deliveries_repo
@@ -94,7 +95,7 @@ def make_monitor(
     record = telegram if telegram is not None else TelegramHealth()
     return HealthMonitor(
         database=lambda: db,
-        clients=lambda: None if client is None else OnePool(client),
+        clients=lambda: None if client is None else cast(ClientPool, OnePool(client)),
         telegram=lambda: record,
         wall_clock=lambda: at,
         clock=clock or FakeClock(1_000.0),
@@ -245,7 +246,10 @@ async def test_auth_fatal_is_degraded_but_still_200(
 ) -> None:
     client = ConductorClient(
         api_key=FAKE_API_KEY,
-        api_url=settings.conductor_api_url, transport=transport_returning(401), sleep=_no_sleep, max_attempts=1
+        api_url=settings.conductor_api_url,
+        transport=transport_returning(401),
+        sleep=_no_sleep,
+        max_attempts=1,
     )
     with pytest.raises(AuthFatal):
         await client.get_session_status("sess-1")
@@ -332,7 +336,11 @@ def test_telegram_health_is_a_process_wide_record() -> None:
 async def test_circuit_open_is_degraded_but_still_200(
     system_db: Database, settings: Settings
 ) -> None:
-    client = ConductorClient(api_key=FAKE_API_KEY, api_url=settings.conductor_api_url, transport=transport_returning(500))
+    client = ConductorClient(
+        api_key=FAKE_API_KEY,
+        api_url=settings.conductor_api_url,
+        transport=transport_returning(500),
+    )
     client.circuit.trip(45.0, "GET /sessions/{id}/status")
     report = await make_monitor(db=system_db, client=client).report()
     await client.aclose()
@@ -369,7 +377,10 @@ async def test_server_error_leaves_the_check_green(
     """A 500 from Conductor is their outage, not ours: report, do not restart."""
     client = ConductorClient(
         api_key=FAKE_API_KEY,
-        api_url=settings.conductor_api_url, transport=transport_returning(503), sleep=_no_sleep, max_attempts=1
+        api_url=settings.conductor_api_url,
+        transport=transport_returning(503),
+        sleep=_no_sleep,
+        max_attempts=1,
     )
     with pytest.raises(ApiError):
         await client.get_session_status("sess-1")
@@ -495,7 +506,9 @@ async def test_fast_cadence_uses_the_grace_floor(system_db: Database) -> None:
     assert report.polling["overdue"] == 0
 
 
-async def test_unbound_sessions_are_not_polled_and_not_counted(system_db: Database) -> None:
+async def test_unbound_sessions_are_not_polled_and_not_counted(
+    system_db: Database,
+) -> None:
     await seed_session(system_db, "sess-idle", bound=False, at=WALL - 10_000_000)
     report = await make_monitor(db=system_db).report()
     assert report.polling["bound_sessions"] == 0
@@ -638,7 +651,7 @@ async def test_the_body_is_scrubbed(system_db: Database) -> None:
 async def test_reports_are_cached_within_the_ttl(system_db: Database) -> None:
     clock = FakeClock(1_000.0)
     monitor = HealthMonitor(
-        database=lambda: db,
+        database=lambda: system_db,
         clients=lambda: None,
         clock=clock,
         wall_clock=lambda: WALL,
@@ -689,7 +702,10 @@ async def test_http_degraded_state_is_visible_at_200(
 ) -> None:
     client = ConductorClient(
         api_key=FAKE_API_KEY,
-        api_url=settings.conductor_api_url, transport=transport_returning(403), sleep=_no_sleep, max_attempts=1
+        api_url=settings.conductor_api_url,
+        transport=transport_returning(403),
+        sleep=_no_sleep,
+        max_attempts=1,
     )
     with pytest.raises(AuthFatal):
         await client.get_session_status("sess-1")
@@ -908,7 +924,10 @@ async def test_format_health_html_is_telegram_safe(
     )
     client = ConductorClient(
         api_key=FAKE_API_KEY,
-        api_url=settings.conductor_api_url, transport=transport_returning(401), sleep=_no_sleep, max_attempts=1
+        api_url=settings.conductor_api_url,
+        transport=transport_returning(401),
+        sleep=_no_sleep,
+        max_attempts=1,
     )
     with pytest.raises(AuthFatal):
         await client.get_session_status("sess-1")
@@ -935,7 +954,9 @@ async def test_format_health_html_mentions_telegram_only_when_it_is_failing(
     record = TelegramHealth()
     for _ in range(TELEGRAM_FAILURE_THRESHOLD):
         record.record_failure("conflict: <other> instance")
-    text = format_health_html(await make_monitor(db=system_db, telegram=record).report())
+    text = format_health_html(
+        await make_monitor(db=system_db, telegram=record).report()
+    )
 
     assert f"telegram: {TELEGRAM_FAILURE_THRESHOLD} failed polls" in text
     assert "&lt;other&gt;" in text and "<other>" not in text

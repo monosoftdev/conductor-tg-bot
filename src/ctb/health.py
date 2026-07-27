@@ -60,7 +60,6 @@ from aiohttp import web
 from ctb import __version__
 from ctb.conductor.pool import ClientPool
 from ctb.db.connection import Database, get_database, now_ms
-from ctb.runtime import client_pool, system_database
 from ctb.db.migrate import current_schema_version
 from ctb.db.repo import deliveries as deliveries_repo
 from ctb.db.repo import events as events_repo
@@ -69,6 +68,7 @@ from ctb.db.repo import sessions as sessions_repo
 from ctb.db.repo import voice_inputs as voice_repo
 from ctb.delivery.render.html import escape
 from ctb.logging import get_logger, scrub_secrets
+from ctb.runtime import client_pool, system_database
 from ctb.turn.machine import format_duration
 
 log = get_logger(__name__)
@@ -453,6 +453,7 @@ class HealthMonitor:
         section["available"] = True
 
         throttled = 0
+        recent_total = 0
         auth_failures = 0
         failures_total = 0
         requests_total = 0
@@ -461,10 +462,11 @@ class HealthMonitor:
         rejected: list[str] = []
         for slug, client in clients:
             try:
-                stats = client.health()
-                recent = client.recent_events()
+                stats: Mapping[str, Any] = client.health()
+                recent: tuple[Any, ...] = client.recent_events()
             except Exception:  # pragma: no cover - pure reads
                 continue
+            recent_total += len(recent)
             throttled += sum(1 for event in recent if event.status_code == 429)
             failures_total += int(stats.get("failures", 0) or 0)
             requests_total += int(stats.get("requests", 0) or 0)
@@ -512,7 +514,7 @@ class HealthMonitor:
             degradations.append(
                 Degradation(
                     DEGRADATION_RATE_LIMITED,
-                    f"{throttled} of the last {len(recent)} API attempts were 429s; "
+                    f"{throttled} of the last {recent_total} API attempts were 429s; "
                     "the token bucket may need tuning.",
                 )
             )
@@ -1144,7 +1146,7 @@ __all__ = [
     "POLL_LAG_FACTOR",
     "POLL_LAG_GRACE_MS",
     "TELEGRAM_FAILURE_THRESHOLD",
-    "ClientProvider",
+    "PoolProvider",
     "DatabaseProvider",
     "Degradation",
     "DetailPolicy",

@@ -444,9 +444,9 @@ class Supervisor:
             if callable(notify) and tenant_id not in self._auth_notified:
                 self._auth_notified.add(tenant_id)
                 try:
-                    await cast(
-                        Callable[[str, uuid.UUID], Awaitable[None]], notify
-                    )(session_id, tenant_id)
+                    await cast(Callable[[str, uuid.UUID], Awaitable[None]], notify)(
+                        session_id, tenant_id
+                    )
                 except Exception as exc:
                     _log.error(
                         "supervisor.auth_notice_failed",

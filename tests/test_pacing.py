@@ -125,9 +125,7 @@ class TestGlobalBudget:
 
 
 class TestRateLimitBlast:
-    def test_a_429_pauses_only_the_offending_chat(
-        self, pacer: TelegramPacer
-    ) -> None:
+    def test_a_429_pauses_only_the_offending_chat(self, pacer: TelegramPacer) -> None:
         pacer.pause_chat(-100, 5.0)
         assert pacer.paused_for(-100) == pytest.approx(5.0)
         assert pacer.chat_ready(-100) is False
@@ -180,9 +178,7 @@ class TestRotor:
         rotor.served((-1, 0))
         clock.advance(1.0)
         rotor.served((-2, 0))
-        order = rotor.order(
-            [(-1, 0), (-2, 0), (-3, 0)], key=lambda item: item
-        )
+        order = rotor.order([(-1, 0), (-2, 0), (-3, 0)], key=lambda item: item)
         assert order == [(-3, 0), (-1, 0), (-2, 0)]  # never served, then oldest
 
     def test_urgency_beats_fairness(self, clock: FakeClock) -> None:

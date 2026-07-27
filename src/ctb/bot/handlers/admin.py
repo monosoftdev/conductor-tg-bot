@@ -108,9 +108,7 @@ async def remove(
     except ValueError:
         await tell(message, "Usage: <code>/remove telegram_user_id</code>")
         return
-    removed = await tenancy.remove_member(
-        system_database(), tenant.tenant_id, user_id
-    )
+    removed = await tenancy.remove_member(system_database(), tenant.tenant_id, user_id)
     if not removed:
         await tell(
             message,
@@ -208,9 +206,9 @@ async def export(
     try:
         payload: dict[str, Any] = {
             "workspace": tenant.slug,
-            "chats": [
-                _asdict(row) for row in await chats_repo.list_all(database)
-            ][:_EXPORT_LIMIT],
+            "chats": [_asdict(row) for row in await chats_repo.list_all(database)][
+                :_EXPORT_LIMIT
+            ],
             "workspaces": [
                 _asdict(row) for row in await workspaces_repo.list_all(database)
             ][:_EXPORT_LIMIT],

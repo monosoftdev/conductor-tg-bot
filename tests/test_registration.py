@@ -269,7 +269,9 @@ class TestBinding:
     ) -> None:
         code = await self._register(settings, said)
         await registration.setup(group(f"/setup {code}"), NullState(), db=db)
-        row = await tenancy.get(system_db, (await tenancy.chat_for(system_db, GROUP)).tenant_id)  # type: ignore[union-attr]
+        bound = await tenancy.chat_for(system_db, GROUP)
+        assert bound is not None
+        row = await tenancy.get(system_db, bound.tenant_id)
         assert row is not None
 
         await registration.setup(

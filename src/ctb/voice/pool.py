@@ -67,9 +67,7 @@ class ProviderPool:
     async def get(self, tenant: TenantRow) -> SpeechProvider | None:
         if tenant.elevenlabs_key_ct is None or not tenant.elevenlabs_key_fp:
             return None
-        key = _Key(
-            tenant.id, tenant.elevenlabs_key_fp, self._model, self._language
-        )
+        key = _Key(tenant.id, tenant.elevenlabs_key_fp, self._model, self._language)
         async with self._lock:
             existing = self._entries.get(key)
             if existing is not None:

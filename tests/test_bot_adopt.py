@@ -19,7 +19,7 @@ import asyncio
 import random
 from collections.abc import AsyncIterator, Callable
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
@@ -856,7 +856,7 @@ async def test_the_view_being_down_leaves_general_switch_working(
 
     monkeypatch.setattr(core_handlers, "board_rows", boom)
 
-    assert await core_handlers.adoptable_rows(db, None) == []
+    assert await core_handlers.adoptable_rows(db, cast(ConductorClient, None)) == []
 
 
 async def test_the_callback_opens_the_topic_and_answers_with_a_jump(

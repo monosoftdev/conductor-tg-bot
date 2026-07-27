@@ -37,11 +37,14 @@ from ctb.bot.keyboards import (
     keyboard,
 )
 from ctb.bot.middleware.routing import Route
+from ctb.bot.middleware.tenancy import TenantSettings
 from ctb.conductor.client import ConductorClient
+from ctb.conductor.pool import ClientPool
 from ctb.db.connection import Database, now_ms
 from ctb.db.repo import chats as chats_repo
 from ctb.db.repo import prompts as prompts_repo
 from ctb.db.repo import sessions as sessions_repo
+from ctb.db.repo import tenancy
 from ctb.db.repo import voice_inputs as voice_repo
 from ctb.db.repo import workspaces as workspaces_repo
 from ctb.db.repo.voice_inputs import VoiceInputRow
@@ -54,9 +57,6 @@ from ctb.voice.intent import (
     VoiceIntentKind,
     parse_intent,
 )
-from ctb.bot.middleware.tenancy import TenantSettings
-from ctb.conductor.pool import ClientPool
-from ctb.db.repo import tenancy
 from ctb.voice.pool import ProviderPool
 from ctb.voice.provider import SpeechProvider, TranscriptionError
 

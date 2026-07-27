@@ -121,7 +121,8 @@ class PoolStub:
 
 
 async def test_only_lease_holder_spawns_and_reconciles_bindings(
-    db: Database, system_db: Database,
+    db: Database,
+    system_db: Database,
 ) -> None:
     await seed_bound(db, "s1", "s2")
     first_created: list[BlockingPoller] = []
@@ -159,7 +160,9 @@ async def test_only_lease_holder_spawns_and_reconciles_bindings(
     await second.stop()
 
 
-async def test_lease_loss_cancels_every_poller(db: Database, system_db: Database) -> None:
+async def test_lease_loss_cancels_every_poller(
+    db: Database, system_db: Database
+) -> None:
     await seed_bound(db, "s1")
     created: list[BlockingPoller] = []
     supervisor = Supervisor(
@@ -184,7 +187,8 @@ async def test_lease_loss_cancels_every_poller(db: Database, system_db: Database
 
 
 async def test_crashed_poller_restarts_after_exponential_backoff(
-    db: Database, system_db: Database,
+    db: Database,
+    system_db: Database,
 ) -> None:
     await seed_bound(db, "s1")
     made: list[BlockingPoller] = []
@@ -218,7 +222,8 @@ async def test_crashed_poller_restarts_after_exponential_backoff(
 
 
 async def test_a_latched_auth_failure_clears_after_an_inflight_success(
-    db: Database, system_db: Database,
+    db: Database,
+    system_db: Database,
 ) -> None:
     """One transient 403 must not silence every session until redeploy."""
     await seed_bound(db, "s1")

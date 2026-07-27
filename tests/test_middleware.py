@@ -16,9 +16,9 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
-from types import SimpleNamespace
 from collections.abc import AsyncGenerator, Callable
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 from aiogram import Bot, Dispatcher, Router
@@ -93,13 +93,13 @@ from ctb.bot.middleware import (
     StrangerNotifier,
     TenantMiddleware,
 )
-from ctb.conductor.pool import MissingKeyError
-from ctb.db.repo import tenancy as tenancy_repo
 from ctb.bot.middleware.context import new_request_id
+from ctb.conductor.pool import ClientPool, MissingKeyError
 from ctb.db.connection import Database
 from ctb.db.errors import DatabaseError
 from ctb.db.repo import chats as chats_repo
 from ctb.db.repo import sessions as sessions_repo
+from ctb.db.repo import tenancy as tenancy_repo
 from ctb.db.repo import workspaces as workspaces_repo
 from ctb.settings import Settings
 from ctb.turn.state import CardButton
@@ -417,7 +417,7 @@ def make_dispatcher(
         dispatcher,
         settings=settings,
         system_db=resolved_system,
-        clients=NullPool(),
+        clients=cast(ClientPool, NullPool()),
         db=db,
         tenancy=auth or make_tenancy(settings, resolved_system),
     )
@@ -451,9 +451,11 @@ async def seated(system_db: Database) -> None:
         system_db, GROUP_ID, BOOTSTRAP_TENANT_ID, is_primary=True, bound_by=OWNER_ID
     )
     await tenancy_repo.add_member(
-        system_db, BOOTSTRAP_TENANT_ID, OWNER_ID, role="owner")
+        system_db, BOOTSTRAP_TENANT_ID, OWNER_ID, role="owner"
+    )
     await tenancy_repo.add_member(
-        system_db, BOOTSTRAP_TENANT_ID, ALLOWED_ID, role="member")
+        system_db, BOOTSTRAP_TENANT_ID, ALLOWED_ID, role="member"
+    )
 
 
 @pytest.mark.parametrize("kind", UPDATE_KINDS)
@@ -475,7 +477,12 @@ async def test_a_stranger_gets_silence_on_every_update_type(
 
 @pytest.mark.parametrize("kind", UPDATE_KINDS)
 async def test_a_member_passes_on_every_update_type(
-    kind: str, bot: Bot, bot_settings: Settings, db: Database, system_db: Database, seated: None
+    kind: str,
+    bot: Bot,
+    bot_settings: Settings,
+    db: Database,
+    system_db: Database,
+    seated: None,
 ) -> None:
     dispatcher, seen = make_dispatcher(bot_settings, db, system_db=system_db)
     await dispatcher.feed_update(bot, build_update(kind, ALLOWED_ID))
@@ -525,8 +532,7 @@ async def test_a_dm_from_someone_in_two_workspaces_needs_an_explicit_binding(
     bot: Bot, bot_settings: Settings, db: Database, system_db: Database, seated: None
 ) -> None:
     """A prompt must never silently land in the wrong organisation."""
-    await tenancy_repo.add_member(
-        system_db, OTHER_TENANT_ID, ALLOWED_ID, role="member")
+    await tenancy_repo.add_member(system_db, OTHER_TENANT_ID, ALLOWED_ID, role="member")
     dispatcher, seen = make_dispatcher(bot_settings, db, system_db=system_db)
     update = Update(
         update_id=1,
@@ -561,8 +567,7 @@ async def test_inviting_someone_lets_them_in(
     await dispatcher.feed_update(bot, build_update("message", 4242))
     assert seen == []
 
-    await tenancy_repo.add_member(
-        system_db, BOOTSTRAP_TENANT_ID, 4242, role="member")
+    await tenancy_repo.add_member(system_db, BOOTSTRAP_TENANT_ID, 4242, role="member")
     await dispatcher.feed_update(bot, build_update("message", 4242, update_id=2))
     assert len(seen) == 1
 
@@ -574,8 +579,7 @@ async def test_removing_someone_locks_them_out(
     await dispatcher.feed_update(bot, build_update("message", ALLOWED_ID))
     assert len(seen) == 1
 
-    await tenancy_repo.remove_member(
-        system_db, BOOTSTRAP_TENANT_ID, ALLOWED_ID)
+    await tenancy_repo.remove_member(system_db, BOOTSTRAP_TENANT_ID, ALLOWED_ID)
     await dispatcher.feed_update(bot, build_update("message", ALLOWED_ID, update_id=2))
     assert len(seen) == 1
 
@@ -583,8 +587,7 @@ async def test_removing_someone_locks_them_out(
 async def test_a_suspended_workspace_stops_answering(
     bot: Bot, bot_settings: Settings, db: Database, system_db: Database, seated: None
 ) -> None:
-    await tenancy_repo.set_status(
-        system_db, BOOTSTRAP_TENANT_ID, "suspended")
+    await tenancy_repo.set_status(system_db, BOOTSTRAP_TENANT_ID, "suspended")
     dispatcher, seen = make_dispatcher(bot_settings, db, system_db=system_db)
     await dispatcher.feed_update(bot, build_update("message", ALLOWED_ID))
     assert seen == []
@@ -612,9 +615,7 @@ async def test_registration_commands_reach_a_handler_without_a_tenant(
     dispatcher, seen = make_dispatcher(bot_settings, db, system_db=system_db)
     update = Update(
         update_id=1,
-        message=_message(
-            9999, chat_id=9999, chat_type="private", text="/start"
-        ),
+        message=_message(9999, chat_id=9999, chat_type="private", text="/start"),
     )
 
     await dispatcher.feed_update(bot, update)
@@ -671,8 +672,12 @@ async def test_the_tenant_context_reaches_the_handler(
 
 
 async def test_owners_are_told_about_a_stranger_once_per_day(
-    bot: Bot, session: RecordingSession, bot_settings: Settings, db: Database,
-    system_db: Database, seated: None,
+    bot: Bot,
+    session: RecordingSession,
+    bot_settings: Settings,
+    db: Database,
+    system_db: Database,
+    seated: None,
 ) -> None:
     clock = FakeClock()
     notifier = StrangerNotifier(clock=clock)
@@ -689,8 +694,12 @@ async def test_owners_are_told_about_a_stranger_once_per_day(
 
 
 async def test_a_different_stranger_gets_their_own_notice(
-    bot: Bot, session: RecordingSession, bot_settings: Settings, db: Database,
-    system_db: Database, seated: None,
+    bot: Bot,
+    session: RecordingSession,
+    bot_settings: Settings,
+    db: Database,
+    system_db: Database,
+    seated: None,
 ) -> None:
     notifier = StrangerNotifier(clock=FakeClock())
     auth = make_tenancy(bot_settings, system_db, notifier=notifier)
@@ -703,10 +712,14 @@ async def test_a_different_stranger_gets_their_own_notice(
 
 
 async def test_a_flood_of_strangers_cannot_flood_the_owners(
-    bot: Bot, session: RecordingSession, bot_settings: Settings, db: Database,
-    system_db: Database, seated: None,
+    bot: Bot,
+    session: RecordingSession,
+    bot_settings: Settings,
+    db: Database,
+    system_db: Database,
+    seated: None,
 ) -> None:
-    """"Once per stranger" without a cap is a spam amplifier, not a guard."""
+    """ "Once per stranger" without a cap is a spam amplifier, not a guard."""
     notifier = StrangerNotifier(clock=FakeClock(), max_per_window=3)
     auth = make_tenancy(bot_settings, system_db, notifier=notifier)
     dispatcher, _ = make_dispatcher(bot_settings, db, system_db=system_db, auth=auth)
@@ -720,8 +733,12 @@ async def test_a_flood_of_strangers_cannot_flood_the_owners(
 
 
 async def test_a_failing_notice_does_not_break_the_rejection_path(
-    bot: Bot, session: RecordingSession, bot_settings: Settings, db: Database,
-    system_db: Database, seated: None,
+    bot: Bot,
+    session: RecordingSession,
+    bot_settings: Settings,
+    db: Database,
+    system_db: Database,
+    seated: None,
 ) -> None:
     session.raises = RuntimeError("blocked by user")
     notifier = StrangerNotifier(clock=FakeClock())
@@ -1352,7 +1369,7 @@ async def test_fsm_is_reachable_through_the_dispatcher(
         dispatcher,
         settings=bot_settings,
         system_db=system_db,
-        clients=NullPool(),
+        clients=cast(ClientPool, NullPool()),
         db=db,
         tenancy=make_tenancy(bot_settings, system_db),
     )
@@ -1409,9 +1426,10 @@ def test_build_app_wires_everything(
         settings=bot_settings,
         db=db,
         system_db=system_db,
-        clients=NullPool(),
+        clients=cast(ClientPool, NullPool()),
         bot=bot,
-        routers=[router])
+        routers=[router],
+    )
     assert app.dispatcher["settings"] is bot_settings
     assert app.dispatcher["db"] is db
     assert app.dispatcher["nonces"] is app.nonces
@@ -1424,7 +1442,8 @@ async def test_an_unexpected_handler_error_replies_without_leaking(
     bot: Bot,
     session: RecordingSession,
     bot_settings: Settings,
-    db: Database, system_db: Database,
+    db: Database,
+    system_db: Database,
     seated: None,
 ) -> None:
     router = Router(name="broken")
@@ -1437,9 +1456,10 @@ async def test_an_unexpected_handler_error_replies_without_leaking(
         settings=bot_settings,
         db=db,
         system_db=system_db,
-        clients=NullPool(),
+        clients=cast(ClientPool, NullPool()),
         bot=bot,
-        routers=[router])
+        routers=[router],
+    )
 
     await app.dispatcher.feed_update(bot, build_update("message", OWNER_ID))
 
@@ -1476,9 +1496,10 @@ async def test_polling_retries_a_conflict_instead_of_crashing(
         settings=bot_settings,
         db=db,
         system_db=system_db,
-        clients=NullPool(),
+        clients=cast(ClientPool, NullPool()),
         bot=bot,
-        routers=[])
+        routers=[],
+    )
     attempts = 0
 
     async def fake_start_polling(*_args: Any, **_kwargs: Any) -> None:
@@ -1506,9 +1527,10 @@ async def test_polling_backs_off_on_an_unexpected_error(
         settings=bot_settings,
         db=db,
         system_db=system_db,
-        clients=NullPool(),
+        clients=cast(ClientPool, NullPool()),
         bot=bot,
-        routers=[])
+        routers=[],
+    )
     calls = 0
 
     async def boom(*_args: Any, **_kwargs: Any) -> None:
@@ -1534,9 +1556,10 @@ async def test_polling_propagates_cancellation(
         settings=bot_settings,
         db=db,
         system_db=system_db,
-        clients=NullPool(),
+        clients=cast(ClientPool, NullPool()),
         bot=bot,
-        routers=[])
+        routers=[],
+    )
 
     async def cancelled(*_args: Any, **_kwargs: Any) -> None:
         raise asyncio.CancelledError
@@ -1553,7 +1576,8 @@ async def test_app_close_closes_the_session(
         settings=bot_settings,
         db=db,
         system_db=system_db,
-        clients=NullPool(),
+        clients=cast(ClientPool, NullPool()),
         bot=bot,
-        routers=[])
+        routers=[],
+    )
     await app.close()

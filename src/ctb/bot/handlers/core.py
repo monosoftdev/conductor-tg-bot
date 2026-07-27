@@ -171,10 +171,9 @@ async def new_workspace(
         await start_wizard(
             message,
             route=route,
-            settings=settings,
+            tenant=tenant,
             state=state,
             db=db,
-            client=client,
         )
         return
     try:

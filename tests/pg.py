@@ -16,13 +16,13 @@ from __future__ import annotations
 import os
 import uuid
 from collections.abc import AsyncIterator, Iterator
-from typing import Final
+from typing import Final, LiteralString, cast
 
 import psycopg
 import pytest
 
-from ctb.db.bootstrap import APP_ROLE, WORKER_ROLE, bootstrap
 from ctb.crypto import SecretBox
+from ctb.db.bootstrap import APP_ROLE, WORKER_ROLE, bootstrap
 from ctb.db.connection import Database, reset_tenant, set_database, set_tenant
 from ctb.runtime import reset_runtime, set_secret_box, set_system_database
 
@@ -96,7 +96,9 @@ def pg_schema() -> tuple[str, ...]:
             conn.execute("DROP SCHEMA public CASCADE")
             conn.execute("CREATE SCHEMA public")
     except psycopg.OperationalError as exc:  # pragma: no cover - no server
-        pytest.skip(f"PostgreSQL is not reachable ({exc}); run: docker compose up -d db")
+        pytest.skip(
+            f"PostgreSQL is not reachable ({exc}); run: docker compose up -d db"
+        )
     try:
         bootstrap(
             admin_dsn(),
@@ -142,7 +144,10 @@ def pg_reset(pg_schema: tuple[str, ...]) -> Iterator[tuple[str, ...]]:
     """An empty schema with both test tenants seeded, before every test."""
     with psycopg.connect(admin_dsn(), autocommit=True) as conn:
         conn.execute(
-            f"TRUNCATE {', '.join(pg_schema)} RESTART IDENTITY CASCADE"  # noqa: S608
+            cast(
+                LiteralString,
+                f"TRUNCATE {', '.join(pg_schema)} RESTART IDENTITY CASCADE",
+            )
         )
         _seed_tenants(conn)
     yield pg_schema

@@ -533,7 +533,7 @@ async def typed_prompt(
             route=route,
             request=request,
             db=db,
-            client=client,
+            client=tenant.client,
         )
     except Exception as exc:
         await tell(message, f"New failed: {escape(short_error(exc))}", silent=False)

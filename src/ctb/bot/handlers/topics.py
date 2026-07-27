@@ -149,8 +149,7 @@ def resolve_client(
     if client is not None:
         return client
     raise RuntimeError(
-        "no Conductor client in scope; the handler must take "
-        "`tenant: TenantContext`"
+        "no Conductor client in scope; the handler must take `tenant: TenantContext`"
     )
 
 

@@ -348,9 +348,7 @@ class TestMigrations:
 
     def test_a_do_block_is_not_mistaken_for_one(self, tmp_path: Path) -> None:
         """``DO $$ BEGIN … END $$`` is procedural, not transactional."""
-        (tmp_path / "001_ok.sql").write_text(
-            "DO $x$\nBEGIN\n  PERFORM 1;\nEND\n$x$;"
-        )
+        (tmp_path / "001_ok.sql").write_text("DO $x$\nBEGIN\n  PERFORM 1;\nEND\n$x$;")
         assert _checked_sql(discover_migrations(tmp_path)[0])
 
     async def test_the_schema_is_applied(self, system_db: Database) -> None:
@@ -382,9 +380,7 @@ class TestMigrations:
 
     async def test_the_old_allowlist_table_is_gone(self, system_db: Database) -> None:
         """``tenant_members`` replaced it; a leftover would be a second door."""
-        assert (
-            await system_db.fetch_val("SELECT to_regclass('allowed_users')") is None
-        )
+        assert await system_db.fetch_val("SELECT to_regclass('allowed_users')") is None
 
     async def test_reading_the_version_needs_no_write_rights(
         self, db: Database
@@ -449,9 +445,7 @@ class TestDatabase:
                 "INSERT INTO sessions(id, workspace_id) VALUES ('s', 'missing')"
             )
 
-    async def test_the_delivery_claim_can_use_its_index(
-        self, db: Database
-    ) -> None:
+    async def test_the_delivery_claim_can_use_its_index(self, db: Database) -> None:
         """Asserts the index is *usable*, not that the planner picks it today.
 
         Disabling sequential scans tests the intent without making the test's

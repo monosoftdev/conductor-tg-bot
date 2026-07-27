@@ -52,17 +52,17 @@ from aiogram.exceptions import (
 )
 from aiogram.types import BufferedInputFile, InlineKeyboardMarkup, LinkPreviewOptions
 
+from ctb.db import NO_THREAD_ID
+from ctb.db.connection import Database
+from ctb.db.repo import deliveries as deliveries_repo
+from ctb.db.repo.deliveries import DeliveryRow
+from ctb.db.repo.transcript import DeliveryDraft
 from ctb.delivery.pacing import (
     CHAT_BURST,
     CHAT_RATE_PER_MINUTE,
     DestinationRotor,
     TelegramPacer,
 )
-from ctb.db import NO_THREAD_ID
-from ctb.db.connection import Database
-from ctb.db.repo import deliveries as deliveries_repo
-from ctb.db.repo.deliveries import DeliveryRow
-from ctb.db.repo.transcript import DeliveryDraft
 from ctb.delivery.render.chunk import (
     MessagePart,
     PartKind,
@@ -456,9 +456,12 @@ class Outbox:
 
     async def _has_stranded_rows(self) -> bool:
         """Anything in ``sending`` that is not ours, and so still to recover."""
-        return await deliveries_repo.count_unclaimed_sending(
-            self._db, claim_id=self._claim_id
-        ) > 0
+        return (
+            await deliveries_repo.count_unclaimed_sending(
+                self._db, claim_id=self._claim_id
+            )
+            > 0
+        )
 
     # -- focus ------------------------------------------------------------
 
