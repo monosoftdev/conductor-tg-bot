@@ -24,14 +24,12 @@ import asyncio
 import json
 import random
 from collections.abc import AsyncIterator, Callable
-from pathlib import Path
 from typing import Any
 
 import pytest
 
 from ctb.conductor.client import ConductorClient
 from ctb.db.connection import Database
-from ctb.db.migrate import apply_migrations
 from ctb.db.repo import chats, deliveries, lease, prompts, sessions, transcript
 from ctb.db.repo import workspaces as workspaces_repo
 from ctb.db.repo.deliveries import DeliveryKey, DeliveryRow
@@ -330,7 +328,7 @@ async def test_a_crash_after_sending_resends_rather_than_losing(
     assert (await states(db, session.session_id))["sending"] == 1
 
     # Boot: orphans are re-claimed, because a lost reply is worse than a repeat.
-    recovery = await deliveries.recover_orphaned(db, claim_id="worker-b")
+    recovery = await deliveries.recover_orphaned(db, claim_id="worker-b", orphan_after_ms=0)
     assert len(recovery.claimed) == 1
     assert recovery.skipped == ()
     for row in recovery.claimed:
@@ -375,7 +373,7 @@ async def test_recovery_skips_a_payload_already_on_the_wire(
     )
     await deliveries.claim(db, claim_id="worker-a")
 
-    recovery = await deliveries.recover_orphaned(db, claim_id="worker-b")
+    recovery = await deliveries.recover_orphaned(db, claim_id="worker-b", orphan_after_ms=0)
 
     assert recovery.claimed == ()
     assert len(recovery.skipped) == 1
@@ -388,8 +386,7 @@ async def test_recovery_skips_a_payload_already_on_the_wire(
 @pytest.fixture
 async def second_db(db: Database) -> AsyncIterator[Database]:
     """A second connection to the same file — the redeploy overlap, for real."""
-    other = await Database(Path(db.path)).connect()
-    await apply_migrations(other)
+    other = await Database(db.dsn, min_size=1, max_size=2).connect()
     try:
         yield other
     finally:
@@ -447,17 +444,21 @@ async def test_two_pollers_on_one_database_never_duplicate_a_delivery(
     assert counts.get("pending", 0) == 0
 
 
-async def test_only_one_supervisor_holds_the_lease(
-    db: Database, second_db: Database
-) -> None:
+async def test_only_one_supervisor_holds_the_lease(system_db: Database) -> None:
     """Defence in depth: the overlap should not even get as far as polling."""
-    first = await lease.acquire(db, holder="instance-a")
-    second = await lease.acquire(second_db, holder="instance-b")
+    other = await Database(
+        system_db.dsn, min_size=1, max_size=2, system=True
+    ).connect()
+    try:
+        first = await lease.acquire(system_db, holder="instance-a")
+        second = await lease.acquire(other, holder="instance-b")
 
-    assert first is not None
-    assert second is None
-    assert await lease.heartbeat(second_db, holder="instance-b") is None
-    assert await lease.heartbeat(db, holder="instance-a") is not None
+        assert first is not None
+        assert second is None
+        assert await lease.heartbeat(other, holder="instance-b") is None
+        assert await lease.heartbeat(system_db, holder="instance-a") is not None
+    finally:
+        await other.close()
 
 
 async def test_a_second_poller_drains_what_the_first_already_recorded(
