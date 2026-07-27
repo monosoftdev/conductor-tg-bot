@@ -33,6 +33,7 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import hmac
 import os
 import re
 import uuid
@@ -41,7 +42,9 @@ from dataclasses import dataclass
 from typing import Final
 
 from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 __all__ = [
     "KEY_BYTES",
@@ -189,13 +192,46 @@ class SecretBox:
             if box.open(blob, tenant_id=probe, purpose="self-check") != secret:
                 raise SecretError(f"master key {kid!r} failed its round trip")
 
+    def derive(self, label: str, length: int = 32) -> bytes:
+        """A subkey for a different purpose, from the *active* master key.
+
+        HKDF, so the derived key tells you nothing about the master and two
+        labels never collide. Used for the callback-payload MAC, which needs a
+        key that every replica of a deployment agrees on and nobody outside it
+        can guess.
+
+        Rotating the master key rotates this too, which invalidates in-flight
+        signed payloads — acceptable for buttons that already expire in
+        minutes, and the safe direction to fail in.
+        """
+        return HKDF(
+            algorithm=hashes.SHA256(),
+            length=length,
+            salt=None,
+            info=b"ctb-derive|" + label.encode("utf-8"),
+        ).derive(self._active.key)
+
+    def fingerprint_of(self, plaintext: str, *, tenant_id: uuid.UUID) -> str:
+        """Keyed handle for "is this the same key?".
+
+        HMAC rather than a bare digest: ``conductor_key_fp`` is readable by the
+        application role, and an unsalted hash of an API key is offline-
+        guessable for any key with predictable structure. Tenant-scoped so the
+        same key stored twice does not correlate across workspaces.
+        """
+        mac = hmac.new(
+            self.derive("key-fingerprint"),
+            tenant_id.bytes + plaintext.encode("utf-8"),
+            hashlib.sha256,
+        )
+        return mac.hexdigest()[:16]
+
     @staticmethod
     def fingerprint(plaintext: str) -> str:
-        """A stable, non-reversible handle for "is this the same key?".
+        """Unkeyed digest. Prefer :meth:`fingerprint_of`, which is keyed.
 
-        Stored alongside the ciphertext so key rotation can invalidate a cached
-        client, and ``/key`` can answer "you already have this one", without
-        anything ever decrypting.
+        Retained for comparing two plaintexts in memory (a test, a migration),
+        never for anything that gets written down.
         """
         return hashlib.sha256(plaintext.encode("utf-8")).hexdigest()[:16]
 

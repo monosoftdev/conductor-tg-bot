@@ -27,7 +27,7 @@ from ctb.db.repo import tenancy
 from ctb.db.repo.tenancy import TenantRow
 from ctb.runtime import secret_box
 from ctb.settings import Settings
-from tests.pg import BOOTSTRAP_TENANT_ID
+from tests.pg import BOOTSTRAP_TENANT_ID, OTHER_TENANT_ID
 
 pytestmark = pytest.mark.db
 
@@ -344,8 +344,28 @@ class TestKeyIntake:
         assert stored is not None
         assert stored.conductor_key_ct is not None
         assert secret.encode() not in stored.conductor_key_ct
-        assert stored.conductor_key_fp == SecretBox.fingerprint(secret)
+        assert stored.conductor_key_fp == secret_box().fingerprint_of(
+            secret, tenant_id=BOOTSTRAP_TENANT_ID
+        )
         assert stored.status == "active"
+
+    async def test_the_fingerprint_is_keyed_not_a_bare_digest(
+        self, db: Database, system_db: Database, said: list[str]
+    ) -> None:
+        """``conductor_key_fp`` is readable by the app role.
+
+        An unsalted hash of an API key is offline-guessable for any key with
+        predictable structure, so the handle is an HMAC under the master key and
+        scoped to the tenant — the same key in two workspaces does not
+        correlate.
+        """
+        secret = "cndk_live_real_key_0009"
+        assert secret_box().fingerprint_of(
+            secret, tenant_id=BOOTSTRAP_TENANT_ID
+        ) != SecretBox.fingerprint(secret)
+        assert secret_box().fingerprint_of(
+            secret, tenant_id=BOOTSTRAP_TENANT_ID
+        ) != secret_box().fingerprint_of(secret, tenant_id=OTHER_TENANT_ID)
 
     async def test_the_stored_key_round_trips(
         self, db: Database, system_db: Database, said: list[str]

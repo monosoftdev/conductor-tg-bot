@@ -41,7 +41,7 @@ from ctb.bot.handlers.topics import (
     require_topic,
     resolve_db,
 )
-from ctb.bot.middleware.tenancy import TenantContext
+from ctb.bot.middleware.tenancy import TenantContext, forget_cached
 from ctb.conductor.client import ConductorClient
 from ctb.conductor.pool import CONDUCTOR_KEY_PURPOSE
 from ctb.db.connection import Database, tenant_scope
@@ -242,6 +242,11 @@ async def setup(
                 "<code>/setup &lt;code&gt;</code> here.",
             )
             return
+        # Prove the group works *before* spending the code. A single-use code
+        # burned on a failed permissions check would leave the workspace
+        # permanently unbindable, with no way to issue another.
+        if not await _capable(message):
+            return
         redeemed = await tenancy.consume_enrollment_token(
             system, token_hash=hash_code(code), purpose="bind_chat"
         )
@@ -255,18 +260,8 @@ async def setup(
         return
     else:
         tenant_id = binding.tenant_id
-
-    support = await forum_support(message.bot, message.chat.id)
-    if support.degraded:
-        detail = support.detail or "forum topics and topic permissions"
-        await tell(message, f"Setup blocked · {escape(detail)}.", silent=False)
-        return
-    try:
-        probe = await require_topic(message.bot, message.chat.id, "setup check")
-    except TopicCreateError as exc:
-        await tell(message, f"Setup blocked · {escape(exc.reason)}.", silent=False)
-        return
-    await discard_topic(message.bot, message.chat.id, probe)
+        if not await _capable(message):
+            return
 
     try:
         await tenancy.bind_chat(
@@ -295,6 +290,30 @@ async def setup(
         else "\nGeneral is search-only; <code>/new</code> creates topics."
     )
     await tell(message, "Ready ·" + tail)
+
+
+async def _capable(message: Message) -> bool:
+    """Can the bot really run here? Perform the capability, do not ask about it.
+
+    ``can_manage_topics`` has been observed ``true`` on a chat that then refused
+    ``createForumTopic``, so ``/setup`` used to answer "Ready" while every
+    ``/new`` failed. Create a throwaway topic and delete it: two calls, no
+    residue, and the answer is the truth.
+    """
+    if message.bot is None:  # pragma: no cover - guarded by the caller
+        return False
+    support = await forum_support(message.bot, message.chat.id)
+    if support.degraded:
+        detail = support.detail or "forum topics and topic permissions"
+        await tell(message, f"Setup blocked · {escape(detail)}.", silent=False)
+        return False
+    try:
+        probe = await require_topic(message.bot, message.chat.id, "setup check")
+    except TopicCreateError as exc:
+        await tell(message, f"Setup blocked · {escape(exc.reason)}.", silent=False)
+        return False
+    await discard_topic(message.bot, message.chat.id, probe)
+    return True
 
 
 async def _setup_dm(
@@ -342,7 +361,7 @@ async def set_key(
 
     system = system_database()
     box = secret_box()
-    fingerprint = box.fingerprint(value)
+    fingerprint = box.fingerprint_of(value, tenant_id=tenant.tenant_id)
     current = tenant.row.elevenlabs_key_fp if speech else tenant.row.conductor_key_fp
     await _delete(message)
 
@@ -385,6 +404,7 @@ async def set_key(
     if tenant.status == "pending":
         await tenancy.set_status(system, tenant.tenant_id, "active")
     log.info("registration.key_stored", tenant=tenant.slug)
+    forget_cached(tenant.tenant_id)
     await tell(
         message,
         "Key stored and your message deleted. Your workspace is active — "
@@ -408,6 +428,7 @@ async def revoke(message: Message, tenant: TenantContext, state: FSMContext) -> 
     )
     await tenancy.set_status(system, tenant.tenant_id, "pending")
     log.info("registration.key_revoked", tenant=tenant.slug)
+    forget_cached(tenant.tenant_id)
     await tell(
         message,
         "Keys deleted and polling stopped. Send <code>/key</code> to start again.",

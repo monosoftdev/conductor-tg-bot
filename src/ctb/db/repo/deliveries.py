@@ -52,6 +52,7 @@ from ctb.db.repo._util import (
 __all__ = [
     "DEDUPE_WINDOW_MS",
     "ORPHAN_AFTER_MS",
+    "RECOVERY_BATCH",
     "Destination",
     "DeliveryKey",
     "DeliveryRow",
@@ -82,7 +83,17 @@ DEDUPE_WINDOW_MS = 10 * 60 * 1000
 #: A ``sending`` row younger than this may still be in flight on a live peer.
 #: Only older rows are treated as orphaned, so recovery cannot steal and
 #: double-send work another worker is holding.
-ORPHAN_AFTER_MS: Final = 60_000
+#:
+#: Comfortably longer than the outbox's own worst case: a row held through a
+#: full Telegram ``retry_after`` (capped at 60s) plus the send that follows must
+#: not sit at the threshold, or a redeploy overlap would reclaim a row that is
+#: about to be sent.
+ORPHAN_AFTER_MS: Final = 150_000
+
+#: Rows recovered per pass. The outbox keeps recovery armed until a pass finds
+#: nothing left, so a large backlog drains over several passes rather than one
+#: long-running transaction.
+RECOVERY_BATCH: Final = 200
 
 _COLUMNS = """
     session_id, message_id, part_index, chat_id, thread_id, session_index, kind,
@@ -278,6 +289,7 @@ async def claim(
     *,
     claim_id: str,
     limit: int = 20,
+    tenant_id: uuid.UUID | None = None,
     session_id: str | None = None,
     chat_id: int | None = None,
     thread_id: int | None = None,
@@ -290,6 +302,12 @@ async def claim(
     answer it refers to inside the same topic. Priority orders *destinations*
     against each other, which is what :func:`pending_destinations` exposes.
 
+    ``tenant_id`` is **required in effect** for the outbox, which runs on the
+    BYPASSRLS pool: a chat belongs to one workspace, but that is a single-table
+    invariant, and unbinding a chat breaks it while leaving the old workspace's
+    rows behind. Passing the tenant makes the delivery path safe on its own
+    rather than on somebody else's promise.
+
     Concurrent claimers skip each other's locked rows rather than blocking, so
     the loser simply gets fewer rows — never the same rows. Scope the claim to
     one destination (``chat_id``/``thread_id``) to keep ordering per topic while
@@ -298,6 +316,9 @@ async def claim(
     stamp = now_ms() if at is None else at
     where: list[str] = ["state = 'pending'"]
     scope_params: list[Any] = []
+    if tenant_id is not None:
+        where.append("tenant_id = ?")
+        scope_params.append(tenant_id)
     if session_id is not None:
         where.append("session_id = ?")
         scope_params.append(session_id)
@@ -463,6 +484,7 @@ async def recover_orphaned(
     claim_id: str,
     dedupe_window_ms: int = DEDUPE_WINDOW_MS,
     orphan_after_ms: int = ORPHAN_AFTER_MS,
+    limit: int = RECOVERY_BATCH,
     at: int | None = None,
 ) -> RecoveryResult:
     """Take over rows stranded in ``sending`` by a crash. At-least-once.
@@ -477,7 +499,12 @@ async def recover_orphaned(
     else is re-claimed and re-sent — losing a reply is worse than repeating one.
 
     Every update re-asserts ``state = 'sending'``; a row another worker took in
-    the meantime is left alone rather than double-claimed.
+    the meantime is left alone rather than double-claimed. Rows already held
+    under *our own* ``claim_id`` are skipped outright — recovering them would be
+    recovering from ourselves.
+
+    Bounded by ``limit``: an unbounded stranded set would otherwise be one
+    transaction holding row locks over the whole table.
     """
     stamp = now_ms() if at is None else at
     dedupe_cutoff = stamp - max(0, dedupe_window_ms)
@@ -488,11 +515,14 @@ async def recover_orphaned(
         rows = await db.fetch_all(
             f"""
             SELECT {_COLUMNS} FROM deliveries
-             WHERE state = 'sending' AND COALESCE(claimed_at, 0) <= ?
+             WHERE state = 'sending'
+               AND COALESCE(claimed_at, 0) <= ?
+               AND COALESCE(claim_id, '') <> ?
              ORDER BY session_index, part_index
+             LIMIT ?
                FOR UPDATE SKIP LOCKED
             """,
-            (orphan_cutoff,),
+            (orphan_cutoff, claim_id, max(1, limit)),
         )
         for raw in rows:
             row = DeliveryRow.from_row(raw)

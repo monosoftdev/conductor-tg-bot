@@ -25,7 +25,7 @@ from aiogram.types import BufferedInputFile, Message
 from ctb.bot.app import register_router
 from ctb.bot.handlers.common import abandon_wizard, command_text, short_error, tell
 from ctb.bot.handlers.topics import resolve_db
-from ctb.bot.middleware.tenancy import TenantContext
+from ctb.bot.middleware.tenancy import TenantContext, forget_cached
 from ctb.db.connection import Database
 from ctb.db.repo import chats as chats_repo
 from ctb.db.repo import deliveries, events, lease, tenancy
@@ -82,13 +82,18 @@ async def invite(
     if role not in ("member", "admin"):
         await tell(message, "Role must be <code>member</code> or <code>admin</code>.")
         return
-    await tenancy.add_member(
-        system_database(),
-        tenant.tenant_id,
-        user_id,
-        role=role,
-        added_by=tenant.user_id,
-    )
+    try:
+        await tenancy.add_member(
+            system_database(),
+            tenant.tenant_id,
+            user_id,
+            role=role,
+            added_by=tenant.user_id,
+        )
+    except tenancy.RoleError as exc:
+        await tell(message, escape(str(exc)))
+        return
+    forget_cached(tenant.tenant_id)
     await tell(message, f"Added <code>{user_id}</code> as {escape(role)}.")
 
 
@@ -98,7 +103,7 @@ async def remove(
     tenant: TenantContext,
     state: FSMContext,
 ) -> None:
-    """Unseat a user. The last remaining owner cannot be removed."""
+    """Unseat a user. Owners can only be removed by owners, never the last."""
     await abandon_wizard(state)
     if not tenant.is_owner:
         await tell(message, "Owners only.")
@@ -108,14 +113,45 @@ async def remove(
     except ValueError:
         await tell(message, "Usage: <code>/remove telegram_user_id</code>")
         return
-    removed = await tenancy.remove_member(system_database(), tenant.tenant_id, user_id)
+    removed = await tenancy.remove_member(
+        system_database(), tenant.tenant_id, user_id, removed_by=tenant.user_id
+    )
     if not removed:
         await tell(
             message,
             f"Did not remove <code>{user_id}</code> — not a member, or the last owner.",
         )
         return
+    forget_cached(tenant.tenant_id)
     await tell(message, f"Removed <code>{user_id}</code>.")
+
+
+@router.message(Command("leave"))
+async def leave(
+    message: Message,
+    tenant: TenantContext,
+    state: FSMContext,
+) -> None:
+    """Remove *yourself* from this workspace.
+
+    Anyone can seat anyone with ``/invite``, so there has to be a way out that
+    does not depend on the person who seated you. An owner cannot leave while
+    they are the last one — that would strand the workspace.
+    """
+    await abandon_wizard(state)
+    left = await tenancy.remove_member(
+        system_database(), tenant.tenant_id, tenant.user_id
+    )
+    if not left:
+        await tell(
+            message,
+            "You are the last owner of <b>"
+            + escape(tenant.slug)
+            + "</b>. Make someone else an owner first, or use <code>/forget</code>.",
+        )
+        return
+    forget_cached(tenant.tenant_id)
+    await tell(message, f"You have left <b>{escape(tenant.slug)}</b>.")
 
 
 @router.message(Command("members"))
@@ -124,7 +160,11 @@ async def members(
     tenant: TenantContext,
     state: FSMContext,
 ) -> None:
+    """Who is in this workspace. Owners only — it lists Telegram user ids."""
     await abandon_wizard(state)
+    if not tenant.is_owner:
+        await tell(message, "Owners only.")
+        return
     rows = await tenancy.list_members(system_database(), tenant.tenant_id)
     lines = [f"<b>{escape(tenant.slug)}</b> · {len(rows)} member(s)"]
     for row in rows:

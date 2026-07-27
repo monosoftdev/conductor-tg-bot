@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Final
 
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
@@ -211,15 +211,7 @@ class RoutingMiddleware(BaseMiddleware):
         # `chats.kind` is authoritative once a row exists (a DM row is written
         # as kind='dm'), but the live Telegram chat type wins for General vs
         # topic because a topic can be deleted out from under us.
-        return Route(
-            chat_id=chat_id,
-            thread_id=route.thread_id,
-            kind=route.kind,
-            chat=chat,
-            session=session,
-            reply_to_message_id=route.reply_to_message_id,
-            via_reply=via_reply,
-        )
+        return replace(route, chat=chat, session=session, via_reply=via_reply)
 
     async def _session_for(
         self, db: Database, chat: ChatRow | None, chat_id: int, thread_id: int

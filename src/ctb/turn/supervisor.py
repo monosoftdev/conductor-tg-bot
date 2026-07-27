@@ -50,6 +50,10 @@ RECONCILE_INTERVAL_S: Final = lease.HEARTBEAT_MS / 1000.0
 MAX_RESTART_BACKOFF_S: Final = 60.0
 MAINTENANCE_INTERVAL_S: Final = 24 * 60 * 60.0
 
+#: Idle Conductor clients are swept far more often than retention runs: each
+#: one holds a decrypted API key in an httpx header until it goes.
+CLIENT_SWEEP_INTERVAL_S: Final = 300.0
+
 #: Hard ceiling on concurrent pollers across every tenant. Reaching it logs
 #: ``supervisor.pollers_starved``, which is the signal to shard the lease.
 GLOBAL_MAX_POLLERS: Final = 200
@@ -110,6 +114,7 @@ class Supervisor:
         #: Tenant rows for this pass: quotas, and the sealed key the pool needs.
         self._tenant_rows: dict[uuid.UUID, tenancy.TenantRow] = {}
         self._next_maintenance_at = 0.0
+        self._next_sweep_at = 0.0
 
     @property
     def task_count(self) -> int:
@@ -269,6 +274,11 @@ class Supervisor:
         # Rebuilt every pass: a suspension or a rotated key must be seen now.
         self._tenant_rows.clear()
         rows = await sessions.list_bound(self.system_db)
+        # Load the quotas *before* selecting. `_quota` reads this cache, and
+        # filling it lazily inside `_spawn` — which runs after — meant every
+        # tenant silently got the global ceiling instead of its own.
+        for tenant_id in {row.tenant_id for row in rows if row.tenant_id}:
+            await self._tenant(tenant_id)
         wanted = {row.id: row for row in self._select(rows)}
 
         for session_id in tuple(self._tasks):
@@ -343,6 +353,12 @@ class Supervisor:
 
     async def _run_maintenance_if_due(self) -> None:
         now = self._clock()
+        if now >= self._next_sweep_at:
+            self._next_sweep_at = now + CLIENT_SWEEP_INTERVAL_S
+            try:
+                await self.clients.sweep()
+            except Exception as exc:  # pragma: no cover - sweep is best effort
+                _log.warning("supervisor.client_sweep_failed", error=repr(exc))
         if now < self._next_maintenance_at:
             return
         self._next_maintenance_at = now + MAINTENANCE_INTERVAL_S

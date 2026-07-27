@@ -534,6 +534,12 @@ async def build_runtime(
         secrets = settings.secret_box()
         secrets.self_check()
         set_secret_box(secrets)
+        # Callback payloads that must survive a redeploy are HMAC'd under a key
+        # derived from the same master, so every replica agrees and nothing
+        # outside the deployment can mint one.
+        from ctb.bot.keyboards import set_signing_key
+
+        set_signing_key(secrets.derive("callback-signature"))
 
         version = await made.verify_schema(runtime.system_db)
         log.info("runtime.database_ready", schema_version=version)

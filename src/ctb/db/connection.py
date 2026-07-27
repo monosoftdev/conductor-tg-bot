@@ -33,9 +33,10 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from contextvars import ContextVar, Token
+from types import MappingProxyType
 from typing import Any, Final, LiteralString, Self, cast
 
 from psycopg import AsyncConnection
@@ -80,9 +81,22 @@ type Params = Sequence[Any]
 
 _EMPTY: Final[tuple[Any, ...]] = ()
 
-#: The connection an open ``transaction()`` owns, and the task that opened it.
-_bound: ContextVar[tuple[AsyncConnection[Row], int] | None] = ContextVar(
-    "ctb_db_bound", default=None
+#: Open transactions, keyed by ``(pool id, task id)``.
+#:
+#: Both halves matter. The task id is required because ``asyncio.create_task``
+#: *copies* the context — without it a child task would issue statements on its
+#: parent's connection, which psycopg does not allow. The pool id is required
+#: because two pools exist: a system-pool call made inside an app-pool
+#: transaction would otherwise run on the app connection, under a role with no
+#: grants on the system tables.
+#: The default is an immutable mapping: a shared mutable default would be one
+#: dict for the whole process, and every ``_bound.set`` here replaces rather
+#: than mutates, so nothing ever writes through it.
+_NO_TRANSACTIONS: Final[Mapping[tuple[int, int], AsyncConnection[Row]]] = (
+    MappingProxyType({})
+)
+_bound: ContextVar[Mapping[tuple[int, int], AsyncConnection[Row]]] = ContextVar(
+    "ctb_db_bound", default=_NO_TRANSACTIONS
 )
 
 #: The tenant every scoped statement is filtered by.
@@ -197,6 +211,10 @@ class Database:
 
     # -- the seam every statement goes through -------------------------------
 
+    def _binding_key(self) -> tuple[int, int]:
+        """Which open transaction, if any, this call belongs to."""
+        return (id(self), _task_id())
+
     async def _apply_scope(self, conn: AsyncConnection[Row]) -> None:
         """Publish the tenant, transaction-locally.
 
@@ -221,9 +239,9 @@ class Database:
     @asynccontextmanager
     async def _acquire(self) -> AsyncIterator[AsyncConnection[Row]]:
         """The open transaction's connection, or a fresh one that self-commits."""
-        bound = _bound.get()
-        if bound is not None and bound[1] == _task_id():
-            yield bound[0]
+        existing = _bound.get().get(self._binding_key())
+        if existing is not None:
+            yield existing
             return
         async with self.pool.connection() as conn:
             await self._apply_scope(conn)
@@ -245,14 +263,15 @@ class Database:
         argument stays so the call sites that pass it keep reading the same.
         """
         del immediate
-        task = _task_id()
-        bound = _bound.get()
-        if bound is not None and bound[1] == task:
-            yield bound[0]
+        key = self._binding_key()
+        open_now = _bound.get()
+        existing = open_now.get(key)
+        if existing is not None:
+            yield existing
             return
         async with self.pool.connection() as conn:
             await self._apply_scope(conn)
-            token = _bound.set((conn, task))
+            token = _bound.set({**open_now, key: conn})
             try:
                 try:
                     yield conn

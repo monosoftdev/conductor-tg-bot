@@ -13,7 +13,7 @@ from aiogram.types import ReactionTypeEmoji
 
 from ctb.bot.handlers import topics
 from ctb.db import NO_THREAD_ID
-from ctb.db.connection import Database
+from ctb.db.connection import Database, tenant_scope
 from ctb.db.repo import prompts, sessions, tenancy
 from ctb.delivery.outbox import Outbox, Priority
 from ctb.delivery.render.html import escape
@@ -60,6 +60,16 @@ class BotActionSink:
         targets: list[int] = list(recipients)
         if primary is not None and primary.chat_id not in targets:
             targets.append(primary.chat_id)
+        # The notice is a *tenant's* row. The supervisor calls this from its own
+        # reconcile loop, outside any scope, so enter one — otherwise the
+        # tenant_id default is NULL and the one message that explains the outage
+        # is the one that fails to enqueue.
+        async with tenant_scope(tenant_id):
+            await self._enqueue_notices(session_id, tenant_id, targets)
+
+    async def _enqueue_notices(
+        self, session_id: str, tenant_id: uuid.UUID, targets: list[int]
+    ) -> None:
         for chat_id in targets:
             await self._outbox.enqueue_notice(
                 "Conductor rejected this workspace's API key. Send "

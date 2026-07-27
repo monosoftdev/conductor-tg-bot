@@ -641,6 +641,10 @@ class HealthMonitor:
             "voice": voice,
             "lease": lease_section,
             "api_events": [_event_dict(event, at=at) for event in recent],
+            # Cross-tenant on purpose: this is renderer coverage, not customer
+            # data. The rows' `sample_session_id`/`sample_message_id` *are* a
+            # pointer into one tenant's transcripts, so they are deliberately
+            # not surfaced here — only the shape and the count.
             "unknown_content_types": [
                 {
                     "type": row.type,

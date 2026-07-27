@@ -39,6 +39,7 @@ from ctb.db.repo._util import (
 
 __all__ = [
     "ROLE_ORDER",
+    "RoleError",
     "TenantChat",
     "TenantMember",
     "TenantRow",
@@ -458,6 +459,10 @@ async def count_workspaces(db: Database, tenant_id: uuid.UUID) -> int:
 # ── members ──────────────────────────────────────────────────────────────────
 
 
+class RoleError(RuntimeError):
+    """A role change that would leave the workspace unadministerable."""
+
+
 async def add_member(
     db: Database,
     tenant_id: uuid.UUID,
@@ -469,8 +474,19 @@ async def add_member(
     added_by: int | None = None,
     at: int | None = None,
 ) -> TenantMember:
-    """Seat a user, or update their role. Idempotent."""
+    """Seat a user, or update their role. Idempotent.
+
+    **Only an owner may change an owner's role.** Admins pass the same
+    ``is_owner`` command gate as owners, so without this an admin could demote
+    the owner to ``member`` — and nothing in Telegram grants ``owner`` back.
+    """
     stamp = now_ms() if at is None else at
+    if role != "owner":
+        existing = await member(db, tenant_id, user_id)
+        if existing is not None and existing.role == "owner":
+            actor = None if added_by is None else await member(db, tenant_id, added_by)
+            if actor is None or actor.role != "owner":
+                raise RoleError("only an owner can change an owner's role")
     row = await db.fetch_one(
         f"""
         INSERT INTO tenant_members
@@ -532,18 +548,37 @@ async def list_owner_ids(db: Database, tenant_id: uuid.UUID) -> tuple[int, ...]:
     return tuple(as_int(row["user_id"]) for row in rows)
 
 
-async def remove_member(db: Database, tenant_id: uuid.UUID, user_id: int) -> bool:
-    """Unseat a user. The last remaining owner cannot be removed."""
+async def remove_member(
+    db: Database,
+    tenant_id: uuid.UUID,
+    user_id: int,
+    *,
+    removed_by: int | None = None,
+) -> bool:
+    """Unseat a user.
+
+    Two guards, and the second is the one that matters: the last **owner**
+    cannot be removed, where owner means the ``owner`` role specifically and
+    not the admins who merely pass the same command gate. Counting admins would
+    let an admin remove the owner and leave a workspace nobody can administer.
+    """
     async with db.transaction():
-        owners = await list_owner_ids(db, tenant_id)
         current = await member(db, tenant_id, user_id)
         if current is None:
             return False
-        if (
-            current.is_sole_owner_role
-            and len([uid for uid in owners if uid != user_id]) == 0
-        ):
-            return False
+        if current.role == "owner":
+            actor = (
+                None if removed_by is None else await member(db, tenant_id, removed_by)
+            )
+            if removed_by is not None and (actor is None or actor.role != "owner"):
+                return False
+            remaining = [
+                row
+                for row in await list_members(db, tenant_id)
+                if row.role == "owner" and row.user_id != user_id
+            ]
+            if not remaining:
+                return False
         changed = await db.execute(
             "DELETE FROM tenant_members WHERE tenant_id = ? AND user_id = ?",
             (tenant_id, user_id),

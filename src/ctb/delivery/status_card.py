@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
+import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
 from typing import Any, Final, Protocol
@@ -37,7 +38,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
 
 from ctb.db import NO_THREAD_ID
-from ctb.db.connection import Database
+from ctb.db.connection import Database, current_tenant, tenant_scope
 from ctb.db.repo import sessions as sessions_repo
 from ctb.delivery.render.html import escape, strip_html
 from ctb.logging import get_logger
@@ -316,6 +317,9 @@ class _Card:
     chat_id: int
     thread_id: int
     state: CardState
+    #: Whose card this is. The tick loop is process-wide, so persisting the
+    #: card's message id needs the owning tenant's scope explicitly.
+    tenant_id: uuid.UUID | None = None
     deep_link: str | None = None
     message_id: int | None = None
     typing: bool = False
@@ -627,7 +631,7 @@ class StatusCards:
             return
         self._cards.pop(card.key, None)
         card.typing = False
-        await self._persist_card_id(card.session_id, None)
+        await self._persist_card_id(card, None)
 
     # -- the periodic pass ------------------------------------------------
 
@@ -685,12 +689,16 @@ class StatusCards:
                 chat_id=chat_id,
                 thread_id=thread_id,
                 state=CardState(),
+                # Captured here, where a scope exists: `handle` runs inside the
+                # poller's tenant, `tick` does not.
+                tenant_id=current_tenant(),
                 deep_link=deep_link,
                 last_change_at=self._clock(),
             )
             self._cards[key] = card
         else:
             card.session_id = session_id
+            card.tenant_id = card.tenant_id or current_tenant()
             if deep_link is not None:
                 card.deep_link = deep_link
         return card
@@ -748,7 +756,7 @@ class StatusCards:
         self._counters["posted"] += 1
         if card.message_id is not None:
             await self._pin_card(card)
-            await self._persist_card_id(card.session_id, card.message_id)
+            await self._persist_card_id(card, card.message_id)
 
     async def _edit(self, card: _Card, rendered: str, now: float) -> None:
         markup = self._markup(card)
@@ -843,12 +851,28 @@ class StatusCards:
             # Pinning needs a permission we may not have. The card still works.
             _log.info("status_card.pin_failed", chat_id=card.chat_id, error=repr(exc))
 
-    async def _persist_card_id(self, session_id: str, message_id: int | None) -> None:
+    async def _persist_card_id(self, card: _Card, message_id: int | None) -> None:
+        """Remember (or forget) which message is this session's card.
+
+        Runs from the process-wide tick loop, so it enters the card's own
+        tenant scope. Without that the write is rejected and the id goes stale
+        across a redeploy — the card is then edited into a message that is no
+        longer the newest thing in the topic.
+        """
+        tenant_id = card.tenant_id or current_tenant()
+        if tenant_id is None:
+            _log.warning("status_card.unscoped", session_id=card.session_id)
+            return
         try:
-            await sessions_repo.set_status_card(self._db, session_id, message_id)
+            async with tenant_scope(tenant_id):
+                await sessions_repo.set_status_card(
+                    self._db, card.session_id, message_id
+                )
         except Exception as exc:
             _log.warning(
-                "status_card.persist_failed", session_id=session_id, error=repr(exc)
+                "status_card.persist_failed",
+                session_id=card.session_id,
+                error=repr(exc),
             )
 
     def _markup(self, card: _Card) -> InlineKeyboardMarkup | None:

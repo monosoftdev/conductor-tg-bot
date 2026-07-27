@@ -701,6 +701,7 @@ class Outbox:
                 self._db,
                 claim_id=self._claim_id,
                 limit=self._batch_size,
+                tenant_id=destination.tenant_id,
                 chat_id=destination.chat_id,
                 thread_id=destination.thread_id,
             )
@@ -719,6 +720,7 @@ class Outbox:
                     self._db,
                     claim_id=self._claim_id,
                     limit=self._batch_size,
+                    tenant_id=head.tenant_id,
                     chat_id=head.chat_id,
                     thread_id=head.thread_id,
                 )

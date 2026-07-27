@@ -1361,3 +1361,57 @@ async def test_issuing_a_token_invalidates_the_previous_one(
         )
         is not None
     )
+
+
+async def test_an_admin_cannot_demote_the_owner(system_db: Database) -> None:
+    """Admins pass the same command gate as owners, so this is a real path.
+
+    Demote-then-nothing-grants-it-back is a one-way door: no Telegram command
+    creates an ``owner``, so the workspace would have no administrator at all.
+    """
+    tenant = await tenancy.create(system_db, slug="d", name="D", owner_user_id=1)
+    await tenancy.add_member(system_db, tenant.id, 2, role="admin", added_by=1)
+
+    with pytest.raises(tenancy.RoleError, match="only an owner"):
+        await tenancy.add_member(system_db, tenant.id, 1, role="member", added_by=2)
+
+    still = await tenancy.member(system_db, tenant.id, 1)
+    assert still is not None and still.role == "owner"
+
+
+async def test_an_owner_can_demote_another_owner(system_db: Database) -> None:
+    tenant = await tenancy.create(system_db, slug="d2", name="D", owner_user_id=1)
+    await tenancy.add_member(system_db, tenant.id, 2, role="owner", added_by=1)
+
+    demoted = await tenancy.add_member(
+        system_db, tenant.id, 2, role="member", added_by=1
+    )
+    assert demoted.role == "member"
+
+
+async def test_an_admin_cannot_remove_the_owner(system_db: Database) -> None:
+    """The other route to the same one-way door."""
+    tenant = await tenancy.create(system_db, slug="d3", name="D", owner_user_id=1)
+    await tenancy.add_member(system_db, tenant.id, 2, role="admin", added_by=1)
+
+    assert await tenancy.remove_member(system_db, tenant.id, 1, removed_by=2) is False
+    assert await tenancy.member(system_db, tenant.id, 1) is not None
+
+
+async def test_admins_do_not_count_as_owners_for_the_last_owner_guard(
+    system_db: Database,
+) -> None:
+    """An admin is not a substitute; removing the owner would strand it."""
+    tenant = await tenancy.create(system_db, slug="d4", name="D", owner_user_id=1)
+    await tenancy.add_member(system_db, tenant.id, 2, role="admin", added_by=1)
+
+    assert await tenancy.remove_member(system_db, tenant.id, 1, removed_by=1) is False
+
+
+async def test_anyone_can_remove_themselves(system_db: Database) -> None:
+    """``/leave``. Anyone can seat anyone, so there must be a way out."""
+    tenant = await tenancy.create(system_db, slug="d5", name="D", owner_user_id=1)
+    await tenancy.add_member(system_db, tenant.id, 9, role="member", added_by=1)
+
+    assert await tenancy.remove_member(system_db, tenant.id, 9, removed_by=9) is True
+    assert await tenancy.member(system_db, tenant.id, 9) is None

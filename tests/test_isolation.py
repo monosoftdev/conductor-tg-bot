@@ -19,15 +19,19 @@ import pytest
 from ctb.db.connection import (
     Database,
     current_tenant,
-    reset_tenant,
-    set_tenant,
     tenant_scope,
 )
 from ctb.db.errors import InsufficientPrivilege, TenantScopeError
 from ctb.db.repo import chats as chats_repo
 from ctb.db.repo import sessions as sessions_repo
 from ctb.db.repo import workspaces as workspaces_repo
-from tests.pg import BOOTSTRAP_TENANT_ID, OTHER_TENANT_ID, admin_dsn, app_dsn
+from tests.pg import (
+    BOOTSTRAP_TENANT_ID,
+    OTHER_TENANT_ID,
+    admin_dsn,
+    app_dsn,
+    unscoped,
+)
 
 pytestmark = pytest.mark.db
 
@@ -132,16 +136,24 @@ class TestScopeIsRequired:
         assert uuid.UUID(str(value)) == BOOTSTRAP_TENANT_ID
 
     async def test_the_guc_does_not_survive_into_the_next_checkout(
-        self, db: Database
+        self, db: Database, system_db: Database
     ) -> None:
-        """It is transaction-local, so a pooled connection cannot leak a scope."""
-        assert await db.fetch_val("SELECT current_setting('ctb.tenant_id')")
-        token = set_tenant(None)
-        try:
-            with pytest.raises(TenantScopeError):
-                await db.fetch_val("SELECT current_setting('ctb.tenant_id')")
-        finally:
-            reset_tenant(token)
+        """It is transaction-local, so a pooled connection cannot leak a scope.
+
+        Observed on the *worker* pool, which needs no scope of its own: if the
+        setting were session-level rather than transaction-local, a connection
+        returned to the pool after a scoped statement would hand the next
+        borrower somebody else's tenant.
+        """
+        async with tenant_scope(OTHER_TENANT_ID):
+            assert await system_db.fetch_val(
+                "SELECT current_setting('ctb.tenant_id')"
+            ) == str(OTHER_TENANT_ID)
+        async with unscoped():
+            leaked = await system_db.fetch_val(
+                "SELECT current_setting('ctb.tenant_id', true)"
+            )
+        assert leaked in (None, ""), "the scope survived into the next checkout"
 
 
 class TestReadIsolation:
@@ -219,6 +231,15 @@ class TestSystemPool:
         assert [row["chat_id"] for row in seen] == [-800, -700]
 
     async def test_the_worker_pool_needs_no_tenant_in_scope(
-        self, system_db: Database
+        self, db: Database, system_db: Database
     ) -> None:
-        assert await system_db.fetch_val("SELECT COUNT(*) FROM chats") == 0
+        """And it sees rows it did not write, which is why it needs no scope."""
+        await chats_repo.ensure(db, -900, 0, kind="general")
+        async with unscoped():
+            assert await system_db.fetch_val("SELECT COUNT(*) FROM chats") == 1
+
+    async def test_the_app_pool_still_refuses_without_one(self, db: Database) -> None:
+        """The counterpart. Deleting the system bypass must not pass silently."""
+        async with unscoped():
+            with pytest.raises(TenantScopeError):
+                await db.fetch_val("SELECT COUNT(*) FROM chats")

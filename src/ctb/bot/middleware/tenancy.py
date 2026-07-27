@@ -56,10 +56,41 @@ __all__ = [
     "TenantContext",
     "TenantMiddleware",
     "TenantSettings",
+    "current_tenancy",
+    "forget_cached",
+    "set_tenancy",
     "UNRESOLVED_COMMANDS",
+    "UNRESOLVED_GROUP_COMMANDS",
 ]
 
 log = get_logger(__name__)
+
+#: The installed middleware, so a handler that changes a key or a role can
+#: expire the resolution cache immediately instead of waiting out its TTL.
+_INSTALLED: TenantMiddleware | None = None
+
+
+def set_tenancy(middleware: TenantMiddleware | None) -> None:
+    global _INSTALLED
+    _INSTALLED = middleware
+
+
+def current_tenancy() -> TenantMiddleware | None:
+    return _INSTALLED
+
+
+def forget_cached(tenant_id: uuid.UUID) -> None:
+    """Expire this workspace's resolution cache immediately.
+
+    Resolution is cached for 30 seconds. Anything that changes what a
+    resolution *means* — a stored key, a revoked key, a role, a membership —
+    calls this, because for ``/revoke`` the alternative is a key you just
+    deleted continuing to work for half a minute.
+    """
+    middleware = current_tenancy()
+    if middleware is not None:
+        middleware.invalidate(tenant_id)
+
 
 #: One notice per unknown user per day.
 STRANGER_NOTICE_INTERVAL_S: Final = 24 * 60 * 60.0
@@ -74,9 +105,15 @@ _MAX_TRACKED_STRANGERS: Final = 4096
 #: updates is three lookups rather than three hundred.
 TENANT_CACHE_TTL_S: Final = 30.0
 
-#: Commands a *non-member* may run, because they are how someone becomes one.
-#: They only reach a handler in a private chat; a group is still refused.
+#: Commands a *non-member* may run in a **private chat**, because they are how
+#: someone becomes one.
 UNRESOLVED_COMMANDS: Final = frozenset({"/start", "/register", "/help", "/privacy"})
+
+#: The one command a non-member may run in a **group**. Binding a fresh
+#: supergroup is impossible otherwise — it has no ``tenant_chats`` row yet, which
+#: is exactly what ``/setup`` is for. It is safe because it does nothing without
+#: a valid single-use code, which only its own workspace's owner ever saw.
+UNRESOLVED_GROUP_COMMANDS: Final = frozenset({"/setup"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -274,6 +311,7 @@ class TenantMiddleware(BaseMiddleware):
         self.rejected = 0
         self.resolved = 0
         self.unresolved_allowed = 0
+        set_tenancy(self)
 
     # -- the boundary ---------------------------------------------------------
 
@@ -370,17 +408,25 @@ class TenantMiddleware(BaseMiddleware):
         return entry
 
     async def _sole_membership_binding(self, user: User) -> tenancy.TenantChat | None:
-        """A DM resolves to the user's tenant when they have exactly one.
+        """Which workspace does this person's DM belong to?
 
-        With several, the DM must be bound explicitly (``/use <slug>``) so a
-        prompt cannot silently land in the wrong organisation.
+        One membership is unambiguous. With several, prefer the ones they
+        **own** — anyone can seat anyone with ``/invite``, and without this
+        preference a stranger could seat a victim and jam their DMs, including
+        the ``/key`` they need to finish their own sign-up. Ties among owned
+        workspaces stay ambiguous and are refused, because a prompt must never
+        silently land in the wrong organisation.
         """
         memberships = await tenancy.memberships_for_user(self._db, user.id)
-        if len(memberships) != 1:
+        if not memberships:
             return None
-        only = memberships[0]
+        owned = [seat for seat in memberships if seat.role == "owner"]
+        candidates = owned or memberships
+        if len(candidates) != 1:
+            return None
+        chosen = candidates[0]
         return tenancy.TenantChat(
-            chat_id=0, tenant_id=only.tenant_id, kind="dm", is_primary=False
+            chat_id=0, tenant_id=chosen.tenant_id, kind="dm", is_primary=False
         )
 
     def _remember(self, key: tuple[int, int], entry: _CacheEntry) -> None:
@@ -424,8 +470,8 @@ class TenantMiddleware(BaseMiddleware):
         user: User,
         chat: Chat | None,
     ) -> Any:
-        """No tenant. Only the private-chat registration commands get through."""
-        if chat is not None and chat.type == "private" and _is_entry_command(event):
+        """No tenant. Only the commands that *create* one get through."""
+        if chat is not None and _is_entry_command(event, chat.type):
             self.unresolved_allowed += 1
             data["tenant"] = None
             data["principal"] = Principal(user_id=user.id, source="anonymous")
@@ -496,14 +542,17 @@ def _chat_of(event: TelegramObject, data: dict[str, Any]) -> Chat | None:
     return None
 
 
-def _is_entry_command(event: TelegramObject) -> bool:
-    """Is this one of the few commands a non-member may run?"""
+def _is_entry_command(event: TelegramObject, chat_type: str) -> bool:
+    """Is this one of the few commands a non-member may run, here?"""
     message = event.message if isinstance(event, Update) else None
     text = (getattr(message, "text", None) or "").strip()
     if not text.startswith("/"):
         return False
     word = text.split(maxsplit=1)[0].split("@", 1)[0].casefold()
-    return word in UNRESOLVED_COMMANDS
+    allowed = (
+        UNRESOLVED_COMMANDS if chat_type == "private" else UNRESOLVED_GROUP_COMMANDS
+    )
+    return word in allowed
 
 
 def _update_type(event: TelegramObject) -> str:

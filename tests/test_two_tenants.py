@@ -13,6 +13,7 @@ from __future__ import annotations
 import datetime as dt
 import uuid
 from collections.abc import AsyncGenerator
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -32,6 +33,7 @@ from ctb.db.repo import deliveries as deliveries_repo
 from ctb.db.repo import sessions as sessions_repo
 from ctb.db.repo import tenancy
 from ctb.db.repo import workspaces as workspaces_repo
+from ctb.delivery.outbox import Outbox
 from ctb.settings import Settings
 from tests.conftest import FAKE_BOT_TOKEN
 from tests.pg import BOOTSTRAP_TENANT_ID, OTHER_TENANT_ID
@@ -348,3 +350,146 @@ class TestKeyIsolation:
                 tenant_id=OTHER_TENANT_ID,
                 purpose="conductor_api_key",
             )
+
+
+class TestDeliveryNeverCrossesTenants:
+    """The outbox runs on the BYPASSRLS pool, so its own filter must be right.
+
+    A chat belongs to one workspace — but that is one table's invariant, and
+    ``unbind_chat`` breaks it while leaving the old workspace's rows behind.
+    The delivery path must be safe without relying on that.
+    """
+
+    async def _queue(
+        self, db: Database, tenant_id: uuid.UUID, mark: str, chat_id: int
+    ) -> None:
+        async with tenant_scope(tenant_id):
+            await workspaces_repo.upsert(db, f"ws-{mark}", name=mark)
+            await sessions_repo.upsert(
+                db, f"sess-{mark}", workspace_id=f"ws-{mark}", chat_id=chat_id
+            )
+            await deliveries_repo.enqueue(
+                db,
+                session_id=f"sess-{mark}",
+                message_id=f"m-{mark}",
+                chat_id=chat_id,
+                payload_json=f'{{"text":"{mark} secret"}}',
+            )
+
+    async def test_a_claim_for_one_workspace_cannot_take_anothers_rows(
+        self, db: Database, system_db: Database, two_tenants: None
+    ) -> None:
+        """Even when both workspaces somehow queued for the same chat id."""
+        shared = -1_002_000_000_999
+        await self._queue(db, BOOTSTRAP_TENANT_ID, "acme", shared)
+        await self._queue(db, OTHER_TENANT_ID, "rivl", shared)
+
+        rows = await deliveries_repo.claim(
+            system_db,
+            claim_id="outbox",
+            limit=99,
+            tenant_id=BOOTSTRAP_TENANT_ID,
+            chat_id=shared,
+            thread_id=0,
+        )
+
+        assert [row.message_id for row in rows] == ["m-acme"]
+
+    async def test_the_outbox_carries_the_tenant_from_the_destination(
+        self, db: Database, system_db: Database, two_tenants: None
+    ) -> None:
+        """`pending_destinations` reports it; `run_once` must actually use it."""
+        shared = -1_002_000_000_998
+        await self._queue(db, BOOTSTRAP_TENANT_ID, "acme", shared)
+        await self._queue(db, OTHER_TENANT_ID, "rivl", shared)
+
+        claimed: list[tuple[uuid.UUID | None, int | None]] = []
+        real_claim = deliveries_repo.claim
+
+        async def spy(*args: Any, **kwargs: Any) -> Any:
+            claimed.append((kwargs.get("tenant_id"), kwargs.get("chat_id")))
+            return await real_claim(*args, **kwargs)
+
+        outbox = Outbox(cast(Any, _NullBot()), system_db, orphan_after_ms=0)
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(deliveries_repo, "claim", spy)
+            await outbox.run_once()
+
+        assert claimed, "run_once claimed nothing"
+        assert all(tenant is not None for tenant, _chat in claimed), (
+            "a claim went out with no tenant filter"
+        )
+
+
+class _NullBot:
+    """Swallows every send; this suite is about what gets *claimed*."""
+
+    async def send_message(self, **_kwargs: Any) -> Any:
+        return SimpleNamespace(message_id=1)
+
+    async def send_document(self, **_kwargs: Any) -> Any:
+        return SimpleNamespace(message_id=1)
+
+
+class TestPollingIsGatedByTheTenantRow:
+    """``sessions.list_bound`` joins ``tenants``, and that join *is* the switch.
+
+    Suspension and a rejected key both stop polling with no code path involved,
+    which is why the join has to be there and has to be tested.
+    """
+
+    async def _bind(self, db: Database, tenant_id: uuid.UUID, mark: str) -> None:
+        async with tenant_scope(tenant_id):
+            await workspaces_repo.upsert(db, f"ws-{mark}", name=mark)
+            await sessions_repo.upsert(
+                db, f"sess-{mark}", workspace_id=f"ws-{mark}", is_bound=True
+            )
+
+    async def test_both_workspaces_are_polled_while_active(
+        self, db: Database, system_db: Database, two_tenants: None
+    ) -> None:
+        await self._bind(db, BOOTSTRAP_TENANT_ID, "acme")
+        await self._bind(db, OTHER_TENANT_ID, "rivl")
+        bound = await sessions_repo.list_bound(system_db)
+        assert {row.id for row in bound} == {"sess-acme", "sess-rivl"}
+
+    async def test_suspending_one_stops_only_its_polling(
+        self, db: Database, system_db: Database, two_tenants: None
+    ) -> None:
+        await self._bind(db, BOOTSTRAP_TENANT_ID, "acme")
+        await self._bind(db, OTHER_TENANT_ID, "rivl")
+
+        await tenancy.set_status(system_db, BOOTSTRAP_TENANT_ID, "suspended")
+
+        bound = await sessions_repo.list_bound(system_db)
+        assert {row.id for row in bound} == {"sess-rivl"}
+
+    async def test_a_rejected_key_stops_only_its_polling(
+        self, db: Database, system_db: Database, two_tenants: None
+    ) -> None:
+        await self._bind(db, BOOTSTRAP_TENANT_ID, "acme")
+        await self._bind(db, OTHER_TENANT_ID, "rivl")
+
+        await tenancy.mark_auth_failed(system_db, OTHER_TENANT_ID, reason="401")
+
+        bound = await sessions_repo.list_bound(system_db)
+        assert {row.id for row in bound} == {"sess-acme"}
+
+    async def test_a_new_key_starts_it_again(
+        self, db: Database, system_db: Database, two_tenants: None
+    ) -> None:
+        """The only thing that clears the stamp, which is the intended flow."""
+        await self._bind(db, BOOTSTRAP_TENANT_ID, "acme")
+        await tenancy.mark_auth_failed(system_db, BOOTSTRAP_TENANT_ID, reason="401")
+        assert await sessions_repo.list_bound(system_db) == []
+
+        await tenancy.set_conductor_key(
+            system_db,
+            BOOTSTRAP_TENANT_ID,
+            ciphertext=b"sealed",
+            kid="v2",
+            fingerprint="fp",
+        )
+        assert [row.id for row in await sessions_repo.list_bound(system_db)] == [
+            "sess-acme"
+        ]

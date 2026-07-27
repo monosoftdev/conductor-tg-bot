@@ -17,6 +17,7 @@ from typing import Any
 
 import pytest
 
+from ctb.bot.keyboards import set_signing_key
 from ctb.conductor.models import TranscriptMessage
 from ctb.crypto import SecretBox
 from ctb.settings import Settings, reset_settings, set_settings
@@ -75,6 +76,19 @@ FAKE_MASTER_KEYS = TEST_MASTER_KEYS
 def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in _LEAKY_ENV:
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _signing_key() -> Iterator[None]:
+    """Callback payloads are signed, so every test needs the key.
+
+    Deterministic and installed everywhere, because a payload minted in one
+    test and read in another must verify — which is exactly what a redeploy
+    does, and what these payloads exist for.
+    """
+    set_signing_key(SecretBox.from_env_value(TEST_MASTER_KEYS).derive("callback"))
+    yield
+    set_signing_key(None)
 
 
 @pytest.fixture

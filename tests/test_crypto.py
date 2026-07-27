@@ -92,6 +92,23 @@ class TestRoundTrip:
         second = secret_box.seal(SECRET, tenant_id=TENANT_A, purpose="conductor")
         assert first != second
 
+    def test_every_nonce_is_fresh(self, secret_box: SecretBox) -> None:
+        """Reusing a GCM nonce under one key is catastrophic, not untidy.
+
+        The data key is random per seal, so ciphertexts would still differ and
+        an equality check alone would not notice. Look at the nonces.
+        """
+        wrap: set[bytes] = set()
+        body: set[bytes] = set()
+        for _ in range(50):
+            blob = secret_box.seal(SECRET, tenant_id=TENANT_A, purpose="c")
+            kid_len = blob[4]
+            start = 5 + kid_len
+            wrap.add(blob[start : start + 12])
+            body.add(blob[start + 60 : start + 72])
+        assert len(wrap) == 50
+        assert len(body) == 50
+
     def test_unicode_survives(self, secret_box: SecretBox) -> None:
         secret = "ключ-🔑-key"
         blob = secret_box.seal(secret, tenant_id=TENANT_A, purpose="conductor")
@@ -170,6 +187,20 @@ class TestOperationalSafety:
         self, secret_box: SecretBox
     ) -> None:
         secret_box.self_check()
+
+    def test_self_check_actually_round_trips(
+        self, secret_box: SecretBox, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """This is the boot canary. A no-op canary is worse than none.
+
+        A misconfigured ``CTB_MASTER_KEYS`` must kill the process at boot, not
+        surface as an unexplained failure on the first customer's first prompt.
+        """
+        monkeypatch.setattr(
+            SecretBox, "open", lambda *_a, **_k: "something else entirely"
+        )
+        with pytest.raises(SecretError, match="round trip"):
+            secret_box.self_check()
 
     def test_fingerprint_is_stable_and_not_the_secret(
         self, secret_box: SecretBox

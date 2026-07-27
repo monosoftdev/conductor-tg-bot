@@ -54,7 +54,7 @@ from ctb.bot.middleware import (
 )
 from ctb.conductor.pool import ClientPool
 from ctb.db import NO_THREAD_ID
-from ctb.db.connection import Database, get_database
+from ctb.db.connection import Database, current_tenant, get_database
 from ctb.db.repo import wizard as wizard_repo
 from ctb.health import telegram_health
 from ctb.logging import get_logger
@@ -304,6 +304,14 @@ class PostgresStorage(BaseStorage):
 
     ``bot_id`` is deliberately ignored: one process runs exactly one bot, and a
     token rotation should not orphan an in-flight wizard.
+
+    **A wizard belongs to a tenant.** aiogram's FSM middleware reads storage on
+    *every* update, before any handler runs — including the registration
+    commands, which by definition have no tenant yet. With no tenant there is no
+    wizard, so every read answers empty and every write is dropped rather than
+    raising. The alternative — letting :class:`~ctb.db.errors.TenantScopeError`
+    escape — turns ``/register`` into "⚠️ Request failed", which is how nobody
+    signs up.
     """
 
     def __init__(
@@ -334,7 +342,14 @@ class PostgresStorage(BaseStorage):
 
     # -- state -----------------------------------------------------------------
 
+    @staticmethod
+    def _scoped() -> bool:
+        """Is there a tenant to own a wizard? Unresolved updates have none."""
+        return current_tenant() is not None
+
     async def get_state(self, key: StorageKey) -> str | None:
+        if not self._scoped():
+            return None
         chat_id, thread_id, user_id = self._seat(key)
         row = await wizard_repo.get(self.db, chat_id, thread_id, user_id=user_id)
         if row is None:
@@ -345,6 +360,8 @@ class PostgresStorage(BaseStorage):
         return _read_ns(row.data, namespace).get("state")
 
     async def set_state(self, key: StorageKey, state: StateType = None) -> None:
+        if not self._scoped():
+            return
         chat_id, thread_id, user_id = self._seat(key)
         value = _state_str(state)
         namespace = self._namespace(key)
@@ -383,6 +400,8 @@ class PostgresStorage(BaseStorage):
     # -- data ------------------------------------------------------------------
 
     async def get_data(self, key: StorageKey) -> dict[str, Any]:
+        if not self._scoped():
+            return {}
         chat_id, thread_id, user_id = self._seat(key)
         row = await wizard_repo.get(self.db, chat_id, thread_id, user_id=user_id)
         if row is None:
@@ -395,6 +414,8 @@ class PostgresStorage(BaseStorage):
         return dict(_read_ns(row.data, namespace).get("data") or {})
 
     async def set_data(self, key: StorageKey, data: Mapping[str, Any]) -> None:
+        if not self._scoped():
+            return
         chat_id, thread_id, user_id = self._seat(key)
         namespace = self._namespace(key)
         db = self.db

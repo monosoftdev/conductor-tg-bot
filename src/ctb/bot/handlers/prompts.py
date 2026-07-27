@@ -41,7 +41,10 @@ from ctb.db.repo import prompts as prompts_repo
 from ctb.db.repo import sessions as sessions_repo
 from ctb.db.repo import transcript as transcript_repo
 from ctb.delivery.render.html import escape
+from ctb.logging import get_logger
 from ctb.turn.supervisor import Supervisor
+
+log = get_logger(__name__)
 
 ROUTER_ORDER = 900
 router = Router(name=__name__)
@@ -208,13 +211,31 @@ async def plain_text(
 @router.callback_query(Cb.filter(F.action == Action.STOP.value))
 async def stop_callback(
     query: CallbackQuery,
+    tenant: TenantContext,
     nonces: NonceStore,
+    db: Database | None = None,
     supervisor: Supervisor | None = None,
 ) -> None:
+    """Cancel a running turn.
+
+    The session id is read back through the **tenant-scoped** pool before the
+    supervisor is asked to do anything. ``Supervisor.dispatch`` looks up a
+    process-global task map with no tenant of its own, so this lookup is the
+    only thing standing between a stray payload and somebody else's agent.
+    """
     try:
         ticket = resolve(query, expect=Action.STOP, store=nonces)
     except NonceError as exc:
         await query.answer(exc.user_message, show_alert=True)
+        return
+    if await sessions_repo.get(resolve_db(db), ticket.target) is None:
+        log.warning(
+            "prompts.stop_foreign_session",
+            session_id=ticket.target,
+            tenant=tenant.slug,
+            user_id=query.from_user.id,
+        )
+        await query.answer("That session is not in this workspace.", show_alert=True)
         return
     try:
         accepted = await request_cancel(

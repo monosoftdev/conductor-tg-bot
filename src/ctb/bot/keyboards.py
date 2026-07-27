@@ -25,7 +25,7 @@ pinned card's ``Stop`` answered "This button has expired." So the card's
 non-destructive controls (:data:`RESTARTABLE_ACTIONS`) mint a **self-describing**
 payload instead of a random handle::
 
-    ctb:stop:.<expiry-base36>.<session-id>
+    ctb:stop:.<expiry-base36><hmac>.<session-id>
 
 It is still registered in the store, so while the process lives it is
 single-use and behaves exactly as before. Once the store is gone,
@@ -55,6 +55,9 @@ wizard and is refused.
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import secrets
 import time
 from collections.abc import Callable, Iterable, Sequence
@@ -96,6 +99,7 @@ __all__ = [
     "reset_nonce_store",
     "resolve",
     "set_nonce_store",
+    "set_signing_key",
     "stateless_payload",
     "status_card_keyboard",
     "truncate_label",
@@ -196,6 +200,15 @@ RESTARTABLE_ACTIONS: Final[frozenset[str]] = frozenset(
 _STATELESS_MARK: Final = "."
 #: Keeps ``ctb:archreq:.<expiry>.<uuid>`` inside Telegram's 64-byte cap.
 _MAX_STATELESS_TARGET: Final = 40
+#: Characters of truncated HMAC. 40 bits on a payload that also expires within
+#: minutes and is bounded by Telegram's 64-byte callback budget — forging one
+#: means ~5x10^11 guesses inside that window, against a bot that answers one
+#: callback at a time.
+_SIG_LEN: Final = 8
+
+#: The expiry is stored at 8-second granularity. One base36 character saved,
+#: and a button's lifetime is measured in minutes.
+_EXPIRY_GRANULARITY: Final = 8
 _STATELESS_TARGET_CHARS: Final = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
 )
@@ -440,11 +453,42 @@ def _base36(value: int) -> str:
     return "".join(reversed(out))
 
 
+#: Signing key for restart-survivable payloads, derived once from the master
+#: key. Every replica of a deployment agrees; nothing outside it can mint one.
+_SIGNING_KEY: bytes | None = None
+
+
+def set_signing_key(key: bytes | None) -> None:
+    """Install the callback-signing key (boot path and tests)."""
+    global _SIGNING_KEY
+    _SIGNING_KEY = key
+
+
+def _stateless_key() -> bytes:
+    global _SIGNING_KEY
+    if _SIGNING_KEY is None:
+        from ctb.runtime import secret_box
+
+        _SIGNING_KEY = secret_box().derive("callback-signature")
+    return _SIGNING_KEY
+
+
+def _sign(body: str) -> str:
+    """Truncated HMAC. Ten base32 characters is 50 bits — plenty for a payload
+    that also expires, inside a 64-byte Telegram budget."""
+    digest = hmac.new(_stateless_key(), body.encode("utf-8"), hashlib.sha256).digest()
+    return base64.b32encode(digest).decode("ascii").rstrip("=").lower()[:_SIG_LEN]
+
+
 def stateless_payload(action: Action | str, target: str, ttl: float) -> str | None:
-    """``.<expiry-base36>.<target>``, or ``None`` when it does not apply.
+    """``.<expiry-base36>.<sig>.<target>``, or ``None`` when it does not apply.
 
     Wall clock, not monotonic: the whole point is that a process which did not
     mint this can still read it.
+
+    **Signed.** Without a MAC the expiry and the target are just bytes the
+    tapper supplied, so single-use and TTL would be decorative and anyone could
+    address any session id they had ever seen. The signature covers both.
     """
     if _action_value(action) not in RESTARTABLE_ACTIONS:
         return None
@@ -452,27 +496,36 @@ def stateless_payload(action: Action | str, target: str, ttl: float) -> str | No
         return None
     if not set(target) <= _STATELESS_TARGET_CHARS:
         return None
-    expiry = int(time.time() + max(ttl, 0.0))
-    return f"{_STATELESS_MARK}{_base36(expiry)}{_STATELESS_MARK}{target}"
+    stamp = _base36(int(time.time() + max(ttl, 0.0)) // _EXPIRY_GRANULARITY)
+    body = f"{_action_value(action)}|{stamp}|{target}"
+    # `<stamp><sig>` is one field: the signature is fixed-length, so a third
+    # separator would cost a byte of a 64-byte budget for nothing.
+    return f"{_STATELESS_MARK}{stamp}{_sign(body)}{_STATELESS_MARK}{target}"
 
 
 def read_stateless(nonce: str, action: str, *, now: float | None = None) -> Ticket:
     """Re-derive a ticket from a payload the store no longer remembers.
 
     Raises :class:`NonceError` exactly like :meth:`NonceStore.consume`, so a
-    tampered or stale payload is indistinguishable from an expired button.
+    tampered, forged or stale payload is indistinguishable from an expired
+    button. The signature is checked **before** the expiry, so a forgery cannot
+    even learn whether its guessed timestamp was plausible.
     """
     if not nonce.startswith(_STATELESS_MARK):
         raise NonceError("unknown")
-    stamp, mark, target = nonce[len(_STATELESS_MARK) :].partition(_STATELESS_MARK)
-    if not stamp or not mark or not target:
+    head, mark, target = nonce[len(_STATELESS_MARK) :].partition(_STATELESS_MARK)
+    if not mark or not target or len(head) <= _SIG_LEN:
         raise NonceError("malformed")
+    stamp, signature = head[:-_SIG_LEN], head[-_SIG_LEN:]
     if action not in RESTARTABLE_ACTIONS:
         raise NonceError("mismatch")
     if not set(target) <= _STATELESS_TARGET_CHARS:
         raise NonceError("malformed")
+    body = f"{action}|{stamp}|{target}"
+    if not hmac.compare_digest(signature, _sign(body)):
+        raise NonceError("forged")
     try:
-        expires_at = float(int(stamp, 36))
+        expires_at = float(int(stamp, 36) * _EXPIRY_GRANULARITY)
     except ValueError as exc:
         raise NonceError("malformed", repr(exc)) from exc
     if (time.time() if now is None else now) >= expires_at:
@@ -762,7 +815,7 @@ def resolve(
     A :data:`RESTARTABLE_ACTIONS` payload the store has never heard of is
     re-derived from the payload itself — that, and only that, is how a card or
     wizard button minted before a redeploy still works after it. It is not a
-    hole in the allow-list: this runs behind ``AuthMiddleware``, so anyone who
+    hole in the boundary: this runs behind ``TenantMiddleware``, so anyone who
     can present a payload at all is already allow-listed. The per-user check is
     the one thing lost with the store; ``wiz`` gets it back from the FSM row,
     which is keyed by ``(chat_id, thread_id, user_id)``.

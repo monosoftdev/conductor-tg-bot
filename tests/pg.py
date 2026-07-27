@@ -16,18 +16,27 @@ from __future__ import annotations
 import os
 import uuid
 from collections.abc import AsyncIterator, Iterator
-from typing import Final, LiteralString, cast
+from contextlib import asynccontextmanager
+from typing import Any, Final, LiteralString, cast
 
 import psycopg
 import pytest
 
 from ctb.crypto import SecretBox
 from ctb.db.bootstrap import APP_ROLE, WORKER_ROLE, bootstrap
-from ctb.db.connection import Database, reset_tenant, set_database, set_tenant
+from ctb.db.connection import (
+    Database,
+    reset_tenant,
+    set_database,
+    set_tenant,
+    tenant_scope,
+)
 from ctb.runtime import reset_runtime, set_secret_box, set_system_database
 
 __all__ = [
     "BOOTSTRAP_TENANT_ID",
+    "as_tenant",
+    "unscoped",
     "OTHER_TENANT_ID",
     "admin_dsn",
     "app_dsn",
@@ -184,21 +193,49 @@ async def db(pg_reset: tuple[str, ...]) -> AsyncIterator[Database]:
 
 @pytest.fixture
 async def system_db(pg_reset: tuple[str, ...]) -> AsyncIterator[Database]:
-    """The **worker** pool: BYPASSRLS, cross-tenant reads allowed.
+    """The **worker** pool: BYPASSRLS, cross-tenant reads, and no tenant scope.
 
-    The bootstrap tenant is still in scope, mirroring production — a worker
-    acts *on behalf of* a tenant even though it may read across all of them —
-    so inserts pick up the right ``tenant_id`` default.
+    Production workers run exactly like this. A worker that needs to *write* a
+    tenant's row must enter that tenant's scope explicitly — which is the point
+    of not providing one here.
     """
     database = await Database(
         worker_dsn(), min_size=1, max_size=6, system=True
     ).connect()
-    token = set_tenant(BOOTSTRAP_TENANT_ID)
+    # Deliberately does NOT touch the tenant scope, in either direction: the
+    # scope is a process-wide ContextVar, so a fixture that set or cleared it
+    # would silently fight the `db` fixture depending on which ran last. Tests
+    # that need to prove worker behaviour say so with `unscoped()`.
     try:
         yield database
     finally:
-        reset_tenant(token)
         await database.close()
+
+
+@asynccontextmanager
+async def unscoped() -> AsyncIterator[None]:
+    """Run a block the way a background worker runs: with no tenant at all.
+
+    This is the shape that hid three real bugs — the FSM storage read on every
+    update, the voice workers, and the status-card writer all raised in
+    production while every test sailed past with a scope the fixture supplied.
+    """
+    token = set_tenant(None)
+    try:
+        yield
+    finally:
+        reset_tenant(token)
+
+
+def as_tenant(tenant_id: uuid.UUID = BOOTSTRAP_TENANT_ID) -> Any:
+    """Seed a tenant's rows, on either pool.
+
+    The worker pool bypasses row-level security but still needs a scope to
+    *write*: ``tenant_id`` is filled from the GUC, so an unscoped insert is a
+    NOT NULL violation. Production workers enter a scope for exactly this
+    reason, and a test that seeds without one is not modelling anything real.
+    """
+    return tenant_scope(tenant_id)
 
 
 async def make_tenant(

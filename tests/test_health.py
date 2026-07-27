@@ -61,7 +61,7 @@ from ctb.health import (
 )
 from ctb.settings import Settings, reset_settings
 from tests.conftest import FAKE_API_KEY, FakeClock
-from tests.pg import worker_dsn
+from tests.pg import as_tenant, worker_dsn
 
 WALL = 1_700_000_000_000  # a fixed epoch-ms "now" for every deterministic test
 
@@ -113,6 +113,26 @@ async def seed_session(
     at: int = WALL,
     poll_interval_ms: int = 20_000,
     turn_state: str = "IDLE",
+) -> None:
+    async with as_tenant():
+        await _seed_session(
+            system_db,
+            session_id,
+            bound=bound,
+            at=at,
+            poll_interval_ms=poll_interval_ms,
+            turn_state=turn_state,
+        )
+
+
+async def _seed_session(
+    system_db: Database,
+    session_id: str,
+    *,
+    bound: bool,
+    at: int,
+    poll_interval_ms: int,
+    turn_state: str,
 ) -> None:
     await sessions_repo.upsert(
         system_db, session_id, chat_id=-100123, thread_id=7, is_bound=bound, at=at
@@ -520,35 +540,37 @@ async def test_unbound_sessions_are_not_polled_and_not_counted(
 
 
 async def test_delivery_counts_and_backlog(system_db: Database) -> None:
-    await seed_session(system_db)
-    for index in range(DELIVERY_BACKLOG + 2):
-        await deliveries_repo.enqueue(
-            system_db,
-            session_id="sess-1",
-            message_id=f"msg-{index}",
-            chat_id=-100123,
-            thread_id=7,
-            session_index=index,
-            payload_json=json.dumps({"html": "hi"}),
-        )
-    report = await make_monitor(db=system_db).report()
-    assert report.deliveries["pending"] == DELIVERY_BACKLOG + 2
-    assert report.deliveries["by_state"]["pending"] == DELIVERY_BACKLOG + 2
-    assert report.has(DEGRADATION_DELIVERY_BACKLOG)
-    assert report.http_status == 200
+    async with as_tenant():
+        await seed_session(system_db)
+        for index in range(DELIVERY_BACKLOG + 2):
+            await deliveries_repo.enqueue(
+                system_db,
+                session_id="sess-1",
+                message_id=f"msg-{index}",
+                chat_id=-100123,
+                thread_id=7,
+                session_index=index,
+                payload_json=json.dumps({"html": "hi"}),
+            )
+        report = await make_monitor(db=system_db).report()
+        assert report.deliveries["pending"] == DELIVERY_BACKLOG + 2
+        assert report.deliveries["by_state"]["pending"] == DELIVERY_BACKLOG + 2
+        assert report.has(DEGRADATION_DELIVERY_BACKLOG)
+        assert report.http_status == 200
 
 
 async def test_failed_deliveries_are_degradations(system_db: Database) -> None:
-    await seed_session(system_db)
-    await deliveries_repo.enqueue(
-        system_db, session_id="sess-1", message_id="m1", chat_id=-100123
-    )
-    await deliveries_repo.mark_failed(
-        system_db, ("sess-1", "m1", 0, -100123), error="entity parse", retry=False
-    )
-    report = await make_monitor(db=system_db).report()
-    assert report.deliveries["failed"] == 1
-    assert report.has(DEGRADATION_DELIVERY_FAILED)
+    async with as_tenant():
+        await seed_session(system_db)
+        await deliveries_repo.enqueue(
+            system_db, session_id="sess-1", message_id="m1", chat_id=-100123
+        )
+        await deliveries_repo.mark_failed(
+            system_db, ("sess-1", "m1", 0, -100123), error="entity parse", retry=False
+        )
+        report = await make_monitor(db=system_db).report()
+        assert report.deliveries["failed"] == 1
+        assert report.has(DEGRADATION_DELIVERY_FAILED)
 
 
 # ── the singleton lease ──────────────────────────────────────────────────────
@@ -616,19 +638,20 @@ async def test_last_twenty_api_events_newest_first(system_db: Database) -> None:
 
 
 async def test_unknown_content_types_are_reported(system_db: Database) -> None:
-    await events_repo.note_unknown_content_type(
-        system_db,
-        content_type="futureEvent",
-        signature="deadbeefdeadbeef",
-        session_id="sess-1",
-        message_id="sess-1:9:0",
-        at=WALL - 500,
-    )
-    report = await make_monitor(db=system_db).report()
-    assert report.unknown_content_types[0]["type"] == "futureEvent"
-    assert report.unknown_content_types[0]["count"] == 1
-    # An unknown shape is data to look at, not a reason to restart.
-    assert report.status is HealthStatus.OK
+    async with as_tenant():
+        await events_repo.note_unknown_content_type(
+            system_db,
+            content_type="futureEvent",
+            signature="deadbeefdeadbeef",
+            session_id="sess-1",
+            message_id="sess-1:9:0",
+            at=WALL - 500,
+        )
+        report = await make_monitor(db=system_db).report()
+        assert report.unknown_content_types[0]["type"] == "futureEvent"
+        assert report.unknown_content_types[0]["count"] == 1
+        # An unknown shape is data to look at, not a reason to restart.
+        assert report.status is HealthStatus.OK
 
 
 async def test_the_body_is_scrubbed(system_db: Database) -> None:
@@ -910,38 +933,41 @@ def test_default_pool_provider_degrades_instead_of_raising() -> None:
 async def test_format_health_html_is_telegram_safe(
     system_db: Database, settings: Settings
 ) -> None:
-    await seed_session(system_db, at=WALL - 400_000, poll_interval_ms=120_000)
-    await events_repo.record_api_event(
-        system_db,
-        method="GET",
-        endpoint="/sessions/{id}/status",
-        status_code=200,
-        duration_ms=42,
-        at=WALL - 100,
-    )
-    await events_repo.note_unknown_content_type(
-        system_db, content_type="a<b>c", signature="ffff0000ffff0000", at=WALL - 100
-    )
-    client = ConductorClient(
-        api_key=FAKE_API_KEY,
-        api_url=settings.conductor_api_url,
-        transport=transport_returning(401),
-        sleep=_no_sleep,
-        max_attempts=1,
-    )
-    with pytest.raises(AuthFatal):
-        await client.get_session_status("sess-1")
-    await client.aclose()
+    async with as_tenant():
+        await seed_session(system_db, at=WALL - 400_000, poll_interval_ms=120_000)
+        await events_repo.record_api_event(
+            system_db,
+            method="GET",
+            endpoint="/sessions/{id}/status",
+            status_code=200,
+            duration_ms=42,
+            at=WALL - 100,
+        )
+        await events_repo.note_unknown_content_type(
+            system_db, content_type="a<b>c", signature="ffff0000ffff0000", at=WALL - 100
+        )
+        client = ConductorClient(
+            api_key=FAKE_API_KEY,
+            api_url=settings.conductor_api_url,
+            transport=transport_returning(401),
+            sleep=_no_sleep,
+            max_attempts=1,
+        )
+        with pytest.raises(AuthFatal):
+            await client.get_session_status("sess-1")
+        await client.aclose()
 
-    text = format_health_html(await make_monitor(db=system_db, client=client).report())
+        text = format_health_html(
+            await make_monitor(db=system_db, client=client).report()
+        )
 
-    assert "<b>degraded</b>" in text
-    assert DEGRADATION_AUTH_FATAL in text
-    assert "circuit <code>closed</code>" in text
-    assert "1 bound · 1 overdue" in text
-    assert "/sessions/{id}/status" in text
-    assert "a&lt;b&gt;c" in text and "<b>c" not in text
-    assert "MarkdownV2" not in text
+        assert "<b>degraded</b>" in text
+        assert DEGRADATION_AUTH_FATAL in text
+        assert "circuit <code>closed</code>" in text
+        assert "1 bound · 1 overdue" in text
+        assert "/sessions/{id}/status" in text
+        assert "a&lt;b&gt;c" in text and "<b>c" not in text
+        assert "MarkdownV2" not in text
 
 
 async def test_format_health_html_mentions_telegram_only_when_it_is_failing(

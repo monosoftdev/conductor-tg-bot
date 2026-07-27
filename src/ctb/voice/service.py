@@ -40,7 +40,7 @@ from ctb.bot.middleware.routing import Route
 from ctb.bot.middleware.tenancy import TenantSettings
 from ctb.conductor.client import ConductorClient
 from ctb.conductor.pool import ClientPool
-from ctb.db.connection import Database, now_ms
+from ctb.db.connection import Database, now_ms, tenant_scope
 from ctb.db.repo import chats as chats_repo
 from ctb.db.repo import prompts as prompts_repo
 from ctb.db.repo import sessions as sessions_repo
@@ -227,7 +227,8 @@ class VoiceService:
     async def _recover(self) -> None:
         """Requeue what a dead process left behind; report what we gave up on."""
         try:
-            recovery = await voice_repo.recover_stale(self.db)
+            # Cross-tenant maintenance, so the worker pool.
+            recovery = await voice_repo.recover_stale(self.system_db)
             pruned = await self._prune()
         except asyncio.CancelledError:
             raise
@@ -246,7 +247,7 @@ class VoiceService:
 
     async def _prune(self) -> int:
         cutoff = now_ms() - self.settings.voice_completed_retention_days * 86_400_000
-        return await voice_repo.prune_terminal(self.db, before=cutoff)
+        return await voice_repo.prune_terminal(self.system_db, before=cutoff)
 
     async def _worker(self, index: int) -> None:
         while not self._stop.is_set():
@@ -262,12 +263,17 @@ class VoiceService:
                 await self._pause(_ERROR_BACKOFF_SECONDS)
 
     async def _tick(self, index: int) -> None:
-        row = await voice_repo.claim_next(self.db)
+        # Claiming is cross-tenant, so it runs on the worker pool. Everything
+        # after it acts on *one* tenant's rows and runs in that tenant's scope.
+        row = await voice_repo.claim_next(self.system_db)
         if row is None:
             await self._pause(_POLL_SECONDS)
             return
+        if row.tenant_id is None:  # pragma: no cover - the column is NOT NULL
+            return
         try:
-            await self._process(row)
+            async with tenant_scope(row.tenant_id):
+                await self._process(row)
         except asyncio.CancelledError:
             raise
         except Exception as exc:

@@ -703,10 +703,15 @@ async def sql_command(
 @router.message(Command("tidy"))
 async def tidy(
     message: Message,
+    tenant: TenantContext,
     state: FSMContext,
     db: Database | None = None,
 ) -> None:
+    """Close stale and archived topics. Owners only — it closes other people's."""
     await abandon_wizard(state)
+    if not tenant.is_owner:
+        await tell(message, "Owners only.")
+        return
     database = resolve_db(db)
     closed = 0
     cutoff = int(time.time() * 1000) - 7 * 24 * 60 * 60 * 1000

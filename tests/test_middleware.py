@@ -95,7 +95,7 @@ from ctb.bot.middleware import (
 )
 from ctb.bot.middleware.context import new_request_id
 from ctb.conductor.pool import ClientPool, MissingKeyError
-from ctb.db.connection import Database
+from ctb.db.connection import Database, tenant_scope
 from ctb.db.errors import DatabaseError
 from ctb.db.repo import chats as chats_repo
 from ctb.db.repo import sessions as sessions_repo
@@ -1388,10 +1388,14 @@ async def test_fsm_is_reachable_through_the_dispatcher(
     await dispatcher.feed_update(bot, build_update("message", OWNER_ID))
     assert seen == ["asked"]
     assert routes[0].chat_id == GROUP_ID
-    stored = await db.fetch_val(
-        "SELECT state_key FROM wizard_state WHERE user_id = ?", (OWNER_ID,)
-    )
+    # The scope lives for the duration of the update, so read it back inside
+    # one — exactly as a handler would.
+    async with tenant_scope(BOOTSTRAP_TENANT_ID):
+        stored = await db.fetch_val(
+            "SELECT state_key FROM wizard_state WHERE user_id = ?", (OWNER_ID,)
+        )
     assert stored == "asked"
+    assert routes[0].tenant_id == BOOTSTRAP_TENANT_ID
 
 
 # =============================================================================
@@ -1581,3 +1585,53 @@ async def test_app_close_closes_the_session(
         routers=[],
     )
     await app.close()
+
+
+async def test_an_uninvited_seat_cannot_jam_a_dm(
+    bot: Bot,
+    bot_settings: Settings,
+    db: Database,
+    system_db: Database,
+    seated: None,
+) -> None:
+    """Anyone can ``/invite`` anyone, so an unwanted seat must not lock you out.
+
+    Ambiguous DMs resolve to nothing. Without preferring the workspace you
+    *own*, a stranger could seat you in theirs and every private command you
+    sent — including the ``/key`` finishing your own sign-up — would be met
+    with silence, permanently.
+    """
+    await tenancy_repo.add_member(system_db, OTHER_TENANT_ID, OWNER_ID, role="member")
+    dispatcher, seen = make_dispatcher(bot_settings, db, system_db=system_db)
+
+    await dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=1,
+            message=_message(OWNER_ID, chat_id=OWNER_ID, chat_type="private"),
+        ),
+    )
+
+    assert len(seen) == 1
+
+
+async def test_two_owned_workspaces_stay_ambiguous(
+    bot: Bot,
+    bot_settings: Settings,
+    db: Database,
+    system_db: Database,
+    seated: None,
+) -> None:
+    """Preferring what you own must not become guessing between two of them."""
+    await tenancy_repo.add_member(system_db, OTHER_TENANT_ID, OWNER_ID, role="owner")
+    dispatcher, seen = make_dispatcher(bot_settings, db, system_db=system_db)
+
+    await dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=1,
+            message=_message(OWNER_ID, chat_id=OWNER_ID, chat_type="private"),
+        ),
+    )
+
+    assert seen == []
