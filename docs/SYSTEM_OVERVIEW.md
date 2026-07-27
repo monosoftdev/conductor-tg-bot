@@ -2,8 +2,13 @@
 
 ## What this is
 
-A private Telegram control plane for Conductor cloud workspaces and sessions.
-Telegram is the mobile interface; Conductor remains the execution system.
+A Telegram control plane for Conductor cloud workspaces and sessions. Telegram
+is the mobile interface; Conductor remains the execution system.
+
+**One bot, many workspaces.** Each brings its own Conductor API key, its own
+supergroup and its own members. Isolation is enforced by PostgreSQL row-level
+security — see [`TENANCY.md`](TENANCY.md), which is the document to read before
+changing anything in this area.
 
 - **General** is the cockpit: search history, inspect all work, or create a
   workspace. Ordinary text or audio never prompts an agent from General.
@@ -118,7 +123,7 @@ Spoken `done` still creates a named confirmation and never archives directly.
 │ supervisor → transcript cursor → outbox       │
 │ health server                                 │
 │                                               │
-│ /data/bot.db · WAL · migrations · backups     │
+│ PostgreSQL · two roles · RLS · no volume      │
 └──────────────┬───────────────────┬─────────────┘
                │ HTTPS             │ HTTPS
 ┌──────────────▼──────────┐  ┌─────▼────────────┐
@@ -143,18 +148,22 @@ restart the complete unit.
 ## Configuration and keys
 
 All secrets are Railway environment variables; none belongs in Telegram,
-SQLite, or the repository.
+the database, or the repository.
 
 | Variable | Where used | Required |
 |---|---|---|
-| `TELEGRAM_BOT_TOKEN` | Railway process → Telegram Bot API | Yes |
-| `CONDUCTOR_API_KEY` | Railway process → Conductor cloud API | Yes |
-| `ALLOWED_TELEGRAM_USER_IDS` | Local authorization; first ID is owner | Yes |
-| `TELEGRAM_CHAT_ID` | Optional second fence for one supergroup | No |
+| `TELEGRAM_BOT_TOKEN` | The one shared bot | Yes |
+| `DATABASE_URL` | The `ctb_app` role; row-level security applies | Yes |
+| `SYSTEM_DATABASE_URL` | The `ctb_worker` role; BYPASSRLS, workers only | Yes |
+| `CTB_MASTER_KEYS` | Seals every tenant's stored API key | Yes |
 | `HEALTH_TOKEN` | Protects detailed public health output | Strongly recommended |
-| `ELEVENLABS_API_KEY` | Speech-to-text provider | Only with voice enabled |
-| `VOICE_ENABLED`, `VOICE_MODE` | Voice rollout control | No |
-| `RAILWAY_RUN_UID=0` | Lets SQLite write a Railway-mounted `/data` volume | Required on Railway |
+| `PLATFORM_ADMIN_IDS` | Platform commands; not an allow-list for using the bot | No |
+| `REGISTRATION_OPEN` | Self-serve sign-up | No |
+| `VOICE_ENABLED` | Platform kill switch; each tenant stores its own speech key | No |
+
+Per-workspace settings — the Conductor key, agent/model defaults, voice mode,
+quotas — live in the `tenants` table, not in the environment. Nothing in the
+environment identifies a customer.
 
 The bot does not call an LLM itself to write code. The selected Conductor
 session owns its agent/model/effort settings. The bot is a durable control and
@@ -171,8 +180,8 @@ delivery layer; ElevenLabs is only the provisional speech-to-text model.
 - Voice jobs preserve the original route and operation ID across redeploys.
 - Workspace creation uses a stable reconciliation nonce; session creation uses
   a caller-supplied ID.
-- SQLite runs in WAL mode on the Railway volume with migrations, daily backups,
-  and retention maintenance.
+- PostgreSQL holds all state; the container is stateless. Retention runs
+  daily under the singleton lease. Backups are the database's own.
 
 ## Efficiency model
 
@@ -205,7 +214,7 @@ delivery layer; ElevenLabs is only the provisional speech-to-text model.
 
 ## Deployment boundary
 
-Run exactly one Railway replica with a persistent volume mounted at `/data`.
+Run exactly one Railway replica. There is no volume.
 The final remaining validation is live: real Telegram permissions, real
 Conductor credentials, real speech recordings, and redeploys during active
 turns/transcription.

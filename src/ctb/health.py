@@ -5,16 +5,16 @@ whether a deploy is promoted and whether a running instance is restarted. That
 makes the definition of *unhealthy* a policy decision, not a formality:
 
 **Only a dead database fails the check.** A restart re-runs the boot path —
-open the SQLite file on the volume, migrate, take the lease, spawn pollers — so
+open both pools, verify the schema, take the lease, spawn pollers — so
 a restart is a plausible fix for exactly one class of failure: the process
 cannot reach its own state. Everything else is reported in the body at HTTP
 200, because a restart loop would make it *worse*:
 
-* **auth fatal (401/403).** ``client.py`` stops every poller and keeps the bot
-  alive on purpose. Cycling the process cannot conjure a valid
-  ``CONDUCTOR_API_KEY``; it would only lose the in-memory state that lets the
-  owner see *why* the bot went quiet. Reported as the ``auth_fatal``
-  degradation, HTTP 200.
+* **auth fatal (401/403).** The supervisor stops *that tenant's* pollers and
+  keeps the bot alive on purpose — everyone else is unaffected. Cycling the
+  process cannot conjure a valid key; it would only lose the in-memory state
+  that lets the owner see *why* their workspace went quiet. Reported as the
+  ``auth_fatal`` degradation, HTTP 200.
 * **circuit open / rate limited.** Conductor is down or throttling us. A
   restart re-opens the circuit against the same unhealthy upstream and drops
   the backoff window. Reported, HTTP 200.
@@ -82,7 +82,7 @@ PORT_ENV_VARS: Final[tuple[str, ...]] = ("PORT", "HEALTH_PORT")
 TOKEN_ENV_VAR: Final[str] = "HEALTH_TOKEN"
 TOKEN_HEADER: Final[str] = "X-Health-Token"
 
-#: A wedged SQLite file must fail the check rather than hang Railway's probe.
+#: An exhausted pool must fail the check rather than hang Railway's probe.
 DB_TIMEOUT_S: Final[float] = 5.0
 #: The endpoint may be public; collecting a report costs ~6 queries.
 CACHE_TTL_S: Final[float] = 2.0

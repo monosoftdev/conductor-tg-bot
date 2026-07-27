@@ -13,7 +13,7 @@ Resolution order, cheapest first:
    pointer).
 
 The middleware is **read-only by default**. Creating a ``chats`` row on every
-incoming update would write to SQLite for every keystroke in a group the bot
+incoming update would write to the database for every keystroke in a group
 merely watches; the handlers that actually need a row call ``chats.ensure``.
 
 It is also the one place that knows, for every update, which topic the thumb is

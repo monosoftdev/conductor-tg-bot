@@ -76,6 +76,11 @@ Result · tap a numbered choice; ✓ is recommended
 <code>/fork</code> starts another session here
 <code>/notify</code> sets topic alerts
 
+<b>This workspace</b>
+<code>/invite id</code> adds someone · <code>/members</code> lists them
+<code>/key</code> (privately) sets your Conductor key
+<code>/export</code> downloads your data · <code>/privacy</code> explains it
+
 Stop from the pinned card. /done always confirms.
 Voice commands need “command” or “команда”."""
 

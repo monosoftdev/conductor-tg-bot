@@ -1,5 +1,12 @@
 # Conductor Telegram Bot (`conductor-tg-bot`)
 
+> **Historical.** This is the original single-user design, kept because its
+> reasoning about the Conductor API, the turn state machine and the delivery
+> contract is still exactly right and still implemented. Two things in it are
+> now out of date: storage is PostgreSQL rather than SQLite, and the bot serves
+> many workspaces rather than one owner. For those, read
+> [`TENANCY.md`](TENANCY.md) — and where the two disagree, `TENANCY.md` wins.
+
 ## Context
 
 You run many Conductor cloud agents in parallel, but you can only drive them from the Mac. Conductor

@@ -12,7 +12,7 @@ outage.
 **HTML, never MarkdownV2.** Set once as the bot's default parse mode, together
 with ``link_preview_is_disabled`` (PLAN §Telegram formatting).
 
-**FSM state in SQLite.** aiogram ships ``MemoryStorage``; a redeploy in the
+**FSM state in PostgreSQL.** aiogram ships ``MemoryStorage``; a redeploy in the
 middle of the ``/new`` wizard would drop you back to step one.
 :class:`PostgresStorage` puts it in ``wizard_state``, where it also picks up the
 30-minute expiry — yesterday's half-finished wizard must not hijack today's
@@ -104,8 +104,11 @@ BOT_COMMANDS: Final[tuple[BotCommand, ...]] = (
     BotCommand(command="fork", description="New session here"),
     BotCommand(command="notify", description="Topic alerts"),
     BotCommand(command="done", description="Archive workspace"),
-    BotCommand(command="setup", description="Check group permissions"),
-    BotCommand(command="health", description="Bot status"),
+    BotCommand(command="setup", description="Link this group to a workspace"),
+    BotCommand(command="invite", description="Add someone to this workspace"),
+    BotCommand(command="health", description="Workspace status"),
+    BotCommand(command="register", description="Create a workspace"),
+    BotCommand(command="key", description="Store your Conductor API key"),
     BotCommand(command="help", description="Quick control guide"),
 )
 
@@ -295,7 +298,7 @@ class PostgresStorage(BaseStorage):
 
     * The default destiny with no business connection — the only combination
       this bot produces — maps straight onto the ``state_key`` column and the
-      ``data_json`` object, so the table stays human-readable in ``sqlite3``.
+      ``data_json`` object, so the table stays readable in ``psql``.
     * Anything else (aiogram scenes, business accounts) is namespaced under the
       reserved ``data_json`` key ``__ns__``. Handlers must not use that key.
 

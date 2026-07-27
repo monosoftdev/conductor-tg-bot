@@ -1,4 +1,4 @@
-"""SQLite persistence: connection, migrations, and the repo layer.
+"""PostgreSQL persistence: connection, migrations, and the repo layer.
 
 ``db/repo/*`` is the seam if this ever needs to become Postgres — nothing above
 it writes SQL directly.
@@ -18,8 +18,8 @@ from ctb.db.connection import (
 from ctb.db.migrate import apply_migrations, current_schema_version
 
 #: `thread_id` is NOT NULL everywhere; 0 means "no forum topic" — a DM, or the
-#: supergroup's General cockpit. SQLite allows NULLs inside a PRIMARY KEY, which
-#: would silently break the uniqueness of the `(chat_id, thread_id)` routing key.
+#: supergroup's General cockpit. A nullable column inside a primary key would
+#: silently break the uniqueness of the `(chat_id, thread_id)` routing key.
 NO_THREAD_ID: Final = 0
 
 #: `content_json` is capped at this many bytes per transcript message. The
