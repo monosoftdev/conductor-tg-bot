@@ -11,13 +11,20 @@
 name: CI
 
 on:
+  # Every branch, not just the long-lived ones. A restricted `pull_request`
+  # trigger (private repo, app-authored push, required approval) means no run
+  # at all — which on a PR is indistinguishable from "checks haven't started".
+  # Push is the trigger that always fires; pull_request is the one branch
+  # protection reads.
   push:
-    branches: [main, dev]
   pull_request:
   merge_group:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # `head_ref` on a pull request, `ref` on a push — so the two events for one
+  # branch share a group and the older run is cancelled instead of doubling
+  # the bill.
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 env:
