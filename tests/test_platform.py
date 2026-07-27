@@ -175,7 +175,7 @@ class TestOperator:
             settings,
             NullState(),
         )
-        assert "No workspace" in said[-1]
+        assert "No team" in said[-1]
 
     async def test_no_argument_shows_the_usage(
         self,

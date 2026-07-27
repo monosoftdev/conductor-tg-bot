@@ -66,7 +66,7 @@ async def invite(
     tenant: TenantContext,
     state: FSMContext,
 ) -> None:
-    """Seat another Telegram user in this workspace.
+    """Seat another Telegram user in this team.
 
     This is the co-founder path: same group, same Conductor organisation, same
     topics. ``/invite <id> admin`` promotes instead.
@@ -142,7 +142,7 @@ async def leave(
     tenant: TenantContext,
     state: FSMContext,
 ) -> None:
-    """Remove *yourself* from this workspace.
+    """Remove *yourself* from this team.
 
     Anyone can seat anyone with ``/invite``, so there has to be a way out that
     does not depend on the person who seated you. An owner cannot leave while
@@ -170,7 +170,7 @@ async def members(
     tenant: TenantContext,
     state: FSMContext,
 ) -> None:
-    """Who is in this workspace. Owners only — it lists Telegram user ids."""
+    """Who is in this team. Owners only — it lists Telegram user ids."""
     await abandon_wizard(state)
     if not tenant.is_owner:
         await tell(message, "Owners only.")
@@ -269,7 +269,7 @@ async def health(
     db: Database | None = None,
     health_monitor: HealthMonitor | None = None,
 ) -> None:
-    """This workspace's health. Platform-wide numbers live on ``/health`` HTTP."""
+    """This team's health. Platform-wide numbers live on ``/health`` HTTP."""
     await abandon_wizard(state)
     if not tenant.is_owner:
         await tell(message, "Owners only.")
@@ -375,7 +375,7 @@ async def export(
     state: FSMContext,
     db: Database | None = None,
 ) -> None:
-    """Download this workspace's rows as JSON.
+    """Download this team's rows as JSON.
 
     Every read runs on the tenant-scoped pool, so the file cannot contain
     another workspace's data even if this function is wrong.
@@ -387,7 +387,7 @@ async def export(
     database = resolve_db(db)
     try:
         payload: dict[str, Any] = {
-            "workspace": tenant.slug,
+            "team": tenant.slug,
             "chats": [_asdict(row) for row in await chats_repo.list_all(database)][
                 :_EXPORT_LIMIT
             ],

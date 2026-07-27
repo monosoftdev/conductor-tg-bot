@@ -76,11 +76,11 @@ Result · tap a numbered choice; ✓ is recommended
 <code>/fork</code> starts another session here
 <code>/notify</code> sets topic alerts
 
-<b>This workspace</b>
+<b>Your team</b>
 <code>/invite id</code> adds someone · <code>/members</code> lists them
 <code>/key</code> (privately) sets your Conductor key
 <code>/export</code> downloads your data · <code>/privacy</code> explains it
-<code>/use name</code> picks which one your DMs mean · <code>/leave</code> exits one
+<code>/use name</code> picks which team your DMs mean · <code>/leave</code> exits one
 <code>/voice on</code> needs your own <code>/voicekey</code> first
 
 Stop from the pinned card. /done always confirms.

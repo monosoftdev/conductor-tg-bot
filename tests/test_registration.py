@@ -28,8 +28,8 @@ from ctb.db.repo import sessions as sessions_repo
 from ctb.db.repo import tenancy
 from ctb.db.repo import workspaces as workspaces_repo
 from ctb.db.repo.tenancy import TenantRow
-from ctb.runtime import secret_box
-from ctb.settings import Settings
+from ctb.runtime import secret_box, system_database
+from ctb.settings import Settings, load_settings
 from tests.pg import BOOTSTRAP_TENANT_ID, OTHER_TENANT_ID
 
 pytestmark = pytest.mark.db
@@ -48,6 +48,50 @@ class FakeBot:
     async def delete_message(self, chat_id: int, message_id: int) -> bool:
         self.deleted.append((chat_id, message_id))
         return True
+
+
+def voice_settings(*, enabled: bool = True) -> Settings:
+    """Platform settings for the key handler, which decides voice on storage."""
+    return load_settings(
+        telegram_bot_token="123456:AA",
+        database_url="postgresql://x/y",
+        system_database_url="postgresql://x/y",
+        master_keys="v1:" + "A" * 43,
+        voice_enabled=enabled,
+    )
+
+
+async def issue_code_for(
+    system_db: Database,
+    settings: Settings,
+    said: list[str],
+    *,
+    slug: str,
+    user_id: int = OWNER,
+) -> str:
+    """Register, store a key, and return the binding code.
+
+    The code is minted once a Conductor key exists, not at ``/register``, so
+    its 15-minute clock starts when the owner is ready to make a group rather
+    than while they are still hunting for an API key.
+    """
+    await registration.register(
+        dm(f"/register {slug}", user_id=user_id), settings, NullState()
+    )
+    created = await tenancy.get_by_slug(system_db, slug)
+    assert created is not None
+    await tenancy.set_conductor_key(
+        system_db, created.id, ciphertext=b"sealed", kid="v1", fingerprint=f"fp-{slug}"
+    )
+    keyed = await tenancy.get(system_db, created.id)
+    assert keyed is not None
+    await registration.register(
+        dm(f"/register {slug}", user_id=user_id),
+        settings,
+        NullState(),
+        tenant=context(keyed, user_id=user_id),
+    )
+    return said[-1].rsplit("/setup ", 1)[1].split("<", 1)[0].strip()
 
 
 class NullState:
@@ -92,14 +136,16 @@ def group(text: str, *, bot: FakeBot | None = None, user_id: int = OWNER) -> Any
     )
 
 
-def context(row: TenantRow, *, role: str = "owner") -> TenantContext:
+def context(
+    row: TenantRow, *, role: str = "owner", user_id: int = OWNER
+) -> TenantContext:
     return TenantContext(
         tenant_id=row.id,
         slug=row.slug,
         status=row.status,
         role=role,
-        user_id=OWNER,
-        owner_ids=(OWNER,),
+        user_id=user_id,
+        owner_ids=(user_id,),
         primary_chat_id=None,
         settings=TenantSettings(),
         row=row,
@@ -138,9 +184,7 @@ class TestRegister:
     async def test_it_issues_a_code_that_is_stored_only_as_a_digest(
         self, db: Database, system_db: Database, settings: Settings, said: list[str]
     ) -> None:
-        await registration.register(dm("/register Acme"), settings, NullState())
-
-        code = said[0].rsplit("/setup ", 1)[1].split("<", 1)[0].strip()
+        code = await issue_code_for(system_db, settings, said, slug="acme")
         stored = await system_db.fetch_val("SELECT token_hash FROM enrollment_tokens")
         assert stored == registration.hash_code(code)
         assert code not in str(stored)
@@ -213,8 +257,37 @@ class TestRegister:
 
 
 class TestBinding:
-    async def _register(self, settings: Settings, said: list[str]) -> str:
+    async def _register(
+        self, settings: Settings, said: list[str], system_db: Database | None = None
+    ) -> str:
+        """Walk the private half and return the binding code.
+
+        The code is minted once a Conductor key is stored, not at `/register` —
+        so the 15-minute clock starts when the owner is ready to make a group
+        rather than while they are still looking for an API key.
+        """
         await registration.register(dm("/register Acme"), settings, NullState())
+        system = system_db if system_db is not None else system_database()
+        created = await tenancy.get_by_slug(system, "acme")
+        assert created is not None
+        await tenancy.set_conductor_key(
+            system,
+            created.id,
+            ciphertext=b"sealed",
+            kid="v1",
+            fingerprint="fp-acme",
+        )
+        # Re-fetch: the context carries the row, and the row is what
+        # `_resume_registration` reads to decide which step you are on.
+        keyed = await tenancy.get(system, created.id)
+        assert keyed is not None
+        # Re-running /register resumes: key present, no group yet -> code.
+        await registration.register(
+            dm("/register Acme"),
+            settings,
+            NullState(),
+            tenant=context(keyed),
+        )
         return said[-1].rsplit("/setup ", 1)[1].split("<", 1)[0].strip()
 
     @pytest.fixture(autouse=True)
@@ -284,10 +357,9 @@ class TestBinding:
         assert first is not None
 
         # Somebody else registers and tries to point the same group at theirs.
-        await registration.register(
-            dm("/register Rival", user_id=OWNER + 5), settings, NullState()
+        rival_code = await issue_code_for(
+            system_db, settings, said, slug="rival", user_id=OWNER + 5
         )
-        rival_code = said[-1].rsplit("/setup ", 1)[1].split("<", 1)[0].strip()
         await registration.setup(group(f"/setup {rival_code}"), NullState(), db=db)
 
         still = await tenancy.chat_for(system_db, GROUP)
@@ -389,7 +461,10 @@ class TestKeyIntake:
         row = await self._tenant(system_db)
 
         await registration.set_key(
-            group("/key cndk_leaked_0001", bot=bot), context(row), NullState()
+            group("/key cndk_leaked_0001", bot=bot),
+            context(row),
+            voice_settings(),
+            NullState(),
         )
 
         assert bot.deleted == [(GROUP, 12)]
@@ -403,7 +478,7 @@ class TestKeyIntake:
         secret = "cndk_live_real_key_0001"
 
         await registration.set_key(
-            dm(f"/key {secret}", bot=bot), context(row), NullState()
+            dm(f"/key {secret}", bot=bot), context(row), voice_settings(), NullState()
         )
 
         assert bot.deleted == [(OWNER, 11)]
@@ -440,7 +515,9 @@ class TestKeyIntake:
         row = await self._tenant(system_db)
         secret = "cndk_live_real_key_0002"
 
-        await registration.set_key(dm(f"/key {secret}"), context(row), NullState())
+        await registration.set_key(
+            dm(f"/key {secret}"), context(row), voice_settings(), NullState()
+        )
 
         stored = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
         assert stored is not None
@@ -469,7 +546,9 @@ class TestKeyIntake:
         row = await self._tenant(system_db)
         before = row.conductor_key_fp
 
-        await registration.set_key(dm("/key typo"), context(row), NullState())
+        await registration.set_key(
+            dm("/key typo"), context(row), voice_settings(), NullState()
+        )
 
         after = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
         assert after is not None and after.conductor_key_fp == before
@@ -480,11 +559,15 @@ class TestKeyIntake:
     ) -> None:
         secret = "cndk_live_real_key_0003"
         row = await self._tenant(system_db)
-        await registration.set_key(dm(f"/key {secret}"), context(row), NullState())
+        await registration.set_key(
+            dm(f"/key {secret}"), context(row), voice_settings(), NullState()
+        )
         stored = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
         assert stored is not None
 
-        await registration.set_key(dm(f"/key {secret}"), context(stored), NullState())
+        await registration.set_key(
+            dm(f"/key {secret}"), context(stored), voice_settings(), NullState()
+        )
 
         assert "already the stored key" in said[-1]
 
@@ -493,7 +576,10 @@ class TestKeyIntake:
     ) -> None:
         row = await self._tenant(system_db)
         await registration.set_key(
-            dm("/key whatever"), context(row, role="member"), NullState()
+            dm("/key whatever"),
+            context(row, role="member"),
+            voice_settings(),
+            NullState(),
         )
         assert "owners can store its key" in said[-1]
 
@@ -501,7 +587,9 @@ class TestKeyIntake:
         self, db: Database, system_db: Database, said: list[str]
     ) -> None:
         row = await self._tenant(system_db)
-        await registration.set_key(dm("/key cndk_x"), context(row), NullState())
+        await registration.set_key(
+            dm("/key cndk_x"), context(row), voice_settings(), NullState()
+        )
         keyed = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
         assert keyed is not None and keyed.has_conductor_key
 
@@ -553,7 +641,7 @@ class TestUse:
         await registration.use(dm("/use theirs"), context(row), NullState())
 
         assert await tenancy.chat_for(system_db, OWNER) is None
-        assert "not in a workspace" in said[-1]
+        assert "not in a team" in said[-1]
 
     async def test_with_no_argument_it_lists_what_you_are_in(
         self, db: Database, system_db: Database, said: list[str]
@@ -749,7 +837,9 @@ class TestSpeechKeyIntake:
         monkeypatch.setattr(registration, "check_elevenlabs_key", refuse)
         row = await self._tenant(system_db)
 
-        await registration.set_key(dm("/voicekey sk_typo"), context(row), NullState())
+        await registration.set_key(
+            dm("/voicekey sk_typo"), context(row), voice_settings(), NullState()
+        )
 
         assert "ElevenLabs rejected" in said[-1]
         after = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
@@ -768,9 +858,11 @@ class TestSpeechKeyIntake:
         monkeypatch.setattr(registration, "check_elevenlabs_key", accept)
         row = await self._tenant(system_db)
 
-        await registration.set_key(dm("/voicekey sk_good"), context(row), NullState())
+        await registration.set_key(
+            dm("/voicekey sk_good"), context(row), voice_settings(), NullState()
+        )
 
-        assert "/voice on" in said[-1], "say what to do next"
+        assert "voice is on" in said[-1].casefold(), "storing a key enables it"
         after = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
         assert after is not None and after.elevenlabs_key_ct is not None
 
@@ -791,7 +883,107 @@ class TestSpeechKeyIntake:
         row = await self._tenant(system_db)
 
         await registration.set_key(
-            dm("/voicekey sk_typo", bot=bot), context(row), NullState()
+            dm("/voicekey sk_typo", bot=bot),
+            context(row),
+            voice_settings(),
+            NullState(),
         )
 
         assert bot.deleted, "a refused key must still be deleted"
+
+
+class TestAKeyOnTheWrongCommand:
+    """The live failure: `/voice sk_...` printed a status line and moved on.
+
+    The key was left sitting in Telegram history in plaintext, and the reply
+    said nothing was wrong. A credential is a credential whatever command
+    carried it.
+    """
+
+    async def _tenant(self, system_db: Database) -> TenantRow:
+        row = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
+        assert row is not None
+        return row
+
+    async def test_it_is_deleted_and_stored_rather_than_ignored(
+        self,
+        db: Database,
+        system_db: Database,
+        said: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        async def accept(_key: str, **_kw: Any) -> None:
+            return None
+
+        monkeypatch.setattr(registration, "check_elevenlabs_key", accept)
+        bot = FakeBot()
+        row = await self._tenant(system_db)
+        secret = "sk_9aa0285a88a625df7d3fecb4ad46911151724b75899bb51b"
+
+        await registration.voice(
+            dm(f"/voice {secret}", bot=bot),
+            context(row),
+            voice_settings(),
+            NullState(),
+        )
+
+        assert bot.deleted, "a key on the wrong command is still a key"
+        after = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
+        assert after is not None and after.elevenlabs_key_ct is not None
+        assert after.voice_enabled is True, "storing a key turns it on"
+
+    async def test_a_refused_key_is_still_deleted(
+        self,
+        db: Database,
+        system_db: Database,
+        said: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        async def refuse(_key: str, **_kw: Any) -> str:
+            return "invalid_api_key"
+
+        monkeypatch.setattr(registration, "check_elevenlabs_key", refuse)
+        bot = FakeBot()
+        row = await self._tenant(system_db)
+
+        await registration.voice(
+            dm(f"/voice {'x' * 40}", bot=bot),
+            context(row),
+            voice_settings(),
+            NullState(),
+        )
+
+        assert bot.deleted, "deletion must not wait on validation"
+        after = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
+        assert after is not None and after.elevenlabs_key_ct is None
+
+    async def test_on_and_off_are_not_mistaken_for_keys(
+        self, db: Database, system_db: Database, said: list[str]
+    ) -> None:
+        bot = FakeBot()
+        row = await self._tenant(system_db)
+
+        await registration.voice(
+            dm("/voice off", bot=bot), context(row), voice_settings(), NullState()
+        )
+
+        assert not bot.deleted
+        assert "off" in said[-1].casefold()
+
+    @pytest.mark.parametrize(
+        "text",
+        ["on", "off", "", "please turn it on", "yes"],
+        ids=lambda t: t or "empty",
+    )
+    def test_ordinary_words_are_not_secrets(self, text: str) -> None:
+        assert not registration.looks_like_secret(text)
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "sk_9aa0285a88a625df7d3fecb4ad46911151724b75899bb51b",
+            "cnd_live_abcdefghijklmnopqrstuvwxyz012345",
+        ],
+    )
+    def test_real_keys_are_secrets(self, text: str) -> None:
+        assert registration.looks_like_secret(text)

@@ -462,14 +462,19 @@ class TestDatabase:
     async def test_the_delivery_claim_can_use_its_index(self, db: Database) -> None:
         """Asserts the index is *usable*, not that the planner picks it today.
 
-        Disabling sequential scans tests the intent without making the test's
-        stability depend on the cost model at a particular row count.
+        Both statements run in **one** transaction. ``SET LOCAL`` lasts until
+        the end of the current transaction, and every ``execute`` outside a
+        block is its own — so the setting was discarded before the ``EXPLAIN``
+        and this test was silently asserting that the planner happens to prefer
+        the index at whatever row count the suite left behind. It passed alone
+        and flaked in a full run.
         """
-        await db.execute("SET LOCAL enable_seqscan = off")
-        plan = await db.fetch_all(
-            "EXPLAIN (FORMAT JSON) SELECT * FROM deliveries WHERE state = 'pending' "
-            "ORDER BY session_index, part_index"
-        )
+        async with db.transaction():
+            await db.execute("SET LOCAL enable_seqscan = off")
+            plan = await db.fetch_all(
+                "EXPLAIN (FORMAT JSON) SELECT * FROM deliveries "
+                "WHERE state = 'pending' ORDER BY session_index, part_index"
+            )
         assert "idx_deliveries_claim" in json.dumps(plan, default=str)
 
     async def test_thread_id_zero_keeps_the_routing_key_unique(

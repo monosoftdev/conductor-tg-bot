@@ -36,7 +36,7 @@ log = get_logger(__name__)
 _LIST_LIMIT = 30
 
 _USAGE = (
-    "<code>/platform list</code> · every workspace and its state\n"
+    "<code>/platform list</code> · every team and its state\n"
     "<code>/platform suspend &lt;slug&gt;</code> · stop its polling now\n"
     "<code>/platform resume &lt;slug&gt;</code> · let it run again"
 )
@@ -77,7 +77,7 @@ async def platform(
     if action in {"suspend", "resume"} and slug:
         target = await tenancy.get_by_slug(system, slug)
         if target is None:
-            await tell(message, "No workspace by that name.")
+            await tell(message, "No team by that name.")
             return
         status = "suspended" if action == "suspend" else "active"
         await tenancy.set_status(system, target.id, status)
