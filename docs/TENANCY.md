@@ -8,7 +8,8 @@ How one bot serves many workspaces without any of them seeing each other.
                      one Telegram bot token
                               │
               ┌───────────────┴───────────────┐
-        Acme's supergroup              Rival's supergroup
+         Acme's chats                    Rival's chats
+        (a DM, maybe a group)          (a DM, maybe a group)
               │                               │
         TenantMiddleware ──── chat_id → tenant, then membership
               │
@@ -20,12 +21,28 @@ How one bot serves many workspaces without any of them seeing each other.
         one PostgreSQL, one Conductor client per key
 ```
 
-**A Telegram chat belongs to exactly one workspace.** `tenant_chats.chat_id` is
+**A Telegram chat belongs to exactly one tenant.** `tenant_chats.chat_id` is
 a primary key, which is why resolution is a single point lookup and why every
 other table's `chat_id` is already tenant-unique.
 
-**Many Telegram users drive one workspace.** A co-founder is a `tenant_members`
-row, not a second deployment.
+**A tenant does not have to own a group.** Since the group became optional
+(2026-07-27) the common shape is one tenant, one `tenant_chats` row, and that
+row is a **private chat** — `kind='dm'`, `is_primary=true`, written by `/start`
+itself. `/setup` adds a `kind='group'` row later and moves `is_primary` to it,
+because that is then where the team lives and where owner notices belong.
+Nothing else in this document distinguishes the two kinds: the GUC, the
+policies, the roles and `primary_chat()` all take a `chat_id`.
+
+Binding the DM at `/start` is load-bearing, not cosmetic. Without a row, a
+private chat resolves by *sole* membership — which stops resolving the moment
+somebody owns two teams, and `/use`, the command that fixes that, needs a
+resolved tenant of its own. The bind is best-effort and non-destructive: a DM
+already claimed by another tenant stays where it is, because creating a second
+team must not silently re-point the first one's chat.
+
+**Many Telegram users drive one tenant.** A co-founder is a `tenant_members`
+row, not a second deployment — and not necessarily a groupmate: an invited
+member can drive the team from their own private chat.
 
 ## Where the boundary is
 
@@ -36,9 +53,9 @@ query with no tenant in scope raises rather than returning everything.
 
 It resolves in this order:
 
-1. `tenant_chats[chat_id]` → the workspace. No binding means refusal, not
+1. `tenant_chats[chat_id]` → the tenant. No binding means refusal, not
    "unknown yet": a shared bot can be added to any group by anyone.
-2. `tenant_members[(tenant, user)]` → the person. Being in the right group is
+2. `tenant_members[(tenant, user)]` → the person. Being in the right chat is
    not authorisation.
 3. An update with no chat at all (inline query, poll answer, payment callback)
    resolves the way a private message does — by the sender's own membership,
@@ -47,13 +64,18 @@ It resolves in this order:
 Rejection is silence. Two exceptions, both of which exist because they are how
 somebody *becomes* a member, and both reach a handler with `tenant=None`:
 
-* `/start`, `/register`, `/help` and `/privacy`, in a **private chat**.
+* `/start`, `/register`, `/help`, `/privacy` and `/platform`, in a **private
+  chat**. `/start` is now the whole of sign-up, so this is the only door.
 * `/setup`, in a **group**. A fresh supergroup has no `tenant_chats` row by
-  definition, so without this the second step of sign-up is unreachable. It is
+  definition, so without this the optional group flow is unreachable. It is
   safe because it does nothing without a valid single-use code, which only its
-  own workspace's owner ever saw — and it proves the bot can really create a
-  topic *before* spending that code, so a permissions problem does not leave a
-  workspace permanently unbindable.
+  own tenant's owner ever saw (minted by `/team`, stored as a digest, bound to
+  the user who asked) — and it proves the bot can really create a topic
+  *before* spending that code, so a permissions problem does not leave a group
+  permanently unbindable.
+
+`/team` is deliberately **not** on either list: it needs a resolved tenant and
+an owner, because it mints a code that binds one.
 
 ## Why row-level security
 
@@ -110,7 +132,7 @@ reintroduces exactly the bug the tests are written to catch.
 | `get_client()` | `TenantContext.client` | handlers silently use the wrong organisation's key |
 | `Settings.conductor_api_key` | `tenants.conductor_key_ct`, sealed | one key for everyone |
 | `Settings.owner_id` | `tenant_members.role` | one workspace's owner administers all of them |
-| `Settings.telegram_chat_id` | `tenant_chats` | one supergroup per deployment |
+| `Settings.telegram_chat_id` | `tenant_chats` | one chat — DM or group — per deployment |
 | one `TokenBucket` | `TelegramPacer`, global + per chat | one customer's backlog starves the rest |
 | `FocusTracker` single slot | bounded dict | one user's thumb overwrites everyone's |
 | `auth_fatal` boolean | per-tenant set | one rejected key stops every workspace |

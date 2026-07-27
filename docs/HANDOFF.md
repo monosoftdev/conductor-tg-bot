@@ -3,15 +3,56 @@
 ## Current state
 
 The bot is multi-tenant on PostgreSQL. One Telegram bot token serves many
-workspaces; each brings its own Conductor API key. Ready for a first deployment
+teams; each brings its own Conductor API key. Ready for a first deployment
 and a live phone pass.
+
+**Sign-up is two private messages.** `/start` creates the team, `/key` stores
+the Conductor key, `/new` opens a workspace — and its topic — in that same
+private chat. A Telegram group is the optional `/team` flow, for several people
+who want one shared topic list. Nothing in the default path asks anyone to
+create a supergroup, enable Topics or grant admin rights.
 
 Verified offline, on every commit:
 
-- **1,927 tests pass** against a real PostgreSQL 16.
+- **2,031 tests pass** against a real PostgreSQL 16.
 - `ruff format --check`, `ruff check`, `pyright` — all clean.
 - The real runtime boots against a real database: all six services start,
   `/health` returns `ok`, the lease is acquired, shutdown is clean.
+
+## The group became optional (2026-07-27)
+
+Telegram now supports topics **inside a private chat with a bot** (@BotFather →
+*Threaded Mode*). A bot may create, rename and delete them there with no admin
+rights and no Premium; the sibling toggle *"Disallow users to create new
+threads"* governs the **user**, and `BOT_FORUM_CREATE_FORBIDDEN` is never about
+the bot. So the chat model is unchanged — one topic per workspace, routed on
+`(chat_id, message_thread_id)` — and only its host is now free.
+
+**This is the one thing in the repo built on an unverified Telegram feature.**
+Bot API 10.0 (2026-05-08) carries an open regression: `sendMessage` with
+`message_thread_id` in a private chat has been reported answering *"message
+thread not found"*, and `createForumTopic` in DMs failing outright.
+`scripts/probe_dm_topics.py` answers it against a live token in about five
+seconds, and **nobody has run it yet.**
+
+Everything is therefore written to degrade, and the degradation is the tested
+path, not the hoped-for one:
+
+- `dm_topic_support` refuses only on an explicit `has_topics_enabled: False`.
+  Absent means try — the created topic is the only real proof.
+- The topic is created **before** `POST /workspaces`, which has no idempotency
+  key. A refusal after it would strand a paid container no retry can adopt.
+- A DM refusal returns the linear `thread_id = 0` seat instead of raising, so
+  the workspace is still created, the prompt still queued, the chat still
+  works. One line says so, once per chat: *Topics unavailable here · one
+  workspace at a time.*
+- `send_html` retries once without `message_thread_id` when Telegram says the
+  thread is gone, sharing `THREAD_GONE_MARKERS` with the delivery path.
+- The group path is byte-identical to what it was, `/setup` probe included.
+
+Known gap: `/board` adoption in a DM (`adopt.py`) is still linear — it does not
+open a topic. `tests/test_bot_adopt.py` records it with an unchanged assertion,
+so fixing it will fail that test rather than change behaviour silently.
 
 ## What changed from the single-user design
 
@@ -19,12 +60,12 @@ Verified offline, on every commit:
 |---|---|---|
 | Storage | SQLite on a Railway volume | PostgreSQL, no volume |
 | Identity | `ALLOWED_TELEGRAM_USER_IDS` | `tenants` + `tenant_members` + `tenant_chats` |
-| Conductor key | one, from the environment | one per workspace, sealed in the database |
+| Conductor key | one, from the environment | one per team, sealed in the database |
 | Isolation | n/a | row-level security, two database roles |
 | Owner | first id in a list | a role on a membership row |
-| Backup | whole `.db` file to the owner | per-workspace `/export`; managed PG backups |
+| Backup | whole `.db` file to the owner | per-team `/export`; managed PG backups |
 | Rate limiting | one 15/min bucket | global + per-chat budgets, per-destination rotor |
-| Auth failure | stopped every poller | stops one workspace |
+| Auth failure | stopped every poller | stops one team |
 
 `docs/TENANCY.md` explains the isolation model and lists the seams that must
 not be re-cut.
@@ -67,19 +108,19 @@ What was fixed, and why each mattered:
 | | Was | Now |
 |---|---|---|
 | `/key` from a non-owner | refused *before* deleting — the key sat in Telegram forever | deleted first, always, and the reply says if deletion failed |
-| Setup codes | bearer tokens; anyone holding one could bind their group to your workspace | bound to the issuing user, and `/register` re-issues instead of dead-ending |
+| Setup codes | bearer tokens; anyone holding one could bind their group to your team | bound to the issuing user, and `/team` re-issues instead of dead-ending |
 | Callback budget | a fixed 40-char cap; a 36-char UUID + `archreq` hit exactly 64 bytes, 37 removed **every** button from the card | measured per action, degrades to a non-restart-proof button |
-| Last owner | could demote themselves, orphaning the workspace permanently | refused unless a second owner exists |
+| Last owner | could demote themselves, orphaning the team permanently | refused unless a second owner exists |
 | `ctb_app` grants | could `SELECT` every tenant's sealed key blob | no grant at all on the four scope-deciding tables |
 | Delivery ordering | a network blip re-ordered a topic (`1, 2, 3, 0`) | a deferral stops the batch; a terminal drop does not |
 | One chat's 429 | slept up to 60s on the single outbox task — every tenant stalled | inline only under 2s, then pause that chat and move on |
 | Voice recovery | no orphan window; a redeploy re-transcribed and **re-billed** in-flight jobs | same 150s guard as deliveries |
 | `/use` | invalidated the wrong cache entry, then raised forever on the second call | invalidates the tenant it left; `rebind_chat` makes it repeatable |
-| Deleted topic | that turn's output lost silently and permanently | rerouted to the group's General |
+| Deleted topic | that turn's output lost silently and permanently | rerouted to the chat root (a group's General, or the DM itself) |
 | Clean shutdown | released rows with no hash guard — a SIGTERM duplicated more readily than a crash | same `content_hash` guard as crash recovery |
 | `deliveries` | never pruned; agent output outlived the 30-day transcript promise | pruned on the same window |
 | `MAX_ATTEMPTS`, `REGISTRATION_RATE_PER_HOUR` | declared, documented, never read | enforced |
-| `api_events.tenant_id` | always NULL, so per-workspace `/health` was blind | attributed |
+| `api_events.tenant_id` | always NULL, so per-team `/health` was blind | attributed |
 | `StatusCards` | claimed to share the outbox pacer; did not | shares it, and reports its 429s |
 | Supervisor | leaked a client pin when a poller ended by itself, so a decrypted key could never be swept | unpins on every exit path |
 | `/voice` | `tenants.voice_enabled` gated the feature and **no command set it** | the command exists |
@@ -114,18 +155,26 @@ with their feature deleted now fail with it.
 None of this can be proven offline.
 
 1. Deploy to Railway with a real PostgreSQL and real secrets.
-2. Walk the sign-up flow from a phone: `/register` → `/setup <code>` → `/key`
-   → `/new` → an answer arrives.
-3. Two real workspaces at once, each with its own key, staying separate.
-4. Redeploy mid-turn; the answer arrives exactly once.
-5. Watch `/health` for real Conductor and Telegram 429s, and tune the two rate
+2. **Run `scripts/probe_dm_topics.py`.** Threaded Mode on in @BotFather, then
+   `TELEGRAM_BOT_TOKEN` + `TELEGRAM_DM_CHAT_ID` and go. It answers four
+   questions in order: can the bot create a DM topic, send into it, rename it,
+   and set the state icon. Do this *first* — it decides whether the default
+   install has a topic list or the linear fallback, and everything else on this
+   list is cheaper to interpret once it is known.
+3. Walk the default sign-up from a phone: `/start` → `/key` → `/new` → an
+   answer arrives, all in one private chat.
+4. Walk the optional group: `/team` → supergroup with Topics → `/setup <code>`
+   → `/new` in General.
+5. Two real teams at once, each with its own key, staying separate.
+6. Redeploy mid-turn; the answer arrives exactly once.
+7. Watch `/health` for real Conductor and Telegram 429s, and tune the two rate
    budgets — the current numbers are under the documented ceilings but have
    never met real traffic.
-6. Voice: a workspace storing its own speech key, then 30 owner recordings
+8. Voice: a team storing its own speech key, then 30 owner recordings
    before moving `voice_mode` from `prompts` to `commands`.
-7. Re-probe a sleeping workspace (probe assumption 8 is still unmeasured).
-8. Curate real tool-heavy and error transcripts; the non-trivial renderer
-   fixtures are still labelled synthetic.
+9. Re-probe a sleeping workspace (probe assumption 8 is still unmeasured).
+10. Curate real tool-heavy and error transcripts; the non-trivial renderer
+    fixtures are still labelled synthetic.
 
 ## Before opening registration to strangers
 

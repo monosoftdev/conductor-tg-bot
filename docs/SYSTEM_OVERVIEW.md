@@ -5,14 +5,22 @@
 A Telegram control plane for Conductor cloud workspaces and sessions. Telegram
 is the mobile interface; Conductor remains the execution system.
 
-**One bot, many workspaces.** Each brings its own Conductor API key, its own
-supergroup and its own members. Isolation is enforced by PostgreSQL row-level
-security — see [`TENANCY.md`](TENANCY.md), which is the document to read before
-changing anything in this area.
+**One bot, many teams.** Each brings its own Conductor API key, its own chats
+and its own members. Isolation is enforced by PostgreSQL row-level security —
+see [`TENANCY.md`](TENANCY.md), which is the document to read before changing
+anything in this area.
 
-- **General** is the cockpit: search history, inspect all work, or create a
-  workspace. Ordinary text or audio never prompts an agent from General.
-- **One forum topic maps to one workspace.** The topic's current session is the
+**A team's home is a private chat**; a supergroup is the optional `/team` flow
+for several people sharing one topic list. Topics work in both — in a DM they
+need @BotFather's *Threaded Mode* and no rights at all, and where Telegram
+refuses them the chat degrades to one workspace at a time. Read that story once
+in [`HANDOFF.md`](HANDOFF.md); everything below is the same either way.
+
+- **The chat root is the cockpit**: a group's **General**, or the private chat
+  itself. Search history, inspect all work, create a workspace. Ordinary text
+  or audio never prompts an agent from a group's General — in a private chat
+  the root is also the linear seat, so text there is a prompt.
+- **One topic maps to one workspace.** The topic's current session is the
   prompt destination, so routing is visible and predictable.
 - **One pinned status card represents the live turn.** Progress edits that card
   instead of creating tool-noise bubbles.
@@ -25,14 +33,14 @@ changing anything in this area.
 
 | Goal | Fastest action |
 |---|---|
-| Start work | In General: `/new [project:] prompt` |
-| Resume laptop work | General: `/attach [name]`, then tap `+ Open` |
+| Start work | In the chat root: `/new [project:] prompt` |
+| Resume laptop work | Chat root: `/attach [name]`, then tap `+ Open` |
 | Continue work | Open its topic and send text, voice, or audio |
 | See current state | `/mode` — status, workspace, branch, model, queue, actions |
 | See all work | `/board` — ten compact recent rows with topic jump buttons |
 | Change session | `/s [search]` — active/recent sessions first |
 | Stop | Tap **Stop** on the card or run `/stop` |
-| Search history | General text or `/find text` |
+| Search history | `/find text`, or plain text in a group's General |
 | Finish | `/done`, then tap the named archive confirmation |
 
 Replying to a bot message uses that message's session, even from General. This
@@ -47,7 +55,7 @@ is the escape hatch for continuing a specific result without opening its topic.
 | Send a prompt | Type in its topic | The bot reacts 👀 instead of adding a receipt bubble |
 | Prompt finishes | Read the answer; reaction becomes 👍 | Pinned card also becomes Done |
 | Agent needs a decision | Tap one of 2–4 buttons | Recommended option is first, green, and checked |
-| Open another workspace | General `/board` or `/s` | Deep-link button opens its topic; no binding is changed |
+| Open another workspace | `/board` or `/s` from the chat root | Deep-link button opens its topic; no binding is changed |
 | Resume a laptop cloud workspace | `/attach name`, tap `+ Open`, then type in its new topic | Starts at the current transcript tail; history is not replayed |
 | Change session | Topic `/s` | Only sessions from that workspace are offered |
 | Run parallel approaches | `/fork name`, then `/s` | Sessions share the workspace topic without cross-workspace routing |
@@ -59,8 +67,10 @@ is the escape hatch for continuing a specific result without opening its topic.
 | Finish work | Tap Archive, then named confirmation | Topic is marked archived and closed |
 
 General never accepts an accidental ordinary prompt. `/s` in General is
-navigation, and `/s` inside a topic cannot bind a session from another
-workspace.
+navigation, and `/s` inside a topic — group or DM — cannot bind a session from
+another workspace. A private chat's root is the exception by design: it is a
+seat, not a cockpit, so `/s` there switches across workspaces and plain text
+prompts the one it is bound to.
 
 A workspace started in the Conductor app can be resumed from Telegram when it
 is a **Conductor cloud workspace visible to the configured API account**.
@@ -114,7 +124,7 @@ Spoken `done` still creates a named confirmation and never archives directly.
 
 ```text
 ┌──────────────────── phone ────────────────────┐
-│ Telegram app · General + workspace topics     │
+│ Telegram app · chat root + workspace topics   │
 └──────────────────────┬────────────────────────┘
                        │ Telegram Bot API
 ┌──────────────────────▼ Railway ───────────────┐
@@ -200,9 +210,10 @@ delivery layer; ElevenLabs is only the provisional speech-to-text model.
 
 ## Safety boundaries
 
-- Environment allowlist plus a DB allowlist protects every Telegram update.
-- An optional group ID confines operation to one private supergroup while
-  retaining allowlisted DMs.
+- Every Telegram update resolves through `tenant_chats` then `tenant_members`;
+  an unbound chat or an unseated user is refused in silence.
+- A chat belongs to exactly one team, DM or group, and being in it is not
+  authorisation.
 - General has no direct ordinary-prompt path.
 - Destructive actions use short-lived, single-use callback nonces.
 - Every archive entry point, including status cards, requires a named second

@@ -66,17 +66,22 @@ from ctb.turn.state import TopicMarker, TurnState
 router = Router(name=__name__)
 register_router(router, order=30)
 
+#: Written for someone whose whole bot is this private chat, and still true in
+#: a group: "here" is the DM root or General, "a workspace topic" is the room
+#: ``/new`` opens either way. It used to open with "General ·", which named a
+#: room a DM-only user does not have.
 _HELP = """<b>Phone loop</b>
-General · <code>/new</code>, <code>/attach</code>, <code>/board</code>, or search
-Topic · send text, voice, or audio
+Here · <code>/new</code>, <code>/attach</code>, <code>/board</code>, or search
+In a workspace · send text, voice, or audio
 Result · tap a numbered choice; ✓ is recommended
 
 <code>/mode</code> controls this session
-<code>/s</code> switches only inside this workspace
+<code>/s</code> switches session · inside a workspace, only its own
 <code>/fork</code> starts another session here
-<code>/notify</code> sets topic alerts
+<code>/notify</code> sets alerts here
 
 <b>Your team</b>
+<code>/team</code> adds a group for several people · optional
 <code>/invite id</code> adds someone · <code>/members</code> lists them
 <code>/key</code> (privately) sets your Conductor key
 <code>/export</code> downloads your data · <code>/privacy</code> explains it

@@ -55,20 +55,26 @@ UIs). Do this twice, once for `main` and once for `dev`:
 
 ## 2 · The Telegram bot — you, 5 minutes
 
-One bot serves every workspace. Customers add *this* bot to *their* group.
+One bot serves every team. Most customers will only ever use it in their own
+private chat; some will add *this* bot to *their* group.
 
 1. Message [@BotFather](https://t.me/BotFather) → `/newbot`.
 2. Give it a display name and a `_bot`-suffixed username.
 3. Copy the token. **This is a secret** — it can read every message in every
    group the bot is in.
 
-Then, still in BotFather, two settings that are not optional:
+Then, still in BotFather, three settings. The first two are not optional:
 
 - `/setprivacy` → select your bot → **Disable**.
   Privacy mode ON means the bot only sees messages starting with `/`. The whole
   point of this bot is that you type a prompt in a topic without a command, so
   with privacy on it appears to ignore you.
 - `/setjoingroups` → **Enable**. It has to be addable to groups.
+- **Threaded Mode** → **Enable**. This is what lets the bot open one topic per
+  workspace *inside a private chat*, which is the default install. The bot
+  needs no admin rights and no Premium there. Leave the sibling toggle
+  "Disallow users to create new threads" alone unless you want your users
+  making threads of their own — it governs the **user**, never the bot.
 
 Verify before you go further:
 
@@ -78,6 +84,22 @@ curl "https://api.telegram.org/bot<YOUR_TOKEN>/getMe"
 
 `{"ok":true,...}` means the token is good. Anything else, and every later step
 will fail for a reason that looks like something else.
+
+Then verify the part that documentation cannot promise. DM topics rest on a Bot
+API 10.x feature with an open regression, so ask the API rather than the docs:
+
+```bash
+export TELEGRAM_BOT_TOKEN=...      # the token you just copied
+export TELEGRAM_DM_CHAT_ID=...     # your own Telegram user id
+.venv/bin/python scripts/probe_dm_topics.py
+```
+
+Send the bot a DM first; Telegram refuses to open a conversation the user never
+started. Four checks, in order: create a topic, send into it, rename it, set
+its state icon. **A failure is not a blocker** — the bot degrades to one
+workspace at a time per private chat and says so once — but it is the
+difference between a topic list and a linear chat for every user you onboard,
+and you want to know which one you are promising.
 
 **Get your own Telegram user id** while you are here — you need it for
 `PLATFORM_ADMIN_IDS`. Message [@userinfobot](https://t.me/userinfobot); it
@@ -275,24 +297,32 @@ If it crash-loops, the log line names the cause. The three that actually happen:
 This is the part no test covers. Follow
 [`GETTING_STARTED.md`](GETTING_STARTED.md) as a real user:
 
-1. `/register acme` in a private chat with the bot.
-2. Create a private supergroup, turn on **Topics**, add the bot as an admin
-   with *manage topics*, *pin*, *delete*, *send*.
-3. `/setup <code>` in that group. Expect **Ready**.
-4. `/key <your Conductor API key>` privately. It should confirm the key works,
+1. `/start` in a private chat with the bot. It creates your team and asks for
+   one thing.
+2. `/key <your Conductor API key>`, there. It should confirm the key works,
    that it stored it, and that it deleted your message — and your message
    should be gone.
-5. `/new fix the typo in the readme` in the group.
-6. An answer arrives in a new topic, under a pinned status card.
+3. `/new fix the typo in the readme`, still there.
+4. An answer arrives under a pinned status card — in its own topic if DM topics
+   work, in the chat itself if they do not. Either is a pass; only the first
+   matches what the probe in step 2 told you.
 
-If step 6 works, every layer works: Telegram polling, tenancy resolution, the
+If step 4 works, every layer works: Telegram polling, tenancy resolution, the
 sealed key, the Conductor client, the transcript cursor, the delivery outbox
 and the status card.
+
+Then the optional group, which is a different code path end to end:
+
+5. `/team` privately → a card with a 15-minute single-use code.
+6. Create a private supergroup, turn on **Topics**, add the bot as an admin
+   with *manage topics*, *pin*, *delete*, *send*.
+7. `/setup <code>` in that group. Expect **Ready**.
+8. `/new …` in its **General**; the answer arrives in a new topic there.
 
 Then, before opening registration:
 
 - `/platform list` — confirm you are recognised as the operator.
-- Register a **second** workspace from a different Telegram account with a
+- Register a **second** team from a different Telegram account with a
   different Conductor key, and confirm neither sees the other's `/board`.
 - Redeploy while a turn is running. The answer must arrive exactly once.
 

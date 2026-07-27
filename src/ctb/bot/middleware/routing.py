@@ -2,8 +2,21 @@
 
 The address of a prompt is the forum topic your thumb is in (PLAN §Chat model).
 That makes routing a pure lookup with no ambient "current session" variable to
-lose track of, and DM mode falls out for free: a private chat has no thread, so
-it is ``thread_id = 0`` and gets exactly one bound session.
+lose track of, in every chat there is.
+
+A private chat can host topics too, and whether it does is a **runtime fact**:
+the same DM is a column of topics when Telegram allows it and one linear seat
+when it does not, sometimes on consecutive days. So the two coexist, told apart
+by the thread on the update rather than by a flag:
+
+* ``thread_id == 0`` in a DM — the linear seat, and the DM's cockpit. Exactly
+  one bound session, and ``/s`` may switch it to *any* workspace, which is what
+  makes a topicless DM usable at all.
+* ``thread_id != 0`` in a DM — a workspace's topic, addressed exactly as a
+  group topic is: ``/s`` stays inside that workspace, because the way to reach
+  another one is to tap its topic.
+
+:attr:`Route.is_dm` therefore means "the one-seat DM", not "a private chat".
 
 Resolution order, cheapest first:
 
@@ -31,7 +44,12 @@ from typing import Any, Final
 
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
 from aiogram.dispatcher.middlewares.user_context import EVENT_CONTEXT_KEY, EventContext
-from aiogram.types import Message, TelegramObject
+from aiogram.types import (
+    CallbackQuery,
+    MaybeInaccessibleMessage,
+    Message,
+    TelegramObject,
+)
 from aiogram.types import Update as TgUpdate
 
 from ctb.db import NO_THREAD_ID
@@ -118,8 +136,20 @@ class Route:
         return self.session_id is not None
 
     @property
-    def is_dm(self) -> bool:
+    def is_private(self) -> bool:
+        """A private chat, topics or not."""
         return self.kind == "dm"
+
+    @property
+    def is_dm(self) -> bool:
+        """The **one-seat** DM: a private chat with no topic in play.
+
+        Deliberately narrower than :attr:`is_private`. Everything that reads
+        this reads it to mean "one session at a time, switchable to anything"
+        — true of the DM root, and false of a DM topic, which is addressed like
+        any other topic.
+        """
+        return self.kind == "dm" and self.thread_id == NO_THREAD_ID
 
     @property
     def is_general(self) -> bool:
@@ -128,7 +158,8 @@ class Route:
 
     @property
     def is_topic(self) -> bool:
-        return self.kind == "topic"
+        """A workspace's own room — in a group or in a DM."""
+        return self.thread_id != NO_THREAD_ID and self.kind in {"topic", "dm"}
 
 
 class RoutingMiddleware(BaseMiddleware):
@@ -166,7 +197,7 @@ class RoutingMiddleware(BaseMiddleware):
         if not isinstance(context, EventContext):
             context = EventContext()
         chat_id = context.chat_id
-        thread_id = context.thread_id or NO_THREAD_ID
+        thread_id = _thread_id(context, event)
         kind = _chat_kind(context, thread_id)
         reply_to = _reply_to_message_id(event)
 
@@ -239,7 +270,51 @@ class RoutingMiddleware(BaseMiddleware):
         return await sessions_repo.get(db, session_id)
 
 
+def _thread_id(context: EventContext, event: TelegramObject) -> int:
+    """Which seat this update arrived in.
+
+    aiogram only publishes ``EventContext.thread_id`` when Telegram also set
+    ``is_topic_message``, which is documented for forums and *not* promised for
+    a topic in a private chat. Getting that wrong would silently address every
+    prompt typed in a DM topic to the DM root — a wrong session, not a missing
+    one — so a private chat falls back to the raw ``message_thread_id``. In a
+    private chat there is nothing else it could mean.
+    """
+    if context.thread_id:
+        return context.thread_id
+    chat = context.chat
+    if chat is None or chat.type != "private":
+        return NO_THREAD_ID
+    message = _message_of(event)
+    if message is None:
+        return NO_THREAD_ID
+    return getattr(message, "message_thread_id", None) or NO_THREAD_ID
+
+
+def _message_of(event: TelegramObject) -> Message | MaybeInaccessibleMessage | None:
+    """The message an update hangs off, whoever sent it."""
+    if isinstance(event, TgUpdate):
+        query = event.callback_query
+        return (
+            event.message
+            or event.edited_message
+            or (query.message if query is not None else None)
+        )
+    if isinstance(event, Message):
+        return event
+    if isinstance(event, CallbackQuery):
+        return event.message
+    return None
+
+
 def _chat_kind(context: EventContext, thread_id: int) -> str:
+    """Which *chat* this is. Which *seat* is :attr:`Route.thread_id`'s job.
+
+    A private chat stays ``"dm"`` whether or not the update arrived in a topic:
+    everything downstream that branches on the kind — the voice queue's replay,
+    ``chats.ensure`` — needs to know it is talking to a person, and would go
+    looking for group topic rights if told otherwise.
+    """
     chat = context.chat
     if chat is None:
         return "unknown"

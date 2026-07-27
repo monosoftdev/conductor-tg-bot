@@ -19,8 +19,10 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import Message, ReactionTypeEmoji
 
 from ctb.bot.handlers.topics import (
+    TopicCreateError,
     apply_marker,
     discard_topic,
+    dm_topic_support,
     forum_support,
     require_topic,
     resolve_db,
@@ -38,8 +40,11 @@ from ctb.db.repo import prompts as prompts_repo
 from ctb.db.repo import sessions as sessions_repo
 from ctb.db.repo import workspaces as workspaces_repo
 from ctb.delivery.render.html import escape
+from ctb.logging import get_logger
 from ctb.turn import cursor
 from ctb.turn.state import Cancel, Evidence, TopicMarker, TurnState
+
+log = get_logger(__name__)
 
 FOCUS_MS: Final = 30 * 60 * 1000
 #: Last resort only. Precedence is chat default → ``DEFAULT_BRANCH`` env →
@@ -67,6 +72,17 @@ MOBILE_REPLY_INSTRUCTION: Final = (
     "('1. ...', '2. ...') with your recommendation first. Write nothing after "
     "the last option. Otherwise never write a Choices block."
 )
+#: Said once when a chat that should have had a topic per workspace could not
+#: get one. What Telegram said is for the log — the tenant cannot flip another
+#: account's @BotFather toggle — so the line carries only what changes for them.
+LINEAR_DM_NOTICE: Final = (
+    "Topics unavailable here · one workspace at a time. <code>/s</code> switches."
+)
+#: Chats already told. In-process on purpose: this is a nudge, not a fact worth
+#: a column, and repeating it once after a redeploy is cheaper than a migration.
+_LINEAR_TOLD: Final[set[int]] = set()
+_LINEAR_TOLD_MAX: Final = 4096
+
 _PROJECT_PREFIX = re.compile(r"^([^\s:]{1,80}):\s*(.+)$", re.S)
 #: A pick or an ack carries no new task, and the contract is already in the
 #: session from an earlier turn. Appending 140 words of formatting rules to the
@@ -99,6 +115,24 @@ class CreatedBinding:
     thread_id: int
     label: str
     deep_link: str | None = None
+    #: Set when this chat wanted a topic and Telegram would not give one, so
+    #: the workspace took the chat's single linear seat instead. Telegram's own
+    #: words, for the caller that wants to show them; the chat only ever gets
+    #: :data:`LINEAR_DM_NOTICE`.
+    linear_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _Seat:
+    """Where a new workspace will live, decided before anything is paid for."""
+
+    thread_id: int
+    #: Set only when *this* call created the topic — the only one we may delete.
+    fresh_topic: int | None = None
+    #: The name a replayed nonce's topic already carries, if it drifted.
+    prior_label: str | None = None
+    #: Why there is no topic, when there should have been one.
+    refusal: str | None = None
 
 
 class CancelDispatcher(Protocol):
@@ -356,6 +390,81 @@ def augment_prompt(text: str) -> str:
     return f"{cleaned}\n\n{MOBILE_REPLY_INSTRUCTION}"
 
 
+async def _seat_for(
+    *,
+    bot: Bot | None,
+    database: Database,
+    chat_id: int,
+    chat_type: str,
+    label: str,
+    nonce: str,
+) -> _Seat:
+    """Reserve the room this workspace will live in — **before** it is paid for.
+
+    A cloud workspace starts billing the instant it is created, and
+    ``POST /workspaces`` has no idempotency key, so a topic failure *after* it
+    strands a paid container that no retry can adopt. ``can_manage_topics`` is
+    not proof: it has been observed ``true`` on a chat that then refused
+    ``createForumTopic``. The only proof that a topic can exist is a topic that
+    exists, so it is created first. A topic is free and deletable.
+
+    The two chat kinds differ in what a refusal *means*, not in what is tried:
+
+    * **Group** — a group without topics has no working shape to fall back to
+      (General never prompts), so a refusal fails the command and says why.
+    * **DM** — a refusal degrades to the linear single-seat DM, which is what
+      the bot did here until today and still works. Whether Telegram allows DM
+      topics is a runtime fact, not a config flag; a feature that is optional
+      must never take the bot down with it.
+    """
+    prior = await workspaces_repo.get_by_nonce(database, nonce)
+    if prior is not None and prior.chat_id == chat_id and prior.topic_id:
+        # A replayed update: reuse the topic this nonce already owns rather
+        # than opening a sibling next to it.
+        return _Seat(prior.topic_id, prior_label=prior.topic_name)
+    if chat_type == "private":
+        if bot is None:
+            return _Seat(NO_THREAD_ID, refusal="no bot bound")
+        support = await dm_topic_support(bot)
+        if support.degraded:
+            return _Seat(NO_THREAD_ID, refusal=support.detail or support.reason)
+        try:
+            topic_id = await require_topic(bot, chat_id, label)
+        except TopicCreateError as exc:
+            return _Seat(NO_THREAD_ID, refusal=exc.reason)
+        return _Seat(topic_id, fresh_topic=topic_id)
+    if bot is None:
+        raise RuntimeError("Telegram bot is not bound to the input")
+    support = await forum_support(bot, chat_id)
+    if support.degraded:
+        raise RuntimeError(
+            f"No topic permission ({support.detail or support.reason}). Run /setup."
+        )
+    topic_id = await require_topic(bot, chat_id, label)
+    return _Seat(topic_id, fresh_topic=topic_id)
+
+
+async def note_linear_seat(bot: Bot | None, chat_id: int, reason: str) -> bool:
+    """Tell this chat once that it is linear, and why that is visible to them.
+
+    Never raises and never blocks the create it follows: the workspace exists,
+    the prompt is queued, and a chat that missed one nudge is still a working
+    chat. Returns whether a line was actually sent.
+    """
+    log.info("common.topics_unavailable", chat_id=chat_id, reason=reason)
+    if bot is None or chat_id in _LINEAR_TOLD:
+        return False
+    if len(_LINEAR_TOLD) >= _LINEAR_TOLD_MAX:
+        _LINEAR_TOLD.clear()
+    _LINEAR_TOLD.add(chat_id)
+    try:
+        await send_html(bot, chat_id, LINEAR_DM_NOTICE, thread_id=NO_THREAD_ID)
+    except Exception as exc:  # noqa: BLE001 - cosmetics never fail a create
+        log.warning("common.linear_notice_failed", chat_id=chat_id, error=repr(exc))
+        return False
+    return True
+
+
 async def create_and_bind(
     *,
     message: Message,
@@ -404,33 +513,17 @@ async def create_and_bind_input(
 
     operation_id = action_id or f"{chat_id}:{tg_message_id}"
     nonce = cursor.stable_nonce(operation_id)
-    # A cloud workspace starts billing the instant it is created, and
-    # ``POST /workspaces`` has no idempotency key — so a topic failure *after*
-    # it strands a paid container that no retry can adopt. ``can_manage_topics``
-    # is not proof: it has been observed ``true`` on a chat that then refused
-    # ``createForumTopic``. The only proof that a topic can exist is a topic
-    # that exists, so it is created first. A topic is free and deletable.
-    thread_id = NO_THREAD_ID
-    # Set only when *this* call created the topic — the only one we may delete.
-    fresh_topic: int | None = None
-    prior_label: str | None = None
-    if chat_type != "private":
-        if bot is None:
-            raise RuntimeError("Telegram bot is not bound to the input")
-        prior = await workspaces_repo.get_by_nonce(database, nonce)
-        if prior is not None and prior.chat_id == chat_id and prior.topic_id:
-            # A replayed update: reuse the topic this nonce already owns rather
-            # than opening a sibling next to it.
-            thread_id = prior.topic_id
-            prior_label = prior.topic_name
-        else:
-            support = await forum_support(bot, chat_id)
-            if support.degraded:
-                raise RuntimeError(
-                    f"No topic permission ({support.detail or support.reason}). "
-                    "Run /setup."
-                )
-            thread_id = fresh_topic = await require_topic(bot, chat_id, label)
+    seat = await _seat_for(
+        bot=bot,
+        database=database,
+        chat_id=chat_id,
+        chat_type=chat_type,
+        label=label,
+        nonce=nonce,
+    )
+    thread_id = seat.thread_id
+    fresh_topic = seat.fresh_topic
+    prior_label = seat.prior_label
     try:
         creation = await cursor.create_workspace(
             conductor,
@@ -518,7 +611,9 @@ async def create_and_bind_input(
         message_id=None,
         session_index=-1,
     )
-    kind = "dm" if chat_type == "private" else "topic"
+    # A seat with a thread is a topic seat, whatever chat it is in. Only the
+    # linear DM root is still ``dm``.
+    kind = "dm" if chat_type == "private" and not thread_id else "topic"
     await chats_repo.bind(
         database,
         chat_id,
@@ -578,7 +673,18 @@ async def create_and_bind_input(
         consecutive_idle=0,
     )
     await chats_repo.touch_prompt(database, chat_id, thread_id, focus_for_ms=FOCUS_MS)
-    return CreatedBinding(workspace_id, session_id, thread_id, label, deep_link)
+    # Last, and only once everything above worked: a refusal is worth one line,
+    # a failed create is worth none — the caller is already saying that.
+    if seat.refusal is not None:
+        await note_linear_seat(bot, chat_id, seat.refusal)
+    return CreatedBinding(
+        workspace_id,
+        session_id,
+        thread_id,
+        label,
+        deep_link,
+        linear_reason=seat.refusal,
+    )
 
 
 async def require_session(message: Message, route: Route) -> str | None:

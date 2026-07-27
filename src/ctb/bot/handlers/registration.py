@@ -1,4 +1,4 @@
-"""Self-serve sign-up: create a team, store its keys, bind its group.
+"""Self-serve sign-up: paste a key in a private chat, and go.
 
 **"Team", not "workspace".** Conductor already calls a checkout-plus-agent a
 *workspace*, and ``/new`` creates those by the dozen. Using the same word for
@@ -6,25 +6,26 @@ the thing that owns the API key and the people produced sentences like "this
 workspace is at its limit of 50 workspaces". The container is a **team**; a
 *workspace* is always the Conductor one.
 
-The order is private-first on purpose. Both keys are secrets and a group is the
-one place they must never be typed, so everything private happens in the
-private chat and the owner switches to the group exactly once — which is also
-when the binding code's 15-minute clock starts, rather than while they are
-still hunting for an API key.
+The shortest path to working is **two messages, both private**:
 
-These are the only commands a non-member can reach, and only in a private
-chat — :class:`~ctb.bot.middleware.tenancy.TenantMiddleware` lets exactly this
-set through unresolved. Everything else about someone with no workspace is
-silence.
+1. ``/start`` creates a team implicitly, named after your Telegram account.
+2. ``/key`` stores its Conductor API key. That is the whole sign-up — prompts,
+   topics and results all live in the private chat.
 
-The flow is deliberately three explicit steps rather than one wizard:
+Everything else is additive, and nothing else is required:
 
-1. ``/register <name>`` creates a *pending* team with you as its owner.
-2. ``/key`` stores its Conductor API key; ``/voicekey`` its speech key.
-3. ``/setup <code>`` in your supergroup binds that chat. The code is issued in
-   the private chat and hashed at rest, because a shared bot can be added to
-   any group by anyone — being added is not consent, and without the code
-   somebody could bind the bot to a team that is not theirs.
+* ``/register <name>`` names the team instead of taking the default.
+* ``/team`` explains what a group adds — several people, a shared topic list —
+  and mints the single-use code; ``/setup <code>`` in that supergroup binds it.
+  The code is issued privately and hashed at rest, because a shared bot can be
+  added to any group by anyone: being added is not consent, and without the
+  code somebody could bind the bot to a team that is not theirs.
+* ``/voicekey`` stores a speech key.
+
+``/start``, ``/register``, ``/help``, ``/privacy`` are the only commands a
+non-member can reach, and only in a private chat —
+:class:`~ctb.bot.middleware.tenancy.TenantMiddleware` lets exactly that set
+through unresolved. Everything else about someone with no team is silence.
 
 **The key never stays in Telegram.** Sent in a group it is refused *and*
 deleted, with a rotate-it warning. Sent in a private chat it is validated,
@@ -37,13 +38,14 @@ from __future__ import annotations
 import hashlib
 import re
 import secrets
+import uuid
 from contextlib import suppress
 from typing import Final
 
 from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, Message, User
 
 from ctb.bot.app import register_router
 from ctb.bot.handlers.common import abandon_wizard, command_text, short_error, tell
@@ -90,44 +92,48 @@ _HOUR_MS: Final = 60 * 60 * 1000
 _SLUG_RE: Final = re.compile(r"[^a-z0-9]+")
 _SLUG_MAX: Final = 24
 
+#: What :func:`slugify` returns when a name carries nothing it can keep — a
+#: name in a non-Latin script, or punctuation only. Never used as a slug: the
+#: implicit path falls back to ``team-<telegram id>``, which is unique by
+#: construction and still boring.
+_FALLBACK_SLUG: Final = "workspace"
+
 #: Codes are shown once and stored only as a digest.
 _CODE_BYTES: Final = 9
 
+#: The whole first run. One instruction, because there is only one thing to do:
+#: the team is created implicitly by ``/start``, and a group is optional.
 _WELCOME: Final = (
     "<b>Conductor from your phone</b>\n"
-    "Drive your Conductor cloud agents from Telegram.\n\n"
-    "You bring your own Conductor API key; your workspaces, transcripts and "
-    "spending stay yours.\n\n"
-    "<code>/register your-team-name</code> to begin."
+    "Your key, your workspaces, your spend.\n\n"
+    "One step · <code>/key &lt;your Conductor API key&gt;</code>\n"
+    "conductor.build → Settings → API keys. I check it, encrypt it, and "
+    "delete your message."
 )
 
 _CLOSED: Final = (
     "Sign-up is closed on this instance. Ask whoever runs it for an invitation."
 )
 
-#: Asked for *in this chat*, before the group exists. Both keys are private by
-#: nature and a group is the one place they must never be typed, so finishing
-#: the private half first means the owner switches to the group exactly once —
-#: and the code's 15-minute clock starts when they are ready to use it, not
-#: while they are still hunting for an API key.
+#: Asked for *in this chat*, and nowhere else — a key is the one thing that
+#: must never be typed into a group.
 _ASK_FOR_KEY: Final = (
-    "<b>{slug}</b> is your team. Two things, both here in this chat:\n\n"
-    "1 · <code>/key &lt;your Conductor API key&gt;</code>\n"
-    "   From conductor.build → Settings → API keys. I check it, encrypt it, "
-    "and delete your message.\n"
-    "2 · <i>optional</i> <code>/voicekey &lt;your ElevenLabs key&gt;</code> "
-    "if you want to talk to it.\n\n"
-    "Then I will set you up with a group."
+    "<b>{slug}</b> · one step left.\n"
+    "<code>/key &lt;your Conductor API key&gt;</code>\n"
+    "conductor.build → Settings → API keys. I check it, encrypt it, and "
+    "delete your message."
 )
 
-_NEXT_STEPS: Final = (
-    "Now the group — this is the only part that happens outside this chat.\n\n"
-    "1 · Create a <b>private supergroup</b> and turn on <b>Topics</b>.\n"
+#: The optional half. Nothing above it mentions a group, and nothing here
+#: pretends the bot is unusable without one.
+_GROUP_STEPS: Final = (
+    "<b>Add a group</b> · optional\n"
+    "Several people on one team, and a topic list you all see.\n\n"
+    "1 · Create a <b>private supergroup</b>, turn on <b>Topics</b>.\n"
     "2 · Add <b>this bot</b> as an administrator: manage topics, pin, delete, "
     "send.\n"
-    "3 · In that group send <code>/setup {code}</code>\n\n"
-    "The code expires in 15 minutes and works once. Send "
-    "<code>/register</code> here for a fresh one."
+    "3 · Send there <code>/setup {code}</code>\n\n"
+    "15 minutes, one use. <code>/team</code> mints another."
 )
 
 
@@ -170,8 +176,47 @@ async def issue_code(
 
 
 @router.message(Command("start"))
-async def start(message: Message, state: FSMContext) -> None:
+async def start(
+    message: Message,
+    settings: Settings,
+    state: FSMContext,
+    tenant: TenantContext | None = None,
+) -> None:
+    """The whole sign-up. One command, one instruction back.
+
+    ``/start`` used to print a welcome that asked for ``/register``, which
+    asked for a name, which asked for a key, which asked for a supergroup —
+    three commands and an admin-rights dance before the first prompt. The team
+    is a container, not a decision: it is created here, named after the
+    Telegram account, and can be renamed later by whoever cares.
+
+    Idempotent by membership, not by luck. A second ``/start`` finds the seat
+    the first one made — whether or not the tenancy middleware resolved it —
+    and resumes, so nobody ends up owning two teams by tapping twice.
+    """
     await abandon_wizard(state)
+    if message.chat.type != "private":
+        # A group cannot be the entry point: sign-up ends in a key, and a key
+        # in a group is a key to rotate.
+        await tell(message, "Send <code>/start</code> to me in a private chat.")
+        return
+    if message.from_user is None:  # pragma: no cover - private chats have one
+        return
+    if tenant is not None:
+        await _resume(message, tenant.row, is_owner=tenant.is_owner)
+        return
+
+    system = system_database()
+    seats = await tenancy.memberships_for_user(system, message.from_user.id)
+    if seats:
+        await _resume_seat(message, seats)
+        return
+
+    created = await _create_team(
+        message, settings, name=_default_name(message.from_user)
+    )
+    if created is None:
+        return  # refused, and already said why
     await tell(message, _WELCOME)
 
 
@@ -190,7 +235,7 @@ async def privacy(message: Message, state: FSMContext) -> None:
         "• Voice notes to the speech vendor — only if you enable voice and "
         "store your own key for it.\n\n"
         "<code>/revoke</code> deletes your key. <code>/forget</code> deletes "
-        "the workspace and everything in it.",
+        "the team and everything in it.",
     )
 
 
@@ -201,12 +246,11 @@ async def register(
     state: FSMContext,
     tenant: TenantContext | None = None,
 ) -> None:
-    """Create a team and return the code that binds a group to it.
+    """Name your team, for whoever wants to.
 
-    Re-running it is how you get another code. The first version refused
-    outright once you had a workspace, which dead-ended anybody who took longer
-    than the 15-minute TTL to create a supergroup and grant four admin rights —
-    ``/setup`` needs a code, and this was the only command that minted one.
+    Optional now: ``/start`` already made one. This exists so a team can carry
+    a name somebody chose rather than a Telegram username, and so the old
+    instructions in somebody's scrollback still work.
     """
     await abandon_wizard(state)
     if message.chat.type != "private":
@@ -216,25 +260,146 @@ async def register(
         return
     if tenant is not None:
         # Only *owning* one blocks you. Being a member of somebody else's
-        # workspace is not a reason you cannot have your own.
+        # team is not a reason you cannot have your own.
         if not tenant.is_owner:
             await tell(
                 message,
                 f"You are a member of <b>{escape(tenant.slug)}</b>, which "
                 "someone else owns. Send <code>/leave</code> first if you want "
-                "your own workspace.",
+                "your own team.",
             )
             return
-        await _resume_registration(message, tenant)
-        return
-    if not settings.registration_open:
-        await tell(message, _CLOSED)
+        await _resume(message, tenant.row, is_owner=True)
         return
 
-    name = command_text(message).strip()
-    if not name:
-        await tell(message, "Usage: <code>/register your-team-name</code>")
+    seats = await tenancy.memberships_for_user(system_database(), message.from_user.id)
+    if seats:
+        # The middleware could not resolve which team this chat means, but the
+        # seat exists — creating a second one would only deepen the ambiguity.
+        await _resume_seat(message, seats)
         return
+
+    # An empty name is not an error any more: the default is a good name, and
+    # a usage line here would be one more round trip before the first prompt.
+    name = command_text(message).strip() or _default_name(message.from_user)
+    created = await _create_team(message, settings, name=name)
+    if created is None:
+        return
+    await tell(message, _ASK_FOR_KEY.format(slug=escape(created.slug)))
+
+
+@router.message(Command("team"))
+async def team(
+    message: Message,
+    tenant: TenantContext,
+    state: FSMContext,
+) -> None:
+    """The optional group flow, and the single-use code that starts it.
+
+    Discoverable on its own so nothing earlier has to mention a group. Re-run
+    it for a fresh code: the old one expires in 15 minutes, which is less time
+    than creating a supergroup and granting four admin rights often takes.
+    """
+    await abandon_wizard(state)
+    if message.chat.type != "private":
+        await tell(message, "Send <code>/team</code> to me in a private chat.")
+        return
+    if not tenant.is_owner:
+        await tell(message, "Owners only.")
+        return
+    if message.from_user is None:  # pragma: no cover - private chats have one
+        return
+    await tell(message, await _group_card(message, tenant))
+
+
+async def _resume(message: Message, row: tenancy.TenantRow, *, is_owner: bool) -> None:
+    """Answer someone who already has a team with the one thing left to do.
+
+    Two states now, not three: no key yet, or ready. A group is no longer a
+    step, so "you have not made one" is not an unfinished sign-up.
+    """
+    if not row.has_conductor_key:
+        if not is_owner:
+            await tell(
+                message,
+                f"<b>{escape(row.slug)}</b> has no Conductor key yet · its "
+                "owner sends <code>/key</code>.",
+            )
+            return
+        await tell(message, _ASK_FOR_KEY.format(slug=escape(row.slug)))
+        return
+    await tell(message, await _ready(row))
+
+
+async def _resume_seat(message: Message, seats: list[tenancy.TenantMember]) -> None:
+    """Resume from a membership row, when no tenant was resolved for us.
+
+    ``/start`` and ``/register`` run unresolved, so this is the idempotency
+    guard: the seat is the proof a team already exists, and two taps must not
+    make two teams. Ownership wins ties the way the middleware picks a DM's
+    team, and a genuine tie is answered rather than guessed.
+    """
+    system = system_database()
+    owned = [seat for seat in seats if seat.role in ("owner", "admin")]
+    candidates = owned or seats
+    if len(candidates) != 1:
+        await tell(
+            message,
+            "You are in several teams · <code>/use name</code> picks the one "
+            "this chat means.",
+        )
+        return
+    row = await tenancy.get(system, candidates[0].tenant_id)
+    if row is None:  # pragma: no cover - FK makes this unreachable
+        return
+    await _resume(message, row, is_owner=candidates[0].role in ("owner", "admin"))
+
+
+async def _ready(row: tenancy.TenantRow) -> str:
+    """The finish line, and where to prompt. Never "now build a group"."""
+    if await _has_group(row.id):
+        return (
+            f"<b>{escape(row.slug)}</b> is ready · send "
+            "<code>/new &lt;prompt&gt;</code> in your group."
+        )
+    return (
+        f"<b>{escape(row.slug)}</b> is ready · send "
+        "<code>/new &lt;prompt&gt;</code> here.\n"
+        "<code>/team</code> adds a group · optional."
+    )
+
+
+async def _has_group(tenant_id: uuid.UUID) -> bool:
+    chats = await tenancy.list_chats(system_database(), tenant_id)
+    return any(chat.kind == "group" for chat in chats)
+
+
+def _default_name(user: User) -> str:
+    """A team name derived from the Telegram account.
+
+    The container needs *a* name, not a decision. ``/register`` still takes a
+    better one, and it is only ever a label — the slug is what appears in logs.
+    """
+    if user.username:
+        return user.username
+    full = " ".join(part for part in (user.first_name, user.last_name) if part)
+    return full.strip() or f"team-{user.id}"
+
+
+async def _create_team(
+    message: Message, settings: Settings, *, name: str
+) -> tenancy.TenantRow | None:
+    """Create a team, or say why not. ``None`` means the caller is done.
+
+    This is the sign-up path whichever command reached it, so the instance's
+    open/closed switch and its rate limit are enforced here rather than in one
+    of the two callers.
+    """
+    if message.from_user is None:  # pragma: no cover - callers checked
+        return None
+    if not settings.registration_open:
+        await tell(message, _CLOSED)
+        return None
 
     system = system_database()
     # Registration is open and unauthenticated: one INSERT per call, and
@@ -246,9 +411,13 @@ async def register(
             "registration.rate_limited", recent=recent, user_id=message.from_user.id
         )
         await tell(message, "Sign-ups are busy right now. Try again in an hour.")
-        return
+        return None
 
     slug = slugify(name)
+    if slug == _FALLBACK_SLUG:
+        # Nothing survived slugification — a name in another script, or one
+        # that really is "workspace". Either way, say whose it is.
+        slug = f"team-{message.from_user.id}"
     # Slugs are visible to their owner and appear in logs, so a collision must
     # not merge two customers. Suffix instead.
     if await tenancy.get_by_slug(system, slug) is not None:
@@ -263,43 +432,49 @@ async def register(
         )
     except Exception as exc:
         await tell(message, f"Could not register: {escape(short_error(exc))}")
-        return
+        return None
 
     log.info("registration.created", tenant=created.slug)
-    await tell(message, _ASK_FOR_KEY.format(slug=escape(created.slug)))
+    await _claim_dm(message, created)
+    return created
 
 
-async def _resume_registration(message: Message, tenant: TenantContext) -> None:
-    """Pick up where an interrupted sign-up left off, with a fresh code.
+async def _claim_dm(message: Message, row: tenancy.TenantRow) -> None:
+    """Point this private chat at the team it just created.
 
-    Three states, answered in the order the setup happens: no key yet, a key but
-    no group, and finished. Each ends with the one thing to do next, because
-    "you already have a team" is not an instruction.
+    Without a row the DM resolves by *sole* membership, which stops resolving
+    the moment somebody owns two teams — and ``/use``, the command that fixes
+    that, needs a resolved tenant itself. Binding here means the second team
+    never dead-ends the first.
+
+    Best effort, and deliberately non-destructive: a DM already bound to
+    another team stays where it is. ``/use`` is how one person says which of
+    their teams this chat means; creating one must not decide it for them.
     """
-    if message.from_user is None:  # pragma: no cover - private chats have one
+    if message.from_user is None:  # pragma: no cover - callers checked
         return
     system = system_database()
-    if not tenant.row.has_conductor_key:
-        await tell(message, _ASK_FOR_KEY.format(slug=escape(tenant.slug)))
+    if await tenancy.chat_for(system, message.chat.id) is not None:
         return
-    bound = await tenancy.primary_chat(system, tenant.tenant_id)
-    if bound is None:
-        await tell(message, await _group_instructions(message, tenant))
-        return
-    await tell(
-        message,
-        f"<b>{escape(tenant.slug)}</b> is set up and running. "
-        "Send <code>/new &lt;prompt&gt;</code> in your group, or "
-        "<code>/members</code> to see who is in.",
-    )
+    with suppress(Exception):
+        await tenancy.bind_chat(
+            system,
+            message.chat.id,
+            row.id,
+            kind="dm",
+            # Owner notices land here until a group is bound; `/setup` moves
+            # the flag to the group, because that is where the team is then.
+            is_primary=True,
+            bound_by=message.from_user.id,
+        )
 
 
-async def _group_instructions(message: Message, tenant: TenantContext) -> str:
+async def _group_card(message: Message, tenant: TenantContext) -> str:
     """A fresh binding code and what to do with it.
 
-    Minted here rather than at ``/register`` so the 15-minute clock starts when
-    the owner is actually ready to create a group — not while they are still
-    looking for an API key.
+    Minted at ``/team`` rather than at sign-up so the 15-minute clock starts
+    when the owner is actually ready to make a group — and so nothing before
+    this point has to mention one.
     """
     if message.from_user is None:  # pragma: no cover - private chats have one
         return ""
@@ -310,7 +485,7 @@ async def _group_instructions(message: Message, tenant: TenantContext) -> str:
         purpose="bind_chat",
     )
     log.info("registration.code_issued", tenant=tenant.slug)
-    return _NEXT_STEPS.format(code=escape(code))
+    return _GROUP_STEPS.format(code=escape(code))
 
 
 @router.message(Command("setup"))
@@ -347,8 +522,8 @@ async def setup(
         if not code:
             await tell(
                 message,
-                "This group is not linked to a workspace yet. Send "
-                "<code>/register</code> to me privately, then run "
+                "This group is not linked to a team yet. Send "
+                "<code>/team</code> to me privately for a code, then "
                 "<code>/setup &lt;code&gt;</code> here.",
             )
             return
@@ -379,8 +554,8 @@ async def setup(
             await tell(
                 message,
                 "That code was issued to someone else. Ask the person who ran "
-                "<code>/register</code> to run <code>/setup</code> here, or "
-                "send <code>/register</code> to me privately for your own code.",
+                "<code>/team</code> to run <code>/setup</code> here, or send "
+                "<code>/team</code> to me privately for your own code.",
             )
             return
     elif tenant is None or not tenant.is_owner:
@@ -453,17 +628,17 @@ async def _setup_dm(
     message: Message, tenant: TenantContext | None, db: Database | None
 ) -> None:
     if tenant is None:
-        await tell(message, "Send <code>/register</code> first.")
+        await tell(message, "Send <code>/start</code> first.")
         return
     async with tenant_scope(tenant.tenant_id):
         await chats_repo.ensure(resolve_db(db), message.chat.id, 0, kind="dm")
-    await tell(message, "DM mode ready · one session at a time.")
+    await tell(message, "DM ready · <code>/new &lt;prompt&gt;</code> starts one.")
 
 
 @router.message(Command("key", "voicekey"))
 async def set_key(
     message: Message,
-    tenant: TenantContext,
+    tenant: TenantContext | None,
     settings: Settings,
     state: FSMContext,
 ) -> None:
@@ -492,6 +667,18 @@ async def set_key(
         note = _delete_note(deleted)
     else:
         note = ""
+
+    if tenant is None:
+        # A key pasted before `/start`. The message is already deleted above,
+        # which is the urgent half; the instruction is the cheap half.
+        # Unreachable while ``UNRESOLVED_COMMANDS`` withholds ``/key`` from a
+        # non-member — but a live credential must never depend on that.
+        await tell(
+            message,
+            "Send <code>/start</code> first, then the key." + note,
+            silent=not note,
+        )
+        return
 
     if not tenant.is_owner:
         await tell(
@@ -586,19 +773,10 @@ async def set_key(
     forget_cached(tenant.tenant_id)
     stored = "Key stored and your message deleted." if not note else "Key stored."
 
-    # Hand straight on to the next step rather than ending the conversation.
-    # The owner is here, in the private chat, with nothing else to do — making
-    # them run /register again to find out what happens next is the round trip
-    # this ordering exists to remove.
-    bound = await tenancy.primary_chat(system, tenant.tenant_id)
-    if bound is None:
-        tail = "\n\n" + await _group_instructions(message, tenant)
-    else:
-        tail = (
-            " Your team is active — send <code>/new &lt;prompt&gt;</code> "
-            "in your group."
-        )
-    await tell(message, stored + tail + note)
+    # This is the end of sign-up, so say so and name the next thing to *do*.
+    # It used to hand out a binding code here, which made a supergroup read as
+    # step three of three rather than an option nobody has to take.
+    await tell(message, stored + "\n" + await _ready(tenant.row) + note)
 
 
 async def _store_speech_key(
@@ -832,7 +1010,7 @@ async def use(
                 names.append(f"<code>{escape(row.slug)}</code>{mark}")
         await tell(
             message,
-            "Usage: <code>/use workspace-name</code>\nYou are in: "
+            "Usage: <code>/use team-name</code>\nYou are in: "
             + (", ".join(names) or "nothing yet"),
         )
         return
@@ -884,7 +1062,7 @@ async def forget(
         await tell(message, "Send <code>/forget</code> to me in a private chat.")
         return
     if tenant.role != "owner":
-        await tell(message, "Only an owner can delete a workspace.")
+        await tell(message, "Only an owner can delete a team.")
         return
     await tell(
         message,
