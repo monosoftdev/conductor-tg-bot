@@ -26,8 +26,19 @@ from ctb.db.repo._util import (
     update_sql,
 )
 
+
+class ChatOwnedElsewhereError(RuntimeError):
+    """A chat id is already routed to a different tenant.
+
+    ``tenant_chats.chat_id`` is a primary key precisely so this cannot happen
+    in production — one Telegram chat belongs to one workspace, forever. This
+    exists so that if the invariant is ever broken, it says so.
+    """
+
+
 __all__ = [
     "ChatKind",
+    "ChatOwnedElsewhereError",
     "ChatRow",
     "bind",
     "delete",
@@ -139,8 +150,15 @@ async def ensure(
             (chat_id, thread_id, kind, stamp, stamp),
         )
         row = await get(db, chat_id, thread_id)
-    if row is None:  # pragma: no cover - the insert above guarantees a row
-        raise RuntimeError(f"chats row vanished for ({chat_id}, {thread_id})")
+    if row is None:
+        # The insert succeeded-or-conflicted, yet we cannot read it back. The
+        # only way that happens is a row under a *different* tenant: the PK is
+        # (chat_id, thread_id), so the conflict is real while row-level
+        # security hides the winner. Say that, rather than "vanished".
+        raise ChatOwnedElsewhereError(
+            f"chat {chat_id} already belongs to another workspace; a Telegram "
+            "chat can be bound to only one"
+        )
     return row
 
 
