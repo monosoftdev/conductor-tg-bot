@@ -65,7 +65,7 @@ Operator: `/platform list|suspend|resume`, gated on `PLATFORM_ADMIN_IDS`
 
 ## Running it
 
-Python 3.13 and a PostgreSQL 16 server.
+Python 3.13 and a PostgreSQL 16+ server (tested on 16 in CI, verified on 18).
 
 ```bash
 python3.13 -m venv .venv
