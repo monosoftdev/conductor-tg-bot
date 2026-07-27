@@ -1783,3 +1783,90 @@ async def test_the_step_after_a_tap_is_tappable_by_the_owner(
     )
 
     assert second.answers == [""], "the owner must be able to tap the card it drew"
+
+
+async def _wizard_to_branch(
+    db: Database, settings: Settings, monkeypatch: Any
+) -> list[Any]:
+    """Start the wizard and answer the project step. Returns the cards drawn."""
+    cards: list[Any] = []
+
+    async def fake_edit(_message: Any, _text: str, markup: Any) -> None:
+        cards.append(markup)
+
+    async def fake_tell(_message: Any, _text: str, **kwargs: Any) -> Any:
+        cards.append(kwargs.get("reply_markup"))
+        return SimpleNamespace(message_id=3)
+
+    monkeypatch.setattr(new_workspace, "_edit", fake_edit)
+    monkeypatch.setattr(new_workspace, "tell", fake_tell)
+    await new_workspace.start_wizard(
+        _wizard_message(),  # type: ignore[arg-type]
+        route=Route(chat_id=-1001, kind="topic"),
+        settings=settings,
+        state=_seat(db),
+        db=db,
+        client=_CountingClient(),  # type: ignore[arg-type]
+        nonces=NonceStore(),
+    )
+    return cards
+
+
+def _labelled(markup: Any, label: str) -> str:
+    return str(
+        next(
+            item for row in markup.inline_keyboard for item in row if item.text == label
+        ).callback_data
+    )
+
+
+async def test_go_with_defaults_mid_wizard_keeps_the_answers_already_given(
+    db: Database, settings_factory: Callable[..., Settings], monkeypatch: Any
+) -> None:
+    """Pick dev, then hit defaults: dev survives, the rest come from settings.
+
+    "Go with defaults" is a jump to the end, not an answer to one step — so
+    every question after it is answered from configuration and every question
+    before it keeps what was chosen.
+    """
+    settings = settings_factory(
+        default_branch="dev",
+        default_agent="claude",
+        default_model="opus-5-1m",
+        default_effort="high",
+    )
+    cards = await _wizard_to_branch(db, settings, monkeypatch)
+
+    # Project step → branch step.
+    project = _Tap(str(cards[-1].inline_keyboard[0][0].callback_data))
+    await new_workspace.wizard_callback(
+        project,  # type: ignore[arg-type]
+        _seat(db),
+        NonceStore(),
+        settings,
+    )
+    # Choose dev explicitly, then bail out to defaults on the *next* question.
+    branch = _Tap(_labelled(cards[-1], "dev"))
+    await new_workspace.wizard_callback(
+        branch,  # type: ignore[arg-type]
+        _seat(db),
+        NonceStore(),
+        settings,
+    )
+    defaults = _Tap(_labelled(cards[-1], "Go with defaults →"))
+    await new_workspace.wizard_callback(
+        defaults,  # type: ignore[arg-type]
+        _seat(db),
+        NonceStore(),
+        settings,
+    )
+
+    data = await _seat(db).get_data()
+    assert defaults.answers == [""]
+    assert data["step"] == "prompt", "defaults skips straight to the prompt"
+    assert data["branch"] == "dev", "the explicit choice is not overwritten"
+    assert (data["agent"], data["model"], data["effort"]) == (
+        "claude",
+        "opus-5-1m",
+        "high",
+    )
