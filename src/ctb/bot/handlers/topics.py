@@ -25,6 +25,7 @@ This module has no router. It is imported by the handlers that do.
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass
 from typing import Any, Final
 
@@ -50,19 +51,23 @@ __all__ = [
     "TOPIC_NAME_LIMIT",
     "TOPIC_ICON_COLORS",
     "ForumSupport",
+    "TopicCreateError",
     "apply_marker",
     "attach_topic",
     "close_topic",
     "create_topic",
+    "discard_topic",
     "edit_html",
     "ensure_topic",
     "forum_support",
     "jump_url",
     "marker_for",
+    "require_topic",
     "resolve_client",
     "resolve_db",
     "send_html",
     "sync_marker",
+    "telegram_reason",
     "topic_label",
     "topic_icon_color",
     "topic_title",
@@ -80,6 +85,15 @@ TOPIC_ICON_COLORS: Final[tuple[int, ...]] = (
     0x8EEE98,
     0xFF93B2,
     0xFB6F5F,
+)
+
+#: aiogram wraps every API error as "Telegram server says - Bad Request: <why>".
+#: Only ``<why>`` is worth a phone line; the rest is the same on every failure.
+_TELEGRAM_NOISE: Final = re.compile(
+    r"^\s*(?:telegram\s+server\s+says\s*[-:]?\s*)?"
+    r"(?:(?:bad\s+request|forbidden|unauthorized|conflict|not\s+found"
+    r"|too\s+many\s+requests)\s*:\s*)?",
+    re.IGNORECASE,
 )
 
 #: Turn states that mean "this session is busy right now".
@@ -313,18 +327,44 @@ async def forum_support(bot: Bot, chat_id: int) -> ForumSupport:
     return ForumSupport(True)
 
 
-async def create_topic(
+def telegram_reason(exc: BaseException) -> str:
+    """Telegram's own words, stripped of the boilerplate around them.
+
+    ``"Telegram server says - Bad Request: not enough rights to create a
+    topic"`` becomes ``"not enough rights to create a topic"`` — the only part
+    that tells the owner what to fix, and short enough for one phone line.
+    """
+    text = str(exc).strip()
+    line = text.splitlines()[0] if text else type(exc).__name__
+    cleaned = _TELEGRAM_NOISE.sub("", line).strip()
+    return (cleaned or type(exc).__name__)[:120]
+
+
+class TopicCreateError(RuntimeError):
+    """Telegram refused to create the forum topic, and said why.
+
+    The old hardcoded "run /setup and grant Manage Topics" sent the owner in a
+    circle when ``/setup`` reported everything was fine — so the reason travels
+    with the exception all the way to the chat.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(f"Topic creation failed · {reason}")
+        self.reason = reason
+
+
+async def require_topic(
     bot: Bot,
     chat_id: int,
     label: str,
     *,
     marker: TopicMarker = TopicMarker.INITIALIZING,
-) -> int | None:
-    """Create the topic **now**, before the workspace exists.
+) -> int:
+    """Create the topic **now**, before the workspace exists — or raise.
 
-    ``None`` means this chat cannot host topics (a DM, forum mode off, missing
-    permission) — the caller falls back to degraded single-session mode rather
-    than failing the command.
+    This call is the *proof* that a topic can exist here. ``can_manage_topics``
+    is not: it has been observed ``true`` on a chat that then refused
+    ``createForumTopic``. Anything that costs money runs after this returns.
     """
     try:
         topic = await bot.create_forum_topic(
@@ -333,9 +373,62 @@ async def create_topic(
             icon_color=topic_icon_color(label),
         )
     except TelegramAPIError as exc:
-        log.warning("topics.create_failed", chat_id=chat_id, error=str(exc))
-        return None
+        reason = telegram_reason(exc)
+        log.warning(
+            "topics.create_failed", chat_id=chat_id, reason=reason, error=str(exc)
+        )
+        raise TopicCreateError(reason) from exc
     return topic.message_thread_id
+
+
+async def create_topic(
+    bot: Bot,
+    chat_id: int,
+    label: str,
+    *,
+    marker: TopicMarker = TopicMarker.INITIALIZING,
+) -> int | None:
+    """:func:`require_topic` for callers that degrade instead of failing.
+
+    ``None`` means this chat cannot host topics (a DM, forum mode off, missing
+    permission) — the caller falls back to degraded single-session mode rather
+    than failing the command.
+    """
+    try:
+        return await require_topic(bot, chat_id, label, marker=marker)
+    except TopicCreateError:
+        return None
+
+
+async def discard_topic(bot: Bot, chat_id: int, topic_id: int) -> bool:
+    """Undo a topic *this same call* just created. Never a pre-existing one.
+
+    A topic is free and deletable; the cloud workspace it was meant to host is
+    neither. When the create half of the pair fails, the topic goes away so a
+    retry does not leave a column of empty rooms behind. Delete first, close as
+    the fallback — an old topic with messages in it cannot be deleted.
+    """
+    try:
+        await bot.delete_forum_topic(chat_id=chat_id, message_thread_id=topic_id)
+        return True
+    except TelegramAPIError as exc:
+        log.warning(
+            "topics.discard_failed",
+            chat_id=chat_id,
+            topic_id=topic_id,
+            error=str(exc),
+        )
+    try:
+        await bot.close_forum_topic(chat_id=chat_id, message_thread_id=topic_id)
+    except TelegramAPIError as exc:
+        log.warning(
+            "topics.discard_close_failed",
+            chat_id=chat_id,
+            topic_id=topic_id,
+            error=str(exc),
+        )
+        return False
+    return True
 
 
 async def attach_topic(

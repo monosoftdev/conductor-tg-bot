@@ -19,8 +19,10 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import Message, ReactionTypeEmoji
 
 from ctb.bot.handlers.topics import (
-    create_topic,
+    apply_marker,
+    discard_topic,
     forum_support,
+    require_topic,
     resolve_client,
     resolve_db,
     send_html,
@@ -38,7 +40,7 @@ from ctb.db.repo import workspaces as workspaces_repo
 from ctb.delivery.render.html import escape
 from ctb.settings import Settings
 from ctb.turn import cursor
-from ctb.turn.state import Cancel, Evidence, TurnState
+from ctb.turn.state import Cancel, Evidence, TopicMarker, TurnState
 
 FOCUS_MS: Final = 30 * 60 * 1000
 DEFAULT_BRANCH: Final = "main"
@@ -371,65 +373,68 @@ async def create_and_bind_input(
     operation_id = action_id or f"{chat_id}:{tg_message_id}"
     nonce = cursor.stable_nonce(operation_id)
     # A cloud workspace starts billing the instant it is created, and
-    # ``POST /workspaces`` has no idempotency key — so every retry after a
-    # failed ``create_forum_topic`` strands another paid container. Prove the
-    # topic can be created *before* spending anything.
+    # ``POST /workspaces`` has no idempotency key — so a topic failure *after*
+    # it strands a paid container that no retry can adopt. ``can_manage_topics``
+    # is not proof: it has been observed ``true`` on a chat that then refused
+    # ``createForumTopic``. The only proof that a topic can exist is a topic
+    # that exists, so it is created first. A topic is free and deletable.
+    thread_id = NO_THREAD_ID
+    # Set only when *this* call created the topic — the only one we may delete.
+    fresh_topic: int | None = None
+    prior_label: str | None = None
     if chat_type != "private":
         if bot is None:
             raise RuntimeError("Telegram bot is not bound to the input")
         prior = await workspaces_repo.get_by_nonce(database, nonce)
-        reusable = prior is not None and prior.chat_id == chat_id and prior.topic_id
-        if not reusable:
+        if prior is not None and prior.chat_id == chat_id and prior.topic_id:
+            # A replayed update: reuse the topic this nonce already owns rather
+            # than opening a sibling next to it.
+            thread_id = prior.topic_id
+            prior_label = prior.topic_name
+        else:
             support = await forum_support(bot, chat_id)
             if support.degraded:
                 raise RuntimeError(
                     f"No topic permission ({support.detail or support.reason}). "
                     "Run /setup."
                 )
-    creation = await cursor.create_workspace(
-        conductor,
-        database,
-        chat_id=chat_id,
-        project_id=request.project_id,
-        branch=request.branch,
-        session_name=request.prompt[:80],
-        agent=request.agent,
-        model=request.model,
-        effort=request.effort,
-        nonce=nonce,
-    )
-    if not creation.ok or creation.workspace_id is None:
-        raise RuntimeError(
-            "Workspace create is uncertain. Check Conductor; it was not retried."
+            thread_id = fresh_topic = await require_topic(bot, chat_id, label)
+    try:
+        creation = await cursor.create_workspace(
+            conductor,
+            database,
+            chat_id=chat_id,
+            project_id=request.project_id,
+            branch=request.branch,
+            session_name=request.prompt[:80],
+            agent=request.agent,
+            model=request.model,
+            effort=request.effort,
+            nonce=nonce,
         )
+        if not creation.ok or creation.workspace_id is None:
+            raise RuntimeError(
+                "Workspace create is uncertain. Check Conductor; it was not retried."
+            )
+    except BaseException:
+        # Nothing will ever live in this room. Free and deletable, unlike the
+        # container it was meant to host — so a retry finds no empty siblings.
+        if fresh_topic is not None and bot is not None:
+            await discard_topic(bot, chat_id, fresh_topic)
+        raise
     workspace_id = creation.workspace_id
     workspace_name = creation.name
     deep_link = creation.deep_link
-    # Create the topic only after the stable workspace nonce has reconciled.
-    # Persist the mapping immediately: once Telegram returns, a normal replay
-    # reuses this topic instead of creating a sibling duplicate.
-    thread_id = NO_THREAD_ID
-    cached = await workspaces_repo.get_by_nonce(database, nonce)
-    if chat_type != "private":
-        if cached is not None and cached.chat_id == chat_id and cached.topic_id:
-            thread_id = cached.topic_id
-        else:
-            if bot is None:
-                raise RuntimeError("Telegram bot is not bound to the input")
-            created_topic = await create_topic(bot, chat_id, label)
-            if created_topic is None:
-                raise RuntimeError(
-                    "Topic creation failed. Run /setup and grant Manage Topics."
-                )
-            thread_id = created_topic
-            await workspaces_repo.upsert(
-                database,
-                workspace_id,
-                create_nonce=nonce,
-                chat_id=chat_id,
-                topic_id=thread_id,
-                topic_name=label,
-            )
+    # Persist the mapping immediately: from here on a replay reuses this topic.
+    if fresh_topic is not None:
+        await workspaces_repo.upsert(
+            database,
+            workspace_id,
+            create_nonce=nonce,
+            chat_id=chat_id,
+            topic_id=thread_id,
+            topic_name=label,
+        )
     session_id = creation.session_id or ""
     if not session_id:
         page = await conductor.list_workspace_sessions(workspace_id, limit=1)
@@ -453,6 +458,13 @@ async def create_and_bind_input(
         topic_id=thread_id if thread_id else None,
         topic_name=label,
     )
+    # The topic was named before the workspace existed. If what it actually
+    # carries is not what the workspace ended up called, correct it through the
+    # one rename path there is — never a second mechanism.
+    if bot is not None and prior_label is not None and prior_label != label:
+        await apply_marker(
+            bot, database, workspace_id, TopicMarker.INITIALIZING, label=label
+        )
     await sessions_repo.upsert(
         database,
         session_id,

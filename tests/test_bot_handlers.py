@@ -6,6 +6,8 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.methods import CreateForumTopic
 
 from ctb.bot.handlers import core as core_handlers
 from ctb.bot.handlers import prompts as prompt_handlers
@@ -32,12 +34,22 @@ from ctb.bot.handlers.core import (
     status_icon,
 )
 from ctb.bot.handlers.power import switchable_sessions
-from ctb.bot.handlers.topics import TOPIC_ICON_COLORS, topic_icon_color
+from ctb.bot.handlers.topics import (
+    TOPIC_ICON_COLORS,
+    TopicCreateError,
+    telegram_reason,
+    topic_icon_color,
+)
 from ctb.bot.keyboards import NonceStore
 from ctb.bot.middleware.routing import Route
+from ctb.bot.wizards import new_workspace
 from ctb.conductor.models import (
     PostMessageResult,
     PostState,
+    Project,
+    ProjectsPage,
+    Session,
+    SessionsPage,
     SqlResult,
     TranscriptMessage,
     WorkspaceCreateResult,
@@ -87,14 +99,26 @@ class _NullState:
 
 
 class _ForumBot:
-    """Just enough of ``Bot`` for ``forum_support`` plus ``create_forum_topic``."""
+    """Just enough of ``Bot`` for ``forum_support`` plus the topic lifecycle."""
 
     def __init__(
-        self, *, is_forum: bool = True, can_manage_topics: bool = True
+        self,
+        *,
+        is_forum: bool = True,
+        can_manage_topics: bool = True,
+        create_error: Exception | None = None,
+        delete_error: Exception | None = None,
+        trace: list[str] | None = None,
     ) -> None:
         self._is_forum = is_forum
         self._can_manage_topics = can_manage_topics
+        self._create_error = create_error
+        self._delete_error = delete_error
         self.topics = 0
+        self.deleted: list[int] = []
+        self.closed: list[int] = []
+        self.renamed: list[str] = []
+        self.trace = trace if trace is not None else []
 
     async def get_chat(self, _chat_id: int) -> Any:
         return SimpleNamespace(type="supergroup", is_forum=self._is_forum)
@@ -106,21 +130,61 @@ class _ForumBot:
         return SimpleNamespace(can_manage_topics=self._can_manage_topics)
 
     async def create_forum_topic(self, **_: Any) -> Any:
+        self.trace.append("create_topic")
+        if self._create_error is not None:
+            raise self._create_error
         self.topics += 1
         return SimpleNamespace(message_thread_id=99)
+
+    async def delete_forum_topic(self, **kwargs: Any) -> None:
+        self.trace.append("delete_topic")
+        if self._delete_error is not None:
+            raise self._delete_error
+        self.deleted.append(int(kwargs["message_thread_id"]))
+
+    async def close_forum_topic(self, **kwargs: Any) -> None:
+        self.trace.append("close_topic")
+        self.closed.append(int(kwargs["message_thread_id"]))
+
+    async def edit_forum_topic(self, **kwargs: Any) -> None:
+        self.trace.append("rename_topic")
+        self.renamed.append(str(kwargs["name"]))
+
+
+def _refused(reason: str) -> TelegramBadRequest:
+    """What aiogram raises when Telegram refuses the call."""
+    return TelegramBadRequest(
+        method=CreateForumTopic(chat_id=-1001, name="x"), message=reason
+    )
 
 
 class _CountingClient:
     """Counts the one call that costs money."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        create_error: Exception | None = None,
+        trace: list[str] | None = None,
+    ) -> None:
         self.creates = 0
+        self._create_error = create_error
+        self.trace = trace if trace is not None else []
 
     async def list_project_workspaces(self, *_: Any, **__: Any) -> WorkspacesPage:
         return WorkspacesPage(data=[], has_more=False)
 
+    async def list_projects(self, *_: Any, **__: Any) -> ProjectsPage:
+        return ProjectsPage(data=[Project(id="project-1", name="api")], has_more=False)
+
+    async def list_workspace_sessions(self, *_: Any, **__: Any) -> SessionsPage:
+        return SessionsPage(data=[Session(id="session-new")], has_more=False)
+
     async def create_workspace(self, **_: Any) -> WorkspaceCreateResult:
+        self.trace.append("create_workspace")
         self.creates += 1
+        if self._create_error is not None:
+            raise self._create_error
         return WorkspaceCreateResult(
             workspace_id="workspace-1",
             session_id="session-new",
@@ -798,3 +862,295 @@ async def test_new_still_creates_the_workspace_when_topics_are_allowed(
     assert client.creates == 1
     assert bot.topics == 1
     assert created.thread_id == 99
+
+
+async def test_no_workspace_is_paid_for_when_telegram_refuses_the_topic(
+    db: Database,
+) -> None:
+    """The money test.
+
+    Telegram reported ``can_manage_topics`` true and then refused
+    ``createForumTopic`` — the permission bit is a hint, the created topic is
+    the proof. ``POST /workspaces`` has no idempotency key, so a workspace
+    created before that refusal is a paid container nothing can adopt.
+    """
+    bot = _ForumBot(create_error=_refused("Bad Request: not enough rights"))
+    client = _CountingClient()
+    assert (await bot.get_chat_member(-1001, 42)).can_manage_topics is True
+
+    with pytest.raises(TopicCreateError) as error:
+        await create_and_bind_input(
+            bot=bot,  # type: ignore[arg-type]
+            chat_id=-1001,
+            chat_type="supergroup",
+            tg_message_id=5,
+            route=Route(chat_id=-1001, kind="general"),
+            request=_REQUEST,
+            db=db,
+            client=client,  # type: ignore[arg-type]
+        )
+
+    assert client.creates == 0
+    assert await workspaces_repo.list_all(db) == []
+    # …and the reason is Telegram's own, not a guess that sends the owner to
+    # a /setup that reports everything is fine.
+    assert str(error.value) == "Topic creation failed · not enough rights"
+
+
+async def test_topic_is_created_before_the_workspace_is_paid_for(
+    db: Database,
+) -> None:
+    trace: list[str] = []
+    bot = _ForumBot(trace=trace)
+    client = _CountingClient(trace=trace)
+
+    await create_and_bind_input(
+        bot=bot,  # type: ignore[arg-type]
+        chat_id=-1001,
+        chat_type="supergroup",
+        tg_message_id=5,
+        route=Route(chat_id=-1001, kind="general"),
+        request=_REQUEST,
+        db=db,
+        client=client,  # type: ignore[arg-type]
+    )
+
+    assert trace == ["create_topic", "create_workspace"]
+
+
+async def test_orphan_topic_is_discarded_when_the_workspace_create_fails(
+    db: Database,
+) -> None:
+    """A topic is free and deletable; a retry must not stack empty rooms."""
+    bot = _ForumBot()
+    client = _CountingClient(create_error=RuntimeError("conductor is down"))
+
+    with pytest.raises(RuntimeError, match="conductor is down"):
+        await create_and_bind_input(
+            bot=bot,  # type: ignore[arg-type]
+            chat_id=-1001,
+            chat_type="supergroup",
+            tg_message_id=5,
+            route=Route(chat_id=-1001, kind="general"),
+            request=_REQUEST,
+            db=db,
+            client=client,  # type: ignore[arg-type]
+        )
+
+    assert bot.deleted == [99]
+    assert bot.closed == []
+
+
+async def test_orphan_topic_is_closed_when_it_cannot_be_deleted(
+    db: Database,
+) -> None:
+    bot = _ForumBot(delete_error=_refused("Bad Request: topic not found"))
+    client = _CountingClient(create_error=RuntimeError("conductor is down"))
+
+    with pytest.raises(RuntimeError, match="conductor is down"):
+        await create_and_bind_input(
+            bot=bot,  # type: ignore[arg-type]
+            chat_id=-1001,
+            chat_type="supergroup",
+            tg_message_id=5,
+            route=Route(chat_id=-1001, kind="general"),
+            request=_REQUEST,
+            db=db,
+            client=client,  # type: ignore[arg-type]
+        )
+
+    assert bot.deleted == []
+    assert bot.closed == [99]
+
+
+async def test_a_replayed_new_reuses_the_workspace_and_the_topic(
+    db: Database,
+) -> None:
+    """Same update twice: one paid workspace, one topic, no siblings."""
+    bot = _ForumBot()
+    client = _CountingClient()
+    kwargs: dict[str, Any] = {
+        "bot": bot,
+        "chat_id": -1001,
+        "chat_type": "supergroup",
+        "tg_message_id": 5,
+        "route": Route(chat_id=-1001, kind="general"),
+        "request": _REQUEST,
+        "db": db,
+        "client": client,
+    }
+
+    first = await create_and_bind_input(**kwargs)
+    second = await create_and_bind_input(**kwargs)
+
+    assert client.creates == 1
+    assert bot.topics == 1
+    assert bot.deleted == [] and bot.closed == []
+    assert first.thread_id == second.thread_id == 99
+    assert first.workspace_id == second.workspace_id
+    assert len(await workspaces_repo.list_all(db)) == 1
+
+
+async def test_a_replay_renames_a_topic_whose_title_drifted(
+    db: Database,
+) -> None:
+    """The label is fixed through the one rename path, not a second one."""
+    bot = _ForumBot()
+    client = _CountingClient()
+    await create_and_bind_input(
+        bot=bot,  # type: ignore[arg-type]
+        chat_id=-1001,
+        chat_type="supergroup",
+        tg_message_id=5,
+        route=Route(chat_id=-1001, kind="general"),
+        request=_REQUEST,
+        db=db,
+        client=client,  # type: ignore[arg-type]
+    )
+    await workspaces_repo.update(db, "workspace-1", topic_name="stale/name")
+
+    await create_and_bind_input(
+        bot=bot,  # type: ignore[arg-type]
+        chat_id=-1001,
+        chat_type="supergroup",
+        tg_message_id=5,
+        route=Route(chat_id=-1001, kind="general"),
+        request=_REQUEST,
+        db=db,
+        client=client,  # type: ignore[arg-type]
+    )
+
+    assert bot.topics == 1
+    assert bot.renamed == ["~ api/main"]
+
+
+async def test_a_dm_creates_no_topic_and_still_binds(db: Database) -> None:
+    """Degraded DM mode never touches the forum API."""
+    bot = _ForumBot()
+    client = _CountingClient()
+
+    created = await create_and_bind_input(
+        bot=bot,  # type: ignore[arg-type]
+        chat_id=1001,
+        chat_type="private",
+        tg_message_id=5,
+        route=Route(chat_id=1001, kind="dm"),
+        request=_REQUEST,
+        db=db,
+        client=client,  # type: ignore[arg-type]
+    )
+
+    assert created.thread_id == 0
+    assert bot.topics == 0 and bot.deleted == [] and bot.closed == []
+    assert client.creates == 1
+
+
+async def test_new_tells_the_owner_what_telegram_actually_said(
+    db: Database, settings: Any, monkeypatch: Any
+) -> None:
+    """The hardcoded "run /setup" sent the owner in a circle: /setup was happy."""
+    sent: list[tuple[str, Any]] = []
+
+    async def fake_tell(_message: Any, text: str, **kwargs: Any) -> None:
+        sent.append((text, kwargs.get("silent", True)))
+
+    monkeypatch.setattr(core_handlers, "tell", fake_tell)
+    bot = _ForumBot(
+        create_error=_refused("Bad Request: not enough rights to create a topic")
+    )
+    client = _CountingClient()
+    message = SimpleNamespace(
+        text="/new fix the flaky test",
+        chat=SimpleNamespace(id=-1001, type="supergroup"),
+        message_thread_id=None,
+        message_id=3,
+        bot=bot,
+    )
+
+    await core_handlers.new_workspace(
+        message,  # type: ignore[arg-type]
+        Route(chat_id=-1001, kind="general"),
+        settings,
+        _NullState(),  # type: ignore[arg-type]
+        db=db,
+        client=client,  # type: ignore[arg-type]
+    )
+
+    assert client.creates == 0
+    assert sent == [
+        (
+            "New failed: Topic creation failed · not enough rights to create a topic",
+            False,
+        )
+    ]
+
+
+def test_the_user_sees_telegrams_own_words_not_a_guess() -> None:
+    """One phone line: the reason, without the wrapper that is always the same."""
+    reason = telegram_reason(
+        _refused("Bad Request: not enough rights to create a topic")
+    )
+
+    assert reason == "not enough rights to create a topic"
+    assert "Telegram server says" not in reason
+    assert str(TopicCreateError(reason)) == (
+        "Topic creation failed · not enough rights to create a topic"
+    )
+
+
+def test_telegram_reason_survives_an_unwrapped_error() -> None:
+    assert telegram_reason(RuntimeError("boom\nstack")) == "boom"
+    assert telegram_reason(RuntimeError("")) == "RuntimeError"
+
+
+class _WizardState:
+    """``_ask_branch`` only reads the data and moves the FSM forward."""
+
+    def __init__(self, data: dict[str, Any]) -> None:
+        self._data = data
+        self.state: Any = None
+
+    async def get_data(self) -> dict[str, Any]:
+        return self._data
+
+    async def set_state(self, state: Any) -> None:
+        self.state = state
+
+
+async def _branch_buttons(branch: str, monkeypatch: Any) -> list[str]:
+    cards: list[Any] = []
+
+    async def fake_edit(_message: Any, _text: str, markup: Any) -> None:
+        cards.append(markup)
+
+    monkeypatch.setattr(new_workspace, "_edit", fake_edit)
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=-1001),
+        message_thread_id=None,
+        message_id=3,
+        from_user=SimpleNamespace(id=1001),
+    )
+    await new_workspace._ask_branch(
+        message,  # type: ignore[arg-type]
+        _WizardState({"branch": branch}),  # type: ignore[arg-type]
+        NonceStore(),
+    )
+    return [
+        item.text
+        for row in cards[0].inline_keyboard
+        for item in row
+        if item.text not in ("Go with defaults →", "Cancel")
+    ]
+
+
+async def test_branch_step_offers_main_once_when_it_is_also_the_default(
+    monkeypatch: Any,
+) -> None:
+    """Two taps that do the same thing were rendering as two buttons."""
+    assert await _branch_buttons("main", monkeypatch) == ["main"]
+
+
+async def test_branch_step_still_offers_both_when_they_differ(
+    monkeypatch: Any,
+) -> None:
+    assert await _branch_buttons("dev", monkeypatch) == ["main", "dev"]

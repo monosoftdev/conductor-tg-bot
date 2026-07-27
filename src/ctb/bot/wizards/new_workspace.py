@@ -55,6 +55,23 @@ class NewWorkspace(StatesGroup):
     prompt = State()
 
 
+def _unique(options: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Two buttons that do the same thing are one button.
+
+    The branch step offers ``main`` *and* the remembered default, which is
+    usually also ``main`` — a bare ``/new`` rendered "main" twice. Options that
+    genuinely differ (``main`` and ``dev``) are both kept, in order.
+    """
+    seen: set[str] = set()
+    unique: list[tuple[str, str]] = []
+    for label, target in options:
+        if target in seen:
+            continue
+        seen.add(target)
+        unique.append((label, target))
+    return unique
+
+
 def _rows(
     options: list[tuple[str, str]],
     *,
@@ -80,7 +97,7 @@ def _rows(
                 else "primary"
             ),
         )
-        for label, target in options
+        for label, target in _unique(options)
     ]
     return [items[index : index + columns] for index in range(0, len(items), columns)]
 
