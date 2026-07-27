@@ -68,6 +68,16 @@ _AUDIT_LIMIT: Final = 140
 _POLL_SECONDS: Final = 0.5
 _ERROR_BACKOFF_SECONDS: Final = 5.0
 _MAINTENANCE_SECONDS: Final = 3_600.0
+#: Ceiling on one job, end to end. Every step inside is already bounded, but
+#: "already bounded" is a claim about code that was read, not about code that
+#: ran — and the failure it misses is the worst one: the note sits on
+#: "Transcribing…" forever and the worker never takes another. A deadline turns
+#: that into a message with a Retry button.
+_JOB_DEADLINE_SECONDS: Final = 180.0
+#: A row left mid-flight (deadline, restart, hard kill) used to wait for the
+#: next boot to be noticed. Sweep on this cadence instead, so a stuck note
+#: recovers on its own rather than needing a redeploy.
+_RECOVERY_SECONDS: Final = 120.0
 _STATIC_KEYTERMS: Final[tuple[str, ...]] = (
     "Conductor",
     "Telegram",
@@ -199,6 +209,7 @@ class VoiceService:
         async with asyncio.TaskGroup() as tasks:
             for index in range(self.settings.voice_max_concurrent):
                 tasks.create_task(self._worker(index), name=f"ctb-voice-{index}")
+            tasks.create_task(self._sweep(), name="ctb-voice-sweep")
             tasks.create_task(self._maintenance(), name="ctb-voice-maintenance")
 
     async def stop(self) -> None:
@@ -249,9 +260,21 @@ class VoiceService:
             await self._pause(_POLL_SECONDS)
             return
         try:
-            await self._process(row)
+            async with asyncio.timeout(_JOB_DEADLINE_SECONDS):
+                await self._process(row)
         except asyncio.CancelledError:
             raise
+        except TimeoutError:
+            error = "Transcription timed out."
+            log.warning(
+                "voice.job_timed_out",
+                chat_id=row.chat_id,
+                tg_message_id=row.tg_message_id,
+                worker=index,
+                seconds=_JOB_DEADLINE_SECONDS,
+            )
+            await voice_repo.fail(self.db, row, error=error)
+            await self._send_failure(row, error)
         except Exception as exc:
             error = short_error(exc)
             log.warning(
@@ -263,6 +286,33 @@ class VoiceService:
             )
             await voice_repo.fail(self.db, row, error=error)
             await self._send_failure(row, error)
+
+    async def _sweep(self) -> None:
+        """Re-queue rows abandoned mid-flight, without waiting for a restart.
+
+        ``recover_stale`` ran only at boot, so a note that died between claim
+        and completion held "Transcribing…" until the next redeploy. On its own
+        that is a hang the owner cannot tell from a slow provider.
+        """
+        while not self._stop.is_set():
+            await self._pause(_RECOVERY_SECONDS)
+            if self._stop.is_set():
+                return
+            try:
+                recovery = await voice_repo.recover_stale(self.db)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("voice.recover_failed", error=short_error(exc))
+                continue
+            if recovery.requeued or recovery.abandoned:
+                log.info(
+                    "voice.stale_recovered",
+                    requeued=recovery.requeued,
+                    abandoned=len(recovery.abandoned),
+                )
+            for row in recovery.abandoned:
+                await self._send_failure(row, "Transcription kept failing.")
 
     async def _maintenance(self) -> None:
         while not self._stop.is_set():

@@ -1041,11 +1041,15 @@ def format_health_html(report: HealthReport, *, events: int = 5) -> str:
             report.deliveries.get("failed", 0),
         )
     )
+    # ``transcribing`` earns its own number: a note stuck mid-flight is what a
+    # hang looks like, and it is invisible folded into ``pending``.
+    transcribing = int(report.voice.get("transcribing", 0) or 0)
     lines.append(
-        "🎙 voice: {} pending · {} failed · {} clarify".format(
+        "🎙 voice: {} pending · {} failed · {} clarify{}".format(
             report.voice.get("pending", 0),
             report.voice.get("failed", 0),
             report.voice.get("waiting_for_user", 0),
+            f" · {transcribing} transcribing" if transcribing else "",
         )
     )
 

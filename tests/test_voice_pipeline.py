@@ -69,6 +69,20 @@ class FakeProvider:
         return None
 
 
+class HangingProvider(FakeProvider):
+    """A provider that never returns — the shape of the live "Transcribing…"."""
+
+    def __init__(self, *, hang_first_only: bool = False) -> None:
+        super().__init__()
+        self._hang_first_only = hang_first_only
+
+    async def transcribe(self, *args: Any, **kwargs: Any) -> Transcription:
+        self.calls += 1
+        if not self._hang_first_only or self.calls == 1:
+            await asyncio.sleep(3600)
+        return Transcription(self.text, language="en")
+
+
 class FakeClient:
     def __init__(self) -> None:
         self.posts: list[tuple[str, str, str]] = []
@@ -685,3 +699,48 @@ async def test_retention_covers_failed_and_waiting_rows(db: Database) -> None:
     remaining = await db.fetch_all("SELECT tg_message_id FROM voice_inputs")
     assert pruned == 3
     assert sorted(int(row["tg_message_id"]) for row in remaining) == [83, 84]
+
+
+async def test_a_job_that_hangs_becomes_a_message_not_a_stuck_card(
+    db: Database, settings_factory: Any, monkeypatch: Any
+) -> None:
+    """The live failure: a note parked on "Transcribing…" indefinitely.
+
+    Every step inside ``_process`` is individually bounded, which is a claim
+    about code that was read rather than code that ran. The deadline is the
+    claim that still holds when one of those bounds is wrong.
+    """
+    settings = settings_factory(voice_enabled=True)
+    service = make_service(settings, db, provider=HangingProvider())
+    monkeypatch.setattr(voice_service_module, "_JOB_DEADLINE_SECONDS", 0.01)
+    await service.enqueue(voice_message(), _route())
+
+    await service._tick(0)
+
+    row = await voice_repo.get(db, -1001, 55)
+    assert row is not None
+    assert row.state == "failed", "the worker must not sit on it forever"
+    assert "timed out" in (row.last_error or "").casefold()
+
+
+async def test_the_worker_takes_the_next_note_after_one_hangs(
+    db: Database, settings_factory: Any, monkeypatch: Any
+) -> None:
+    """A hung job used to take the worker with it, not just its own note."""
+    settings = settings_factory(voice_enabled=True)
+    provider = HangingProvider(hang_first_only=True)
+    service = make_service(settings, db, provider=provider)
+    monkeypatch.setattr(voice_service_module, "_JOB_DEADLINE_SECONDS", 0.01)
+
+    await service.enqueue(voice_message(), _route())
+    await service._tick(0)
+    second = voice_message()
+    second.message_id = 56
+    await service.enqueue(second, _route())
+    await service._tick(0)
+
+    assert provider.calls == 2, "the second note is still picked up"
+
+
+def _route() -> Route:
+    return Route(chat_id=-1001, thread_id=7, kind="topic")
