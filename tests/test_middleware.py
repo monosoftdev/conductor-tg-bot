@@ -58,7 +58,7 @@ from ctb.bot import app as bot_app
 from ctb.bot.app import (
     BotApp,
     ConflictGuard,
-    SqliteStorage,
+    PostgresStorage,
     build_app,
     clear_routers,
     create_bot,
@@ -86,7 +86,7 @@ from ctb.bot.keyboards import (
     url_button,
 )
 from ctb.bot.middleware import (
-    AuthMiddleware,
+    TenantMiddleware,
     LogContextMiddleware,
     Route,
     RoutingMiddleware,
@@ -370,18 +370,18 @@ def make_dispatcher(
     settings: Settings,
     db: Database | None,
     *,
-    auth: AuthMiddleware | None = None,
+    auth: TenantMiddleware | None = None,
     storage: BaseStorage | None = None,
 ) -> tuple[Dispatcher, list[Any]]:
     """A Dispatcher with the production middleware stack and a catch-all."""
     dispatcher = Dispatcher(
-        storage=storage or SqliteStorage(db), settings=settings, db=db
+        storage=storage or PostgresStorage(db), settings=settings, db=db
     )
     install_middleware(
         dispatcher,
         settings=settings,
         db=db,
-        auth=auth or AuthMiddleware(settings, db=db, notify_owner=False),
+        auth=auth or TenantMiddleware(settings, db=db, notify_owner=False),
     )
 
     seen: list[Any] = []
@@ -496,7 +496,7 @@ async def test_db_failure_fails_closed(
     assert len(seen) == 1
 
 
-class SpyStorage(SqliteStorage):
+class SpyStorage(PostgresStorage):
     """Counts reads, to prove a stranger never reaches the storage."""
 
     def __init__(self, db: Database) -> None:
@@ -529,9 +529,9 @@ async def test_a_stranger_never_touches_the_fsm_storage(
 async def test_principal_marks_the_owner(
     bot: Bot, bot_settings: Settings, db: Database
 ) -> None:
-    dispatcher = Dispatcher(storage=SqliteStorage(db), settings=bot_settings, db=db)
+    dispatcher = Dispatcher(storage=PostgresStorage(db), settings=bot_settings, db=db)
     dispatcher.update.outer_middleware(
-        AuthMiddleware(bot_settings, db=db, notify_owner=False)
+        TenantMiddleware(bot_settings, db=db, notify_owner=False)
     )
     captured: list[dict[str, Any]] = []
 
@@ -555,7 +555,7 @@ async def test_owner_is_dmed_once_per_unknown_user_per_day(
     bot: Bot, session: RecordingSession, bot_settings: Settings, db: Database
 ) -> None:
     clock = FakeClock()
-    auth = AuthMiddleware(bot_settings, db=db, notify_owner=True, clock=clock)
+    auth = TenantMiddleware(bot_settings, db=db, notify_owner=True, clock=clock)
     dispatcher, seen = make_dispatcher(bot_settings, db, auth=auth)
 
     for i in range(5):
@@ -583,7 +583,7 @@ async def test_a_different_stranger_gets_their_own_notice(
     bot: Bot, bot_settings: Settings, db: Database
 ) -> None:
     clock = FakeClock()
-    auth = AuthMiddleware(bot_settings, db=db, notify_owner=True, clock=clock)
+    auth = TenantMiddleware(bot_settings, db=db, notify_owner=True, clock=clock)
     dispatcher, _ = make_dispatcher(bot_settings, db, auth=auth)
     await dispatcher.feed_update(bot, build_update("message", 7001, 1))
     await dispatcher.feed_update(bot, build_update("message", 7002, 2))
@@ -595,7 +595,7 @@ async def test_a_flood_of_strangers_cannot_flood_the_owner(
     bot: Bot, bot_settings: Settings, db: Database
 ) -> None:
     clock = FakeClock()
-    auth = AuthMiddleware(
+    auth = TenantMiddleware(
         bot_settings,
         db=db,
         notify_owner=True,
@@ -613,7 +613,7 @@ async def test_a_failing_dm_does_not_break_the_rejection_path(
     bot: Bot, session: RecordingSession, bot_settings: Settings, db: Database
 ) -> None:
     session.raises = RuntimeError("owner blocked the bot")
-    auth = AuthMiddleware(bot_settings, db=db, notify_owner=True, clock=FakeClock())
+    auth = TenantMiddleware(bot_settings, db=db, notify_owner=True, clock=FakeClock())
     dispatcher, seen = make_dispatcher(bot_settings, db, auth=auth)
     await dispatcher.feed_update(bot, build_update("message", STRANGER_ID))
     assert seen == []
@@ -1044,13 +1044,13 @@ def storage_key(
 
 async def test_fsm_state_survives_a_restart(db: Database, db_path: Any) -> None:
     key = storage_key()
-    storage = SqliteStorage(db)
+    storage = PostgresStorage(db)
     await storage.set_state(key, "NewWorkspace:branch")
     await storage.set_data(key, {"project": "api", "prompt": "fix the test"})
 
     # A brand-new storage object over the same file is what a redeploy looks
     # like from the wizard's point of view.
-    restarted = SqliteStorage(db)
+    restarted = PostgresStorage(db)
     assert await restarted.get_state(key) == "NewWorkspace:branch"
     assert await restarted.get_data(key) == {
         "project": "api",
@@ -1059,7 +1059,7 @@ async def test_fsm_state_survives_a_restart(db: Database, db_path: Any) -> None:
 
 
 async def test_fsm_seats_are_isolated_by_chat_thread_and_user(db: Database) -> None:
-    storage = SqliteStorage(db)
+    storage = PostgresStorage(db)
     a = storage_key(thread_id=1)
     b = storage_key(thread_id=2)
     c = storage_key(thread_id=1, user_id=ALLOWED_ID)
@@ -1072,7 +1072,7 @@ async def test_fsm_seats_are_isolated_by_chat_thread_and_user(db: Database) -> N
 
 
 async def test_fsm_dm_key_has_no_thread(db: Database) -> None:
-    storage = SqliteStorage(db)
+    storage = PostgresStorage(db)
     key = StorageKey(bot_id=1, chat_id=DM_ID, user_id=OWNER_ID, thread_id=None)
     await storage.set_state(key, "wizard")
     assert await storage.get_state(key) == "wizard"
@@ -1083,7 +1083,7 @@ async def test_fsm_dm_key_has_no_thread(db: Database) -> None:
 
 
 async def test_fsm_clearing_removes_the_row(db: Database) -> None:
-    storage = SqliteStorage(db)
+    storage = PostgresStorage(db)
     key = storage_key()
     await storage.set_state(key, "step")
     await storage.set_data(key, {"x": 1})
@@ -1096,7 +1096,7 @@ async def test_fsm_clearing_removes_the_row(db: Database) -> None:
 
 
 async def test_fsm_update_data_merges(db: Database) -> None:
-    storage = SqliteStorage(db)
+    storage = PostgresStorage(db)
     key = storage_key()
     await storage.set_data(key, {"a": 1})
     merged = await storage.update_data(key, {"b": 2})
@@ -1105,7 +1105,7 @@ async def test_fsm_update_data_merges(db: Database) -> None:
 
 
 async def test_fsm_non_default_destiny_is_namespaced(db: Database) -> None:
-    storage = SqliteStorage(db)
+    storage = PostgresStorage(db)
     plain = storage_key()
     scene = StorageKey(
         bot_id=1,
@@ -1127,7 +1127,7 @@ async def test_fsm_non_default_destiny_is_namespaced(db: Database) -> None:
 
 
 async def test_fsm_expired_wizard_reads_as_absent(db: Database) -> None:
-    storage = SqliteStorage(db, ttl_ms=1)
+    storage = PostgresStorage(db, ttl_ms=1)
     key = storage_key()
     await storage.set_state(key, "yesterday")
     await asyncio.sleep(0.01)
@@ -1139,12 +1139,12 @@ async def test_fsm_is_reachable_through_the_dispatcher(
     bot: Bot, bot_settings: Settings, db: Database
 ) -> None:
     """Moving the FSM middleware behind the allow-list must not break it."""
-    dispatcher = Dispatcher(storage=SqliteStorage(db), settings=bot_settings, db=db)
+    dispatcher = Dispatcher(storage=PostgresStorage(db), settings=bot_settings, db=db)
     install_middleware(
         dispatcher,
         settings=bot_settings,
         db=db,
-        auth=AuthMiddleware(bot_settings, db=db, notify_owner=False),
+        auth=TenantMiddleware(bot_settings, db=db, notify_owner=False),
     )
     seen: list[str | None] = []
     routes: list[Route] = []
@@ -1199,7 +1199,7 @@ def test_build_app_wires_everything(
     assert app.dispatcher["settings"] is bot_settings
     assert app.dispatcher["db"] is db
     assert app.dispatcher["nonces"] is app.nonces
-    assert isinstance(app.storage, SqliteStorage)
+    assert isinstance(app.storage, PostgresStorage)
     assert app.routers == (router,)
     assert app.health()["routers"] == ["x"]
 

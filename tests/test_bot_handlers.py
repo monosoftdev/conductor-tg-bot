@@ -16,7 +16,7 @@ from aiogram.fsm.storage.base import StorageKey
 from aiogram.methods import CreateForumTopic, SendMessage
 from aiogram.types import Chat, Message
 
-from ctb.bot.app import SqliteStorage
+from ctb.bot.app import PostgresStorage
 from ctb.bot.handlers import core as core_handlers
 from ctb.bot.handlers import prompts as prompt_handlers
 from ctb.bot.handlers.common import (
@@ -1356,7 +1356,7 @@ class _Tap:
 def _seat(db: Database, *, user_id: int = 1001, thread_id: int | None = None) -> Any:
     """A DB-backed FSM context — the thing that already survived the redeploy."""
     return FSMContext(
-        storage=SqliteStorage(db),
+        storage=PostgresStorage(db),
         key=StorageKey(bot_id=0, chat_id=-1001, user_id=user_id, thread_id=thread_id),
     )
 

@@ -360,7 +360,7 @@ async def bind(
         at=at,
         chat_id=chat_id,
         thread_id=thread_id,
-        is_bound=1,
+        is_bound=True,
     )
 
 
@@ -368,7 +368,7 @@ async def unbind(
     db: Database, session_id: str, *, at: int | None = None
 ) -> SessionRow | None:
     """Stop polling. The cursor is kept so a re-bind resumes where it left off."""
-    return await update(db, session_id, at=at, is_bound=0)
+    return await update(db, session_id, at=at, is_bound=False)
 
 
 async def mark_dead(
@@ -378,7 +378,7 @@ async def mark_dead(
     stamp = now_ms() if at is None else at
     columns: dict[str, Any] = {
         "turn_state": str(TurnState.DEAD),
-        "is_bound": 0,
+        "is_bound": False,
         "dead_at": stamp,
         "entered_state_at": stamp,
     }
@@ -434,7 +434,7 @@ async def clear_cursor_only(
 ) -> SessionRow | None:
     """``/status`` works again: leave the degraded fixed-cadence mode."""
     return await update(
-        db, session_id, at=at, cursor_only=0, consecutive_status_failures=0
+        db, session_id, at=at, cursor_only=False, consecutive_status_failures=0
     )
 
 
@@ -465,7 +465,7 @@ async def seek_to_end(
         at=at,
         cursor_message_id=message_id,
         cursor_session_index=session_index,
-        seeded=1,
+        seeded=True,
     )
 
 

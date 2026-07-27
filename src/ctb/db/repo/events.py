@@ -334,7 +334,7 @@ async def note_unknown_content_type(
                 (type, shape_signature, count, sample_session_id,
                  sample_message_id, first_seen_at, last_seen_at)
             VALUES (?, ?, 1, ?, ?, ?, ?)
-            ON CONFLICT(type, shape_signature) DO UPDATE SET
+            ON CONFLICT (tenant_id, type, shape_signature) DO UPDATE SET
                 count        = unknown_content_types.count + 1,
                 last_seen_at = excluded.last_seen_at
             """,
