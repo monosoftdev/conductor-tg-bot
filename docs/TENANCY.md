@@ -1,0 +1,167 @@
+# Tenancy
+
+How one bot serves many workspaces without any of them seeing each other.
+
+## The shape
+
+```
+                     one Telegram bot token
+                              │
+              ┌───────────────┴───────────────┐
+        Acme's supergroup              Rival's supergroup
+              │                               │
+        TenantMiddleware ──── chat_id → tenant, then membership
+              │
+     ┌────────┴────────┐
+ ctb.tenant_id GUC   ClientPool
+     │                   │
+  app pool (RLS)   Acme's key │ Rival's key
+     │                        │
+        one PostgreSQL, one Conductor client per key
+```
+
+**A Telegram chat belongs to exactly one workspace.** `tenant_chats.chat_id` is
+a primary key, which is why resolution is a single point lookup and why every
+other table's `chat_id` is already tenant-unique.
+
+**Many Telegram users drive one workspace.** A co-founder is a `tenant_members`
+row, not a second deployment.
+
+## Where the boundary is
+
+`TenantMiddleware` is the only place that decides who someone is. It runs
+second in the chain — after log context, before routing and before aiogram's
+FSM middleware — because both of those read the database, and a tenant-scoped
+query with no tenant in scope raises rather than returning everything.
+
+It resolves in this order:
+
+1. `tenant_chats[chat_id]` → the workspace. No binding means refusal, not
+   "unknown yet": a shared bot can be added to any group by anyone.
+2. `tenant_members[(tenant, user)]` → the person. Being in the right group is
+   not authorisation.
+3. An update with no chat at all (inline query, poll answer, payment callback)
+   resolves the way a private message does — by the sender's own membership,
+   and only when it is unambiguous.
+
+Rejection is silence. The one exception is the registration entry point:
+`/start`, `/register`, `/help` and `/privacy`, in a private chat only, reach a
+handler with `tenant=None`, because they are how somebody becomes a member.
+
+## Why row-level security
+
+The alternative was threading `tenant_id` through 137 repository call sites.
+That is a change whose correctness rests on code review — forever, including
+every call site added later.
+
+Instead every tenant-scoped table has:
+
+```sql
+tenant_id uuid NOT NULL DEFAULT current_setting('ctb.tenant_id', true)::uuid
+ALTER TABLE … ENABLE ROW LEVEL SECURITY;
+ALTER TABLE … FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON …
+    USING      (tenant_id = current_setting('ctb.tenant_id')::uuid)
+    WITH CHECK (tenant_id = current_setting('ctb.tenant_id')::uuid);
+```
+
+Consequences worth stating plainly:
+
+- `SELECT … FROM sessions WHERE id = %s` is unchanged and is now tenant-scoped.
+- `INSERT INTO deliveries (…)` is unchanged; the column default fills
+  `tenant_id`, and `WITH CHECK` rejects anything else.
+- A forgotten filter is a zero-row result, not a leak.
+- `FORCE` matters: without it the table owner bypasses its own policy.
+- `current_setting` is called *without* `missing_ok`, so an unscoped connection
+  raises rather than silently matching nothing.
+
+`tests/test_isolation.py` generates its checks from `pg_class` and
+`information_schema`, so a table added next year is covered without anyone
+remembering to add it.
+
+## The two roles
+
+| | `ctb_app` | `ctb_worker` |
+|---|---|---|
+| Row-level security | enforced | `BYPASSRLS` |
+| Used by | handlers, routing, FSM storage, pollers (inside a scope) | supervisor reconcile, delivery and voice claim loops, prune, tenancy lookups |
+| Grants | the nine tenant tables, plus read on the tenancy ones | everything |
+| Member of the other | **no** | no |
+
+The GUC answers "who is this acting for"; the *role* answers "may this
+connection see everything". They are deliberately separate — a worker with a
+tenant in scope still bypasses RLS, but its inserts pick up the right
+`tenant_id`, which is what lets it write on a tenant's behalf.
+
+## The seams that must not be re-cut
+
+Each of these was a global in the single-user design. Putting one back
+reintroduces exactly the bug the tests are written to catch.
+
+| Was | Now | If you put it back |
+|---|---|---|
+| `get_client()` | `TenantContext.client` | handlers silently use the wrong organisation's key |
+| `Settings.conductor_api_key` | `tenants.conductor_key_ct`, sealed | one key for everyone |
+| `Settings.owner_id` | `tenant_members.role` | one workspace's owner administers all of them |
+| `Settings.telegram_chat_id` | `tenant_chats` | one supergroup per deployment |
+| one `TokenBucket` | `TelegramPacer`, global + per chat | one customer's backlog starves the rest |
+| `FocusTracker` single slot | bounded dict | one user's thumb overwrites everyone's |
+| `auth_fatal` boolean | per-tenant set | one rejected key stops every workspace |
+
+## Secrets
+
+`ctb.crypto.SecretBox`: AES-256-GCM, envelope, AAD-bound to
+`(kid, tenant_id, purpose)`.
+
+The AAD binding is the point. Fernet has none, so copying one row's blob onto
+another row would decrypt cleanly; here it fails authentication. `purpose`
+separates the Conductor key from the speech key on the same row.
+
+There is **no plaintext cache**. `ClientPool.get()` decrypts once, hands the key
+to the client's default headers, and drops the reference. The client is the
+cache; idle eviction after fifteen minutes destroys the last copy in memory.
+`conductor_key_fp` — a truncated SHA-256 — exists so that "is this the same
+key?" never needs a decrypt.
+
+Rotation is prepend, deploy, `python -m ctb.rewrap --rewrap`, drop. Every blob
+names the key that sealed it, so old and new coexist and there is no window.
+
+## Fairness
+
+One shared bot token is one shared Telegram rate budget. Two budgets, kept
+separate because Telegram has two limits:
+
+- **global**, ~25/s against the token;
+- **per chat**, ~15/min, under Telegram's ~20/min per group.
+
+`DestinationRotor` then decides which `(chat, topic)` spends the global budget
+next: most urgent first, then least recently served. Fairness is
+per-destination rather than per tenant, which is strictly stronger — a customer
+with forty busy topics cannot starve one with a single topic, and a runaway
+topic cannot starve its own siblings.
+
+A 429 pauses **only the chat that caused it**. Several distinct chats reporting
+one within ten seconds escalates to a global pause, on the theory that this is
+the signature of a token-level limit rather than a group-level one. Telegram's
+error does not distinguish, so that is a documented heuristic, not a fact.
+
+The supervisor applies the same idea to pollers: a per-tenant `max_pollers` and
+a process-wide ceiling, allocated round-robin by least-recently-served tenant.
+Because the reconcile query orders active turn states first *within* each
+tenant, a tenant at its ceiling still gets its busy sessions polled. Reaching
+the global ceiling logs `supervisor.pollers_starved`, which is the signal to
+shard the lease — the lease name is already a `text` primary key for that.
+
+## Suspension and failure
+
+Both are joins, not code paths:
+
+```sql
+JOIN tenants t ON t.id = s.tenant_id
+ WHERE t.status = 'active' AND t.auth_failed_at IS NULL
+```
+
+Setting `status='suspended'` stops that tenant's polling on the next five-second
+pass. A rejected API key stamps `auth_failed_at`, cancels *that tenant's*
+pollers, and tells its owners — everyone else keeps running. Storing a new key
+clears the stamp, which is the only thing that restarts it.
