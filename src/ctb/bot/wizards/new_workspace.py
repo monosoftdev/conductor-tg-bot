@@ -104,6 +104,9 @@ GONE_MESSAGE: Final = "Wizard closed · /new to start again."
 STALE_MESSAGE: Final = "That step is done · use the buttons on the card."
 #: The payload decodes but names nothing this wizard offered.
 INVALID_MESSAGE: Final = "Not a choice on this card."
+#: An older build minted the button, so it carries nothing to re-derive. The
+#: wizard is still live, so the card is redrawn and the tap simply repeats.
+REFRESHED_MESSAGE: Final = "Card refreshed · tap again."
 
 
 class NewWorkspace(StatesGroup):
@@ -395,6 +398,36 @@ async def _ask_prompt(message: Message, state: FSMContext, nonces: NonceStore) -
     await _edit(message, "Send the first prompt.", markup)
 
 
+async def _reask(
+    step: str,
+    message: Message,
+    state: FSMContext,
+    nonces: NonceStore,
+    settings: Settings,
+) -> bool:
+    """Redraw the step the wizard is on, with buttons this process minted.
+
+    A payload minted by an older build carries nothing to re-derive — the
+    restart-proof format did not exist when it was made — so the only honest
+    recovery is to hand back a card that works. Costs one tap instead of a
+    whole ``/new``.
+    """
+    match step:
+        case "branch":
+            await _ask_branch(message, state, nonces, settings)
+        case "agent":
+            await _ask_agent(message, state, nonces)
+        case "model":
+            await _ask_model(message, state, nonces)
+        case "effort":
+            await _ask_effort(message, state, nonces)
+        case "prompt":
+            await _ask_prompt(message, state, nonces)
+        case _:
+            return False
+    return True
+
+
 def _pick(code: str, data: Mapping[str, Any]) -> tuple[str, str] | str:
     """``(step, value)`` for a tapped option, or the line to answer with.
 
@@ -425,6 +458,19 @@ async def wizard_callback(
     try:
         ticket = resolve(query, expect=Action.WIZARD, store=nonces)
     except NonceError as exc:
+        # A payload this build cannot read is usually one an older build minted
+        # — the restart-proof format did not exist yet, so there is nothing in
+        # it to re-derive. The wizard itself is fine (its state is in SQLite),
+        # so redraw the step rather than dead-end on the word "expired".
+        step = str((await state.get_data()).get("step") or "")
+        if (
+            exc.reason == "unknown"
+            and step
+            and isinstance(query.message, Message)
+            and await _reask(step, query.message, state, nonces, settings)
+        ):
+            await query.answer(REFRESHED_MESSAGE, show_alert=True)
+            return
         await query.answer(exc.user_message, show_alert=True)
         return
     if not isinstance(query.message, Message):

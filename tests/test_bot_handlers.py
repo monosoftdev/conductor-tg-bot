@@ -1680,3 +1680,58 @@ async def test_setup_deletes_the_topic_it_probed_with(
     # 99 is the id the stub hands back from create_forum_topic — so this asserts
     # it deleted the very topic it made, not merely that it deleted something.
     assert bot.deleted == [99], "and cleaned it up, leaving no residue"
+
+
+async def test_a_button_from_an_older_build_redraws_the_card_instead_of_dead_ending(
+    db: Database, settings: Settings, monkeypatch: Any
+) -> None:
+    """The live failure the restart-proof payload could not reach.
+
+    A button minted before that format existed is an opaque random handle —
+    there is nothing in it to re-derive, so it can never resolve. The wizard
+    behind it is still perfectly alive in SQLite, so redraw its step rather
+    than telling the owner a live wizard has "expired".
+    """
+    await _mint_branch_card(db, NonceStore(), settings, monkeypatch)
+
+    edits: list[str] = []
+
+    async def fake_edit(_message: Any, text: str, _markup: Any) -> None:
+        edits.append(text)
+
+    monkeypatch.setattr(new_workspace, "_edit", fake_edit)
+    # Exactly what an old build put in callback_data: a bare random handle.
+    stale = _Tap("ctb:wiz:Ky7cQ2mFq1sVb3Nd")
+    await new_workspace.wizard_callback(
+        stale,  # type: ignore[arg-type]
+        _seat(db),
+        NonceStore(),
+        settings,
+    )
+
+    assert stale.answers == [new_workspace.REFRESHED_MESSAGE]
+    assert edits == ["Branch? Type it or tap."], "the step is redrawn, not skipped"
+    # The redraw is not a state change: the wizard is still on branch.
+    assert (await _seat(db).get_data())["step"] == "branch"
+
+
+async def test_a_stale_button_with_no_wizard_open_still_says_so(
+    db: Database, settings: Settings, monkeypatch: Any
+) -> None:
+    """Nothing to redraw — do not invent a card the owner did not ask for."""
+    edits: list[str] = []
+
+    async def fake_edit(_message: Any, text: str, _markup: Any) -> None:
+        edits.append(text)
+
+    monkeypatch.setattr(new_workspace, "_edit", fake_edit)
+    stale = _Tap("ctb:wiz:Ky7cQ2mFq1sVb3Nd")
+    await new_workspace.wizard_callback(
+        stale,  # type: ignore[arg-type]
+        _seat(db),
+        NonceStore(),
+        settings,
+    )
+
+    assert stale.answers == ["This button has expired. Run the command again."]
+    assert edits == []
