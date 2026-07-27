@@ -248,6 +248,13 @@ class TokenBucket:
     def tokens(self) -> float:
         return self._tokens
 
+    def peek(self, tokens: float = 1.0) -> bool:
+        """Would :meth:`try_acquire` succeed right now? Takes nothing."""
+        now = self._clock()
+        elapsed = max(0.0, now - self._updated)
+        available = min(self._capacity, self._tokens + elapsed * self._rate)
+        return available >= tokens - _TOKEN_EPSILON
+
     def try_acquire(self, tokens: float = 1.0) -> bool:
         """Take ``tokens`` if they are already there. Never sleeps.
 

@@ -76,7 +76,19 @@ def worker_dsn() -> str:
 
 @pytest.fixture(scope="session")
 def pg_schema() -> tuple[str, ...]:
-    """Roles created, migrations applied, once. Returns the truncatable tables."""
+    """Roles created, migrations applied, once. Returns the truncatable tables.
+
+    The schema is dropped first. The test database is disposable by
+    construction, and rebuilding it removes an entire class of confusing
+    failure: an edited migration that the ``schema_version`` table believes has
+    already been applied.
+    """
+    try:
+        with psycopg.connect(admin_dsn(), autocommit=True) as conn:
+            conn.execute("DROP SCHEMA public CASCADE")
+            conn.execute("CREATE SCHEMA public")
+    except psycopg.OperationalError as exc:  # pragma: no cover - no server
+        pytest.skip(f"PostgreSQL is not reachable ({exc}); run: docker compose up -d db")
     try:
         bootstrap(
             admin_dsn(),

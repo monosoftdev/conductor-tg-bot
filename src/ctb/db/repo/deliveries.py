@@ -58,6 +58,7 @@ __all__ = [
     "RecoveryResult",
     "claim",
     "content_hash",
+    "count_unclaimed_sending",
     "counts_by_state",
     "delete_for_session",
     "enqueue",
@@ -85,8 +86,8 @@ ORPHAN_AFTER_MS: Final = 60_000
 
 _COLUMNS = """
     session_id, message_id, part_index, chat_id, thread_id, session_index, kind,
-    state, claim_id, claimed_at, content_hash, payload_json, tg_message_id,
-    attempts, last_error, created_at, updated_at, sent_at
+    priority, state, claim_id, claimed_at, content_hash, payload_json,
+    tg_message_id, attempts, last_error, created_at, updated_at, sent_at
 """
 
 #: Qualified for the claim statement, whose ``RETURNING`` names the alias.
@@ -117,6 +118,7 @@ class DeliveryRow:
     thread_id: int = NO_THREAD_ID
     session_index: int = 0
     kind: str = "text"
+    priority: int = 20
     state: str = "pending"
     claim_id: str | None = None
     claimed_at: int | None = None
@@ -139,6 +141,7 @@ class DeliveryRow:
             thread_id=as_int(row["thread_id"]),
             session_index=as_int(row["session_index"]),
             kind=as_str(row["kind"], "text"),
+            priority=as_int(row["priority"], 20),
             state=as_str(row["state"], "pending"),
             claim_id=as_opt_str(row["claim_id"]),
             claimed_at=as_opt_int(row["claimed_at"]),
@@ -167,6 +170,7 @@ async def enqueue(
     part_index: int = 0,
     session_index: int = 0,
     kind: str = "text",
+    priority: int = 20,
     payload_json: str | None = None,
     hash_of_content: str | None = None,
     at: int | None = None,
@@ -186,9 +190,9 @@ async def enqueue(
         """
         INSERT INTO deliveries
             (session_id, message_id, part_index, chat_id, thread_id,
-             session_index, kind, state, content_hash, payload_json, created_at,
-             updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+             session_index, kind, priority, state, content_hash, payload_json,
+             created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
         ON CONFLICT DO NOTHING
         """,
         (
@@ -199,6 +203,7 @@ async def enqueue(
             thread_id,
             session_index,
             kind,
+            priority,
             digest,
             payload_json,
             stamp,
@@ -228,6 +233,8 @@ class Destination:
     tenant_id: uuid.UUID | None = None
     pending: int = 0
     head_at: int = 0
+    #: The most urgent thing waiting here. Lower is more urgent.
+    priority: int = 20
 
     @property
     def key(self) -> tuple[int, int]:
@@ -243,11 +250,12 @@ async def pending_destinations(db: Database, *, limit: int = 64) -> list[Destina
     rows = await db.fetch_all(
         """
         SELECT tenant_id, chat_id, thread_id,
-               MIN(created_at) AS head_at, COUNT(*) AS pending
+               MIN(created_at) AS head_at, COUNT(*) AS pending,
+               MIN(priority)   AS priority
           FROM deliveries
          WHERE state = 'pending'
          GROUP BY tenant_id, chat_id, thread_id
-         ORDER BY MIN(created_at)
+         ORDER BY MIN(priority), MIN(created_at)
          LIMIT ?
         """,
         (max(1, limit),),
@@ -259,6 +267,7 @@ async def pending_destinations(db: Database, *, limit: int = 64) -> list[Destina
             tenant_id=row["tenant_id"],
             pending=as_int(row["pending"]),
             head_at=as_int(row["head_at"]),
+            priority=as_int(row["priority"], 20),
         )
         for row in rows
     ]
@@ -275,6 +284,11 @@ async def claim(
     at: int | None = None,
 ) -> list[DeliveryRow]:
     """Atomically take up to ``limit`` pending rows for this worker.
+
+    Ordered by ``(session_index, part_index)`` — transcript order — and
+    deliberately *not* by priority: an error notice must never overtake the
+    answer it refers to inside the same topic. Priority orders *destinations*
+    against each other, which is what :func:`pending_destinations` exposes.
 
     Concurrent claimers skip each other's locked rows rather than blocking, so
     the loser simply gets fewer rows — never the same rows. Scope the claim to
@@ -522,6 +536,22 @@ async def recover_orphaned(
                 if changed:
                     claimed.append(replace(row, claim_id=claim_id, claimed_at=stamp))
     return RecoveryResult(claimed=tuple(claimed), skipped=tuple(skipped))
+
+
+async def count_unclaimed_sending(db: Database, *, claim_id: str) -> int:
+    """Rows another worker left in ``sending``.
+
+    Non-zero after a recovery pass means some were still inside the orphan
+    window; the outbox keeps recovery armed rather than stranding them.
+    """
+    return as_int(
+        await db.fetch_val(
+            "SELECT COUNT(*) FROM deliveries "
+            "WHERE state = 'sending' AND COALESCE(claim_id, '') <> ?",
+            (claim_id,),
+            default=0,
+        )
+    )
 
 
 async def pending_count(db: Database, session_id: str | None = None) -> int:

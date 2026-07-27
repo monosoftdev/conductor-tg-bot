@@ -109,18 +109,29 @@ class TelegramPacer:
         return bucket
 
     def chat_ready(self, chat_id: int) -> bool:
-        """Take one token for ``chat_id`` if it has one. Never blocks.
+        """Could this chat send right now? Takes nothing.
 
-        ``False`` means "this destination is saturated or paused" — the caller
-        should serve someone else rather than wait.
+        Used to *choose* a destination. ``False`` means "saturated or paused" —
+        serve someone else rather than wait. The token itself is spent per
+        message, in :meth:`acquire_chat`.
         """
         if self._clock() < self._paused_until.get(chat_id, float("-inf")):
             return False
-        return self._bucket(chat_id).try_acquire()
+        return self._bucket(chat_id).peek()
 
     async def acquire_global(self) -> float:
         """Block until the shared per-token budget allows one more send."""
         return await self._global.acquire()
+
+    async def acquire_chat(self, chat_id: int) -> float:
+        """Block until *this* chat may send again.
+
+        The fair path is :meth:`chat_ready`, which skips a saturated chat and
+        serves someone else. This is the fallback for when there *is* nobody
+        else: one busy topic should still drain at its own rate rather than
+        spin.
+        """
+        return await self._bucket(chat_id).acquire()
 
     @property
     def global_paused_for(self) -> float:
@@ -196,17 +207,19 @@ class DestinationRotor:
         destinations: Sequence[T],
         *,
         key: Callable[[T], tuple[int, int]],
-        promote: Callable[[T], bool] | None = None,
+        urgency: Callable[[T], int] | None = None,
     ) -> list[T]:
-        """Least-recently-served first; anything ``promote`` likes goes first.
+        """Most urgent first, then least recently served.
 
-        ``promote`` is how the focused topic — the one the user's thumb is in —
-        jumps the queue without a second scheduling concept.
+        ``urgency`` is the destination's best pending priority, with the topic
+        the user's thumb is in promoted to the front. Errors therefore still
+        overtake bulk *across* topics, which per-destination claiming would
+        otherwise have lost.
         """
 
         def sort_key(item: T) -> tuple[int, float]:
-            focused = 0 if promote is not None and promote(item) else 1
-            return (focused, self._served.get(key(item), 0.0))
+            rank = 0 if urgency is None else urgency(item)
+            return (rank, self._served.get(key(item), 0.0))
 
         return sorted(destinations, key=sort_key)
 

@@ -94,8 +94,9 @@ _INSERT_MESSAGE = """
 _INSERT_DELIVERY = """
     INSERT INTO deliveries
         (session_id, message_id, part_index, chat_id, thread_id, session_index,
-         kind, state, content_hash, payload_json, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+         kind, priority, state, content_hash, payload_json, created_at,
+         updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
     ON CONFLICT DO NOTHING
 """
 
@@ -209,6 +210,8 @@ class DeliveryDraft:
     thread_id: int = NO_THREAD_ID
     part_index: int = 0
     kind: str = "text"
+    #: Send order; see ``ctb.delivery.outbox.Priority``. Lower goes first.
+    priority: int = 20
     payload_json: str | None = None
     content_hash: str | None = None
 
@@ -340,6 +343,7 @@ async def advance_cursor(
                         draft.thread_id,
                         message.session_index,
                         draft.kind,
+                        draft.priority,
                         digest,
                         payload,
                         stamp,

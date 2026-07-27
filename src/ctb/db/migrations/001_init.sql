@@ -434,6 +434,10 @@ CREATE TABLE IF NOT EXISTS deliveries (
     session_index  bigint NOT NULL DEFAULT 0,   -- claim ordering
     kind           text NOT NULL DEFAULT 'text'
                    CHECK (kind IN ('text', 'code', 'document', 'activity')),
+    -- Send order, lower first (see ctb.delivery.outbox.Priority). A column and
+    -- not a JSON field because the scheduler orders *destinations* by it,
+    -- before any payload has been read.
+    priority       integer NOT NULL DEFAULT 20,
     state          text NOT NULL DEFAULT 'pending'
                    CHECK (state IN ('pending', 'sending', 'sent', 'skipped',
                                     'failed')),
@@ -461,7 +465,7 @@ CREATE TABLE IF NOT EXISTS deliveries (
 -- The claim path: pending rows for one destination, in transcript order. The
 -- leading (chat_id, thread_id) serve the outbox's per-destination round robin.
 CREATE INDEX IF NOT EXISTS idx_deliveries_claim
-    ON deliveries(chat_id, thread_id, session_index, part_index)
+    ON deliveries(chat_id, thread_id, priority, session_index, part_index)
     WHERE state = 'pending';
 CREATE INDEX IF NOT EXISTS idx_deliveries_session
     ON deliveries(tenant_id, session_id, state, session_index, part_index);

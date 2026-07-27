@@ -216,6 +216,10 @@ def outbox_factory(
             "sleep": sleeper,
             "batch_size": 20,
             "burst": 1000.0,  # pacing off unless a test asks for it
+            # Recovery normally leaves a fresh claim alone in case an
+            # overlapping deployment is still sending it. These tests set the
+            # scene and recover immediately, so there is no peer to protect.
+            "orphan_after_ms": 0,
             # Its own tracker, on the fake clock: focus is shared process-wide
             # in production, and a test must not inherit another test's thumb.
             "focus": FocusTracker(clock=clock),
@@ -542,23 +546,30 @@ async def test_retry_after_is_honoured_then_the_send_succeeds(
     assert row is not None and row.state == "sent"
 
 
-async def test_a_second_429_pauses_the_queue_and_requeues_the_batch(
+async def test_a_second_429_pauses_that_chat_and_requeues_the_batch(
     outbox: Outbox, bot: FakeBot, clock: FakeClock, db: Database, session: str
 ) -> None:
+    """One group's flood limit is that group's problem, not everyone's.
+
+    With a shared bot serving every workspace, a global pause here would let
+    one customer's busy topic stop the whole service.
+    """
     bot.queue("send_message", retry_after(5), retry_after(5))
     await enqueue(outbox, message_id="a", session_index=1)
     await enqueue(outbox, message_id="b", session_index=2)
 
     assert await outbox.run_once() == 0
-    assert outbox.paused_for > 0
+    assert outbox.paused_for_chat(CHAT) > 0
+    assert outbox.paused_for == 0  # …and nobody else is affected
     # The untouched row went back to pending rather than sitting claimed.
     second = await deliveries_repo.get(db, (SESSION, "b", 0, CHAT))
     assert second is not None and second.state == "pending"
-    # And the queue really is paused.
+    # And that chat really is paused.
     assert await outbox.run_once() == 0
 
     clock.advance(10.0)
     assert await outbox.run_once() >= 1
+
 
 
 # ── pacing ───────────────────────────────────────────────────────────────────

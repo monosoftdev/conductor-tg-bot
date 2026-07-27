@@ -311,6 +311,7 @@ def drafts_for(
             thread_id=thread_id,
             part_index=part.index,
             kind=part.kind.value,
+            priority=int(priority),
             payload_json=delivery_payload(part, priority=priority),
             content_hash=part.content_hash,
         )
@@ -366,9 +367,12 @@ class Outbox:
         db: Database,
         *,
         pacer: TelegramPacer | None = None,
+        rate_per_minute: float = CHAT_RATE_PER_MINUTE,
+        burst: float = CHAT_BURST,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         batch_size: int = CLAIM_BATCH,
+        orphan_after_ms: int = deliveries_repo.ORPHAN_AFTER_MS,
         idle_interval: float = IDLE_INTERVAL_S,
         focus_window: float = FOCUS_WINDOW_S,
         max_attempts: int = MAX_ATTEMPTS,
@@ -386,11 +390,23 @@ class Outbox:
         self._max_attempts = max(1, max_attempts)
         self._claim_id = claim_id or deliveries_repo.new_claim_id()
         self._quick_replies = quick_replies
-        self._pacer = pacer if pacer is not None else TelegramPacer(
-            clock=clock, sleep=sleep
+        # ``pacer`` is the production path: one instance shared with the
+        # status cards, so both streams spend the same per-token budget. The
+        # rate/burst arguments build a private one, which is what a test that
+        # only cares about a single chat's pacing wants.
+        self._pacer = (
+            pacer
+            if pacer is not None
+            else TelegramPacer(
+                chat_rate_per_minute=max(rate_per_minute, 1.0),
+                chat_burst=max(burst, 1.0),
+                clock=clock,
+                sleep=sleep,
+            )
         )
         self._rotor = DestinationRotor(clock=clock)
         self._focus = focus if focus is not None else focus_tracker()
+        self._orphan_after_ms = orphan_after_ms
         self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._recovered = False
@@ -410,6 +426,10 @@ class Outbox:
     @property
     def claim_id(self) -> str:
         return self._claim_id
+
+    def paused_for_chat(self, chat_id: int) -> float:
+        """Seconds left on a 429 pause for one chat. 0 when it may send."""
+        return self._pacer.paused_for(chat_id)
 
     @property
     def paused_for(self) -> float:
@@ -433,6 +453,12 @@ class Outbox:
 
     async def pending_count(self, session_id: str | None = None) -> int:
         return await deliveries_repo.pending_count(self._db, session_id)
+
+    async def _has_stranded_rows(self) -> bool:
+        """Anything in ``sending`` that is not ours, and so still to recover."""
+        return await deliveries_repo.count_unclaimed_sending(
+            self._db, claim_id=self._claim_id
+        ) > 0
 
     # -- focus ------------------------------------------------------------
 
@@ -473,6 +499,7 @@ class Outbox:
                 session_index=session_index,
                 kind=part.kind.value,
                 payload_json=delivery_payload(part, priority=priority),
+                priority=int(priority),
                 hash_of_content=part.content_hash,
             ):
                 created += 1
@@ -588,6 +615,9 @@ class Outbox:
         while True:
             sent = await self.run_once()
             if sent == 0:
+                if not self._recovered:
+                    # Rows were still inside the orphan window last time.
+                    sent += await self.recover()
                 await self._idle_wait()
 
     async def _idle_wait(self) -> None:
@@ -606,13 +636,19 @@ class Outbox:
         At-least-once by design. :func:`~ctb.db.repo.deliveries.recover_orphaned`
         has already skipped any orphan whose payload matches a recently sent row
         in the same chat, so in the common case this does nothing at all.
+
+        Recovery only takes rows whose claim has gone stale, because a fresh
+        one may still be in flight on an overlapping deployment. That means a
+        *fast* restart can find rows too young to touch — so this stays armed
+        until a pass finds none left, and :meth:`run` calls it again on each
+        idle tick. Latching after the first pass would strand them forever.
         """
         if self._recovered:
             return 0
-        self._recovered = True
         result = await deliveries_repo.recover_orphaned(
-            self._db, claim_id=self._claim_id
+            self._db, claim_id=self._claim_id, orphan_after_ms=self._orphan_after_ms
         )
+        self._recovered = not await self._has_stranded_rows()
         self._counters["recovery_skipped"] += len(result.skipped)
         if result.total:
             _log.info(
@@ -642,16 +678,22 @@ class Outbox:
         destinations = self._rotor.order(
             await deliveries_repo.pending_destinations(self._db, limit=64),
             key=lambda item: (item.chat_id, item.thread_id),
-            promote=lambda item: self._focus.is_focused(
-                item.chat_id, item.thread_id, self._focus_window
+            urgency=lambda item: (
+                int(Priority.FOCUS)
+                if self._focus.is_focused(
+                    item.chat_id, item.thread_id, self._focus_window
+                )
+                else item.priority
             ),
         )
         sent = 0
+        served = 0
         for destination in destinations:
             if self.paused_for > 0:
                 break
             if not self._pacer.chat_ready(destination.chat_id):
                 continue
+            served += 1
             rows = await deliveries_repo.claim(
                 self._db,
                 claim_id=self._claim_id,
@@ -662,17 +704,45 @@ class Outbox:
             self._rotor.served((destination.chat_id, destination.thread_id))
             if not rows:
                 continue
-            jobs = self._prioritize(self._prepare(rows))
-            for index, job in enumerate(jobs):
-                if self.paused_for > 0:
-                    # Telegram told us to back off. Hand the rest of the batch
-                    # back so the next pass re-orders it with fresh priorities
-                    # instead of replaying a stale ordering.
-                    await self._requeue_all(jobs[index:])
-                    break
-                await self._pacer.acquire_global()
-                if await self._deliver(job):
-                    sent += 1
+            sent += await self._drain(jobs=self._prioritize(self._prepare(rows)))
+
+        if sent == 0 and destinations and served == 0:
+            # Every destination is saturated and there is nobody else to serve.
+            # Waiting beats spinning: one busy topic should still drain at its
+            # own rate. ``_drain`` blocks on the chat budget per message.
+            head = destinations[0]
+            if self._pacer.paused_for(head.chat_id) <= 0:
+                rows = await deliveries_repo.claim(
+                    self._db,
+                    claim_id=self._claim_id,
+                    limit=self._batch_size,
+                    chat_id=head.chat_id,
+                    thread_id=head.thread_id,
+                )
+                self._rotor.served((head.chat_id, head.thread_id))
+                if rows:
+                    sent += await self._drain(
+                        jobs=self._prioritize(self._prepare(rows))
+                    )
+        return sent
+
+    async def _drain(self, *, jobs: Sequence[_Job]) -> int:
+        """Send one destination's claimed batch, in order, until told to stop."""
+        sent = 0
+        for index, job in enumerate(jobs):
+            if self.paused_for > 0 or self._pacer.paused_for(job.row.chat_id) > 0:
+                # Telegram told us to back off. Hand the rest of the batch back
+                # so the next pass re-orders it with fresh priorities instead of
+                # replaying a stale ordering.
+                await self._requeue_all(jobs[index:])
+                break
+            # Both budgets, per message: Telegram limits a token *and* a chat,
+            # and spending one token per destination visit would let a single
+            # chat send a whole batch on a single token.
+            await self._pacer.acquire_chat(job.row.chat_id)
+            await self._pacer.acquire_global()
+            if await self._deliver(job):
+                sent += 1
         return sent
 
     async def flush(self, *, max_passes: int = 100) -> int:
