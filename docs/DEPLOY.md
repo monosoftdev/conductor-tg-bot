@@ -1,5 +1,9 @@
 # Deploying
 
+> First time? Read [`SETUP.md`](SETUP.md) instead — it covers this plus the
+> branches, CI protection and BotFather steps, in the order they have to
+> happen. This page is the reference for the deployment itself.
+
 One always-on service and one PostgreSQL database. Nothing else — no volume,
 no Redis, no public webhook, no cron. Telegram is reached by long polling, so
 the container needs outbound network and nothing inbound except the health

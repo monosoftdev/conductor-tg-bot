@@ -122,7 +122,8 @@ Every sealed blob names the key that sealed it, so old and new coexist.
 ## Deploying
 
 One always-on service and one PostgreSQL database. No volume, no Redis, no
-public webhook. Full instructions in [`docs/DEPLOY.md`](docs/DEPLOY.md); the
+public webhook. **Setting it up from zero is [`docs/SETUP.md`](docs/SETUP.md)** —
+branches, CI, BotFather, Railway, roles, keys and variables, in order. The
 shape of it:
 
 1. Add a PostgreSQL database. You need one — there is no SQLite fallback.
