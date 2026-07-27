@@ -54,7 +54,6 @@ from ctb.db.repo import workspaces as workspaces_repo
 from ctb.db.repo.sessions import SessionRow
 from ctb.db.repo.workspaces import WorkspaceRow
 from ctb.delivery.render.html import escape
-from ctb.settings import Settings
 from ctb.turn.state import TurnState
 from ctb.turn.supervisor import Supervisor
 
@@ -161,10 +160,8 @@ async def new_workspace(
     message: Message,
     route: Route,
     tenant: TenantContext,
-    settings: Settings,
     state: FSMContext,
     db: Database | None = None,
-    client: ConductorClient | None = None,
 ) -> None:
     text = command_text(message)
     await abandon_wizard(state)
@@ -348,17 +345,17 @@ async def adoptable_rows(
 @router.message(Command("attach"))
 async def attach_workspace(
     message: Message,
+    tenant: TenantContext,
     state: FSMContext,
     nonces: NonceStore,
     db: Database | None = None,
-    client: ConductorClient | None = None,
 ) -> None:
     """Open a cloud workspace created outside Telegram."""
     await abandon_wizard(state)
     database = resolve_db(db)
     rows = await adoptable_rows(
         database,
-        client,
+        tenant.client,
         query=command_text(message),
         limit=BOARD_VISIBLE,
     )

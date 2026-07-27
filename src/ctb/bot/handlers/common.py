@@ -310,7 +310,7 @@ async def submit_prompt(
         db,
         session_id,
         turn_state=str(TurnState.QUEUED),
-        start_witnessed=0,
+        start_witnessed=False,
         consecutive_idle=0,
     )
     await chats_repo.touch_prompt(db, chat_id, thread_id, focus_for_ms=FOCUS_MS)
@@ -545,7 +545,7 @@ async def create_and_bind_input(
         database,
         session_id,
         turn_state=str(TurnState.WAKING),
-        start_witnessed=0,
+        start_witnessed=False,
         consecutive_idle=0,
     )
     await chats_repo.touch_prompt(database, chat_id, thread_id, focus_for_ms=FOCUS_MS)

@@ -57,6 +57,7 @@ from ctb.bot.keyboards import (
     read_stateless,
 )
 from ctb.bot.middleware.routing import Route
+from ctb.bot.middleware.tenancy import TenantContext, TenantSettings
 from ctb.bot.wizards import new_workspace
 from ctb.conductor.models import (
     PostMessageResult,
@@ -77,10 +78,38 @@ from ctb.db.repo import sessions as sessions_repo
 from ctb.db.repo import workspaces as workspaces_repo
 from ctb.db.repo.chats import ChatRow
 from ctb.db.repo.sessions import SessionRow
+from ctb.db.repo.tenancy import TenantRow
 from ctb.db.repo.workspaces import WorkspaceRow
 from ctb.settings import Settings
 from ctb.turn.cursor import quick_replies_for
 from ctb.turn.state import Cancel, TurnState
+from tests.pg import BOOTSTRAP_TENANT_ID
+
+def fake_tenant(
+    client: Any = None,
+    *,
+    role: str = "owner",
+    user_id: int = 1001,
+    slug: str = "test",
+) -> TenantContext:
+    """The context TenantMiddleware would have injected.
+
+    Handlers reach the Conductor API only through this, which is what makes a
+    cross-organisation read impossible to write by accident.
+    """
+    return TenantContext(
+        tenant_id=BOOTSTRAP_TENANT_ID,
+        slug=slug,
+        status="active",
+        role=role,
+        user_id=user_id,
+        owner_ids=(user_id,),
+        primary_chat_id=None,
+        settings=TenantSettings(),
+        row=TenantRow(id=BOOTSTRAP_TENANT_ID, slug=slug, name=slug, status="active"),
+        _client=client,
+    )
+
 
 
 class PromptClient:
@@ -501,9 +530,9 @@ async def test_general_plain_text_searches_and_never_posts(
     await prompt_handlers.plain_text(
         message,  # type: ignore[arg-type]
         Route(chat_id=-1001, kind="general"),
+        fake_tenant(_CountingClient()),
         NonceStore(),
         db=db,
-        client=None,
     )
 
     # One typed line, one bubble: the Send button rides on the search results
@@ -752,10 +781,10 @@ async def test_board_sends_one_line_and_buttons_never_both_lists(
 
     await core_handlers.board(
         message,  # type: ignore[arg-type]
+        fake_tenant(_CountingClient()),
         _NullState(),  # type: ignore[arg-type]
         NonceStore(),
         db=db,
-        client=_CountingClient(),  # type: ignore[arg-type]
     )
 
     text, markup = sent[0]
@@ -798,10 +827,10 @@ async def test_board_offers_one_tap_adoption_for_a_topicless_workspace(
 
     await core_handlers.board(
         message,  # type: ignore[arg-type]
+        fake_tenant(_CountingClient()),
         _NullState(),  # type: ignore[arg-type]
         store,
         db=db,
-        client=_CountingClient(),  # type: ignore[arg-type]
     )
 
     text, markup = sent[0]
@@ -1195,10 +1224,9 @@ async def test_new_tells_the_owner_what_telegram_actually_said(
     await core_handlers.new_workspace(
         message,  # type: ignore[arg-type]
         Route(chat_id=-1001, kind="general"),
-        settings,
+        fake_tenant(client),
         _NullState(),  # type: ignore[arg-type]
         db=db,
-        client=client,  # type: ignore[arg-type]
     )
 
     assert client.creates == 0
@@ -1409,7 +1437,7 @@ async def test_a_wizard_button_minted_before_a_redeploy_still_works(
         tap,  # type: ignore[arg-type]
         _seat(db),
         NonceStore(),
-        settings,
+        fake_tenant(),
     )
 
     assert tap.answers == [""]
@@ -1463,7 +1491,7 @@ async def test_a_wizard_button_for_a_step_already_passed_is_refused(
         tap,  # type: ignore[arg-type]
         _seat(db),
         NonceStore(),
-        settings,
+        fake_tenant(),
     )
 
     assert tap.answers == [new_workspace.STALE_MESSAGE]
@@ -1482,7 +1510,7 @@ async def test_a_wizard_button_says_closed_when_the_wizard_is_gone(
         tap,  # type: ignore[arg-type]
         _seat(db),
         NonceStore(),
-        settings,
+        fake_tenant(),
     )
 
     assert tap.answers == [new_workspace.GONE_MESSAGE]
@@ -1539,10 +1567,9 @@ async def test_the_whole_wizard_survives_a_redeploy_at_every_step(
     await new_workspace.start_wizard(
         _wizard_message(),  # type: ignore[arg-type]
         route=Route(chat_id=-1001, kind="topic"),
-        settings=settings,
+        tenant=fake_tenant(_CountingClient()),
         state=_seat(db),
         db=db,
-        client=_CountingClient(),  # type: ignore[arg-type]
         nonces=NonceStore(),
     )
 
@@ -1551,9 +1578,9 @@ async def test_the_whole_wizard_survives_a_redeploy_at_every_step(
         tap = _Tap(str(first.callback_data))
         await new_workspace.wizard_callback(
             tap,  # type: ignore[arg-type]
-            _seat(db),  # the DB is all that carried over
+            _seat(db),  # the database is all that carried over
             NonceStore(),  # the registry did not
-            settings,
+            fake_tenant(),
         )
         assert tap.answers == [""], f"step {_step} refused a live button"
 
@@ -1604,7 +1631,7 @@ async def test_defaults_can_set_and_show_the_branch(
                 from_user=SimpleNamespace(id=1001),
             ),
             route,
-            settings,
+            fake_tenant(),
             _NullState(),  # type: ignore[arg-type]
             db=db,
         )

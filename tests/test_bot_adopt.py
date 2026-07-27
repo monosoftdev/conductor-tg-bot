@@ -40,12 +40,14 @@ from ctb.bot.handlers.adopt import (
 from ctb.bot.handlers.common import MOBILE_REPLY_INSTRUCTION, augment_prompt
 from ctb.bot.keyboards import NonceStore
 from ctb.bot.middleware.routing import Route
+from ctb.bot.middleware.tenancy import TenantContext, TenantSettings
 from ctb.conductor.client import ConductorClient
 from ctb.conductor.models import TranscriptMessage, WorkspaceStatusValue
 from ctb.db.connection import Database
 from ctb.db.repo import chats as chats_repo
 from ctb.db.repo import sessions as sessions_repo
 from ctb.db.repo import workspaces as workspaces_repo
+from ctb.db.repo.tenancy import TenantRow
 from ctb.settings import Settings
 from ctb.turn.state import TopicMarker
 from tests.conftest import FAKE_API_KEY
@@ -56,6 +58,34 @@ from tests.fakes.fake_conductor import (
     result,
     user_message,
 )
+from tests.pg import BOOTSTRAP_TENANT_ID
+
+
+def fake_tenant(
+    client: Any = None,
+    *,
+    role: str = "owner",
+    user_id: int = 1001,
+    slug: str = "test",
+) -> TenantContext:
+    """The context TenantMiddleware would have injected.
+
+    Handlers reach the Conductor API only through this, which is what makes a
+    cross-organisation read impossible to write by accident.
+    """
+    return TenantContext(
+        tenant_id=BOOTSTRAP_TENANT_ID,
+        slug=slug,
+        status="active",
+        role=role,
+        user_id=user_id,
+        owner_ids=(user_id,),
+        primary_chat_id=None,
+        settings=TenantSettings(),
+        row=TenantRow(id=BOOTSTRAP_TENANT_ID, slug=slug, name=slug, status="active"),
+        _client=client,
+    )
+
 
 CHAT_ID = -1002000000000
 FIRST_TOPIC = 101
@@ -649,9 +679,9 @@ async def test_a_prompt_in_the_adopted_topic_reaches_the_adopted_session(
             chat=chat,
             session=row,
         ),
+        fake_tenant(client),
         NonceStore(),
         db=db,
-        client=client,
     )
 
     posted = session.posted_ids
@@ -686,10 +716,10 @@ async def test_attach_command_lists_only_matching_unattached_workspaces(
 
     await core_handlers.attach_workspace(
         message,  # type: ignore[arg-type]
+        fake_tenant(client),
         _NullState(),  # type: ignore[arg-type]
         NonceStore(),
         db=db,
-        client=client,
     )
 
     text, markup = sent[0]
@@ -720,10 +750,10 @@ async def test_general_switch_offers_adoption_and_says_what_it_capped(
     await power_handlers.switch_session(
         message,  # type: ignore[arg-type]
         Route(chat_id=CHAT_ID, kind="general"),
+        fake_tenant(client),
         _NullState(),  # type: ignore[arg-type]
         NonceStore(),
         db=db,
-        client=client,
     )
 
     text, markup = sent[0]
@@ -758,10 +788,10 @@ async def test_general_switch_filters_adoptable_workspaces_by_name(
     await power_handlers.switch_session(
         message,  # type: ignore[arg-type]
         Route(chat_id=CHAT_ID, kind="general"),
+        fake_tenant(client),
         _NullState(),  # type: ignore[arg-type]
         NonceStore(),
         db=db,
-        client=client,
     )
 
     _, markup = sent[0]
@@ -805,10 +835,10 @@ async def test_general_switch_finds_an_attached_topic_by_workspace_name(
     await power_handlers.switch_session(
         message,  # type: ignore[arg-type]
         Route(chat_id=CHAT_ID, kind="general"),
+        fake_tenant(client),
         _NullState(),  # type: ignore[arg-type]
         NonceStore(),
         db=db,
-        client=client,
     )
 
     _, markup = sent[0]
@@ -847,8 +877,8 @@ async def test_the_callback_opens_the_topic_and_answers_with_a_jump(
     await adopt_handlers.adopt_callback(
         query,  # type: ignore[arg-type]
         store,
+        fake_tenant(client),
         db=db,
-        client=client,
     )
 
     assert query.answers == ["Opening…"]
@@ -872,8 +902,8 @@ async def test_a_refused_adoption_answers_in_the_chat_not_only_the_toast(
     await adopt_handlers.adopt_callback(
         query,  # type: ignore[arg-type]
         store,
+        fake_tenant(client),
         db=db,
-        client=client,
     )
 
     assert bot.topics == []
