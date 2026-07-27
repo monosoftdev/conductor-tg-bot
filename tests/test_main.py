@@ -514,3 +514,45 @@ class TestAppRoleConfinement:
         """BYPASSRLS without superuser is the subtler half of the same mistake."""
         with pytest.raises(SettingsError, match="bypasses row-level security"):
             await self.check(pg.worker_dsn())
+
+
+class TestConfigurationErrorsAreLegible:
+    """A misconfiguration is not a crash and must not print like one.
+
+    Raising through ``asyncio.run`` buried the one useful line under forty
+    frames of pydantic and asyncio. On a hosting platform that is a scrolling
+    box next to a red "healthcheck failed", and it reads as no error at all —
+    every report of this has been "it does not work and there are no logs".
+    """
+
+    def test_the_reason_is_printed_without_a_traceback(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from ctb.__main__ import _report_bad_configuration
+
+        _report_bad_configuration(
+            SettingsError("Configuration is invalid.\n  missing: CTB_MASTER_KEYS — x")
+        )
+
+        err = capsys.readouterr().err
+        assert "CTB_MASTER_KEYS" in err
+        assert "cannot start" in err
+        assert "Traceback" not in err
+        assert "docs/SETUP.md" in err, "say where the value comes from"
+
+    def test_a_bad_configuration_exits_one_rather_than_crashing(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Exit 1 so the platform restarts with a reason, not a stack trace."""
+        import ctb.__main__ as entry
+
+        async def boom() -> None:
+            raise SettingsError("missing: CTB_MASTER_KEYS — x")
+
+        monkeypatch.setattr(entry, "run", boom)
+
+        with pytest.raises(SystemExit) as exit_info:
+            entry.main()
+
+        assert exit_info.value.code == 1
+        assert "CTB_MASTER_KEYS" in capsys.readouterr().err
