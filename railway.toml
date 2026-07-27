@@ -17,7 +17,15 @@ dockerfilePath = "Dockerfile"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
 healthcheckPath = "/health"
-healthcheckTimeout = 30
+# Generous on purpose. Nothing listens on /health until `build_runtime` has
+# opened both pools and verified the schema, so *every* misconfiguration —
+# a missing variable, an unbootstrapped database, the superuser DSN, a wrong
+# host — presents identically as "1/1 replicas never became healthy".
+#
+# The real reason is always in the deploy log, but only if the process lives
+# long enough to print it. At 30s the platform gave up at the same moment the
+# database connect timed out, so the useful line never appeared.
+healthcheckTimeout = 120
 
 # Stop the old instance before starting the new one, so a redeploy never has
 # two pollers live at once. Delivery claims tolerate an overlap anyway

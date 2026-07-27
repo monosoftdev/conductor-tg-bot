@@ -65,6 +65,9 @@ __all__ = [
 _TENANT_GUC: Final = "ctb.tenant_id"
 
 #: Applied by the server at connection start, so nothing can reset them later.
+#: Seconds to wait for a TCP connection to PostgreSQL before giving up.
+CONNECT_TIMEOUT_S: Final = 10
+
 #: ``statement_timeout`` bounds a runaway query; the idle-in-transaction timeout
 #: kills a leaked transaction instead of letting it wedge a pool slot forever.
 CONNECT_OPTIONS: Final = (
@@ -175,6 +178,11 @@ class Database:
                 "row_factory": dict_row,
                 "autocommit": False,
                 "options": CONNECT_OPTIONS,
+                # Fail fast on a host that is not there. The default is to
+                # wait for the OS TCP timeout — around two minutes — which a
+                # platform healthcheck cuts off first, turning "wrong hostname"
+                # into "replicas never became healthy" with nothing logged.
+                "connect_timeout": CONNECT_TIMEOUT_S,
             },
             reset=_reset_connection,
         )
