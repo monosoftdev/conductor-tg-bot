@@ -198,11 +198,18 @@ class Database:
     # -- the seam every statement goes through -------------------------------
 
     async def _apply_scope(self, conn: AsyncConnection[Row]) -> None:
-        """Publish the tenant to row-level security, transaction-locally."""
-        if self.system:
-            return
+        """Publish the tenant, transaction-locally.
+
+        The GUC answers "who is this acting for"; the *role* answers "may this
+        connection see everything". They are separate on purpose: a system pool
+        with a tenant in scope still bypasses row-level security, but its
+        inserts pick up the right ``tenant_id`` default — which is what lets a
+        worker write on a tenant's behalf without naming the column.
+        """
         tenant = _tenant.get()
         if tenant is None:
+            if self.system:
+                return
             raise TenantScopeError(
                 "no tenant in scope for a tenant-scoped query; wrap the call in "
                 "ctb.db.connection.tenant_scope() or use the system database"

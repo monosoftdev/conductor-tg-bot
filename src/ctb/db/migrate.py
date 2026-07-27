@@ -123,9 +123,17 @@ def _checked_sql(migration: Migration) -> str:
 
 
 async def current_schema_version(db: Database) -> int:
-    """The highest applied version, or 0 on a fresh database."""
-    await db.execute(_SCHEMA_VERSION_DDL)
-    value = await db.fetch_val("SELECT MAX(version) FROM schema_version", default=0)
+    """The highest applied version, or 0 when nothing has been applied.
+
+    Read-only on purpose: ``/health`` calls this on every report, and the roles
+    the application runs as have no rights to create anything. Only
+    :func:`apply_migrations` may touch the schema.
+    """
+    value = await db.fetch_val(
+        "SELECT MAX(version) FROM schema_version "
+        "WHERE to_regclass('schema_version') IS NOT NULL",
+        default=0,
+    )
     return int(value or 0)
 
 

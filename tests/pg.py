@@ -145,13 +145,20 @@ async def db(pg_reset: tuple[str, ...]) -> AsyncIterator[Database]:
 
 @pytest.fixture
 async def system_db(pg_reset: tuple[str, ...]) -> AsyncIterator[Database]:
-    """The **worker** pool: BYPASSRLS, no tenant in scope."""
+    """The **worker** pool: BYPASSRLS, cross-tenant reads allowed.
+
+    The bootstrap tenant is still in scope, mirroring production — a worker
+    acts *on behalf of* a tenant even though it may read across all of them —
+    so inserts pick up the right ``tenant_id`` default.
+    """
     database = await Database(
         worker_dsn(), min_size=1, max_size=6, system=True
     ).connect()
+    token = set_tenant(BOOTSTRAP_TENANT_ID)
     try:
         yield database
     finally:
+        reset_tenant(token)
         await database.close()
 
 

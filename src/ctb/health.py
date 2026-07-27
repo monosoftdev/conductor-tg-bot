@@ -274,6 +274,19 @@ type PoolProvider = Callable[[], ClientPool | None]
 type TelegramProvider = Callable[[], TelegramHealth | None]
 
 
+def _pool_stats(db: Database) -> dict[str, Any]:
+    """Pool counters. Exhaustion is the new deadlock class; make it visible."""
+    try:
+        stats = db.stats()
+    except Exception:  # pragma: no cover - stats are best effort
+        return {}
+    return {
+        "pool_size": stats.get("pool_size", 0),
+        "pool_available": stats.get("pool_available", 0),
+        "pool_waiting": stats.get("requests_waiting", 0),
+    }
+
+
 def default_database_provider() -> Database | None:
     """The process-wide database, or ``None`` before boot installed one."""
     try:
@@ -316,7 +329,7 @@ class HealthMonitor:
         "_cache",
         "_cache_ttl",
         "_cached_at",
-        "_client_provider",
+        "_pool_provider",
         "_clock",
         "_db_provider",
         "_db_timeout",
@@ -441,6 +454,9 @@ class HealthMonitor:
 
         throttled = 0
         auth_failures = 0
+        failures_total = 0
+        requests_total = 0
+        retries_total = 0
         open_circuits: list[str] = []
         rejected: list[str] = []
         for slug, client in clients:
@@ -450,6 +466,9 @@ class HealthMonitor:
             except Exception:  # pragma: no cover - pure reads
                 continue
             throttled += sum(1 for event in recent if event.status_code == 429)
+            failures_total += int(stats.get("failures", 0) or 0)
+            requests_total += int(stats.get("requests", 0) or 0)
+            retries_total += int(stats.get("retries", 0) or 0)
             failures = int(stats.get("auth_failures", 0) or 0)
             if failures:
                 auth_failures += failures
@@ -459,8 +478,16 @@ class HealthMonitor:
                 open_circuits.append(slug)
         section["rate_limited_recent"] = throttled
         section["auth_failures"] = auth_failures
+        section["failures"] = failures_total
+        section["requests"] = requests_total
+        section["retries"] = retries_total
         section["auth_rejected_tenants"] = tuple(sorted(rejected))
         section["open_circuit_tenants"] = tuple(sorted(open_circuits))
+        # One summary line for the operator: the worst breaker anyone is in.
+        section["circuit"] = {
+            "state": "open" if open_circuits else "closed",
+            "open_tenants": len(open_circuits),
+        }
 
         if auth_failures:
             degradations.append(
@@ -534,28 +561,26 @@ class HealthMonitor:
             degradations.append(
                 Degradation(
                     DEGRADATION_DATABASE,
-                    f"SQLite did not answer within {self._db_timeout:g}s.",
+                    f"PostgreSQL did not answer within {self._db_timeout:g}s.",
                 )
             )
-            return (
-                {"ok": False, "path": str(db.path), "error": "timeout"},
-                {},
-            )
+            return ({"ok": False, "error": "timeout", **_pool_stats(db)}, {})
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             degradations.append(
                 Degradation(
-                    DEGRADATION_DATABASE, f"SQLite is unreadable: {_reason(exc)}"
+                    DEGRADATION_DATABASE,
+                    f"PostgreSQL is unreadable: {_reason(exc)}",
                 )
             )
-            return {"ok": False, "path": str(db.path), "error": _reason(exc)}, {}
+            return {"ok": False, "error": _reason(exc), **_pool_stats(db)}, {}
 
         db_section = {
             "ok": True,
-            "path": str(db.path),
             "schema_version": schema_version,
             "query_ms": int((self._clock() - started) * 1000),
+            **_pool_stats(db),
         }
         return db_section, sections
 

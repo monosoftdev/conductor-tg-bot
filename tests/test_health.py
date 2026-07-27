@@ -12,9 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sqlite3
 from collections.abc import AsyncIterator, Callable
-from pathlib import Path
 from typing import Any
 
 import httpx
@@ -23,6 +21,7 @@ import pytest
 from ctb.conductor.client import ConductorClient
 from ctb.conductor.errors import ApiError, AuthFatal, RateLimited
 from ctb.db.connection import Database, set_database
+from ctb.db.errors import DatabaseError
 from ctb.db.repo import deliveries as deliveries_repo
 from ctb.db.repo import events as events_repo
 from ctb.db.repo import lease as lease_repo
@@ -48,8 +47,8 @@ from ctb.health import (
     HealthStatus,
     TelegramHealth,
     create_app,
-    default_client_provider,
     default_database_provider,
+    default_pool_provider,
     detail_allowed,
     format_health_html,
     health_port,
@@ -60,12 +59,26 @@ from ctb.health import (
     telegram_health,
 )
 from ctb.settings import Settings, reset_settings
-from tests.conftest import FakeClock
+from tests.conftest import FAKE_API_KEY, FakeClock
+from tests.pg import worker_dsn
 
 WALL = 1_700_000_000_000  # a fixed epoch-ms "now" for every deterministic test
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
+
+
+class OnePool:
+    """A :class:`ClientPool` stand-in holding at most one tenant's client."""
+
+    def __init__(self, client: ConductorClient | None) -> None:
+        self._client = client
+
+    def clients(self) -> tuple[tuple[str, ConductorClient], ...]:
+        return () if self._client is None else (("tenant-a", self._client),)
+
+    def health(self) -> dict[str, object]:
+        return {"clients": 0 if self._client is None else 1, "pinned": 0}
 
 
 def make_monitor(
@@ -81,7 +94,7 @@ def make_monitor(
     record = telegram if telegram is not None else TelegramHealth()
     return HealthMonitor(
         database=lambda: db,
-        client=lambda: client,
+        clients=lambda: None if client is None else OnePool(client),
         telegram=lambda: record,
         wall_clock=lambda: at,
         clock=clock or FakeClock(1_000.0),
@@ -92,7 +105,7 @@ def make_monitor(
 
 
 async def seed_session(
-    db: Database,
+    system_db: Database,
     session_id: str = "sess-1",
     *,
     bound: bool = True,
@@ -101,10 +114,10 @@ async def seed_session(
     turn_state: str = "IDLE",
 ) -> None:
     await sessions_repo.upsert(
-        db, session_id, chat_id=-100123, thread_id=7, is_bound=bound, at=at
+        system_db, session_id, chat_id=-100123, thread_id=7, is_bound=bound, at=at
     )
     await sessions_repo.update(
-        db,
+        system_db,
         session_id,
         at=at,
         poll_interval_ms=poll_interval_ms,
@@ -157,10 +170,10 @@ async def get_json(
 # ── the happy path and the JSON shape ────────────────────────────────────────
 
 
-async def test_report_shape_is_complete(db: Database) -> None:
-    await seed_session(db)
-    await lease_repo.acquire(db, holder="host:1:abc", at=WALL - 1_000)
-    report = await make_monitor(db=db, holder="host:1:abc").report()
+async def test_report_shape_is_complete(system_db: Database) -> None:
+    await seed_session(system_db)
+    await lease_repo.acquire(system_db, holder="host:1:abc", at=WALL - 1_000)
+    report = await make_monitor(db=system_db, holder="host:1:abc").report()
 
     assert report.status is HealthStatus.OK
     assert report.http_status == 200
@@ -196,18 +209,18 @@ async def test_report_shape_is_complete(db: Database) -> None:
     assert json.loads(json.dumps(body))  # serialisable as-is
 
 
-async def test_uptime_tracks_the_injected_clock(db: Database) -> None:
+async def test_uptime_tracks_the_injected_clock(system_db: Database) -> None:
     clock = FakeClock(1_000.0)
-    monitor = make_monitor(db=db, clock=clock)
+    monitor = make_monitor(db=system_db, clock=clock)
     clock.advance(3_725.0)
     report = await monitor.report()
     assert report.uptime_s == pytest.approx(3_725.0)
     assert report.as_dict()["uptime"] == "1h02m"
 
 
-async def test_summary_omits_everything_identifying(db: Database) -> None:
-    await seed_session(db)
-    report = await make_monitor(db=db, holder="host:1:abc").report()
+async def test_summary_omits_everything_identifying(system_db: Database) -> None:
+    await seed_session(system_db)
+    report = await make_monitor(db=system_db, holder="host:1:abc").report()
     summary = report.summary()
 
     assert set(summary) == {
@@ -228,17 +241,18 @@ async def test_summary_omits_everything_identifying(db: Database) -> None:
 
 
 async def test_auth_fatal_is_degraded_but_still_200(
-    db: Database, settings: Settings
+    system_db: Database, settings: Settings
 ) -> None:
     client = ConductorClient(
-        settings, transport=transport_returning(401), sleep=_no_sleep, max_attempts=1
+        api_key=FAKE_API_KEY,
+        api_url=settings.conductor_api_url, transport=transport_returning(401), sleep=_no_sleep, max_attempts=1
     )
     with pytest.raises(AuthFatal):
         await client.get_session_status("sess-1")
     await client.aclose()
     assert client.auth_failures == 1
 
-    report = await make_monitor(db=db, client=client).report()
+    report = await make_monitor(db=system_db, client=client).report()
 
     # Alive: a restart cannot conjure a valid API key.
     assert report.status is HealthStatus.DEGRADED
@@ -249,12 +263,13 @@ async def test_auth_fatal_is_degraded_but_still_200(
     detail = next(
         d.detail for d in report.degradations if d.code == DEGRADATION_AUTH_FATAL
     )
-    assert "CONDUCTOR_API_KEY" in detail
+    assert "/key" in detail
+    assert "tenant-a" in detail
     assert report.as_dict()["conductor"]["auth_failures"] == 1
 
 
 async def test_a_stuck_telegram_poller_is_visible_and_still_200(
-    db: Database,
+    system_db: Database,
 ) -> None:
     """A bot that reaches nothing on Telegram must not report a clean bill.
 
@@ -265,7 +280,7 @@ async def test_a_stuck_telegram_poller_is_visible_and_still_200(
     for _ in range(TELEGRAM_FAILURE_THRESHOLD):
         record.record_failure("TelegramNetworkError('timeout')")
 
-    report = await make_monitor(db=db, telegram=record).report()
+    report = await make_monitor(db=system_db, telegram=record).report()
 
     assert report.status is HealthStatus.DEGRADED
     assert report.http_status == 200  # a restart cannot fix Telegram
@@ -276,25 +291,25 @@ async def test_a_stuck_telegram_poller_is_visible_and_still_200(
 
 
 async def test_telegram_failures_below_the_threshold_are_not_a_degradation(
-    db: Database,
+    system_db: Database,
 ) -> None:
     """A redeploy overlap costs a conflict or two; that is not an outage."""
     record = TelegramHealth()
     record.record_failure("conflict: terminated by other getUpdates")
 
-    report = await make_monitor(db=db, telegram=record).report()
+    report = await make_monitor(db=system_db, telegram=record).report()
 
     assert report.status is HealthStatus.OK
     assert not report.has(DEGRADATION_TELEGRAM)
 
 
 async def test_one_successful_bot_api_call_clears_the_telegram_degradation(
-    db: Database,
+    system_db: Database,
 ) -> None:
     record = TelegramHealth()
     for _ in range(TELEGRAM_FAILURE_THRESHOLD + 2):
         record.record_failure("conflict")
-    monitor = make_monitor(db=db, telegram=record)
+    monitor = make_monitor(db=system_db, telegram=record)
     assert (await monitor.report(force=True)).has(DEGRADATION_TELEGRAM)
 
     record.record_ok()
@@ -315,11 +330,11 @@ def test_telegram_health_is_a_process_wide_record() -> None:
 
 
 async def test_circuit_open_is_degraded_but_still_200(
-    db: Database, settings: Settings
+    system_db: Database, settings: Settings
 ) -> None:
-    client = ConductorClient(settings, transport=transport_returning(500))
+    client = ConductorClient(api_key=FAKE_API_KEY, api_url=settings.conductor_api_url, transport=transport_returning(500))
     client.circuit.trip(45.0, "GET /sessions/{id}/status")
-    report = await make_monitor(db=db, client=client).report()
+    report = await make_monitor(db=system_db, client=client).report()
     await client.aclose()
 
     assert report.status is HealthStatus.DEGRADED
@@ -329,10 +344,11 @@ async def test_circuit_open_is_degraded_but_still_200(
 
 
 async def test_rate_limiting_is_surfaced_for_tuning(
-    db: Database, settings: Settings
+    system_db: Database, settings: Settings
 ) -> None:
     client = ConductorClient(
-        settings,
+        api_key=FAKE_API_KEY,
+        api_url=settings.conductor_api_url,
         transport=transport_returning(429, headers={"Retry-After": "1"}),
         sleep=_no_sleep,
         max_attempts=1,
@@ -341,30 +357,31 @@ async def test_rate_limiting_is_surfaced_for_tuning(
         await client.get_session_status("sess-1")
     await client.aclose()
 
-    report = await make_monitor(db=db, client=client).report()
+    report = await make_monitor(db=system_db, client=client).report()
     assert report.http_status == 200
     assert report.has(DEGRADATION_RATE_LIMITED)
     assert report.as_dict()["conductor"]["rate_limited_recent"] >= 1
 
 
 async def test_server_error_leaves_the_check_green(
-    db: Database, settings: Settings
+    system_db: Database, settings: Settings
 ) -> None:
     """A 500 from Conductor is their outage, not ours: report, do not restart."""
     client = ConductorClient(
-        settings, transport=transport_returning(503), sleep=_no_sleep, max_attempts=1
+        api_key=FAKE_API_KEY,
+        api_url=settings.conductor_api_url, transport=transport_returning(503), sleep=_no_sleep, max_attempts=1
     )
     with pytest.raises(ApiError):
         await client.get_session_status("sess-1")
     await client.aclose()
 
-    report = await make_monitor(db=db, client=client).report()
+    report = await make_monitor(db=system_db, client=client).report()
     assert report.http_status == 200
     assert report.as_dict()["conductor"]["failures"] >= 1
 
 
-async def test_missing_client_is_not_a_failure(db: Database) -> None:
-    report = await make_monitor(db=db).report()
+async def test_missing_client_is_not_a_failure(system_db: Database) -> None:
+    report = await make_monitor(db=system_db).report()
     assert report.status is HealthStatus.OK
     assert report.conductor == {"available": False}
 
@@ -381,8 +398,8 @@ async def test_no_database_handle_is_down() -> None:
     assert report.database["ok"] is False
 
 
-async def test_closed_database_is_down(db_path: Path) -> None:
-    db = await Database(db_path).connect()
+async def test_closed_database_is_down(pg_reset: object) -> None:
+    db = await Database(worker_dsn(), system=True).connect()
     await db.close()
     report = await make_monitor(db=db).report()
     assert report.status is HealthStatus.DOWN
@@ -391,18 +408,20 @@ async def test_closed_database_is_down(db_path: Path) -> None:
     assert report.database["error"]
 
 
-async def test_unreadable_database_is_down(db_path: Path) -> None:
+async def test_unreadable_database_is_down(pg_reset: object) -> None:
     class Corrupt(Database):
-        """The volume is mounted but the file is not a database any more."""
+        """Connected, but the server rejects everything we send it."""
 
         broken = False
 
-        async def execute(self, sql: str, params: Any = ()) -> int:
+        async def fetch_val(
+            self, sql: str, params: Any = (), default: Any = None
+        ) -> Any:
             if self.broken:
-                raise sqlite3.DatabaseError("file is not a database")
-            return await super().execute(sql, params)
+                raise DatabaseError("relation does not exist")
+            return await super().fetch_val(sql, params, default)
 
-    db = await Corrupt(db_path).connect()
+    db = await Corrupt(worker_dsn(), system=True).connect()
     db.broken = True
     try:
         report = await make_monitor(db=db).report()
@@ -414,18 +433,22 @@ async def test_unreadable_database_is_down(db_path: Path) -> None:
     assert "DatabaseError" in report.database["error"]
 
 
-async def test_wedged_database_times_out_rather_than_hanging(db_path: Path) -> None:
+async def test_wedged_database_times_out_rather_than_hanging(
+    pg_reset: object,
+) -> None:
     class Wedged(Database):
-        """Connects normally, then stops answering — a locked SQLite file."""
+        """Connects normally, then stops answering — an exhausted pool."""
 
         wedged = False
 
-        async def execute(self, sql: str, params: Any = ()) -> int:
+        async def fetch_val(
+            self, sql: str, params: Any = (), default: Any = None
+        ) -> Any:
             if self.wedged:
                 await asyncio.sleep(30)
-            return await super().execute(sql, params)
+            return await super().fetch_val(sql, params, default)
 
-    db = await Wedged(db_path).connect()
+    db = await Wedged(worker_dsn(), system=True).connect()
     db.wedged = True
     try:
         report = await make_monitor(db=db, db_timeout_s=0.05).report()
@@ -439,7 +462,7 @@ async def test_a_raising_provider_is_down_not_an_exception() -> None:
     def boom() -> Database | None:
         raise RuntimeError("no database installed")
 
-    monitor = HealthMonitor(database=boom, client=lambda: None, cache_ttl_s=0.0)
+    monitor = HealthMonitor(database=boom, clients=lambda: None, cache_ttl_s=0.0)
     report = await monitor.report()
     assert report.status is HealthStatus.DOWN
     assert report.has(DEGRADATION_DATABASE)
@@ -448,33 +471,33 @@ async def test_a_raising_provider_is_down_not_an_exception() -> None:
 # ── poll lag ─────────────────────────────────────────────────────────────────
 
 
-async def test_fresh_poller_is_not_overdue(db: Database) -> None:
-    await seed_session(db, at=WALL - 5_000, poll_interval_ms=20_000)
-    report = await make_monitor(db=db).report()
+async def test_fresh_poller_is_not_overdue(system_db: Database) -> None:
+    await seed_session(system_db, at=WALL - 5_000, poll_interval_ms=20_000)
+    report = await make_monitor(db=system_db).report()
     assert report.polling["overdue"] == 0
     assert report.polling["max_lag_ms"] == 5_000
     assert report.status is HealthStatus.OK
 
 
-async def test_silent_poller_is_overdue(db: Database) -> None:
-    await seed_session(db, at=WALL - 400_000, poll_interval_ms=120_000)
-    report = await make_monitor(db=db).report()
+async def test_silent_poller_is_overdue(system_db: Database) -> None:
+    await seed_session(system_db, at=WALL - 400_000, poll_interval_ms=120_000)
+    report = await make_monitor(db=system_db).report()
     assert report.polling["overdue"] == 1
     assert report.polling["max_lag_session_id"] == "sess-1"
     assert report.has(DEGRADATION_POLL_LAG)
     assert report.http_status == 200  # the supervisor restarts pollers itself
 
 
-async def test_fast_cadence_uses_the_grace_floor(db: Database) -> None:
+async def test_fast_cadence_uses_the_grace_floor(system_db: Database) -> None:
     """A 3s QUEUED cadence must not go overdue after 9s — the floor is 30s."""
-    await seed_session(db, at=WALL - 10_000, poll_interval_ms=3_000)
-    report = await make_monitor(db=db).report()
+    await seed_session(system_db, at=WALL - 10_000, poll_interval_ms=3_000)
+    report = await make_monitor(db=system_db).report()
     assert report.polling["overdue"] == 0
 
 
-async def test_unbound_sessions_are_not_polled_and_not_counted(db: Database) -> None:
-    await seed_session(db, "sess-idle", bound=False, at=WALL - 10_000_000)
-    report = await make_monitor(db=db).report()
+async def test_unbound_sessions_are_not_polled_and_not_counted(system_db: Database) -> None:
+    await seed_session(system_db, "sess-idle", bound=False, at=WALL - 10_000_000)
+    report = await make_monitor(db=system_db).report()
     assert report.polling["bound_sessions"] == 0
     assert report.polling["overdue"] == 0
     assert report.status is HealthStatus.OK
@@ -483,11 +506,11 @@ async def test_unbound_sessions_are_not_polled_and_not_counted(db: Database) -> 
 # ── deliveries ───────────────────────────────────────────────────────────────
 
 
-async def test_delivery_counts_and_backlog(db: Database) -> None:
-    await seed_session(db)
+async def test_delivery_counts_and_backlog(system_db: Database) -> None:
+    await seed_session(system_db)
     for index in range(DELIVERY_BACKLOG + 2):
         await deliveries_repo.enqueue(
-            db,
+            system_db,
             session_id="sess-1",
             message_id=f"msg-{index}",
             chat_id=-100123,
@@ -495,22 +518,22 @@ async def test_delivery_counts_and_backlog(db: Database) -> None:
             session_index=index,
             payload_json=json.dumps({"html": "hi"}),
         )
-    report = await make_monitor(db=db).report()
+    report = await make_monitor(db=system_db).report()
     assert report.deliveries["pending"] == DELIVERY_BACKLOG + 2
     assert report.deliveries["by_state"]["pending"] == DELIVERY_BACKLOG + 2
     assert report.has(DEGRADATION_DELIVERY_BACKLOG)
     assert report.http_status == 200
 
 
-async def test_failed_deliveries_are_degradations(db: Database) -> None:
-    await seed_session(db)
+async def test_failed_deliveries_are_degradations(system_db: Database) -> None:
+    await seed_session(system_db)
     await deliveries_repo.enqueue(
-        db, session_id="sess-1", message_id="m1", chat_id=-100123
+        system_db, session_id="sess-1", message_id="m1", chat_id=-100123
     )
     await deliveries_repo.mark_failed(
-        db, ("sess-1", "m1", 0, -100123), error="entity parse", retry=False
+        system_db, ("sess-1", "m1", 0, -100123), error="entity parse", retry=False
     )
-    report = await make_monitor(db=db).report()
+    report = await make_monitor(db=system_db).report()
     assert report.deliveries["failed"] == 1
     assert report.has(DEGRADATION_DELIVERY_FAILED)
 
@@ -518,28 +541,28 @@ async def test_failed_deliveries_are_degradations(db: Database) -> None:
 # ── the singleton lease ──────────────────────────────────────────────────────
 
 
-async def test_lease_held_by_this_instance(db: Database) -> None:
+async def test_lease_held_by_this_instance(system_db: Database) -> None:
     holder = "host:1:abc"
-    await lease_repo.acquire(db, holder=holder, at=WALL - 1_000)
-    report = await make_monitor(db=db, holder=holder).report()
+    await lease_repo.acquire(system_db, holder=holder, at=WALL - 1_000)
+    report = await make_monitor(db=system_db, holder=holder).report()
     assert report.lease["holder"] == holder
     assert report.lease["is_me"] is True
     assert report.lease["held"] is True
     assert not report.has(DEGRADATION_LEASE_LOST)
 
 
-async def test_lease_held_by_another_instance_is_degraded(db: Database) -> None:
-    await lease_repo.acquire(db, holder="other:9:zzz", at=WALL - 1_000)
-    report = await make_monitor(db=db, holder="host:1:abc").report()
+async def test_lease_held_by_another_instance_is_degraded(system_db: Database) -> None:
+    await lease_repo.acquire(system_db, holder="other:9:zzz", at=WALL - 1_000)
+    report = await make_monitor(db=system_db, holder="host:1:abc").report()
     assert report.lease["is_me"] is False
     assert report.has(DEGRADATION_LEASE_LOST)
     assert report.http_status == 200  # racing a restart would be worse
 
 
 async def test_unheld_lease_without_a_holder_is_not_a_degradation(
-    db: Database,
+    system_db: Database,
 ) -> None:
-    report = await make_monitor(db=db).report()
+    report = await make_monitor(db=system_db).report()
     assert report.lease == {
         "name": lease_repo.SUPERVISOR,
         "holder": None,
@@ -548,8 +571,8 @@ async def test_unheld_lease_without_a_holder_is_not_a_degradation(
     assert report.status is HealthStatus.OK
 
 
-async def test_set_holder_starts_reporting_the_lease(db: Database) -> None:
-    monitor = make_monitor(db=db)
+async def test_set_holder_starts_reporting_the_lease(system_db: Database) -> None:
+    monitor = make_monitor(db=system_db)
     assert monitor.holder is None
     monitor.set_holder("host:1:abc")
     report = await monitor.report()
@@ -560,10 +583,10 @@ async def test_set_holder_starts_reporting_the_lease(db: Database) -> None:
 # ── api_events and unknown content types ─────────────────────────────────────
 
 
-async def test_last_twenty_api_events_newest_first(db: Database) -> None:
+async def test_last_twenty_api_events_newest_first(system_db: Database) -> None:
     for index in range(API_EVENT_LIMIT + 5):
         await events_repo.record_api_event(
-            db,
+            system_db,
             method="GET",
             endpoint="/sessions/{id}/messages",
             status_code=200,
@@ -571,7 +594,7 @@ async def test_last_twenty_api_events_newest_first(db: Database) -> None:
             ok=True,
             at=WALL - 1_000 + index,
         )
-    report = await make_monitor(db=db).report()
+    report = await make_monitor(db=system_db).report()
     assert len(report.api_events) == API_EVENT_LIMIT
     assert report.api_events[0]["duration_ms"] == API_EVENT_LIMIT + 4
     assert report.api_events[0]["endpoint"] == "/sessions/{id}/messages"
@@ -579,25 +602,25 @@ async def test_last_twenty_api_events_newest_first(db: Database) -> None:
     assert report.as_dict()["api_event_stats"]["total"] == API_EVENT_LIMIT + 5
 
 
-async def test_unknown_content_types_are_reported(db: Database) -> None:
+async def test_unknown_content_types_are_reported(system_db: Database) -> None:
     await events_repo.note_unknown_content_type(
-        db,
+        system_db,
         content_type="futureEvent",
         signature="deadbeefdeadbeef",
         session_id="sess-1",
         message_id="sess-1:9:0",
         at=WALL - 500,
     )
-    report = await make_monitor(db=db).report()
+    report = await make_monitor(db=system_db).report()
     assert report.unknown_content_types[0]["type"] == "futureEvent"
     assert report.unknown_content_types[0]["count"] == 1
     # An unknown shape is data to look at, not a reason to restart.
     assert report.status is HealthStatus.OK
 
 
-async def test_the_body_is_scrubbed(db: Database) -> None:
+async def test_the_body_is_scrubbed(system_db: Database) -> None:
     await events_repo.record_api_event(
-        db,
+        system_db,
         method="POST",
         endpoint="/sessions/{id}/messages",
         status_code=401,
@@ -605,18 +628,18 @@ async def test_the_body_is_scrubbed(db: Database) -> None:
         error="401 for Authorization: Bearer sk-live-abcdef0123456789",
         at=WALL - 10,
     )
-    body = (await make_monitor(db=db).report()).as_dict()
+    body = (await make_monitor(db=system_db).report()).as_dict()
     assert "sk-live-abcdef0123456789" not in json.dumps(body)
 
 
 # ── caching ──────────────────────────────────────────────────────────────────
 
 
-async def test_reports_are_cached_within_the_ttl(db: Database) -> None:
+async def test_reports_are_cached_within_the_ttl(system_db: Database) -> None:
     clock = FakeClock(1_000.0)
     monitor = HealthMonitor(
         database=lambda: db,
-        client=lambda: None,
+        clients=lambda: None,
         clock=clock,
         wall_clock=lambda: WALL,
         cache_ttl_s=2.0,
@@ -632,10 +655,10 @@ async def test_reports_are_cached_within_the_ttl(db: Database) -> None:
 
 
 async def test_http_health_returns_200_with_detail_on_loopback(
-    db: Database, running_server: Callable[..., Any]
+    system_db: Database, running_server: Callable[..., Any]
 ) -> None:
-    await seed_session(db)
-    server = await running_server(make_monitor(db=db))
+    await seed_session(system_db)
+    server = await running_server(make_monitor(db=system_db))
     status, body = await get_json(server)
     assert status == 200
     assert body["status"] == "ok"
@@ -643,9 +666,9 @@ async def test_http_health_returns_200_with_detail_on_loopback(
 
 
 async def test_http_health_head_is_allowed(
-    db: Database, running_server: Callable[..., Any]
+    system_db: Database, running_server: Callable[..., Any]
 ) -> None:
-    server = await running_server(make_monitor(db=db))
+    server = await running_server(make_monitor(db=system_db))
     async with httpx.AsyncClient() as http:
         response = await http.head(f"http://127.0.0.1:{server.port}{HEALTH_PATH}")
     assert response.status_code == 200
@@ -662,14 +685,15 @@ async def test_http_health_503_when_the_database_is_gone(
 
 
 async def test_http_degraded_state_is_visible_at_200(
-    db: Database, settings: Settings, running_server: Callable[..., Any]
+    system_db: Database, settings: Settings, running_server: Callable[..., Any]
 ) -> None:
     client = ConductorClient(
-        settings, transport=transport_returning(403), sleep=_no_sleep, max_attempts=1
+        api_key=FAKE_API_KEY,
+        api_url=settings.conductor_api_url, transport=transport_returning(403), sleep=_no_sleep, max_attempts=1
     )
     with pytest.raises(AuthFatal):
         await client.get_session_status("sess-1")
-    server = await running_server(make_monitor(db=db, client=client))
+    server = await running_server(make_monitor(db=system_db, client=client))
     status, body = await get_json(server)
     await client.aclose()
 
@@ -679,10 +703,10 @@ async def test_http_degraded_state_is_visible_at_200(
 
 
 async def test_http_token_gate_hides_detail(
-    db: Database, running_server: Callable[..., Any]
+    system_db: Database, running_server: Callable[..., Any]
 ) -> None:
-    await seed_session(db)
-    server = await running_server(make_monitor(db=db), token="s3cret-token")
+    await seed_session(system_db)
+    server = await running_server(make_monitor(db=system_db), token="s3cret-token")
 
     status, body = await get_json(server)
     assert status == 200
@@ -704,24 +728,24 @@ async def test_http_token_gate_hides_detail(
 
 
 async def test_http_unknown_path_is_404(
-    db: Database, running_server: Callable[..., Any]
+    system_db: Database, running_server: Callable[..., Any]
 ) -> None:
-    server = await running_server(make_monitor(db=db))
+    server = await running_server(make_monitor(db=system_db))
     status, _ = await get_json(server, "/")
     assert status == 404
 
 
 async def test_custom_path_is_honoured(
-    db: Database, running_server: Callable[..., Any]
+    system_db: Database, running_server: Callable[..., Any]
 ) -> None:
-    server = await running_server(make_monitor(db=db), path="/healthz")
+    server = await running_server(make_monitor(db=system_db), path="/healthz")
     status, body = await get_json(server, "/healthz")
     assert status == 200
     assert body["status"] == "ok"
 
 
-async def test_app_exposes_the_monitor(db: Database) -> None:
-    monitor = make_monitor(db=db)
+async def test_app_exposes_the_monitor(system_db: Database) -> None:
+    monitor = make_monitor(db=system_db)
     app = create_app(monitor)
     assert app[MONITOR_KEY] is monitor
 
@@ -734,15 +758,15 @@ async def test_handler_survives_a_broken_monitor(
             raise RuntimeError("collector is broken")
 
     server = await running_server(
-        Exploding(database=lambda: None, client=lambda: None, cache_ttl_s=0.0)
+        Exploding(database=lambda: None, clients=lambda: None, cache_ttl_s=0.0)
     )
     status, body = await get_json(server)
     assert status == 503
     assert body["ok"] is False
 
 
-async def test_server_lifecycle_frees_the_port(db: Database) -> None:
-    monitor = make_monitor(db=db)
+async def test_server_lifecycle_frees_the_port(system_db: Database) -> None:
+    monitor = make_monitor(db=system_db)
     server = HealthServer(monitor, host="127.0.0.1", port=0)
     port = await server.start()
     assert port > 0 and server.port == port
@@ -756,8 +780,8 @@ async def test_server_lifecycle_frees_the_port(db: Database) -> None:
         assert second.port == port
 
 
-async def test_serve_health_runs_until_cancelled(db: Database) -> None:
-    monitor = make_monitor(db=db)
+async def test_serve_health_runs_until_cancelled(system_db: Database) -> None:
+    monitor = make_monitor(db=system_db)
     task = asyncio.create_task(serve_health(monitor, host="127.0.0.1", port=0))
     await asyncio.sleep(0.05)
     assert not task.done()
@@ -855,26 +879,24 @@ async def test_default_database_provider_follows_the_installed_handle(
     set_database(db)
 
 
-def test_default_client_provider_degrades_instead_of_raising(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Before boot there is no API key; the health surface must still answer."""
-    from ctb.conductor import client as client_module
+def test_default_pool_provider_degrades_instead_of_raising() -> None:
+    """Before boot there is no pool; the health surface must still answer."""
+    from ctb.runtime import set_client_pool
 
-    monkeypatch.setattr(client_module, "_client", None)
+    set_client_pool(None)
     reset_settings()
-    assert default_client_provider() is None
+    assert default_pool_provider() is None
 
 
 # ── the /health command rendering ────────────────────────────────────────────
 
 
 async def test_format_health_html_is_telegram_safe(
-    db: Database, settings: Settings
+    system_db: Database, settings: Settings
 ) -> None:
-    await seed_session(db, at=WALL - 400_000, poll_interval_ms=120_000)
+    await seed_session(system_db, at=WALL - 400_000, poll_interval_ms=120_000)
     await events_repo.record_api_event(
-        db,
+        system_db,
         method="GET",
         endpoint="/sessions/{id}/status",
         status_code=200,
@@ -882,16 +904,17 @@ async def test_format_health_html_is_telegram_safe(
         at=WALL - 100,
     )
     await events_repo.note_unknown_content_type(
-        db, content_type="a<b>c", signature="ffff0000ffff0000", at=WALL - 100
+        system_db, content_type="a<b>c", signature="ffff0000ffff0000", at=WALL - 100
     )
     client = ConductorClient(
-        settings, transport=transport_returning(401), sleep=_no_sleep, max_attempts=1
+        api_key=FAKE_API_KEY,
+        api_url=settings.conductor_api_url, transport=transport_returning(401), sleep=_no_sleep, max_attempts=1
     )
     with pytest.raises(AuthFatal):
         await client.get_session_status("sess-1")
     await client.aclose()
 
-    text = format_health_html(await make_monitor(db=db, client=client).report())
+    text = format_health_html(await make_monitor(db=system_db, client=client).report())
 
     assert "<b>degraded</b>" in text
     assert DEGRADATION_AUTH_FATAL in text
@@ -903,16 +926,16 @@ async def test_format_health_html_is_telegram_safe(
 
 
 async def test_format_health_html_mentions_telegram_only_when_it_is_failing(
-    db: Database,
+    system_db: Database,
 ) -> None:
     """One phone screen: the healthy case says nothing about Telegram."""
-    quiet = format_health_html(await make_monitor(db=db).report())
+    quiet = format_health_html(await make_monitor(db=system_db).report())
     assert "telegram" not in quiet
 
     record = TelegramHealth()
     for _ in range(TELEGRAM_FAILURE_THRESHOLD):
         record.record_failure("conflict: <other> instance")
-    text = format_health_html(await make_monitor(db=db, telegram=record).report())
+    text = format_health_html(await make_monitor(db=system_db, telegram=record).report())
 
     assert f"telegram: {TELEGRAM_FAILURE_THRESHOLD} failed polls" in text
     assert "&lt;other&gt;" in text and "<other>" not in text
