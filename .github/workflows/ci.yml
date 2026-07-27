@@ -21,10 +21,11 @@ on:
   merge_group:
 
 concurrency:
-  # `head_ref` on a pull request, `ref` on a push — so the two events for one
-  # branch share a group and the older run is cancelled instead of doubling
-  # the bill.
-  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  # `ref_name`, not `ref`: a push gives `postgres-multi-tenant` and a pull
+  # request's `head_ref` gives the same string, so the two events for one
+  # branch land in one group and the second cancels the first. With `ref` they
+  # differed (`refs/heads/x` vs `x`) and every push ran the whole matrix twice.
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
 env:
