@@ -28,6 +28,10 @@ from pydantic.alias_generators import to_camel
 
 from ctb.conductor.errors import PairingError
 
+#: Smoke-test marker for the Telegram -> Conductor -> pull request round trip.
+#: Carries no behaviour; delete it once the round trip is confirmed.
+HELLO_WORLD = "hello world"
+
 __all__ = [
     "AGENT_EFFORTS",
     "AGENT_MODELS",
