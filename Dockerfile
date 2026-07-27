@@ -6,7 +6,12 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-COPY pyproject.toml ./
+# README.md and LICENSE are build inputs, not documentation: `pyproject.toml`
+# names them in `readme` and `license-files`, and hatchling reads both while
+# generating metadata. Without them `pip install .` fails with
+# "Readme file does not exist" — which passes every local check, because a
+# checkout has them, and only shows up in the image build.
+COPY pyproject.toml README.md LICENSE ./
 COPY src/ ./src/
 RUN pip install --no-cache-dir .
 
