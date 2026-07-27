@@ -32,7 +32,7 @@ from types import FrameType
 from typing import Any, Final, cast
 
 from ctb.logging import get_logger
-from ctb.settings import Settings
+from ctb.settings import Settings, SettingsError
 
 __all__ = [
     "OPTIONAL_SERVICES",
@@ -79,7 +79,7 @@ class RuntimeFactories:
     load_settings: Callable[[], Settings]
     configure_logging: Callable[[Settings], None]
     open_databases: Callable[[Settings], Awaitable[tuple[Any, Any]]]
-    apply_migrations: Callable[[Any], Awaitable[Any]]
+    verify_schema: Callable[[Any], Awaitable[int]]
     make_client_pool: Factory
     make_bot: Factory
     make_outbox: Factory
@@ -308,10 +308,24 @@ async def _default_open_databases(settings: Settings) -> tuple[Any, Any]:
     return app, system
 
 
-async def _default_apply_migrations(db: Any) -> Any:
-    from ctb.db.migrate import apply_migrations
+async def _default_verify_schema(db: Any) -> int:
+    """Check the schema is present. The application never applies migrations.
 
-    return await apply_migrations(db)
+    Neither database role may create anything: DDL belongs to
+    ``python -m ctb.db.bootstrap``, run once by an operator with the rights to
+    do it. Booting against an unmigrated database must therefore fail here,
+    loudly, rather than crash-loop on the first query.
+    """
+    from ctb.db.migrate import current_schema_version
+
+    version = await current_schema_version(db)
+    if version < 1:
+        raise SettingsError(
+            "The database has no schema. Run:\n"
+            "  python -m ctb.db.bootstrap --admin-dsn ... "
+            "--app-password ... --worker-password ..."
+        )
+    return version
 
 
 def _default_make_client_pool(settings: Settings, system_db: Any) -> Any:
@@ -466,7 +480,7 @@ def production_factories() -> RuntimeFactories:
         load_settings=_default_load_settings,
         configure_logging=_default_configure_logging,
         open_databases=_default_open_databases,
-        apply_migrations=_default_apply_migrations,
+        verify_schema=_default_verify_schema,
         make_client_pool=_default_make_client_pool,
         make_bot=_default_make_bot,
         make_outbox=_default_make_outbox,
@@ -505,8 +519,8 @@ async def build_runtime(
         secrets.self_check()
         set_secret_box(secrets)
 
-        migrations = await made.apply_migrations(runtime.system_db)
-        log.info("runtime.database_ready", migrations=len(migrations or ()))
+        version = await made.verify_schema(runtime.system_db)
+        log.info("runtime.database_ready", schema_version=version)
 
         runtime.clients = made.make_client_pool(settings, runtime.system_db)
         set_client_pool(runtime.clients)
