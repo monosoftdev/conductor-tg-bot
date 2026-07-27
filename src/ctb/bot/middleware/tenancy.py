@@ -328,16 +328,23 @@ class TenantMiddleware(BaseMiddleware):
     # -- resolution -----------------------------------------------------------
 
     async def _resolve(self, chat: Chat | None, user: User) -> _CacheEntry | None:
-        """``chat_id`` decides the tenant; membership decides the person."""
-        if chat is None:
-            return None
-        cached = self._cache.get((chat.id, user.id))
+        """``chat_id`` decides the tenant; membership decides the person.
+
+        Some update types — inline queries, poll answers, payment callbacks —
+        carry a sender but no chat at all. They resolve the same way a private
+        message does: by the sender's own membership, and only when it is
+        unambiguous.
+        """
+        cache_key = (0 if chat is None else chat.id, user.id)
+        cached = self._cache.get(cache_key)
         if cached is not None and self._clock() - cached.at < self._cache_ttl:
             return cached
 
         try:
-            binding = await tenancy.chat_for(self._db, chat.id)
-            if binding is None and chat.type == "private":
+            binding = (
+                None if chat is None else await tenancy.chat_for(self._db, chat.id)
+            )
+            if binding is None and (chat is None or chat.type == "private"):
                 binding = await self._sole_membership_binding(user)
             if binding is None:
                 return None
@@ -359,7 +366,7 @@ class TenantMiddleware(BaseMiddleware):
             primary_chat_id=None if primary is None else primary.chat_id,
             at=self._clock(),
         )
-        self._remember((chat.id, user.id), entry)
+        self._remember(cache_key, entry)
         return entry
 
     async def _sole_membership_binding(self, user: User) -> tenancy.TenantChat | None:

@@ -48,6 +48,7 @@ from ctb.db.repo import sessions as sessions_repo
 from ctb.db.repo import workspaces as workspaces_repo
 from ctb.settings import Settings
 from ctb.turn.state import TopicMarker
+from tests.conftest import FAKE_API_KEY
 from tests.fakes.fake_conductor import (
     FakeConductor,
     FakeSession,
@@ -146,7 +147,8 @@ async def client(
     settings: Settings, fake: FakeConductor
 ) -> AsyncIterator[ConductorClient]:
     instance = ConductorClient(
-        settings,
+        api_key=FAKE_API_KEY,
+        api_url=settings.conductor_api_url,
         transport=fake.transport(),
         sleep=_no_sleep,
         rng=random.Random(20260726),

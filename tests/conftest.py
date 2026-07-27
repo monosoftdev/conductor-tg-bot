@@ -23,13 +23,13 @@ from ctb.crypto import SecretBox
 from ctb.settings import Settings, reset_settings, set_settings
 from tests.pg import (  # noqa: F401 - fixtures are used by name
     BOOTSTRAP_TENANT_ID,
-    app_dsn,
-    worker_dsn,
     OTHER_TENANT_ID,
+    app_dsn,
     db,
     pg_reset,
     pg_schema,
     system_db,
+    worker_dsn,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
