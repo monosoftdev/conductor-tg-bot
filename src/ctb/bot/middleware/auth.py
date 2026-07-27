@@ -195,7 +195,14 @@ class AuthMiddleware(BaseMiddleware):
                 username=user.username if user is not None else None,
                 update_type=_update_type(event),
             )
-            if user is not None and settings is not None:
+            # A bot is not a person who can be allow-listed, so reporting one
+            # as an unknown *user* is noise the owner can act on in no way.
+            # Most of these are the bot's own doing: creating, renaming or
+            # closing a forum topic posts a service message into that topic,
+            # authored by the bot, and Telegram delivers it straight back. So
+            # the owner's own /new or /setup DMed them about a stranger.
+            # Still dropped either way — only the alert is suppressed.
+            if user is not None and settings is not None and not user.is_bot:
                 await self._maybe_notify_owner(data.get("bot"), user, settings, event)
             return None  # silence
 
