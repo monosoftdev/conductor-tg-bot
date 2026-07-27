@@ -21,6 +21,7 @@ Telegram is the mobile interface; Conductor remains the execution system.
 | Goal | Fastest action |
 |---|---|
 | Start work | In General: `/new [project:] prompt` |
+| Resume laptop work | General: `/attach [name]`, then tap `+ Open` |
 | Continue work | Open its topic and send text, voice, or audio |
 | See current state | `/mode` — status, workspace, branch, model, queue, actions |
 | See all work | `/board` — ten compact recent rows with topic jump buttons |
@@ -42,6 +43,7 @@ is the escape hatch for continuing a specific result without opening its topic.
 | Prompt finishes | Read the answer; reaction becomes 👍 | Pinned card also becomes Done |
 | Agent needs a decision | Tap one of 2–4 buttons | Recommended option is first, green, and checked |
 | Open another workspace | General `/board` or `/s` | Deep-link button opens its topic; no binding is changed |
+| Resume a laptop cloud workspace | `/attach name`, tap `+ Open`, then type in its new topic | Starts at the current transcript tail; history is not replayed |
 | Change session | Topic `/s` | Only sessions from that workspace are offered |
 | Run parallel approaches | `/fork name`, then `/s` | Sessions share the workspace topic without cross-workspace routing |
 | Phone was locked | Tap the pinned-card control | Safe controls live for 15 minutes; destructive confirmation stays 60 seconds |
@@ -54,6 +56,11 @@ is the escape hatch for continuing a specific result without opening its topic.
 General never accepts an accidental ordinary prompt. `/s` in General is
 navigation, and `/s` inside a topic cannot bind a session from another
 workspace.
+
+A workspace started in the Conductor app can be resumed from Telegram when it
+is a **Conductor cloud workspace visible to the configured API account**.
+Railway cannot reach a Mac-local-only process or files that were never pushed
+to the cloud.
 
 ## Telegram-native interface
 
@@ -101,15 +108,24 @@ Spoken `done` still creates a named confirmation and never archives directly.
 ## Runtime flow
 
 ```text
-Telegram update
-  -> allowlist + chat restriction
-  -> topic/reply route snapshot
-  -> typed prompt OR durable voice job
-  -> durable outbound prompt ledger
-  -> Conductor session
-  -> unconditional transcript cursor
-  -> render + durable Telegram outbox
-  -> concise answer in the originating topic
+┌──────────────────── phone ────────────────────┐
+│ Telegram app · General + workspace topics     │
+└──────────────────────┬────────────────────────┘
+                       │ Telegram Bot API
+┌──────────────────────▼ Railway ───────────────┐
+│ One Python process                            │
+│ auth/routing → handlers → prompt/voice ledger │
+│ supervisor → transcript cursor → outbox       │
+│ health server                                 │
+│                                               │
+│ /data/bot.db · WAL · migrations · backups     │
+└──────────────┬───────────────────┬─────────────┘
+               │ HTTPS             │ HTTPS
+┌──────────────▼──────────┐  ┌─────▼────────────┐
+│ Conductor cloud API    │  │ ElevenLabs STT   │
+│ workspaces + sessions  │  │ only when voice  │
+│ prompts + transcripts  │  │ is enabled       │
+└─────────────────────────┘  └──────────────────┘
 ```
 
 Six long-lived services share one structured runtime:
@@ -123,6 +139,26 @@ Six long-lived services share one structured runtime:
 
 Any unexpected critical-service exit stops the process cleanly so Railway can
 restart the complete unit.
+
+## Configuration and keys
+
+All secrets are Railway environment variables; none belongs in Telegram,
+SQLite, or the repository.
+
+| Variable | Where used | Required |
+|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | Railway process → Telegram Bot API | Yes |
+| `CONDUCTOR_API_KEY` | Railway process → Conductor cloud API | Yes |
+| `ALLOWED_TELEGRAM_USER_IDS` | Local authorization; first ID is owner | Yes |
+| `TELEGRAM_CHAT_ID` | Optional second fence for one supergroup | No |
+| `HEALTH_TOKEN` | Protects detailed public health output | Strongly recommended |
+| `ELEVENLABS_API_KEY` | Speech-to-text provider | Only with voice enabled |
+| `VOICE_ENABLED`, `VOICE_MODE` | Voice rollout control | No |
+| `RAILWAY_RUN_UID=0` | Lets SQLite write a Railway-mounted `/data` volume | Required on Railway |
+
+The bot does not call an LLM itself to write code. The selected Conductor
+session owns its agent/model/effort settings. The bot is a durable control and
+delivery layer; ElevenLabs is only the provisional speech-to-text model.
 
 ## Reliability model
 
@@ -149,6 +185,9 @@ restart the complete unit.
   temporary focus window; errors remain loud.
 - `/board`, `/s`, `/mode`, and `/help` are optimized for narrow phone screens
   and put active/current work first.
+- `/attach name` directly finds cloud work started from the laptop; an
+  idempotent one-tap control opens exactly one topic and preserves its current
+  session.
 
 ## Safety boundaries
 

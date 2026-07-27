@@ -1,7 +1,9 @@
 # Telegram Voice Control Plan
 
-Research resumed and refreshed on 2026-07-25. This document is an implementation plan, not a
-completed feature.
+Research resumed and refreshed on 2026-07-25. The durable voice pipeline
+described here is now implemented. Provider quality and automatic spoken
+commands remain rollout-gated until the owner's real-recording benchmark is
+complete.
 
 ## Recommendation
 

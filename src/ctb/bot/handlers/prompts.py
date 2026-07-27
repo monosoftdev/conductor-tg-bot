@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 
 from aiogram import F, Router
+from aiogram.enums import ContentType
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
 from ctb.bot.app import register_router
@@ -44,6 +45,35 @@ from ctb.turn.supervisor import Supervisor
 ROUTER_ORDER = 900
 router = Router(name=__name__)
 register_router(router, order=ROUTER_ORDER)
+
+_SERVICE_CONTENT: frozenset[ContentType] = frozenset(
+    {
+        ContentType.NEW_CHAT_MEMBERS,
+        ContentType.LEFT_CHAT_MEMBER,
+        ContentType.CHAT_OWNER_LEFT,
+        ContentType.CHAT_OWNER_CHANGED,
+        ContentType.NEW_CHAT_TITLE,
+        ContentType.NEW_CHAT_PHOTO,
+        ContentType.DELETE_CHAT_PHOTO,
+        ContentType.GROUP_CHAT_CREATED,
+        ContentType.SUPERGROUP_CHAT_CREATED,
+        ContentType.CHANNEL_CHAT_CREATED,
+        ContentType.MESSAGE_AUTO_DELETE_TIMER_CHANGED,
+        ContentType.MIGRATE_TO_CHAT_ID,
+        ContentType.MIGRATE_FROM_CHAT_ID,
+        ContentType.PINNED_MESSAGE,
+        ContentType.FORUM_TOPIC_CREATED,
+        ContentType.FORUM_TOPIC_EDITED,
+        ContentType.FORUM_TOPIC_CLOSED,
+        ContentType.FORUM_TOPIC_REOPENED,
+        ContentType.GENERAL_FORUM_TOPIC_HIDDEN,
+        ContentType.GENERAL_FORUM_TOPIC_UNHIDDEN,
+        ContentType.VIDEO_CHAT_SCHEDULED,
+        ContentType.VIDEO_CHAT_STARTED,
+        ContentType.VIDEO_CHAT_ENDED,
+        ContentType.VIDEO_CHAT_PARTICIPANTS_INVITED,
+    }
+)
 
 
 def is_general_cockpit(message: Message, route: Route) -> bool:
@@ -83,6 +113,7 @@ async def plain_text(
 ) -> None:
     text = (message.text or "").strip()
     if not text:
+        await tell(message, "Empty message · send the instruction again.")
         return
     if is_general_cockpit(message, route):
         # No send path exists here. Search first; an explicit single-use button
@@ -349,3 +380,32 @@ async def send_callback(
     if isinstance(query.message, Message):
         with contextlib.suppress(Exception):
             await query.message.edit_reply_markup(reply_markup=None)
+
+
+@router.edited_message(F.text)
+async def edited_text(message: Message) -> None:
+    """Telegram edits cannot mutate a prompt already accepted by Conductor."""
+    await tell(
+        message,
+        "Edit not resent · send the correction as a new message.",
+        silent=False,
+    )
+
+
+@router.callback_query()
+async def unknown_callback(query: CallbackQuery) -> None:
+    """Never leave an old or malformed inline button spinning forever."""
+    await query.answer(
+        "Expired control · run /mode for fresh buttons.", show_alert=True
+    )
+
+
+@router.message()
+async def unsupported_message(message: Message) -> None:
+    """Final message catch-all: user payloads get an answer, service events do not."""
+    if message.content_type in _SERVICE_CONTENT:
+        return
+    if message.content_type == ContentType.TEXT:
+        await tell(message, "Unknown command · use /help.", silent=False)
+        return
+    await tell(message, "📎 Not forwarded — text or voice only.", silent=False)

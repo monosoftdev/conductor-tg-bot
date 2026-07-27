@@ -38,6 +38,7 @@ async def allow(
 ) -> None:
     await abandon_wizard(state)
     if not is_owner:
+        await tell(message, "Owner only.")
         return
     try:
         user_id = _user_id(command_text(message))
@@ -62,6 +63,7 @@ async def deny(
 ) -> None:
     await abandon_wizard(state)
     if not is_owner:
+        await tell(message, "Owner only.")
         return
     try:
         user_id = _user_id(command_text(message))
@@ -88,6 +90,7 @@ async def health(
 ) -> None:
     await abandon_wizard(state)
     if not is_owner:
+        await tell(message, "Owner only.")
         return
     database = resolve_db(db)
     try:
@@ -134,6 +137,7 @@ async def backup(
 ) -> None:
     await abandon_wizard(state)
     if not is_owner:
+        await tell(message, "Owner only.")
         return
     try:
         snapshot = await create_backup(resolve_db(db))

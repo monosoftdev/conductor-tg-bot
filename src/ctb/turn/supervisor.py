@@ -91,6 +91,14 @@ class Supervisor:
 
     @property
     def auth_fatal(self) -> bool:
+        # A second in-flight request can prove that a 403 was a transient proxy
+        # rejection after one poller has already raised ``AuthFatal``. The
+        # client clears its counter on that 2xx; clear the supervisor latch as
+        # well or every poller stays cancelled until the next deployment.
+        if self._auth_fatal and self.client.auth_failures == 0:
+            self._auth_fatal = False
+            self._auth_notified = False
+            _log.info("supervisor.auth_recovered")
         return self._auth_fatal or self.client.auth_failures > 0
 
     def _make_poller(self, session_id: str) -> SessionPoller:

@@ -44,7 +44,7 @@ from aiogram.fsm.state import State
 from aiogram.fsm.storage.base import DEFAULT_DESTINY, BaseStorage, StateType, StorageKey
 from aiogram.methods import Response, TelegramMethod
 from aiogram.methods.base import TelegramType
-from aiogram.types import BotCommand
+from aiogram.types import BotCommand, CallbackQuery, ErrorEvent, Message
 
 from ctb.bot.keyboards import NonceStore, get_nonce_store, set_nonce_store
 from ctb.bot.middleware import (
@@ -75,6 +75,7 @@ __all__ = [
     "register_router",
     "registered_routers",
     "run_polling",
+    "unexpected_update_error",
 ]
 
 log = get_logger(__name__)
@@ -94,6 +95,7 @@ CONFLICT_BACKOFF_S: Final = 5.0
 BOT_COMMANDS: Final[tuple[BotCommand, ...]] = (
     BotCommand(command="new", description="New workspace"),
     BotCommand(command="board", description="Live sessions"),
+    BotCommand(command="attach", description="Open laptop workspace"),
     BotCommand(command="stop", description="Stop this turn"),
     BotCommand(command="find", description="Search transcripts"),
     BotCommand(command="mode", description="Current session & controls"),
@@ -105,6 +107,55 @@ BOT_COMMANDS: Final[tuple[BotCommand, ...]] = (
     BotCommand(command="health", description="Bot status"),
     BotCommand(command="help", description="Quick control guide"),
 )
+
+
+async def unexpected_update_error(
+    event: ErrorEvent,
+    bot: Bot,
+    principal: Any = None,
+    request_id: str | None = None,
+) -> bool:
+    """Give an allowed user a bounded failure instead of a silent spinner.
+
+    The allow-list middleware has already populated ``principal`` when a
+    handler was reached. Unknown users remain silent even on an exception.
+    Never include ``repr(exception)`` in Telegram: it can contain an API URL,
+    source text, or another secret. Structured logs are scrubbed separately.
+    """
+    log.error(
+        "bot.update_failed",
+        error=repr(event.exception),
+        request_id=request_id,
+        update_id=event.update.update_id,
+    )
+    if principal is None:
+        return True
+
+    callback = event.update.callback_query
+    if isinstance(callback, CallbackQuery):
+        try:
+            await callback.answer("Request failed. Retry once.", show_alert=True)
+            return True
+        except Exception:
+            # The callback may be too old to answer; fall through to its chat.
+            message = callback.message
+    else:
+        message = event.update.message or event.update.edited_message
+
+    if not isinstance(message, Message):
+        return True
+    try:
+        await bot.send_message(
+            chat_id=message.chat.id,
+            message_thread_id=message.message_thread_id,
+            text="⚠️ Request failed · retry once. If it repeats, run /health.",
+            parse_mode=None,
+            disable_notification=False,
+        )
+    except Exception as notify_exc:
+        log.error("bot.failure_notice_failed", error=repr(notify_exc))
+    return True
+
 
 #: Reserved key inside ``wizard_state.data_json``; see :class:`SqliteStorage`.
 _NAMESPACE_KEY: Final = "__ns__"
@@ -525,6 +576,7 @@ def create_dispatcher(
     auth_middleware = install_middleware(
         dispatcher, settings=settings, db=db, auth=auth
     )
+    dispatcher.errors.register(unexpected_update_error)
     for router in routers:
         dispatcher.include_router(router)
     return dispatcher, auth_middleware

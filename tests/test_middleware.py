@@ -1204,6 +1204,28 @@ def test_build_app_wires_everything(
     assert app.health()["routers"] == ["x"]
 
 
+async def test_unexpected_handler_error_replies_to_the_allowed_user(
+    bot: Bot,
+    session: RecordingSession,
+    bot_settings: Settings,
+    db: Database,
+) -> None:
+    router = Router(name="broken")
+
+    async def boom(_message: Message) -> None:
+        raise RuntimeError("secret internal detail")
+
+    router.message.register(boom)
+    app = build_app(settings=bot_settings, db=db, bot=bot, routers=[router])
+
+    await app.dispatcher.feed_update(bot, build_update("message", OWNER_ID))
+
+    assert session.sent_texts() == [
+        "⚠️ Request failed · retry once. If it repeats, run /health."
+    ]
+    assert "secret internal detail" not in session.sent_texts()[0]
+
+
 def test_created_bot_is_html_with_link_previews_off(bot_settings: Settings) -> None:
     """HTML, never MarkdownV2 (CLAUDE.md), and no link previews (PLAN §2)."""
     made = create_bot(bot_settings)

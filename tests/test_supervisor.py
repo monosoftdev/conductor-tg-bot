@@ -7,6 +7,7 @@ from collections.abc import Callable
 from typing import cast
 
 from ctb.conductor.client import ConductorClient
+from ctb.conductor.errors import AuthFatal
 from ctb.db.connection import Database
 from ctb.db.repo import sessions, workspaces
 from ctb.turn.session_poller import SessionPoller
@@ -42,6 +43,22 @@ class CrashPoller(BlockingPoller):
     async def run(self) -> None:
         self.started.set()
         raise RuntimeError("scripted crash")
+
+
+class AuthCrashPoller(BlockingPoller):
+    def __init__(self, session_id: str, client: ClientStub) -> None:
+        super().__init__(session_id)
+        self.client = client
+
+    async def run(self) -> None:
+        self.started.set()
+        self.client.auth_failures = 1
+        raise AuthFatal(
+            403,
+            {"userMessage": "transient proxy rejection"},
+            method="GET",
+            path="/sessions/{id}/status",
+        )
 
 
 class Clock:
@@ -169,4 +186,43 @@ async def test_crashed_poller_restarts_after_exponential_backoff(
     assert await supervisor.reconcile_once()
     assert len(made) == 2
     assert supervisor.task_count == 1
+    await supervisor.stop()
+
+
+async def test_a_latched_auth_failure_clears_after_an_inflight_success(
+    db: Database,
+) -> None:
+    """One transient 403 must not silence every session until redeploy."""
+    await seed_bound(db, "s1")
+    client = ClientStub()
+    made: list[BlockingPoller] = []
+
+    def factory(session_id: str) -> SessionPoller:
+        poller: BlockingPoller
+        poller = (
+            AuthCrashPoller(session_id, client)
+            if not made
+            else BlockingPoller(session_id)
+        )
+        made.append(poller)
+        return cast(SessionPoller, poller)
+
+    supervisor = Supervisor(
+        cast(ConductorClient, client),
+        db,
+        holder="owner",
+        poller_factory=factory,
+    )
+    assert await supervisor.reconcile_once()
+    await asyncio.sleep(0)
+    assert await supervisor.reconcile_once()
+    assert supervisor.auth_fatal
+    assert supervisor.task_count == 0
+
+    # A request already in flight returns 2xx. ConductorClient does this reset.
+    client.auth_failures = 0
+    assert not supervisor.auth_fatal
+    assert await supervisor.reconcile_once()
+    assert supervisor.task_count == 1
+    assert len(made) == 2
     await supervisor.stop()
