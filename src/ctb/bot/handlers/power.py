@@ -31,14 +31,10 @@ from ctb.bot.handlers.common import (
 )
 from ctb.bot.handlers.core import adoptable_rows, status_icon
 from ctb.bot.handlers.topics import (
-    TopicCreateError,
     apply_marker,
-    discard_topic,
     edit_html,
-    forum_support,
     jump_url,
     marker_for,
-    require_topic,
     resolve_client,
     resolve_db,
     topic_label,
@@ -125,50 +121,6 @@ async def help_command(message: Message, state: FSMContext) -> None:
     await tell(message, _HELP)
 
 
-@router.message(Command("setup"))
-async def setup(
-    message: Message,
-    route: Route,
-    state: FSMContext,
-    db: Database | None = None,
-) -> None:
-    await abandon_wizard(state)
-    database = resolve_db(db)
-    if message.chat.type == "private":
-        await chats_repo.ensure(database, message.chat.id, 0, kind="dm")
-        await tell(message, "DM mode ready · one session at a time.")
-        return
-    if message.chat.type != "supergroup" or message.bot is None:
-        await tell(
-            message,
-            "Use a private supergroup with Forum Topics enabled.",
-            silent=False,
-        )
-        return
-    support = await forum_support(message.bot, message.chat.id)
-    if support.degraded:
-        detail = support.detail or "forum topics and topic permissions"
-        await tell(message, f"Setup blocked · {escape(detail)}.", silent=False)
-        return
-    # Then PROVE it. `can_manage_topics` has been observed `true` on a chat that
-    # then refused `createForumTopic` with "not enough rights to create a topic"
-    # — so /setup reported Ready while every /new failed, and the owner had no
-    # way to tell which answer was lying. A check that does not perform the
-    # capability is a guess; the only proof a topic can exist is a topic that
-    # exists. Create a throwaway one and delete it. Two calls, no residue.
-    try:
-        probe = await require_topic(message.bot, message.chat.id, _SETUP_PROBE_LABEL)
-    except TopicCreateError as exc:
-        await tell(message, f"Setup blocked · {escape(exc.reason)}.", silent=False)
-        return
-    await discard_topic(message.bot, message.chat.id, probe)
-    await chats_repo.ensure(
-        database,
-        message.chat.id,
-        route.thread_id,
-        kind="general",
-    )
-    await tell(message, "Ready · General is search-only; /new creates topics.")
 
 
 @router.message(Command("s"))

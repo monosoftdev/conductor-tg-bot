@@ -22,7 +22,9 @@ import psycopg
 import pytest
 
 from ctb.db.bootstrap import APP_ROLE, WORKER_ROLE, bootstrap
+from ctb.crypto import SecretBox
 from ctb.db.connection import Database, reset_tenant, set_database, set_tenant
+from ctb.runtime import reset_runtime, set_secret_box, set_system_database
 
 __all__ = [
     "BOOTSTRAP_TENANT_ID",
@@ -37,6 +39,12 @@ __all__ = [
 BOOTSTRAP_TENANT_ID: Final = uuid.UUID("00000000-0000-4000-8000-000000000001")
 #: A second tenant, seeded in every test, so isolation is always falsifiable.
 OTHER_TENANT_ID: Final = uuid.UUID("00000000-0000-4000-8000-000000000002")
+
+#: Deterministic so a failing test is reproducible; never used anywhere real.
+TEST_MASTER_KEYS: Final = (
+    "v2:VFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFQ="
+    ",v1:T09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT08="
+)
 
 _APP_PASSWORD: Final = "ctb-app-test"
 _WORKER_PASSWORD: Final = "ctb-worker-test"
@@ -148,15 +156,24 @@ async def db(pg_reset: tuple[str, ...]) -> AsyncIterator[Database]:
     database-touching test in the suite then exercises the isolation policy for
     free, and a repo statement that quietly stopped being tenant-scoped shows up
     as a failure here rather than as a leak in production.
+
+    The process-wide runtime handles are installed alongside it, because that
+    is the shape a handler runs in: a scoped pool for its own data, a worker
+    pool for tenancy lookups, and a :class:`~ctb.crypto.SecretBox`.
     """
     database = await Database(app_dsn(), min_size=1, max_size=6).connect()
+    worker = await Database(worker_dsn(), min_size=1, max_size=4, system=True).connect()
     set_database(database)
+    set_system_database(worker)
+    set_secret_box(SecretBox.from_env_value(TEST_MASTER_KEYS))
     token = set_tenant(BOOTSTRAP_TENANT_ID)
     try:
         yield database
     finally:
         reset_tenant(token)
         set_database(None)
+        reset_runtime()
+        await worker.close()
         await database.close()
 
 

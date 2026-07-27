@@ -1646,27 +1646,34 @@ async def test_defaults_can_set_and_show_the_branch(
 
 
 async def _run_setup(bot: Any, db: Database, monkeypatch: Any) -> list[str]:
-    """Drive ``/setup`` and return the lines it sent."""
-    from ctb.bot.handlers import power as power_handlers
+    """Drive ``/setup`` in an already-bound group and return what it said."""
+    from ctb.bot.handlers import registration as registration_handlers
+
+    from ctb.db.repo import tenancy as tenancy_repo
+    from ctb.runtime import system_database
+
+    await tenancy_repo.bind_chat(
+        system_database(), -1001, BOOTSTRAP_TENANT_ID, is_primary=True
+    )
 
     sent: list[str] = []
 
     async def fake_tell(_message: Any, text: str, **_kwargs: Any) -> None:
         sent.append(text)
 
-    monkeypatch.setattr(power_handlers, "tell", fake_tell)
+    monkeypatch.setattr(registration_handlers, "tell", fake_tell)
     message = SimpleNamespace(
         text="/setup",
-        chat=SimpleNamespace(id=-1001, type="supergroup"),
+        chat=SimpleNamespace(id=-1001, type="supergroup", title="Acme"),
         message_thread_id=None,
         message_id=7,
         from_user=SimpleNamespace(id=1001),
         bot=bot,
     )
-    await power_handlers.setup(
+    await registration_handlers.setup(
         message,  # type: ignore[arg-type]
-        Route(chat_id=-1001, kind="general"),
         _NullState(),  # type: ignore[arg-type]
+        tenant=fake_tenant(),
         db=db,
     )
     return sent
@@ -1702,7 +1709,7 @@ async def test_setup_deletes_the_topic_it_probed_with(
 
     sent = await _run_setup(bot, db, monkeypatch)
 
-    assert sent == ["Ready · General is search-only; /new creates topics."]
+    assert sent == ["Ready ·\nGeneral is search-only; <code>/new</code> creates topics."]
     assert bot.topics == 1, "the probe really created a topic"
     # 99 is the id the stub hands back from create_forum_topic — so this asserts
     # it deleted the very topic it made, not merely that it deleted something.

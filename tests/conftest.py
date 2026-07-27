@@ -10,7 +10,6 @@ into a test run and make an offline test pass for the wrong reason.
 
 from __future__ import annotations
 
-import base64
 import json
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -23,6 +22,7 @@ from ctb.crypto import SecretBox
 from ctb.settings import Settings, reset_settings, set_settings
 from tests.pg import (  # noqa: F401 - fixtures are used by name
     BOOTSTRAP_TENANT_ID,
+    TEST_MASTER_KEYS,
     OTHER_TENANT_ID,
     app_dsn,
     db,
@@ -68,10 +68,7 @@ FAKE_BOT_TOKEN = "1234567890:TESTtokenTESTtokenTESTtokenTESTtoken12"
 FAKE_API_KEY = "ctb_test_api_key_0000000000"
 
 #: Deterministic so a failing test is reproducible; never used anywhere real.
-FAKE_MASTER_KEYS = (
-    "v2:" + base64.urlsafe_b64encode(b"T" * 32).decode()
-    + ",v1:" + base64.urlsafe_b64encode(b"O" * 32).decode()
-)
+FAKE_MASTER_KEYS = TEST_MASTER_KEYS
 
 
 @pytest.fixture(autouse=True)
