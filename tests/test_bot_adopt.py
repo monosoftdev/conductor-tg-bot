@@ -234,7 +234,7 @@ async def _adopt(
 
 
 async def test_adopting_a_remote_workspace_opens_one_topic_and_binds_it(
-    db: Database, client: ConductorClient, fake: FakeConductor
+    db: Database, system_db: Database, client: ConductorClient, fake: FakeConductor
 ) -> None:
     session = _seeded(fake)
     bot = _Bot()
@@ -262,7 +262,9 @@ async def test_adopting_a_remote_workspace_opens_one_topic_and_binds_it(
         session.session_id,
     )
     # Bound is all the supervisor asks for; the poller follows within 5s.
-    assert [r.id for r in await sessions_repo.list_bound(db)] == [session.session_id]
+    assert [r.id for r in await sessions_repo.list_bound(system_db)] == [
+        session.session_id
+    ]
 
 
 async def test_the_snapshot_card_creates_no_deliveries_and_never_moves_the_cursor(

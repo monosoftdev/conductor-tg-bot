@@ -1,5 +1,9 @@
 # conductor-tg-bot
 
+[![CI](https://github.com/reclaimly/conductor-tg-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/reclaimly/conductor-tg-bot/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python 3.13](https://img.shields.io/badge/python-3.13-blue.svg)](https://www.python.org/downloads/)
+
 Drive [Conductor](https://conductor.build) cloud coding agents from Telegram.
 Each workspace gets a forum topic: send a prompt, watch one compact status card,
 and get the answer on your phone.
@@ -19,7 +23,8 @@ cadence and progress UX; it never gates delivery.
 
 ## Using it
 
-Someone who has the bot's handle does this once:
+Four steps, once, from a phone — the full walkthrough with screenshots' worth of
+detail is in [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md):
 
 1. `/register your-team-name` in a private chat with the bot.
 2. Create a private supergroup, enable **Topics**, add the bot as an
@@ -27,6 +32,8 @@ Someone who has the bot's handle does this once:
 3. `/setup <code>` in that group, using the code from step 1.
 4. `/key <your Conductor API key>` privately. The bot validates it, stores it
    encrypted, and **deletes your message**.
+
+Ran out of time on the 15-minute code? `/register` again gives you a fresh one.
 
 Then the daily loop, from the group:
 
@@ -50,9 +57,11 @@ and send it privately instead.
 ## Commands
 
 Daily: `/new` `/attach` `/board` `/stop` `/find` `/mode` `/done`
-Power: `/s` `/fork` `/name` `/open` `/desk` `/log` `/notify` `/defaults` `/sql` `/tidy`
-Workspace: `/invite` `/remove` `/leave` `/members` `/health` `/export` `/key` `/revoke`
+Power: `/s` `/fork` `/name` `/open` `/desk` `/here` `/log` `/notify` `/defaults` `/sql` `/tidy`
+Workspace: `/invite` `/remove` `/leave` `/members` `/health` `/export` `/key` `/voicekey` `/voice` `/revoke`
+Multiple workspaces: `/use` picks which one your DMs mean · `/forget` drops one
 Anyone: `/start` `/register` `/setup` `/privacy` `/help`
+Operator: `/platform list|suspend|resume`, gated on `PLATFORM_ADMIN_IDS`
 
 ## Running it
 
@@ -112,23 +121,27 @@ Every sealed blob names the key that sealed it, so old and new coexist.
 
 ## Deploying
 
-1. Create a Railway PostgreSQL database and a service from this repository.
-2. Run `python -m ctb.db.bootstrap` once against it.
-3. Set `TELEGRAM_BOT_TOKEN`, `DATABASE_URL`, `SYSTEM_DATABASE_URL`,
-   `CTB_MASTER_KEYS`. They are reported together, so set them in one go.
-4. Set `HEALTH_TOKEN` if you generate a public domain — without it the detailed
-   `/health` body is served to loopback only.
-5. Confirm `/health` returns `{"status":"ok","ok":true,...}`.
+One always-on service and one PostgreSQL database. No volume, no Redis, no
+public webhook. Full instructions in [`docs/DEPLOY.md`](docs/DEPLOY.md); the
+shape of it:
+
+1. Add a PostgreSQL database. You need one — there is no SQLite fallback.
+2. `python -m ctb.db.bootstrap` once, with a superuser DSN, to create the two
+   roles and the schema. **Do not point the bot at the superuser** — a
+   superuser bypasses row-level security and every tenant would see every row.
+3. Set `TELEGRAM_BOT_TOKEN`, `DATABASE_URL` (as `ctb_app`), `SYSTEM_DATABASE_URL`
+   (as `ctb_worker`), `CTB_MASTER_KEYS`. All four are reported together, so set
+   them in one go.
+4. Confirm `/health` returns `{"status":"ok","ok":true,...}`.
 
 Keep exactly one replica. Telegram's `getUpdates` and the supervisor lease both
 assume it; `overlapSeconds=0` stops the old deployment before the new one polls.
-There is no volume — the image is stateless.
 
 ## Quality gates
 
 ```bash
 docker compose up -d --wait db
-.venv/bin/python -m pytest -q          # 1866 tests
+.venv/bin/python -m pytest -q          # 1927 tests
 .venv/bin/python -m pytest -q -m "not db"   # the ~1400 that need no server
 .venv/bin/python -m ruff format --check src scripts tests
 .venv/bin/python -m ruff check src scripts tests
@@ -164,4 +177,12 @@ transcript in their organisation and spend their money.
 - Consider `REGISTRATION_OPEN=false` for the first weeks, so your first users
   are people you can call.
 
+## Contributing
+
+Read [`CONTRIBUTING.md`](CONTRIBUTING.md) for the four gates and the
+conventions that are not negotiable. Security reports go through
+[`SECURITY.md`](SECURITY.md), never a public issue.
+
 Architecture and the failure contract are in [`docs/`](docs/).
+
+MIT licensed, © 2026 Reclaimly, Inc. Not affiliated with Conductor or Telegram.

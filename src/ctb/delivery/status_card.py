@@ -40,6 +40,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, LinkPrevie
 from ctb.db import NO_THREAD_ID
 from ctb.db.connection import Database, current_tenant, tenant_scope
 from ctb.db.repo import sessions as sessions_repo
+from ctb.delivery.pacing import TelegramPacer
 from ctb.delivery.render.html import escape, strip_html
 from ctb.logging import get_logger
 from ctb.turn.machine import format_duration
@@ -355,6 +356,7 @@ class StatusCards:
         stall_after: float = CARD_STALL_AFTER_S,
         tick_interval: float = CARD_TICK_S,
         pin: bool = True,
+        pacer: TelegramPacer | None = None,
     ) -> None:
         self._bot = bot
         self._db = db
@@ -366,6 +368,13 @@ class StatusCards:
         self._stall_after = max(0.0, stall_after)
         self._tick_interval = max(0.01, tick_interval)
         self._pin = pin
+        #: The *same* instance the outbox uses, in production. Cards are a
+        #: second uncontrolled stream against one shared bot token: an edit
+        #: every 3s plus a typing action every 4s, per live topic. At thirty
+        #: concurrent turns that is more Bot API calls per second than the
+        #: outbox's whole budget, spent invisibly. Sharing the pacer makes both
+        #: streams draw on one account of what Telegram will accept.
+        self._pacer = pacer
         self._cards: dict[tuple[int, int], _Card] = {}
         #: Topics whose card has already been pinned once. Every turn posts a
         #: fresh card, and pinning each one makes Telegram inject a "pinned a
@@ -729,8 +738,14 @@ class StatusCards:
             return
         await self._edit(card, rendered, now)
 
+    async def _spend(self) -> None:
+        """One Bot API call against the shared per-token budget."""
+        if self._pacer is not None:
+            await self._pacer.acquire_global()
+
     async def _post(self, card: _Card, rendered: str, now: float) -> None:
         markup = self._markup(card)
+        await self._spend()
         try:
             result = await self._bot.send_message(
                 chat_id=card.chat_id,
@@ -760,6 +775,7 @@ class StatusCards:
 
     async def _edit(self, card: _Card, rendered: str, now: float) -> None:
         markup = self._markup(card)
+        await self._spend()
         try:
             await self._bot.edit_message_text(
                 text=rendered,
@@ -802,6 +818,7 @@ class StatusCards:
 
     async def _edit_plain(self, card: _Card, rendered: str, now: float) -> None:
         """The one unformatted retry. Not itself retried."""
+        await self._spend()
         try:
             await self._bot.edit_message_text(
                 text=strip_html(rendered),
@@ -822,6 +839,7 @@ class StatusCards:
 
     async def _send_typing(self, card: _Card, now: float) -> None:
         card.last_typing_at = now
+        await self._spend()
         try:
             await self._bot.send_chat_action(
                 chat_id=card.chat_id,
@@ -841,6 +859,7 @@ class StatusCards:
         # Marked before the call, not after: a chat where we lack the pin
         # permission must not re-ask on every turn.
         self._pinned.add(card.key)
+        await self._spend()
         try:
             await self._bot.pin_chat_message(
                 chat_id=card.chat_id,
@@ -887,6 +906,11 @@ class StatusCards:
             return None
 
     def _back_off(self, card: _Card, exc: TelegramRetryAfter) -> None:
+        # Tell the pacer too. Otherwise the outbox keeps pushing transcript
+        # chunks into a chat Telegram has already started throttling, turning
+        # one 429 into a run of them.
+        if self._pacer is not None:
+            self._pacer.pause_chat(card.chat_id, max(float(exc.retry_after), 0.0))
         card.suppressed_until = self._clock() + max(float(exc.retry_after), 0.0)
         card.dirty = True
         self._counters["errors"] += 1

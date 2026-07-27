@@ -69,9 +69,11 @@ from aiogram.filters.callback_data import CallbackData
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 
 from ctb.db import NO_THREAD_ID
+from ctb.logging import get_logger
 from ctb.turn.state import CardButton
 
 __all__ = [
+    "CALLBACK_DATA_LIMIT",
     "CALLBACK_PREFIX",
     "CONFIRM_TEMPLATE",
     "CONTROL_TTL_S",
@@ -112,6 +114,8 @@ NONCE_TTL_S: Final = 60.0
 #: background. Destructive confirmation still uses ``NONCE_TTL_S``.
 CONTROL_TTL_S: Final = 15 * 60.0
 
+log = get_logger(__name__)
+
 CALLBACK_PREFIX: Final = "ctb"
 
 #: Telegram truncates long button labels on narrow screens; keep the name
@@ -147,6 +151,10 @@ class Action(StrEnum):
     JUMP = "jump"
     #: Open a workspace that already exists in Conductor as a topic here.
     ADOPT = "adopt"
+    #: Delete an entire *workspace* — the tenant row and everything that
+    #: cascades from it. Distinct from ARCHIVE, which retires one Conductor
+    #: workspace: sharing that value would put two handlers on one payload.
+    FORGET = "forget"
     DIFF = "diff"
     CHANGE = "change"
     #: A step of the bare ``/new`` wizard. See the module docstring.
@@ -198,13 +206,14 @@ RESTARTABLE_ACTIONS: Final[frozenset[str]] = frozenset(
 #: Marks a self-describing payload. Not in the url-safe base64 alphabet
 #: ``secrets.token_urlsafe`` draws from, so it can never collide with a nonce.
 _STATELESS_MARK: Final = "."
-#: Keeps ``ctb:archreq:.<expiry>.<uuid>`` inside Telegram's 64-byte cap.
-_MAX_STATELESS_TARGET: Final = 40
 #: Characters of truncated HMAC. 40 bits on a payload that also expires within
 #: minutes and is bounded by Telegram's 64-byte callback budget — forging one
 #: means ~5x10^11 guesses inside that window, against a bot that answers one
 #: callback at a time.
 _SIG_LEN: Final = 8
+
+#: Telegram's hard cap on ``callback_data``, in **bytes**.
+CALLBACK_DATA_LIMIT: Final = 64
 
 #: The expiry is stored at 8-second granularity. One base36 character saved,
 #: and a button's lifetime is measured in minutes.
@@ -307,7 +316,10 @@ class NonceStore:
             self.purge()
         if len(self._tickets) >= self._max:  # pragma: no cover - flood guard
             oldest = min(self._tickets, key=lambda n: self._tickets[n].issued_at)
-            del self._tickets[oldest]
+            # `revoke`, not `del`: a forgotten restart-proof payload falls
+            # through to `read_stateless` and comes back to life, so a plain
+            # delete would resurrect exactly what the eviction meant to retire.
+            self.revoke(oldest)
         lifetime = self._ttl if ttl is None else ttl
         ticket = Ticket(
             nonce=nonce or secrets.token_urlsafe(_NONCE_BYTES),
@@ -474,8 +486,8 @@ def _stateless_key() -> bytes:
 
 
 def _sign(body: str) -> str:
-    """Truncated HMAC. Ten base32 characters is 50 bits — plenty for a payload
-    that also expires, inside a 64-byte Telegram budget."""
+    """Truncated HMAC — :data:`_SIG_LEN` base32 characters, 40 bits. Plenty for
+    a payload that also expires within minutes, inside a 64-byte budget."""
     digest = hmac.new(_stateless_key(), body.encode("utf-8"), hashlib.sha256).digest()
     return base64.b32encode(digest).decode("ascii").rstrip("=").lower()[:_SIG_LEN]
 
@@ -490,17 +502,26 @@ def stateless_payload(action: Action | str, target: str, ttl: float) -> str | No
     tapper supplied, so single-use and TTL would be decorative and anyone could
     address any session id they had ever seen. The signature covers both.
     """
-    if _action_value(action) not in RESTARTABLE_ACTIONS:
+    value = _action_value(action)
+    if value not in RESTARTABLE_ACTIONS:
         return None
-    if not target or len(target) > _MAX_STATELESS_TARGET:
+    if not target:
         return None
     if not set(target) <= _STATELESS_TARGET_CHARS:
         return None
     stamp = _base36(int(time.time() + max(ttl, 0.0)) // _EXPIRY_GRANULARITY)
-    body = f"{_action_value(action)}|{stamp}|{target}"
+    body = f"{value}|{stamp}|{target}"
     # `<stamp><sig>` is one field: the signature is fixed-length, so a third
     # separator would cost a byte of a 64-byte budget for nothing.
-    return f"{_STATELESS_MARK}{stamp}{_sign(body)}{_STATELESS_MARK}{target}"
+    payload = f"{_STATELESS_MARK}{stamp}{_sign(body)}{_STATELESS_MARK}{target}"
+    # The budget is per *action*, not a constant. `ctb:archreq:` costs five
+    # more bytes than `ctb:tx:`, so a single cap generous enough for the
+    # shortest action lets the longest one overflow — and `Cb.pack()` raises,
+    # which `StatusCards._markup` swallows into a card with **no buttons at
+    # all**, Stop included. Measure the real thing instead of guessing.
+    if len(f"{CALLBACK_PREFIX}:{value}:{payload}".encode()) > CALLBACK_DATA_LIMIT:
+        return None
+    return payload
 
 
 def read_stateless(nonce: str, action: str, *, now: float | None = None) -> Ticket:
@@ -587,9 +608,27 @@ def button(
         ttl=ttl,
         nonce=payload,
     )
+    data = ticket.callback_data
+    if len(data.encode()) > CALLBACK_DATA_LIMIT:  # pragma: no cover - belt only
+        # `stateless_payload` already measures, so reaching here means a random
+        # nonce blew the budget — impossible today. Fail to a *working* button
+        # rather than raising: `Cb.pack()`'s ValueError is swallowed upstream
+        # into a card with no buttons at all, which is far worse than one
+        # button that has forgotten how to survive a restart.
+        log.error("keyboards.callback_too_long", action=_action_value(action))
+        ticket = registry.issue(
+            action,
+            target,
+            label=label,
+            user_id=user_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            ttl=ttl,
+        )
+        data = ticket.callback_data
     return InlineKeyboardButton(
         text=label,
-        callback_data=ticket.callback_data,
+        callback_data=data,
         style=style or _style_for(action),
     )
 

@@ -346,6 +346,20 @@ class TestMigrations:
         with pytest.raises(MigrationError, match="manages its own transaction"):
             _checked_sql(discover_migrations(tmp_path)[0])
 
+    def test_a_literal_containing_dollars_does_not_disarm_the_guard(
+        self, tmp_path: Path
+    ) -> None:
+        """A single-quoted `$$` used to open a dollar quote that never closed.
+
+        Everything after it was skipped, so the ``BEGIN``/``COMMIT`` the guard
+        exists to catch sailed straight through.
+        """
+        (tmp_path / "001_sneaky.sql").write_text(
+            "SELECT 'costs $$ dollars';\nBEGIN;\nSELECT 1;\nCOMMIT;"
+        )
+        with pytest.raises(MigrationError, match="manages its own transaction"):
+            _checked_sql(discover_migrations(tmp_path)[0])
+
     def test_a_do_block_is_not_mistaken_for_one(self, tmp_path: Path) -> None:
         """``DO $$ BEGIN … END $$`` is procedural, not transactional."""
         (tmp_path / "001_ok.sql").write_text("DO $x$\nBEGIN\n  PERFORM 1;\nEND\n$x$;")

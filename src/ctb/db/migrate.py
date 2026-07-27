@@ -69,23 +69,37 @@ class Migration:
         return self.path.read_text(encoding="utf-8")
 
 
-def _strip_dollar_quoted(sql: str) -> str:
-    """Blank out ``$tag$ … $tag$`` bodies so the guard only sees real SQL.
+def _strip_quoted(sql: str) -> str:
+    """Blank out quoted bodies so the transaction guard only sees real SQL.
 
-    A ``DO`` block's own ``BEGIN``/``END`` is procedural, not transactional.
+    Both kinds matter. A ``DO`` block's own ``BEGIN``/``END`` is procedural, not
+    transactional, so ``$tag$ … $tag$`` must be skipped — and a *single-quoted
+    literal* containing ``$$`` would otherwise open a dollar quote that never
+    closes, swallowing the rest of the file and disarming the guard entirely.
     """
     out: list[str] = []
     i = 0
     n = len(sql)
     while i < n:
-        match = _DOLLAR_RE.match(sql, i)
-        if match is None:
-            out.append(sql[i])
+        char = sql[i]
+        if char == "'":
+            j = i + 1
+            while j < n:
+                if sql[j] == "'":
+                    if j + 1 < n and sql[j + 1] == "'":
+                        j += 2
+                        continue
+                    break
+                j += 1
+            stop = min(j + 1, n)
+        elif (match := _DOLLAR_RE.match(sql, i)) is not None:
+            tag = match.group(0)
+            end = sql.find(tag, match.end())
+            stop = n if end < 0 else end + len(tag)
+        else:
+            out.append(char)
             i += 1
             continue
-        tag = match.group(0)
-        end = sql.find(tag, match.end())
-        stop = n if end < 0 else end + len(tag)
         # Preserve newlines so the (?m) anchors still line up.
         out.append("\n" * sql.count("\n", i, stop))
         i = stop
@@ -114,7 +128,7 @@ def discover_migrations(directory: Path | None = None) -> tuple[Migration, ...]:
 
 def _checked_sql(migration: Migration) -> str:
     sql = migration.read()
-    if _TXN_RE.search(_strip_dollar_quoted(sql)):
+    if _TXN_RE.search(_strip_quoted(sql)):
         raise MigrationError(
             f"{migration.path.name} manages its own transaction; "
             "migrate.py wraps each file in one itself"

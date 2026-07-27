@@ -48,6 +48,7 @@ from ctb.db.repo._util import (
     content_hash,
     update_sql,
 )
+from ctb.logging import get_logger
 
 __all__ = [
     "DEDUPE_WINDOW_MS",
@@ -68,14 +69,19 @@ __all__ = [
     "mark_failed",
     "mark_sent",
     "mark_skipped",
+    "max_pending_index",
+    "move_to_thread",
     "new_claim_id",
     "pending_count",
+    "prune_terminal",
     "pending_destinations",
     "recover_orphaned",
     "release",
     "requeue",
     "session_for_telegram_message",
 ]
+
+_log = get_logger(__name__)
 
 #: How far back the boot-time duplicate guard looks for an identical payload.
 DEDUPE_WINDOW_MS = 10 * 60 * 1000
@@ -94,6 +100,13 @@ ORPHAN_AFTER_MS: Final = 150_000
 #: nothing left, so a large backlog drains over several passes rather than one
 #: long-running transaction.
 RECOVERY_BATCH: Final = 200
+
+#: How long a settled delivery row is kept. Matched to the transcript window on
+#: purpose: `payload_json` is the same customer content in a different table,
+#: so a longer retention here would silently undo the shorter one there.
+DELIVERY_RETENTION_DAYS: Final = 30
+
+_DAY_MS: Final = 24 * 60 * 60 * 1000
 
 _COLUMNS = """
     session_id, message_id, part_index, chat_id, thread_id, session_index, kind,
@@ -452,18 +465,119 @@ async def requeue(
     )
 
 
-async def release(db: Database, claim_id: str, *, at: int | None = None) -> int:
-    """Hand unsent rows back on a clean shutdown, so boot need not guess."""
+async def prune_terminal(
+    db: Database,
+    *,
+    older_than_days: int = DELIVERY_RETENTION_DAYS,
+    at: int | None = None,
+) -> int:
+    """Delete settled rows past the retention window.
+
+    ``payload_json`` holds the *rendered agent output* — the customer's source
+    code, the same material ``transcript_messages`` is pruned for. Keeping it
+    here forever quietly defeats that retention promise in a second table, and
+    grows the claim index and ``/health``'s state histogram without bound.
+
+    Only ``sent``/``failed``/``skipped`` are touched. A ``pending`` row is work
+    still owed however old it looks, and a ``sending`` row belongs to
+    :func:`recover_orphaned`.
+    """
     stamp = now_ms() if at is None else at
+    cutoff = stamp - max(0, older_than_days) * _DAY_MS
     return await db.execute(
         """
-        UPDATE deliveries
-           SET state = 'pending', claim_id = NULL, claimed_at = NULL,
-               updated_at = ?
-         WHERE claim_id = ? AND state = 'sending'
+        DELETE FROM deliveries
+         WHERE state IN ('sent', 'failed', 'skipped') AND updated_at < ?
         """,
-        (stamp, claim_id),
+        (cutoff,),
     )
+
+
+async def max_pending_index(
+    db: Database, *, chat_id: int, thread_id: int = NO_THREAD_ID
+) -> int:
+    """One past the highest ``session_index`` still queued for a destination.
+
+    So a synthetic message — a notice, an error — lands *after* the content it
+    comments on. Claims are ordered by ``session_index``, so anything minted
+    with a fixed low index jumps the queue inside its own topic.
+    """
+    highest = await db.fetch_val(
+        """
+        SELECT MAX(session_index) FROM deliveries
+         WHERE chat_id = ? AND thread_id = ? AND state IN ('pending', 'sending')
+        """,
+        (chat_id, thread_id),
+        default=None,
+    )
+    return 0 if highest is None else as_int(highest) + 1
+
+
+async def move_to_thread(
+    db: Database, key: DeliveryKey, *, thread_id: int, at: int | None = None
+) -> DeliveryRow | None:
+    """Re-home a row to another topic in the same chat, and requeue it.
+
+    For the one case where the *destination* died rather than the message: a
+    deleted forum topic. Failing those rows terminally would lose the turn's
+    output for good, because the transcript cursor advanced in the transaction
+    that queued them. ``thread_id`` is not part of the primary key, so this is
+    an ordinary update.
+    """
+    stamp = now_ms() if at is None else at
+    return await _set(
+        db,
+        key,
+        {
+            "thread_id": thread_id,
+            "state": "pending",
+            "claim_id": None,
+            "claimed_at": None,
+            "updated_at": stamp,
+        },
+    )
+
+
+async def release(db: Database, claim_id: str, *, at: int | None = None) -> int:
+    """Hand unsent rows back on a clean shutdown, so boot need not guess.
+
+    Rows whose content already landed are marked ``sent`` instead of requeued.
+    A SIGTERM can arrive between Telegram accepting the message and
+    ``mark_sent`` committing; requeueing blindly then makes a *clean* shutdown
+    duplicate more readily than a crash, which goes through the hash-guarded
+    :func:`recover_orphaned`. Same guard, same reasoning, both paths.
+    """
+    stamp = now_ms() if at is None else at
+    async with db.transaction():
+        landed = await db.execute(
+            """
+            UPDATE deliveries AS d
+               SET state = 'sent', claim_id = NULL, claimed_at = NULL,
+                   updated_at = ?
+             WHERE d.claim_id = ? AND d.state = 'sending'
+               AND EXISTS (
+                     SELECT 1 FROM deliveries AS peer
+                      WHERE peer.chat_id = d.chat_id
+                        AND peer.thread_id = d.thread_id
+                        AND peer.content_hash = d.content_hash
+                        AND peer.state = 'sent'
+                        AND (peer.session_id, peer.message_id, peer.part_index)
+                            <> (d.session_id, d.message_id, d.part_index)
+                   )
+            """,
+            (stamp, claim_id),
+        )
+        if landed:
+            _log.info("deliveries.release_deduped", claim_id=claim_id, rows=landed)
+        return await db.execute(
+            """
+            UPDATE deliveries
+               SET state = 'pending', claim_id = NULL, claimed_at = NULL,
+                   updated_at = ?
+             WHERE claim_id = ? AND state = 'sending'
+            """,
+            (stamp, claim_id),
+        )
 
 
 @dataclass(frozen=True, slots=True)

@@ -35,11 +35,12 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any, Self
+from typing import Any, Final, Self
 
 from ctb.conductor.models import TranscriptMessage
 from ctb.db import MAX_CONTENT_BYTES, NO_THREAD_ID, TRANSCRIPT_RETENTION_DAYS
 from ctb.db.connection import Database, Row, now_ms
+from ctb.db.repo import deliveries as deliveries_repo
 from ctb.db.repo._util import (
     as_bool,
     as_int,
@@ -49,6 +50,7 @@ from ctb.db.repo._util import (
     content_hash,
     dumps,
 )
+from ctb.logging import get_logger
 
 __all__ = [
     "AdvanceItem",
@@ -56,6 +58,7 @@ __all__ = [
     "DeliveryDraft",
     "StoredMessage",
     "advance_cursor",
+    "should_shed",
     "count",
     "cursor_of",
     "encode_content",
@@ -103,6 +106,12 @@ _INSERT_DELIVERY = """
 #: Strictly monotonic in ``session_index`` — a stale page cannot rewind us.
 #: ``seeded`` is set too: once real content has been recorded, a later
 #: seek-to-end must not be allowed to jump the cursor over undelivered messages.
+_log = get_logger(__name__)
+
+#: Anything above this is shed under backpressure. Mirrors
+#: ``ctb.delivery.outbox.Priority.ERROR`` without importing upwards.
+_ERROR_PRIORITY: Final = 10
+
 _ADVANCE_CURSOR = """
     UPDATE sessions
        SET cursor_message_id = ?, cursor_session_index = ?, seeded = true,
@@ -247,11 +256,38 @@ async def cursor_of(db: Database, session_id: str) -> tuple[str | None, int] | N
     return as_opt_str(row["cursor_message_id"]), as_int(row["cursor_session_index"], -1)
 
 
+async def should_shed(
+    db: Database, *, max_pending: int | None, session_id: str = ""
+) -> bool:
+    """Is this tenant's delivery backlog over its ceiling?
+
+    ``None`` disables the check. Extracted from ``advance_cursor`` so the
+    protection is one callable thing: as an inline branch it had no test, and
+    disabling it did not turn the suite red.
+
+    The count is tenant-scoped by row-level security and served by the partial
+    claim index, so it is an index-only scan of one workspace's pending rows.
+    """
+    if max_pending is None:
+        return False
+    pending = await deliveries_repo.pending_count(db)
+    if pending < max_pending:
+        return False
+    _log.warning(
+        "transcript.deliveries_shed",
+        session_id=session_id,
+        pending=pending,
+        limit=max_pending,
+    )
+    return True
+
+
 async def advance_cursor(
     db: Database,
     session_id: str,
     items: Sequence[AdvanceItem],
     *,
+    max_pending: int | None = None,
     at: int | None = None,
 ) -> AdvanceResult:
     """Record a page of transcript messages and move the cursor, atomically.
@@ -282,6 +318,12 @@ async def advance_cursor(
         )
 
     ordered = sorted(items, key=lambda item: item.message.session_index)
+    # Backpressure. A workspace whose chat the bot can no longer post to would
+    # otherwise grow `deliveries` without bound, and the destination scan every
+    # other workspace depends on degrades with it. The *cursor still advances*:
+    # dropping a delivery is recoverable from the transcript, losing the cursor
+    # is not.
+    shed = await should_shed(db, max_pending=max_pending, session_id=session_id)
     recorded = 0
     duplicates = 0
     created = 0
@@ -329,6 +371,9 @@ async def advance_cursor(
                 content_ids.add(message.content_id)
 
             for draft in item.deliveries:
+                if shed and draft.priority > int(_ERROR_PRIORITY):
+                    # Errors still get through; they are how the owner finds out.
+                    continue
                 payload = draft.payload_json
                 digest = draft.content_hash
                 if digest is None and payload is not None:

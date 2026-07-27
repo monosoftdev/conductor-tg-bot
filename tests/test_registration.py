@@ -20,10 +20,13 @@ from typing import Any
 import pytest
 
 from ctb.bot.handlers import registration
+from ctb.bot.keyboards import Action, NonceStore
 from ctb.bot.middleware.tenancy import TenantContext, TenantSettings
 from ctb.crypto import SecretBox
-from ctb.db.connection import Database
+from ctb.db.connection import Database, tenant_scope
+from ctb.db.repo import sessions as sessions_repo
 from ctb.db.repo import tenancy
+from ctb.db.repo import workspaces as workspaces_repo
 from ctb.db.repo.tenancy import TenantRow
 from ctb.runtime import secret_box
 from ctb.settings import Settings
@@ -78,13 +81,13 @@ def dm(text: str, *, user_id: int = OWNER, bot: FakeBot | None = None) -> Any:
     )
 
 
-def group(text: str, *, bot: FakeBot | None = None) -> Any:
+def group(text: str, *, bot: FakeBot | None = None, user_id: int = OWNER) -> Any:
     return SimpleNamespace(
         text=text,
         chat=SimpleNamespace(id=GROUP, type="supergroup", title="Acme"),
         message_thread_id=None,
         message_id=12,
-        from_user=SimpleNamespace(id=OWNER),
+        from_user=SimpleNamespace(id=user_id),
         bot=bot or FakeBot(),
     )
 
@@ -172,15 +175,41 @@ class TestRegister:
         assert await tenancy.get_by_slug(system_db, "acme") is None
         assert "closed" in said[0]
 
-    async def test_an_existing_member_is_pointed_at_what_they_have(
+    async def test_an_owner_with_no_group_gets_another_code(
         self, db: Database, system_db: Database, settings: Settings, said: list[str]
     ) -> None:
+        """The 15-minute code expires long before a phone finishes step 2.
+
+        `/register` is the only command that mints one, so refusing outright
+        left anybody who was slow with an unbindable workspace and no way out.
+        """
         row = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
         assert row is not None
         await registration.register(
             dm("/register Again"), settings, NullState(), tenant=context(row)
         )
-        assert "already have" in said[0]
+        assert "/setup " in said[-1]
+        code = said[-1].rsplit("/setup ", 1)[1].split("<", 1)[0].strip()
+        redeemed = await tenancy.consume_enrollment_token(
+            system_db,
+            token_hash=registration.hash_code(code),
+            purpose="bind_chat",
+        )
+        assert redeemed is not None and redeemed[0] == BOOTSTRAP_TENANT_ID
+
+    async def test_a_mere_member_is_told_to_leave_first(
+        self, db: Database, system_db: Database, settings: Settings, said: list[str]
+    ) -> None:
+        """Being in someone else's workspace is not owning one."""
+        row = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
+        assert row is not None
+        await registration.register(
+            dm("/register Mine"),
+            settings,
+            NullState(),
+            tenant=context(row, role="member"),
+        )
+        assert "/leave" in said[-1]
 
 
 class TestBinding:
@@ -263,6 +292,44 @@ class TestBinding:
 
         still = await tenancy.chat_for(system_db, GROUP)
         assert still is not None and still.tenant_id == first.tenant_id
+
+    async def test_a_code_only_works_for_the_person_it_was_issued_to(
+        self, db: Database, system_db: Database, settings: Settings, said: list[str]
+    ) -> None:
+        """A code is otherwise a bearer token for somebody else's workspace.
+
+        Anyone who sees one — a screenshot, a forward, a paste into the wrong
+        chat — could bind a group *they* control to the victim's workspace,
+        which then becomes its primary chat and receives its owner notices.
+        """
+        code = await self._register(settings, said)
+
+        await registration.setup(
+            group(f"/setup {code}", user_id=OWNER + 99), NullState(), db=db
+        )
+
+        assert await tenancy.chat_for(system_db, GROUP) is None
+        assert "issued to someone else" in said[-1]
+
+    async def test_the_routing_row_belongs_to_the_bound_tenant(
+        self, db: Database, system_db: Database, settings: Settings, said: list[str]
+    ) -> None:
+        """`/setup` runs with no tenant in scope, so it must set one itself.
+
+        Without the explicit `tenant_scope`, the `chats` row lands under
+        whatever the ambient scope happens to be — nothing raises, nothing
+        fails, and the group routes to the wrong workspace.
+        """
+        code = await self._register(settings, said)
+        await registration.setup(group(f"/setup {code}"), NullState(), db=db)
+
+        binding = await tenancy.chat_for(system_db, GROUP)
+        assert binding is not None
+        owner = await system_db.fetch_val(
+            "SELECT tenant_id FROM chats WHERE chat_id = ? AND thread_id = 0",
+            (GROUP,),
+        )
+        assert owner == binding.tenant_id
 
     async def test_rebinding_a_bound_group_is_owners_only(
         self, db: Database, system_db: Database, settings: Settings, said: list[str]
@@ -428,7 +495,7 @@ class TestKeyIntake:
         await registration.set_key(
             dm("/key whatever"), context(row, role="member"), NullState()
         )
-        assert said[-1] == "Owners only."
+        assert "owners can store its key" in said[-1]
 
     async def test_revoking_deletes_the_key_and_stops_polling(
         self, db: Database, system_db: Database, said: list[str]
@@ -456,3 +523,206 @@ class TestDisclosure:
         assert "encrypted" in text
         assert "/revoke" in text
         assert "30 days" in text
+
+
+class TestUse:
+    """A DM has to belong to exactly one workspace, and you say which."""
+
+    async def test_it_binds_this_chat_to_a_named_workspace(
+        self, db: Database, system_db: Database, said: list[str]
+    ) -> None:
+        other = await tenancy.create(
+            system_db, slug="second", name="Second", owner_user_id=OWNER
+        )
+        row = await self._tenant(system_db)
+
+        await registration.use(dm("/use second"), context(row), NullState())
+
+        binding = await tenancy.chat_for(system_db, OWNER)
+        assert binding is not None and binding.tenant_id == other.id
+
+    async def test_it_refuses_a_workspace_you_are_not_in(
+        self, db: Database, system_db: Database, said: list[str]
+    ) -> None:
+        """Otherwise it is a way to point your DM at somebody else's."""
+        await tenancy.create(
+            system_db, slug="theirs", name="Theirs", owner_user_id=OWNER + 99
+        )
+        row = await self._tenant(system_db)
+
+        await registration.use(dm("/use theirs"), context(row), NullState())
+
+        assert await tenancy.chat_for(system_db, OWNER) is None
+        assert "not in a workspace" in said[-1]
+
+    async def test_with_no_argument_it_lists_what_you_are_in(
+        self, db: Database, system_db: Database, said: list[str]
+    ) -> None:
+        row = await self._tenant(system_db)
+        await registration.use(dm("/use"), context(row), NullState())
+        assert "test" in said[-1]
+
+    async def _tenant(self, system_db: Database) -> TenantRow:
+        row = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
+        assert row is not None
+        await tenancy.add_member(system_db, BOOTSTRAP_TENANT_ID, OWNER, role="owner")
+        return row
+
+
+class TestForget:
+    """``/privacy`` promises deletion, so deletion has to exist and work."""
+
+    async def _owned(self, system_db: Database) -> TenantRow:
+        await tenancy.add_member(system_db, BOOTSTRAP_TENANT_ID, OWNER, role="owner")
+        row = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
+        assert row is not None
+        return row
+
+    async def test_it_takes_two_taps(
+        self, db: Database, system_db: Database, said: list[str]
+    ) -> None:
+        row = await self._owned(system_db)
+        await registration.forget(
+            dm("/forget"), context(row), NullState(), NonceStore()
+        )
+
+        assert await tenancy.get(system_db, BOOTSTRAP_TENANT_ID) is not None
+        assert "cannot be undone" in said[-1]
+
+    async def test_the_second_tap_deletes_everything(
+        self, db: Database, system_db: Database, said: list[str]
+    ) -> None:
+        row = await self._owned(system_db)
+        async with tenant_scope(BOOTSTRAP_TENANT_ID):
+            await workspaces_repo.upsert(db, "ws-gone", name="gone")
+            await sessions_repo.upsert(db, "sess-gone", workspace_id="ws-gone")
+
+        store = NonceStore()
+        ticket = store.issue(Action.FORGET, str(BOOTSTRAP_TENANT_ID), user_id=OWNER)
+        await registration.confirm_forget(
+            _Tap(ticket.callback_data), context(row), store
+        )
+
+        assert await tenancy.get(system_db, BOOTSTRAP_TENANT_ID) is None
+        assert await system_db.fetch_val("SELECT COUNT(*) FROM sessions") == 0
+
+    async def test_a_payload_naming_another_workspace_is_refused(
+        self, db: Database, system_db: Database, said: list[str]
+    ) -> None:
+        """The guard that stops a leaked payload deleting the wrong customer."""
+        row = await self._owned(system_db)
+        store = NonceStore()
+        ticket = store.issue(Action.FORGET, str(OTHER_TENANT_ID), user_id=OWNER)
+
+        tap = _Tap(ticket.callback_data)
+        await registration.confirm_forget(tap, context(row), store)
+
+        assert await tenancy.get(system_db, OTHER_TENANT_ID) is not None
+        assert tap.answers == ["Not yours to delete."]
+
+    async def test_only_an_owner_can_start_it(
+        self, db: Database, system_db: Database, said: list[str]
+    ) -> None:
+        """Admins pass the ordinary owner gate; deletion needs more than that."""
+        row = await self._owned(system_db)
+        await registration.forget(
+            dm("/forget"), context(row, role="admin"), NullState(), NonceStore()
+        )
+        assert "Only an owner" in said[-1]
+
+
+class _Tap:
+    """A CallbackQuery stand-in that records what it was answered with."""
+
+    def __init__(self, data: str, user_id: int = OWNER) -> None:
+        self.data = data
+        self.from_user = SimpleNamespace(id=user_id)
+        self.answers: list[str] = []
+
+    async def answer(self, text: str = "", **_kwargs: Any) -> None:
+        self.answers.append(text)
+
+
+class TestVoiceToggle:
+    """``tenants.voice_enabled`` gated the feature and nothing ever set it."""
+
+    async def _tenant(self, system_db: Database) -> TenantRow:
+        row = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
+        assert row is not None
+        return row
+
+    async def test_a_workspace_with_a_speech_key_can_turn_voice_on(
+        self, db: Database, system_db: Database, settings_factory: Any, said: list[str]
+    ) -> None:
+        await tenancy.set_elevenlabs_key(
+            system_db,
+            BOOTSTRAP_TENANT_ID,
+            ciphertext=b"sealed",
+            kid="v1",
+            fingerprint="fp",
+        )
+        row = await self._tenant(system_db)
+
+        await registration.voice(
+            dm("/voice on"),
+            context(row),
+            settings_factory(voice_enabled=True),
+            NullState(),
+        )
+
+        after = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
+        assert after is not None and after.voice_enabled is True
+
+    async def test_without_a_speech_key_it_says_so_and_stays_off(
+        self, db: Database, system_db: Database, settings_factory: Any, said: list[str]
+    ) -> None:
+        """There is deliberately no shared key to fall back to."""
+        row = await self._tenant(system_db)
+
+        await registration.voice(
+            dm("/voice on"),
+            context(row),
+            settings_factory(voice_enabled=True),
+            NullState(),
+        )
+
+        assert "/voicekey" in said[-1]
+        after = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
+        assert after is not None and after.voice_enabled is False
+
+    async def test_the_platform_kill_switch_wins(
+        self, db: Database, system_db: Database, settings_factory: Any, said: list[str]
+    ) -> None:
+        await tenancy.set_elevenlabs_key(
+            system_db,
+            BOOTSTRAP_TENANT_ID,
+            ciphertext=b"sealed",
+            kid="v1",
+            fingerprint="fp",
+        )
+        row = await self._tenant(system_db)
+
+        await registration.voice(
+            dm("/voice on"),
+            context(row),
+            settings_factory(voice_enabled=False),
+            NullState(),
+        )
+
+        assert "whole instance" in said[-1]
+        after = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
+        assert after is not None and after.voice_enabled is False
+
+    async def test_a_member_cannot_toggle_it(
+        self, db: Database, system_db: Database, settings_factory: Any, said: list[str]
+    ) -> None:
+        row = await self._tenant(system_db)
+
+        await registration.voice(
+            dm("/voice on"),
+            context(row, role="member"),
+            settings_factory(voice_enabled=True),
+            NullState(),
+        )
+
+        assert said[-1] == "Owners only."

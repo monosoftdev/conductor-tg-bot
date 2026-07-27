@@ -13,12 +13,15 @@ from aiogram.exceptions import TelegramUnauthorizedError
 from ctb.__main__ import (
     RuntimeFactories,
     ServiceStoppedError,
+    _assert_app_role_is_confined,
     build_runtime,
     run,
 )
 from ctb.bot.app import BotApp, run_polling
+from ctb.db.connection import Database as PgDatabase
 from ctb.health import TelegramHealth, reset_telegram_health, telegram_health
-from ctb.settings import Settings
+from ctb.settings import Settings, SettingsError
+from tests import pg
 
 
 class Runner:
@@ -480,3 +483,34 @@ async def test_production_factories_build_every_component_without_network(
     finally:
         await runtime.close()
     assert not db.is_connected
+
+
+class TestAppRoleConfinement:
+    """The one misconfiguration that fails silently in the worst direction.
+
+    Row-level security does not apply to a superuser or a ``BYPASSRLS`` role,
+    not even with ``FORCE``. Point ``DATABASE_URL`` at a managed provider's
+    default ``postgres`` user and everything keeps working while every tenant
+    reads every other tenant's transcripts.
+    """
+
+    async def check(self, dsn: str) -> None:
+        pool = await PgDatabase(dsn, min_size=1, max_size=2).connect()
+        try:
+            await _assert_app_role_is_confined(pool)
+        finally:
+            await pool.close()
+
+    async def test_the_app_role_is_accepted(self, pg_reset: object) -> None:
+        await self.check(pg.app_dsn())
+
+    async def test_a_superuser_dsn_refuses_to_boot(self, pg_reset: object) -> None:
+        with pytest.raises(SettingsError, match="bypasses row-level security"):
+            await self.check(pg.admin_dsn())
+
+    async def test_the_worker_role_refuses_to_boot_as_the_app_pool(
+        self, pg_reset: object
+    ) -> None:
+        """BYPASSRLS without superuser is the subtler half of the same mistake."""
+        with pytest.raises(SettingsError, match="bypasses row-level security"):
+            await self.check(pg.worker_dsn())

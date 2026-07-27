@@ -216,6 +216,26 @@ def match_project(projects: list[Project], query: str) -> Project | None:
     return prefix[0] if len(prefix) == 1 else None
 
 
+async def quota_error(db: Database, defaults: TenantSettings) -> str | None:
+    """The workspace quota, as one named check. ``None`` means go ahead.
+
+    Extracted so the protection is a thing that can be called and tested. As an
+    inline branch it shipped unexercised, and an adversarial review deleted it
+    without turning the suite red — a quota nothing verifies is a number in a
+    column, not a limit.
+
+    Archived workspaces do not count: this bounds what a tenant runs *at once*,
+    not what it has ever run.
+    """
+    live = await workspaces_repo.count_live(db)
+    if live < defaults.max_workspaces:
+        return None
+    return (
+        f"This workspace is at its limit of {defaults.max_workspaces} "
+        "Conductor workspaces. Finish one with /done first."
+    )
+
+
 async def resolve_new_request(
     *,
     text: str,
@@ -251,6 +271,10 @@ async def resolve_new_request(
                     break
     if project is None:
         project = projects[0]
+
+    refusal = await quota_error(db, defaults)
+    if refusal is not None:
+        raise ValueError(refusal)
 
     agent = (chat.default_agent if chat else None) or defaults.default_agent
     model = (chat.default_model if chat else None) or defaults.default_model

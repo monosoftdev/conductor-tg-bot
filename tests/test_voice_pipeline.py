@@ -132,8 +132,8 @@ async def set_voice_mode(system_db: Database, mode: str) -> None:
 def make_service(
     settings: Settings,
     db: Database,
+    system_db: Database,
     *,
-    system_db: Database | None = None,
     bot: FakeBot | None = None,
     provider: FakeProvider | None = None,
     client: FakeClient | None = None,
@@ -142,7 +142,7 @@ def make_service(
     return VoiceService(
         settings,
         db,
-        system_db or db,
+        system_db,
         bot or FakeBot(),  # type: ignore[arg-type]
         cast(Any, FakeClientPool(client or FakeClient())),
         supervisor or FakeSupervisor(),  # type: ignore[arg-type]
@@ -167,10 +167,10 @@ def voice_message(*, size: int = 100, duration: int = 12, thread_id: int = 7) ->
 
 
 async def test_replayed_update_keeps_one_job_and_operation_id(
-    db: Database, settings_factory: Any
+    db: Database, settings_factory: Any, system_db: Database
 ) -> None:
     settings = settings_factory(voice_enabled=True)
-    service = make_service(settings, db)
+    service = make_service(settings, db, system_db)
     message = voice_message()
     route = Route(
         tenant_voice_enabled=True,
@@ -193,10 +193,10 @@ async def test_replayed_update_keeps_one_job_and_operation_id(
 
 
 async def test_uploaded_audio_preserves_filename_and_mime(
-    db: Database, settings_factory: Any
+    db: Database, settings_factory: Any, system_db: Database
 ) -> None:
     settings = settings_factory(voice_enabled=True)
-    service = make_service(settings, db)
+    service = make_service(settings, db, system_db)
     message = voice_message()
     message.voice = None
     message.audio = SimpleNamespace(
@@ -221,7 +221,7 @@ async def test_uploaded_audio_preserves_filename_and_mime(
 
 
 async def test_size_and_duration_reject_before_download(
-    db: Database, settings_factory: Any
+    db: Database, settings_factory: Any, system_db: Database
 ) -> None:
     settings = settings_factory(
         voice_enabled=True,
@@ -229,7 +229,7 @@ async def test_size_and_duration_reject_before_download(
         voice_max_file_bytes=1_000,
     )
     bot = FakeBot()
-    service = make_service(settings, db, bot=bot)
+    service = make_service(settings, db, system_db, bot=bot)
     route = Route(chat_id=-1001, thread_id=7, kind="topic", tenant_voice_enabled=True)
 
     large = await service.enqueue(
@@ -248,7 +248,7 @@ async def test_size_and_duration_reject_before_download(
 
 
 async def test_voice_prompt_uses_snapshot_id_once_and_mobile_instruction(
-    db: Database, settings_factory: Any
+    db: Database, settings_factory: Any, system_db: Database
 ) -> None:
     settings = settings_factory(voice_enabled=True)
     await sessions_repo.upsert(
@@ -262,7 +262,9 @@ async def test_voice_prompt_uses_snapshot_id_once_and_mobile_instruction(
     bot = FakeBot()
     provider = FakeProvider("Fix the flaky test")
     client = FakeClient()
-    service = make_service(settings, db, bot=bot, provider=provider, client=client)
+    service = make_service(
+        settings, db, system_db, bot=bot, provider=provider, client=client
+    )
     row, _ = await voice_repo.create(
         db,
         chat_id=-1001,
@@ -304,12 +306,12 @@ async def test_voice_prompt_uses_snapshot_id_once_and_mobile_instruction(
 
 
 async def test_general_voice_searches_and_never_posts(
-    db: Database, settings_factory: Any
+    db: Database, settings_factory: Any, system_db: Database
 ) -> None:
     settings = settings_factory(voice_enabled=True)
     bot = FakeBot()
     client = FakeClient()
-    service = make_service(settings, db, bot=bot, client=client)
+    service = make_service(settings, db, system_db, bot=bot, client=client)
     row, _ = await voice_repo.create(
         db,
         chat_id=-1001,
@@ -342,12 +344,12 @@ async def test_general_voice_searches_and_never_posts(
 
 
 async def test_recovery_reuses_conductor_message_id(
-    db: Database, settings_factory: Any
+    db: Database, settings_factory: Any, system_db: Database
 ) -> None:
     settings = settings_factory(voice_enabled=True)
     await sessions_repo.upsert(db, "session-voice")
     client = FakeClient()
-    service = make_service(settings, db, client=client)
+    service = make_service(settings, db, system_db, client=client)
     row, _ = await voice_repo.create(
         db,
         chat_id=1001,
@@ -376,10 +378,10 @@ async def test_recovery_reuses_conductor_message_id(
     await db.execute(
         """
         UPDATE voice_inputs
-           SET state = 'dispatching', completed_at = NULL
+           SET state = 'dispatching', completed_at = NULL, updated_at = ?
          WHERE chat_id = ? AND tg_message_id = ?
         """,
-        (row.chat_id, row.tg_message_id),
+        (now_ms() - voice_repo.ORPHAN_AFTER_MS - 1_000, row.chat_id, row.tg_message_id),
     )
     recovery = await voice_repo.recover_stale(db)
     assert recovery.requeued == 1 and recovery.abandoned == ()
@@ -411,7 +413,7 @@ async def test_exact_spoken_stop_uses_the_supervisor(
     service = make_service(
         settings,
         db,
-        system_db=system_db,
+        system_db,
         provider=FakeProvider("command stop"),
         client=client,
         supervisor=supervisor,
@@ -457,6 +459,7 @@ async def test_spoken_done_only_creates_named_confirmation(
     service = make_service(
         settings,
         db,
+        system_db,
         bot=bot,
         provider=FakeProvider("command done"),
     )
@@ -505,7 +508,16 @@ async def seed(
     updated_at: int | None = None,
     completed_at: int | None = None,
 ) -> None:
-    """Insert one voice job directly in the state a crash would have left."""
+    """Insert one voice job directly in the state a crash would have left.
+
+    ``updated_at`` defaults to *older than the orphan window*, because that is
+    what a job left behind by a dead process looks like. A job stamped `now` is
+    one a live peer may still be holding, and `recover_stale` deliberately
+    refuses to touch those — see
+    ``test_a_fresh_claim_is_left_for_the_peer_that_holds_it``.
+    """
+    if updated_at is None:
+        updated_at = now_ms() - voice_repo.ORPHAN_AFTER_MS - 1_000
     await voice_repo.create(
         db,
         chat_id=1001,
@@ -582,10 +594,13 @@ async def test_unavailable_voice_starts_no_workers_and_polls_nothing(
 
 
 async def test_a_claim_error_keeps_the_worker_loop_alive(
-    db: Database, settings_factory: Any, monkeypatch: pytest.MonkeyPatch
+    db: Database,
+    settings_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    system_db: Database,
 ) -> None:
     settings = settings_factory(voice_enabled=True, voice_max_concurrent=1)
-    service = make_service(settings, db)
+    service = make_service(settings, db, system_db)
     calls = 0
 
     async def failing_claim(*args: Any, **kwargs: Any) -> Any:
@@ -610,7 +625,10 @@ async def test_a_claim_error_keeps_the_worker_loop_alive(
 
 
 async def test_a_locked_database_during_fail_does_not_stop_the_service(
-    db: Database, settings_factory: Any, monkeypatch: pytest.MonkeyPatch
+    db: Database,
+    settings_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    system_db: Database,
 ) -> None:
     """The audit's headline: ``fail()`` ran inside the worker's own handler."""
     settings = settings_factory(voice_enabled=True, voice_max_concurrent=1)
@@ -622,7 +640,7 @@ async def test_a_locked_database_during_fail_does_not_stop_the_service(
     monkeypatch.setattr(bot, "get_file", no_file)
     monkeypatch.setattr(voice_repo, "fail", boom)
     monkeypatch.setattr(voice_service_module, "_ERROR_BACKOFF_SECONDS", 0.001)
-    service = make_service(settings, db, bot=bot)
+    service = make_service(settings, db, system_db, bot=bot)
     await seed(db, tg_message_id=71)
 
     task = asyncio.create_task(service.run())
@@ -638,10 +656,13 @@ async def test_a_locked_database_during_fail_does_not_stop_the_service(
 
 
 async def test_a_maintenance_prune_error_does_not_stop_the_service(
-    db: Database, settings_factory: Any, monkeypatch: pytest.MonkeyPatch
+    db: Database,
+    settings_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    system_db: Database,
 ) -> None:
     settings = settings_factory(voice_enabled=True, voice_max_concurrent=1)
-    service = make_service(settings, db)
+    service = make_service(settings, db, system_db)
     prunes = 0
 
     async def failing_prune(*args: Any, **kwargs: Any) -> Any:
@@ -665,6 +686,23 @@ async def test_a_maintenance_prune_error_does_not_stop_the_service(
     await asyncio.wait_for(task, timeout=1)
 
 
+async def test_a_fresh_claim_is_left_for_the_peer_that_holds_it(
+    db: Database,
+) -> None:
+    """A deploy overlaps two containers, and voice costs money per call.
+
+    Without the window the new container requeues a note the old one is still
+    transcribing: two speech-vendor bills, two prompts, one recording.
+    """
+    await seed(db, tg_message_id=80, state="transcribing", updated_at=now_ms())
+
+    recovery = await voice_repo.recover_stale(db)
+
+    assert recovery.requeued == 0 and recovery.abandoned == ()
+    row = await voice_repo.get(db, 1001, 80)
+    assert row is not None and row.state == "transcribing"
+
+
 async def test_recover_stale_gives_up_after_three_attempts(db: Database) -> None:
     await seed(db, tg_message_id=72, state="transcribing", attempts=2)
     await seed(db, tg_message_id=73, state="transcribing", attempts=3)
@@ -686,7 +724,10 @@ async def test_recover_stale_gives_up_after_three_attempts(db: Database) -> None
 
 
 async def test_a_crash_looping_note_is_abandoned_and_reported(
-    db: Database, settings_factory: Any, monkeypatch: pytest.MonkeyPatch
+    db: Database,
+    settings_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    system_db: Database,
 ) -> None:
     """Boot → claim → crash, three times, then the loop stops costing money."""
     settings = settings_factory(voice_enabled=True)
@@ -697,10 +738,17 @@ async def test_a_crash_looping_note_is_abandoned_and_reported(
         raise MemoryError
 
     monkeypatch.setattr(bot, "get_file", oom)
-    service = make_service(settings, db, bot=bot, provider=provider)
+    service = make_service(settings, db, system_db, bot=bot, provider=provider)
     await seed(db, tg_message_id=75)
 
     for _ in range(5):
+        # Age the row: each pass models a *separate* boot after a crash, and
+        # recovery deliberately ignores a claim young enough to still be live
+        # on a peer.
+        await db.execute(
+            "UPDATE voice_inputs SET updated_at = ? WHERE tg_message_id = 75",
+            (now_ms() - voice_repo.ORPHAN_AFTER_MS - 1_000,),
+        )
         await service._recover()
         claimed = await voice_repo.claim_next(db)
         if claimed is None:

@@ -31,6 +31,7 @@ __all__ = [
     "get",
     "get_by_nonce",
     "get_by_topic",
+    "count_live",
     "list_all",
     "list_for_project",
     "mark_archived",
@@ -304,6 +305,15 @@ async def mark_archived(
         at=stamp,
         status=str(WorkspaceStatusValue.ARCHIVED),
         archived_at=stamp,
+    )
+
+
+async def count_live(db: Database) -> int:
+    """Unarchived workspaces in this tenant. Tenant-scoped by row-level security."""
+    return as_int(
+        await db.fetch_val(
+            "SELECT COUNT(*) FROM workspaces WHERE archived_at IS NULL", default=0
+        )
     )
 
 

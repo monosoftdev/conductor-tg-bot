@@ -93,6 +93,11 @@ MAX_POLLING_BACKOFF_S: Final = 60.0
 #: old container to drain instead of hammering ``getUpdates``.
 CONFLICT_BACKOFF_S: Final = 5.0
 
+#: The phone menu, deliberately shorter than the command list. It is the only
+#: discovery surface most people ever read, so it holds the daily loop plus the
+#: three onboarding steps — not everything that exists. Rarely-used commands
+#: (``/forget``, ``/revoke``, ``/tidy``) and operator-only ones (``/platform``)
+#: stay out: advertising them to every customer costs more than it teaches.
 BOT_COMMANDS: Final[tuple[BotCommand, ...]] = (
     BotCommand(command="new", description="New workspace"),
     BotCommand(command="board", description="Live sessions"),
@@ -106,6 +111,7 @@ BOT_COMMANDS: Final[tuple[BotCommand, ...]] = (
     BotCommand(command="done", description="Archive workspace"),
     BotCommand(command="setup", description="Link this group to a workspace"),
     BotCommand(command="invite", description="Add someone to this workspace"),
+    BotCommand(command="use", description="Pick which workspace your DMs mean"),
     BotCommand(command="health", description="Workspace status"),
     BotCommand(command="register", description="Create a workspace"),
     BotCommand(command="key", description="Store your Conductor API key"),

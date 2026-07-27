@@ -30,7 +30,14 @@ from typing import Final, cast
 from ctb.conductor.errors import AuthFatal
 from ctb.conductor.pool import ClientPool, MissingKeyError
 from ctb.db.connection import Database, tenant_scope
-from ctb.db.repo import lease, sessions, tenancy, transcript, wizard
+from ctb.db.repo import (
+    deliveries,
+    lease,
+    sessions,
+    tenancy,
+    transcript,
+    wizard,
+)
 from ctb.db.repo.sessions import SessionRow
 from ctb.logging import get_logger
 from ctb.turn.session_poller import ActionSink, SessionPoller
@@ -166,11 +173,13 @@ class Supervisor:
         client = self.clients.peek(tenant_id)
         if client is None:  # pragma: no cover - _spawn primes the pool first
             raise MissingKeyError(f"no Conductor client for tenant {tenant_id}")
+        row = self._tenant_rows.get(tenant_id)
         return SessionPoller(
             client,
             self.db,
             session_id,
             action_sink=self.action_sink,
+            max_pending_deliveries=None if row is None else row.max_pending_deliveries,
         )
 
     async def start(self) -> None:
@@ -365,6 +374,9 @@ class Supervisor:
         try:
             # System-scoped: retention is a platform job, not a tenant's.
             removed_transcript = await transcript.prune(self.system_db)
+            # `deliveries.payload_json` is the same customer content in another
+            # table; pruning transcripts alone left it there forever.
+            removed_deliveries = await deliveries.prune_terminal(self.system_db)
             removed_wizards = await wizard.prune_expired(self.system_db)
             removed_tokens = await tenancy.prune_enrollment_tokens(self.system_db)
         except Exception as exc:
@@ -376,6 +388,7 @@ class Supervisor:
         _log.info(
             "supervisor.maintenance_complete",
             transcript_rows=removed_transcript,
+            delivery_rows=removed_deliveries,
             wizard_rows=removed_wizards,
             enrollment_tokens=removed_tokens,
         )
@@ -437,6 +450,15 @@ class Supervisor:
     ) -> None:
         self._tasks.pop(session_id, None)
         self._pollers.pop(session_id, None)
+        # Release the client pin here too, not only in `_drop`. A poller that
+        # ends by itself — crashed, or returned because its session was unbound
+        # — never passes through `_drop`, so the pin would never come back and
+        # `_spawn` would take a second one on the next pass. A tenant whose pin
+        # count can no longer reach zero is one whose decrypted API key
+        # `ClientPool.sweep` can never evict, for the life of the process.
+        tenant_id = self._tenant_of.pop(session_id, None)
+        if tenant_id is not None:
+            self.clients.unpin(tenant_id)
         if task.cancelled():
             return
         error = task.exception()
@@ -444,7 +466,6 @@ class Supervisor:
             self._restart.pop(session_id, None)
             return
         if isinstance(error, AuthFatal):
-            tenant_id = self._tenant_of.get(session_id)
             _log.error(
                 "supervisor.auth_fatal", session_id=session_id, tenant=str(tenant_id)
             )

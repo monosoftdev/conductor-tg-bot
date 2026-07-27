@@ -48,7 +48,18 @@ class TestFsmStorageWithoutATenant:
     async def test_reading_state_answers_empty_rather_than_raising(
         self, db: Database
     ) -> None:
+        """The assertion has to be *falsifiable*: seed a wizard first.
+
+        Reading an empty table returns ``None`` whether or not the guard is
+        there, so a bare read proves nothing. Writing a row under a real tenant
+        and then reading it back unscoped distinguishes "handled the missing
+        scope" from "there was nothing to find".
+        """
         storage = PostgresStorage(db)
+        async with as_tenant(BOOTSTRAP_TENANT_ID):
+            await storage.set_state(storage_key(), "NewWorkspace:branch")
+            assert await storage.get_state(storage_key()) == "NewWorkspace:branch"
+
         async with unscoped():
             assert await storage.get_state(storage_key()) is None
             assert await storage.get_data(storage_key()) == {}

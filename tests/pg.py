@@ -17,7 +17,7 @@ import os
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
-from typing import Any, Final, LiteralString, cast
+from typing import Any, Final, LiteralString, NoReturn, cast
 
 import psycopg
 import pytest
@@ -57,6 +57,21 @@ TEST_MASTER_KEYS: Final = (
 
 _APP_PASSWORD: Final = "ctb-app-test"
 _WORKER_PASSWORD: Final = "ctb-worker-test"
+
+
+def _no_server(exc: BaseException) -> NoReturn:
+    """No database: skip on a laptop, **fail** in CI.
+
+    Skipping locally is a kindness — the offline subset is most of the suite and
+    a contributor should not need Docker to run it. Skipping in CI is a lie: it
+    turns "the entire tenant-isolation, RLS, crypto-binding and claim half of
+    the suite did not run" into a green tick. A DSN typo or a changed port would
+    silently disarm every security test we have.
+    """
+    hint = f"PostgreSQL is not reachable ({exc}); run: docker compose up -d db"
+    if os.environ.get("CI"):
+        pytest.fail(f"{hint} — refusing to skip database tests in CI", pytrace=False)
+    pytest.skip(hint)
 
 
 def _base_dsn() -> str:
@@ -105,9 +120,7 @@ def pg_schema() -> tuple[str, ...]:
             conn.execute("DROP SCHEMA public CASCADE")
             conn.execute("CREATE SCHEMA public")
     except psycopg.OperationalError as exc:  # pragma: no cover - no server
-        pytest.skip(
-            f"PostgreSQL is not reachable ({exc}); run: docker compose up -d db"
-        )
+        _no_server(exc)
     try:
         bootstrap(
             admin_dsn(),
@@ -115,9 +128,7 @@ def pg_schema() -> tuple[str, ...]:
             worker_password=_WORKER_PASSWORD,
         )
     except psycopg.OperationalError as exc:  # pragma: no cover - no server
-        pytest.skip(
-            f"PostgreSQL is not reachable ({exc}); run: docker compose up -d db"
-        )
+        _no_server(exc)
     with psycopg.connect(admin_dsn(), autocommit=True) as conn:
         rows = conn.execute(
             "SELECT tablename FROM pg_tables "

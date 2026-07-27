@@ -1,7 +1,7 @@
 """Bind the PLAN §Logging context keys for the lifetime of one update.
 
 Every log line emitted while handling an update — including the rejection line
-from :class:`~ctb.bot.middleware.auth.AuthMiddleware` and every Conductor API
+from :class:`~ctb.bot.middleware.tenancy.TenantMiddleware` and every Conductor API
 call made downstream — carries ``request_id``, ``chat_id``, ``thread_id`` and
 ``user_id``. That is the whole debugging surface: one grep on ``request_id``
 gives the complete story of one thumb press.

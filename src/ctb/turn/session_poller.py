@@ -123,6 +123,7 @@ class SessionPoller:
         session_id: str,
         *,
         action_sink: ActionSink | None = None,
+        max_pending_deliveries: int | None = None,
         clock: Clock = time.monotonic,
         sleep: Sleeper = asyncio.sleep,
         rng: random.Random | None = None,
@@ -131,6 +132,9 @@ class SessionPoller:
         self.db = db
         self.session_id = session_id
         self.action_sink = action_sink
+        #: This workspace's delivery backlog ceiling. ``None`` disables the
+        #: check; the supervisor passes the tenant's own value.
+        self.max_pending_deliveries = max_pending_deliveries
         self._clock = clock
         self._sleep = sleep
         self._rng = rng or random.Random()
@@ -320,7 +324,12 @@ class SessionPoller:
 
     async def _drain_once(self) -> cursor.DrainResult | None:
         try:
-            result = await cursor.drain(self.client, self.db, self.session_id)
+            result = await cursor.drain(
+                self.client,
+                self.db,
+                self.session_id,
+                max_pending=self.max_pending_deliveries,
+            )
         except NotFound:
             await self._apply_evidence(
                 E404("session"), reposted=self._reposted_this_tick

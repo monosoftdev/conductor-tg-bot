@@ -80,6 +80,8 @@ Result · tap a numbered choice; ✓ is recommended
 <code>/invite id</code> adds someone · <code>/members</code> lists them
 <code>/key</code> (privately) sets your Conductor key
 <code>/export</code> downloads your data · <code>/privacy</code> explains it
+<code>/use name</code> picks which one your DMs mean · <code>/leave</code> exits one
+<code>/voice on</code> needs your own <code>/voicekey</code> first
 
 Stop from the pinned card. /done always confirms.
 Voice commands need “command” or “команда”."""
@@ -652,7 +654,13 @@ async def defaults(
             model=model,
             effort=effort,
         )
-        await tell(message, f"Defaults: <b>{agent.value}</b> · {model}/{effort}.")
+        # `effort` is not always allow-listed: an agent with no declared
+        # efforts (cursor) passes any string through validate_pairing.
+        await tell(
+            message,
+            f"Defaults: <b>{escape(agent.value)}</b> · "
+            f"{escape(model or '')}/{escape(effort or '')}.",
+        )
         return
     agent = chat.default_agent or tenant.settings.default_agent
     model = chat.default_model or tenant.settings.default_model

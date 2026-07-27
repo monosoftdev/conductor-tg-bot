@@ -8,7 +8,7 @@ and a live phone pass.
 
 Verified offline, on every commit:
 
-- **1,866 tests pass** against a real PostgreSQL 16.
+- **1,927 tests pass** against a real PostgreSQL 16.
 - `ruff format --check`, `ruff check`, `pyright` — all clean.
 - The real runtime boots against a real database: all six services start,
   `/health` returns `ok`, the lease is acquired, shutdown is clean.
@@ -53,13 +53,40 @@ not be re-cut.
 - **A chat-id collision across tenants used to raise "row vanished".** It now
   raises `ChatOwnedElsewhereError` and says what actually happened.
 
-## The adversarial review, and what it found
+## The second adversarial review
 
-An independent review of the finished branch found four critical bugs and five
-high ones. All are fixed; `docs/TENANCY.md` documents the rules that came out
-of them. The lesson worth keeping:
+A six-way parallel audit of the finished branch — isolation, onboarding, crypto,
+delivery, tests, UX — found four criticals and eight highs, all now fixed. The
+pattern is worth more than the list: **isolation, crypto and claiming were
+excellent; the second-order paths were not.** Eviction on revoke, cache
+invalidation, error-path ordering, pin accounting, retention, and four config
+knobs that described protections which did not exist.
 
-**One line in the test harness hid three of them.** Both database fixtures put
+What was fixed, and why each mattered:
+
+| | Was | Now |
+|---|---|---|
+| `/key` from a non-owner | refused *before* deleting — the key sat in Telegram forever | deleted first, always, and the reply says if deletion failed |
+| Setup codes | bearer tokens; anyone holding one could bind their group to your workspace | bound to the issuing user, and `/register` re-issues instead of dead-ending |
+| Callback budget | a fixed 40-char cap; a 36-char UUID + `archreq` hit exactly 64 bytes, 37 removed **every** button from the card | measured per action, degrades to a non-restart-proof button |
+| Last owner | could demote themselves, orphaning the workspace permanently | refused unless a second owner exists |
+| `ctb_app` grants | could `SELECT` every tenant's sealed key blob | no grant at all on the four scope-deciding tables |
+| Delivery ordering | a network blip re-ordered a topic (`1, 2, 3, 0`) | a deferral stops the batch; a terminal drop does not |
+| One chat's 429 | slept up to 60s on the single outbox task — every tenant stalled | inline only under 2s, then pause that chat and move on |
+| Voice recovery | no orphan window; a redeploy re-transcribed and **re-billed** in-flight jobs | same 150s guard as deliveries |
+| `/use` | invalidated the wrong cache entry, then raised forever on the second call | invalidates the tenant it left; `rebind_chat` makes it repeatable |
+| Deleted topic | that turn's output lost silently and permanently | rerouted to the group's General |
+| Clean shutdown | released rows with no hash guard — a SIGTERM duplicated more readily than a crash | same `content_hash` guard as crash recovery |
+| `deliveries` | never pruned; agent output outlived the 30-day transcript promise | pruned on the same window |
+| `MAX_ATTEMPTS`, `REGISTRATION_RATE_PER_HOUR` | declared, documented, never read | enforced |
+| `api_events.tenant_id` | always NULL, so per-workspace `/health` was blind | attributed |
+| `StatusCards` | claimed to share the outbox pacer; did not | shares it, and reports its 429s |
+| Supervisor | leaked a client pin when a poller ended by itself, so a decrypted key could never be swept | unpins on every exit path |
+| `/voice` | `tenants.voice_enabled` gated the feature and **no command set it** | the command exists |
+
+### The lesson from the first review, still the most important one
+
+**One line in the test harness hid three bugs.** Both database fixtures put
 a tenant in scope for the whole test, so every background task — the FSM
 storage read that runs before *every* handler, the voice workers, the
 status-card writer — looked correct and failed the moment it ran for real.

@@ -1,0 +1,55 @@
+name: Bug report
+description: Something behaved differently than it should have
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        **Do not paste an API key, a bot token or a transcript.** Redact log
+        lines before pasting them. If the bug itself is an exposure, stop and
+        read SECURITY.md instead.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what you got.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: >-
+        The commands you sent, in order. If it involves a specific agent,
+        model or repository shape, say so.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Commit SHA or tag.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where
+      options:
+        - A group topic
+        - A DM with the bot
+        - Local development
+        - Deployed (Railway or similar)
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log lines
+      description: Redacted. Structured lines with the event name are most useful.
+      render: text

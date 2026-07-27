@@ -10,6 +10,8 @@ none apply here.
 
 ## Read first
 
+- `docs/GETTING_STARTED.md` — the user-facing walkthrough. Read it before
+  changing any onboarding message; the two must not drift.
 - `docs/HANDOFF.md` — what's done, what's next, what's blocked. **Start here.**
 - `docs/TENANCY.md` — how isolation works, and the seams you must not cut.
 - `docs/PLAN.md` — the original single-user design. Transition tables, UX, verification plan.
@@ -120,11 +122,46 @@ key.
 - `scripts/probe_transcript.py assume` sends real prompts and costs real tokens. Scratch sessions
   only.
 
-## Commands
+## Running tests
+
+> **Run only the tests for what you changed. CI runs the whole suite, in
+> parallel, and nothing merges until it is green.**
+
+The full suite is ~1,900 tests. Running all of it after every edit is the single
+biggest waste of time in this repo, and it buys nothing a shared runner cannot
+buy more cheaply. So locally:
 
 ```bash
-docker compose up -d --wait db
-.venv/bin/python -m pytest tests/ -q
+docker compose up -d --wait db                     # once per session
+.venv/bin/python -m pytest tests/test_outbox.py -q         # the file you touched
+.venv/bin/python -m pytest tests/ -q -k "callback or nonce"  # or by keyword
 .venv/bin/python -m ruff format . && .venv/bin/python -m ruff check .
 .venv/bin/python -m pyright
 ```
+
+Pick the target by what the change can *break*, not by what it edits — a repo
+change breaks its callers, a middleware change breaks the handlers behind it. If
+you cannot name the tests that cover a change, that is the finding; write one.
+
+Run the full suite locally only when you have a reason: a change to
+`db/connection.py`, `migrations/`, `keyboards.py`, `outbox.py` or the middleware
+chain touches everything, and so does anything you are about to tag.
+
+```bash
+.venv/bin/python -m pytest tests/ -q                       # ~30s, all of it
+.venv/bin/python -m pytest tests/ -q -m "not db"           # ~2s, no Docker
+.venv/bin/python -m pytest -q --splits 4 --group 2         # one CI shard
+```
+
+**CI is the gate, not your laptop.** `.github/workflows/ci.yml` runs format,
+lint, types, the offline subset, four test shards and a real boot smoke — all in
+parallel, each shard against its own PostgreSQL. The `all gates` job is the one
+required check; it fails if any job fails, was skipped, or was cancelled.
+
+Two things that are not negotiable there:
+
+- `CI=true` turns "no database" from a skip into a **failure**. Otherwise a DSN
+  typo hides every RLS, isolation, crypto and claim test behind a green tick.
+- Before claiming a test has teeth, break the code it covers and watch it fail.
+  An adversarial review once deleted ten `is_owner` gates at once and eight of
+  them killed no test.

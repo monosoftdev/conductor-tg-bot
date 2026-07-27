@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import signal
+import uuid
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
@@ -47,6 +48,9 @@ __all__ = [
 ]
 
 log = get_logger(__name__)
+
+#: Built once per process by :func:`_shared_pacer`.
+_PACER: Any = None
 
 type Factory = Callable[..., Any]
 type AsyncFactory = Callable[..., Awaitable[Any]]
@@ -305,7 +309,37 @@ async def _default_open_databases(settings: Settings) -> tuple[Any, Any]:
         max_size=settings.system_db_pool_max,
         system=True,
     )
+    await _assert_app_role_is_confined(app)
     return app, system
+
+
+async def _assert_app_role_is_confined(app: Any) -> None:
+    """Refuse to boot if ``DATABASE_URL`` names a role that bypasses RLS.
+
+    This is the one misconfiguration that fails silently in the worst possible
+    direction. Row-level security does not apply to a superuser or to a role
+    with ``BYPASSRLS`` — not even with ``FORCE`` — so pointing the app pool at,
+    say, a managed provider's default ``postgres`` user would leave every query
+    working, every test passing, and every tenant reading every other tenant's
+    transcripts. Nothing downstream would notice.
+
+    ``pg_roles`` is world-readable and unaffected by RLS, so one query settles
+    it. The scope is arbitrary: we need a tenant set only because the app pool
+    refuses to hand out a connection without one.
+    """
+    from ctb.db.connection import tenant_scope
+
+    async with tenant_scope(uuid.UUID(int=0)):
+        unconfined = await app.fetch_val(
+            "SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = current_user"
+        )
+    if unconfined:
+        raise SettingsError(
+            "DATABASE_URL connects as a role that bypasses row-level security "
+            "(superuser or BYPASSRLS). Tenant isolation would be off and "
+            "nothing else would tell you. Point it at the ctb_app role created "
+            "by `python -m ctb.db.bootstrap`."
+        )
 
 
 async def _default_verify_schema(db: Any) -> int:
@@ -353,7 +387,22 @@ def _default_make_bot(settings: Settings) -> Any:
 def _default_make_outbox(bot: Any, db: Any) -> Any:
     from ctb.delivery.outbox import Outbox
 
-    return Outbox(bot, db)
+    return Outbox(bot, db, pacer=_shared_pacer())
+
+
+def _shared_pacer() -> Any:
+    """One budget for both streams that talk to Telegram.
+
+    Transcript deliveries and status-card edits spend the same bot token
+    against the same per-second ceiling. Two independent pacers would each
+    stay politely under a limit they are jointly blowing through.
+    """
+    from ctb.delivery.pacing import TelegramPacer
+
+    global _PACER
+    if _PACER is None:
+        _PACER = TelegramPacer()
+    return _PACER
 
 
 def _default_make_status_cards(bot: Any, db: Any) -> Any:
@@ -368,7 +417,7 @@ def _default_make_status_cards(bot: Any, db: Any) -> Any:
     ) -> Any:
         return status_card_keyboard(buttons, session_id, deep_link=deep_link)
 
-    return StatusCards(bot, db, keyboard=keyboard)
+    return StatusCards(bot, db, keyboard=keyboard, pacer=_shared_pacer())
 
 
 def _default_make_supervisor(
@@ -420,7 +469,7 @@ def _default_make_voice(
     supervisor: Any,
 ) -> Any:
     from ctb.bot.keyboards import NonceStore
-    from ctb.runtime import secret_box
+    from ctb.runtime import secret_box, set_provider_pool
     from ctb.voice.pool import ProviderPool
     from ctb.voice.service import VoiceService
 
@@ -437,6 +486,10 @@ def _default_make_voice(
         if settings.voice_enabled
         else None
     )
+    # Published so /revoke and /forget can evict a decrypted speech key.
+    # ProviderPool has no idle sweep, so without this the plaintext would
+    # outlive the row it came from for the life of the process.
+    set_provider_pool(providers)
     return VoiceService(
         settings,
         db,

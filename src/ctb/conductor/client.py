@@ -156,11 +156,16 @@ class ApiEvent:
     circuit_state: str
     request_id: str | None
     session_id: str | None
+    #: Which workspace's key made the call. Without it `api_events.tenant_id`
+    #: is NULL on every row and the per-workspace `/health` error line is
+    #: permanently blank however many 401s that workspace just took.
+    tenant_id: uuid.UUID | None = None
 
     def as_row(self) -> dict[str, Any]:
         """Kwargs for an ``INSERT INTO api_events`` in the repo layer."""
         return {
             "at": self.at,
+            "tenant_id": self.tenant_id,
             "method": self.method,
             "endpoint": self.endpoint,
             "status_code": self.status_code,
@@ -805,6 +810,7 @@ class ConductorClient:
             circuit_state=self._circuit.state.value,
             request_id=request_id,
             session_id=session_id,
+            tenant_id=self.tenant_id,
         )
         self._events.append(event)
         self._log.debug(

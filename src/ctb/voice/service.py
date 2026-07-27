@@ -271,22 +271,31 @@ class VoiceService:
             return
         if row.tenant_id is None:  # pragma: no cover - the column is NOT NULL
             return
-        try:
-            async with tenant_scope(row.tenant_id):
+        # The failure path needs the scope as much as the happy path does.
+        # Written as one block rather than try/except *around* the scope,
+        # because `async with` exits before an outer `except` body runs — and
+        # `voice_repo.fail` on the tenant-scoped pool with no tenant set raises
+        # `TenantScopeError`, replacing the real error and leaving the job stuck
+        # in `transcribing` until the next redeploy. The user never hears why
+        # their voice note went nowhere.
+        async with tenant_scope(row.tenant_id):
+            try:
                 await self._process(row)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            error = short_error(exc)
-            log.warning(
-                "voice.job_failed",
-                chat_id=row.chat_id,
-                tg_message_id=row.tg_message_id,
-                worker=index,
-                error=error,
-            )
-            await voice_repo.fail(self.db, row, error=error)
-            await self._send_failure(row, error)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                error = short_error(exc)
+                log.warning(
+                    "voice.job_failed",
+                    chat_id=row.chat_id,
+                    tg_message_id=row.tg_message_id,
+                    worker=index,
+                    error=error,
+                )
+                with suppress(Exception):
+                    await voice_repo.fail(self.db, row, error=error)
+                with suppress(Exception):
+                    await self._send_failure(row, error)
 
     async def _maintenance(self) -> None:
         while not self._stop.is_set():

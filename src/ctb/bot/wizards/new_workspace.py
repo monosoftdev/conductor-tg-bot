@@ -536,7 +536,18 @@ async def typed_prompt(
             client=tenant.client,
         )
     except Exception as exc:
-        await tell(message, f"New failed: {escape(short_error(exc))}", silent=False)
+        # Clear first. The message reads terminal ("at its limit of 50
+        # workspaces"), so the next thing typed is meant for a session — but a
+        # live wizard would swallow it and try to create another workspace,
+        # silently, for the next thirty minutes. The sibling failure branch
+        # above already clears; this one forgetting to was an oversight.
+        await state.clear()
+        await tell(
+            message,
+            f"New failed: {escape(short_error(exc))}\n"
+            "Nothing was created. Run <code>/new</code> to try again.",
+            silent=False,
+        )
         return
     await state.clear()
     target = (

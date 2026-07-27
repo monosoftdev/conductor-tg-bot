@@ -655,9 +655,16 @@ BEGIN
                 'chats, workspaces, sessions, outbound_prompts, '
                 'transcript_messages, deliveries, wizard_state, voice_inputs, '
                 'unknown_content_types TO ctb_app';
-        -- Read-only on the tables that decide scope; TenantMiddleware uses the
-        -- worker pool for them, but a stray read must not be a write.
-        EXECUTE 'GRANT SELECT ON tenants, tenant_members, tenant_chats TO ctb_app';
+        -- Deliberately NO grant on tenants, tenant_members or tenant_chats.
+        -- Those tables decide scope, so they carry no row-level security of
+        -- their own: a SELECT on `tenants` returns every customer's sealed key
+        -- blob, fingerprint and membership graph. Granting even read to the
+        -- request-path role would make `tenancy.chat_for(db, ...)` with the
+        -- handler-injected pool a silent cross-tenant enumeration that no test
+        -- would catch. TenantMiddleware already uses the worker pool for every
+        -- one of these lookups; withholding the grant is what makes the
+        -- alternative fail loudly instead of quietly.
+        --
         -- /health reports the applied version on every request.
         EXECUTE 'GRANT SELECT ON schema_version TO ctb_app';
     END IF;

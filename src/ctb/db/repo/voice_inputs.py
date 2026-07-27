@@ -11,6 +11,7 @@ from ctb.db.repo._util import as_int, as_opt_int, as_opt_str, as_str
 
 __all__ = [
     "MAX_ATTEMPTS",
+    "ORPHAN_AFTER_MS",
     "Recovery",
     "VoiceInputRow",
     "claim_next",
@@ -33,6 +34,12 @@ __all__ = [
 #: next boot. Without a cap that is an unbounded, *billed* crash loop, so a job
 #: that has burned this many claims is abandoned instead of requeued.
 MAX_ATTEMPTS: Final = 3
+
+#: A claimed voice job younger than this may still be in flight on a live peer
+#: during a deploy overlap. Same guard, same reasoning as
+#: :data:`ctb.db.repo.deliveries.ORPHAN_AFTER_MS` — but here a wrong recovery
+#: costs the customer a second speech-vendor bill, not just a duplicate message.
+ORPHAN_AFTER_MS: Final = 150_000
 
 _TERMINAL_STATES: Final[tuple[str, ...]] = ("completed", "failed", "waiting_for_user")
 
@@ -361,6 +368,7 @@ async def recover_stale(
     db: Database,
     *,
     max_attempts: int = MAX_ATTEMPTS,
+    orphan_after_ms: int = ORPHAN_AFTER_MS,
     at: int | None = None,
 ) -> Recovery:
     """Recover jobs whose process died after a conditional claim.
@@ -368,16 +376,26 @@ async def recover_stale(
     A job is requeued only while it still has attempts left. One that has
     already burned ``max_attempts`` is marked ``failed`` instead: the note is
     reproducibly killing the process, and every replay costs the owner money.
+
+    **Only jobs older than ``orphan_after_ms`` are touched.** This runs at
+    boot, and a Railway deploy overlaps the old container with the new one: a
+    row still marked ``transcribing`` may have a live speech-vendor request in
+    flight on the peer. Requeueing it transcribes the same note twice, bills
+    the customer twice and dispatches the prompt twice. ``deliveries`` has the
+    same guard for the same reason — and voice is the path that costs real
+    money per call, so it needs it more, not less.
     """
     stamp = now_ms() if at is None else at
+    cutoff = stamp - max(0, orphan_after_ms)
     exhausted = await db.fetch_all(
         f"""
         SELECT {_COLUMNS}
           FROM voice_inputs
          WHERE state IN ('transcribing', 'dispatching')
            AND attempts >= ?
+           AND updated_at <= ?
         """,
-        (max_attempts,),
+        (max_attempts, cutoff),
     )
     abandoned: list[VoiceInputRow] = []
     for raw in exhausted:
@@ -396,8 +414,9 @@ async def recover_stale(
                             ELSE 'transcribed' END,
                updated_at = ?
          WHERE state IN ('transcribing', 'dispatching')
+           AND updated_at <= ?
         """,
-        (stamp,),
+        (stamp, cutoff),
     )
     return Recovery(requeued=requeued, abandoned=tuple(abandoned))
 

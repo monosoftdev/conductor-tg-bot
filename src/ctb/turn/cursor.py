@@ -704,6 +704,7 @@ async def drain(
     planner: DeliveryPlanner = plan_deliveries,
     max_pages: int = MAX_PAGES_PER_TICK,
     page_limit: int = PAGE_LIMIT,
+    max_pending: int | None = None,
 ) -> DrainResult:
     """Fetch, validate, record and queue everything new. Runs every tick.
 
@@ -808,7 +809,9 @@ async def drain(
                         deliveries=drafts,
                     )
                 )
-            result = await transcript.advance_cursor(db, session_id, tuple(items))
+            result = await transcript.advance_cursor(
+                db, session_id, tuple(items), max_pending=max_pending
+            )
             recorded += result.recorded
             duplicates += result.duplicates
             created += result.deliveries_created

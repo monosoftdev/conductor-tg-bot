@@ -48,8 +48,8 @@ __all__ = [
     "bind_chat",
     "chat_for",
     "consume_enrollment_token",
-    "count_workspaces",
     "create",
+    "created_since",
     "create_enrollment_token",
     "delete_tenant",
     "get",
@@ -63,6 +63,7 @@ __all__ = [
     "memberships_for_user",
     "primary_chat",
     "prune_enrollment_tokens",
+    "rebind_chat",
     "remove_member",
     "set_conductor_key",
     "set_elevenlabs_key",
@@ -239,6 +240,23 @@ def _as_bytes(value: Any) -> bytes | None:
 
 
 # ── tenants ──────────────────────────────────────────────────────────────────
+
+
+async def created_since(db: Database, *, since_ms: int) -> int:
+    """How many workspaces were registered after ``since_ms``.
+
+    The sign-up rate limit. Registration is open by default and every
+    ``/register`` is an unauthenticated INSERT, so without a bound a script with
+    a pool of Telegram accounts can fill the table overnight — and nothing
+    prunes an abandoned `pending` tenant.
+    """
+    return as_int(
+        await db.fetch_val(
+            "SELECT COUNT(*) FROM tenants WHERE created_at >= ?",
+            (since_ms,),
+            default=0,
+        )
+    )
 
 
 async def create(
@@ -444,18 +462,6 @@ async def delete_tenant(db: Database, tenant_id: uuid.UUID) -> bool:
     return await db.execute("DELETE FROM tenants WHERE id = ?", (tenant_id,)) > 0
 
 
-async def count_workspaces(db: Database, tenant_id: uuid.UUID) -> int:
-    """Live workspaces, for the quota check. System pool: crosses RLS."""
-    return as_int(
-        await db.fetch_val(
-            "SELECT COUNT(*) FROM workspaces "
-            "WHERE tenant_id = ? AND archived_at IS NULL",
-            (tenant_id,),
-            default=0,
-        )
-    )
-
-
 # ── members ──────────────────────────────────────────────────────────────────
 
 
@@ -479,6 +485,12 @@ async def add_member(
     **Only an owner may change an owner's role.** Admins pass the same
     ``is_owner`` command gate as owners, so without this an admin could demote
     the owner to ``member`` — and nothing in Telegram grants ``owner`` back.
+
+    **The last owner may not be demoted, not even by themselves.** A workspace
+    with zero owners is unadministrable *and* undeletable: every command that
+    could fix it is gated on ``is_owner``, and ``/forget`` needs the role
+    exactly. One mistyped ``/invite <my own id> member`` would strand the
+    tenant, its sealed key and its transcripts forever.
     """
     stamp = now_ms() if at is None else at
     if role != "owner":
@@ -487,6 +499,10 @@ async def add_member(
             actor = None if added_by is None else await member(db, tenant_id, added_by)
             if actor is None or actor.role != "owner":
                 raise RoleError("only an owner can change an owner's role")
+            if len(await list_owner_ids(db, tenant_id)) <= 1:
+                raise RoleError(
+                    "that is the only owner; promote someone else to owner first"
+                )
     row = await db.fetch_one(
         f"""
         INSERT INTO tenant_members
@@ -663,6 +679,44 @@ async def unbind_chat(db: Database, chat_id: int) -> bool:
     return (
         await db.execute("DELETE FROM tenant_chats WHERE chat_id = ?", (chat_id,)) > 0
     )
+
+
+async def rebind_chat(
+    db: Database,
+    chat_id: int,
+    tenant_id: uuid.UUID,
+    *,
+    kind: str = "dm",
+    title: str | None = None,
+    bound_by: int | None = None,
+    at: int | None = None,
+) -> TenantChat:
+    """Move a private chat to another tenant, on purpose.
+
+    :func:`bind_chat` refuses this, and rightly: a shared bot means anyone can
+    add it to a group, so silently re-homing one would move a customer's topics
+    under somebody else's key. ``/use`` is the opposite situation — one person
+    choosing, in their own private chat, which of the workspaces *they are
+    already in* their DMs mean. Without a way to say that, ``/use`` binds once
+    and then raises forever.
+
+    The caller must have verified membership of ``tenant_id``. Deliberately
+    refuses a group: re-homing a shared chat is never one person's decision.
+    """
+    if kind != "dm":
+        raise ValueError("rebind_chat is for private chats only")
+    stamp = now_ms() if at is None else at
+    async with db.transaction():
+        await unbind_chat(db, chat_id)
+        return await bind_chat(
+            db,
+            chat_id,
+            tenant_id,
+            kind=kind,
+            title=title,
+            bound_by=bound_by,
+            at=stamp,
+        )
 
 
 async def list_chats(db: Database, tenant_id: uuid.UUID) -> list[TenantChat]:

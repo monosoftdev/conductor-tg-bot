@@ -873,27 +873,29 @@ async def test_record_status_keeps_error_text_and_clears_it(seeded: Database) ->
     assert recovered.error_text is None
 
 
-async def test_bound_sessions_drive_the_supervisor(seeded: Database) -> None:
+async def test_bound_sessions_drive_the_supervisor(
+    seeded: Database, system_db: Database
+) -> None:
     await sessions.upsert(seeded, "sess-2", workspace_id=WORKSPACE)
     await sessions.bind(seeded, "sess-2", chat_id=CHAT, thread_id=99)
     await sessions.update(seeded, "sess-2", turn_state="WORKING")
 
-    bound = await sessions.list_bound(seeded)
+    bound = await sessions.list_bound(system_db)
     assert [row.id for row in bound] == ["sess-2", SESSION]  # active first
 
     assert await sessions.get_bound_for(seeded, CHAT, 99) is not None
     await sessions.unbind(seeded, "sess-2")
     assert await sessions.get_bound_for(seeded, CHAT, 99) is None
-    assert [row.id for row in await sessions.list_bound(seeded)] == [SESSION]
+    assert [row.id for row in await sessions.list_bound(system_db)] == [SESSION]
 
 
-async def test_mark_dead_is_terminal(seeded: Database) -> None:
+async def test_mark_dead_is_terminal(seeded: Database, system_db: Database) -> None:
     row = await sessions.mark_dead(seeded, SESSION, reason="404 from /messages")
     assert row is not None
     assert row.state is TurnState.DEAD
     assert row.is_bound is False
     assert row.last_error == "404 from /messages"
-    assert await sessions.list_bound(seeded) == []
+    assert await sessions.list_bound(system_db) == []
 
 
 async def test_session_helpers(seeded: Database) -> None:

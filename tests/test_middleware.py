@@ -1422,6 +1422,29 @@ def test_discover_tolerates_a_missing_handler_package() -> None:
     assert bot_app.discover_routers("ctb.bot.definitely_not_here") == ()
 
 
+def test_the_phone_menu_never_advertises_a_command_that_does_not_exist() -> None:
+    """A menu entry with no handler is a dead button on every user's phone.
+
+    The menu is a hand-written tuple set once at boot, so nothing else would
+    catch a rename or a deleted handler.
+    """
+    clear_routers()
+    try:
+        routers = bot_app.discover_routers()
+    finally:
+        clear_routers()
+
+    handled: set[str] = set()
+    for router in routers:
+        for handler in router.message.handlers:
+            for flt in handler.filters or ():
+                callback = getattr(flt, "callback", None)
+                handled.update(getattr(callback, "commands", ()) or ())
+
+    advertised = {c.command for c in bot_app.BOT_COMMANDS}
+    assert advertised <= handled, advertised - handled
+
+
 def test_build_app_wires_everything(
     bot: Bot, bot_settings: Settings, db: Database, system_db: Database
 ) -> None:

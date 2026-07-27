@@ -24,6 +24,7 @@ from ctb.bot.handlers.common import (
 from ctb.bot.handlers.core import run_find
 from ctb.bot.handlers.topics import resolve_client, resolve_db
 from ctb.bot.keyboards import (
+    CONTROL_TTL_S,
     Action,
     Cb,
     NonceError,
@@ -197,6 +198,12 @@ async def plain_text(
                     user_id=message.from_user.id if message.from_user else None,
                     chat_id=message.chat.id,
                     thread_id=message.message_thread_id or 0,
+                    # A turn outlives the 60-second default many times over,
+                    # and this bubble is the fallback shown precisely where the
+                    # 👀 reaction was refused — i.e. where it is the only Stop
+                    # the user has. Same lifetime as every other control.
+                    ttl=CONTROL_TTL_S,
+                    restartable=True,
                 )
             ]
         ]

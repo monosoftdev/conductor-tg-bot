@@ -14,6 +14,10 @@ opposite: the things a tenant does not get its own copy of.
 ``client_pool``
     Tenant id → Conductor client.
 
+``provider_pool``
+    Tenant id → speech provider. Registered so ``/revoke`` and ``/forget`` can
+    evict a decrypted key rather than leaving it live in a header.
+
 ``secret_box``
     Envelope encryption for stored API keys.
 
@@ -30,12 +34,15 @@ if TYPE_CHECKING:  # pragma: no cover - import cycle at runtime only
     from ctb.conductor.pool import ClientPool
     from ctb.crypto import SecretBox
     from ctb.db.connection import Database
+    from ctb.voice.pool import ProviderPool
 
 __all__ = [
     "client_pool",
+    "provider_pool",
     "reset_runtime",
     "secret_box",
     "set_client_pool",
+    "set_provider_pool",
     "set_secret_box",
     "set_system_database",
     "system_database",
@@ -44,6 +51,7 @@ __all__ = [
 _system_db: Database | None = None
 _client_pool: ClientPool | None = None
 _secret_box: SecretBox | None = None
+_provider_pool: ProviderPool | None = None
 
 
 def set_system_database(db: Database | None) -> None:
@@ -71,6 +79,20 @@ def client_pool() -> ClientPool:
     return _client_pool
 
 
+def set_provider_pool(pool: ProviderPool | None) -> None:
+    global _provider_pool
+    _provider_pool = pool
+
+
+def provider_pool() -> ProviderPool | None:
+    """The speech-provider pool, or ``None`` when voice is off.
+
+    Optional by design — voice is the one feature that can be disabled outright
+    — so callers evicting a key must tolerate its absence rather than raise.
+    """
+    return _provider_pool
+
+
 def set_secret_box(box: SecretBox | None) -> None:
     global _secret_box
     _secret_box = box
@@ -86,4 +108,5 @@ def reset_runtime() -> None:
     """Drop every installed handle. Test teardown."""
     set_system_database(None)
     set_client_pool(None)
+    set_provider_pool(None)
     set_secret_box(None)

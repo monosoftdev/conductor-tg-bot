@@ -27,6 +27,7 @@ from __future__ import annotations
 import time
 import uuid
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Final
 
@@ -105,9 +106,18 @@ _MAX_TRACKED_STRANGERS: Final = 4096
 #: updates is three lookups rather than three hundred.
 TENANT_CACHE_TTL_S: Final = 30.0
 
+#: How often one chat is told its workspace is suspended. Long: the state does
+#: not change on its own, and the notice is a courtesy, not an alert.
+SUSPENDED_NOTICE_INTERVAL_S: Final = 6 * 60 * 60.0
+
 #: Commands a *non-member* may run in a **private chat**, because they are how
 #: someone becomes one.
-UNRESOLVED_COMMANDS: Final = frozenset({"/start", "/register", "/help", "/privacy"})
+#: ``/platform`` is here because an operator of a fresh instance owns no
+#: workspace, and "suspend that customer, now" must not require registering a
+#: decoy one first. The handler still gates on ``PLATFORM_ADMIN_IDS``.
+UNRESOLVED_COMMANDS: Final = frozenset(
+    {"/start", "/register", "/help", "/privacy", "/platform"}
+)
 
 #: The one command a non-member may run in a **group**. Binding a fresh
 #: supergroup is impossible otherwise — it has no ``tenant_chats`` row yet, which
@@ -307,6 +317,10 @@ class TenantMiddleware(BaseMiddleware):
         self._cache_ttl = cache_ttl_s
         self._clock = clock
         self._cache: dict[tuple[int, int], _CacheEntry] = {}
+        #: One "this workspace is suspended" line per chat per interval. A
+        #: suspended group can still be busy, and repeating the notice on every
+        #: message would make the bot the noisiest thing in it.
+        self._suspend_notices: dict[int, float] = {}
         #: Counters for ``/health``.
         self.rejected = 0
         self.resolved = 0
@@ -335,6 +349,11 @@ class TenantMiddleware(BaseMiddleware):
         if tenant.status in ("suspended", "deleted"):
             self.rejected += 1
             log.warning("tenancy.suspended", tenant=tenant.slug, user_id=user.id)
+            # Silence is the rule for *strangers*. This is a known customer in
+            # a known state, and going completely mute — commands and buttons
+            # alike — reads as an outage. One sentence, rate-limited by the
+            # same notifier that bounds stranger notices.
+            await self._say_suspended(data.get("bot"), user, chat)
             return None
 
         context = TenantContext(
@@ -488,6 +507,25 @@ class TenantMiddleware(BaseMiddleware):
         )
         await self._notify_owners(data.get("bot"), user, chat, event)
         return None  # silence
+
+    async def _say_suspended(self, bot: Any, user: User, chat: Chat | None) -> None:
+        """Tell a suspended workspace's member why nothing is happening."""
+        if bot is None or chat is None:
+            return
+        now = self._clock()
+        last = self._suspend_notices.get(chat.id)
+        if last is not None and now - last < SUSPENDED_NOTICE_INTERVAL_S:
+            return
+        self._suspend_notices[chat.id] = now
+        with suppress(Exception):
+            await bot.send_message(
+                chat_id=chat.id,
+                text=(
+                    "This workspace is suspended, so I am not acting on "
+                    "messages here. Contact whoever runs this instance."
+                ),
+                message_thread_id=None,
+            )
 
     async def _notify_owners(
         self, bot: Any, user: User, chat: Chat | None, event: TelegramObject
