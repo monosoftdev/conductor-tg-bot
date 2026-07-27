@@ -12,6 +12,7 @@ pre-escaped.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from typing import Any, Final
 
@@ -61,17 +62,52 @@ _NOISE_KEYS: Final = frozenset(
     {"content", "contents", "new_string", "old_string", "patch", "diff"}
 )
 
+#: Where a shell command stops being the thing it is doing and starts being
+#: plumbing: a chained command, a pipeline, a subshell, a heredoc.
+_CHAIN: Final = re.compile(r"\s(?:&&|\|\||;|\|)\s|<<|\$\(")
+#: Leading segments that say where, not what. Skipped when something follows.
+_NAVIGATION: Final = frozenset({".", "cd", "export", "set", "source", "env"})
+
 
 def activity_text(block: Mapping[str, Any]) -> str:
-    """``Bash · pytest tests/ -q`` — one plain-text line for the status card."""
+    """``Bash · git add app/models/org.py`` — one line for the status card.
+
+    One line **by construction**, not by collapsing: a heredoc'd shell command
+    flattened into a paragraph is exactly the unreadable soup this exists to
+    avoid. The first line, up to the first chain/pipe/subshell, is what a
+    person would say they were doing.
+    """
     name = tool_name(block) or "tool"
     arguments = tool_input(block)
     detail = first_str(arguments, *_DETAIL_KEYS)
     if detail is None:
         detail = _first_short_value(arguments)
+    detail = _headline(detail)
     if not detail:
         return one_line(name)
     return one_line(f"{name} · {detail}", ACTIVITY_LINE_LIMIT)
+
+
+def _headline(detail: str | None) -> str:
+    """The first meaningful line of an argument, without its plumbing."""
+    if not detail:
+        return ""
+    for line in detail.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return _lead_command(stripped)
+    return ""
+
+
+def _lead_command(line: str) -> str:
+    segments = [part.strip() for part in _CHAIN.split(line) if part.strip()]
+    if not segments:
+        return line
+    for segment in segments:
+        head = segment.split(maxsplit=1)[0]
+        if head not in _NAVIGATION:
+            return segment
+    return segments[0]
 
 
 def _first_short_value(arguments: Mapping[str, Any]) -> str | None:

@@ -1,7 +1,16 @@
 """The pinned per-topic status card: one message that carries the live turn.
 
-``⏳ queued`` → ``⚙️ working 1m20s · running pytest`` → ``✅ done in 1m32s ·
-3 files``.
+``⏳ queued`` → ``⚙️ working 1m20s · Bash · pytest -q`` → ``✅ done in 1m32s ·
+12 tools · $0.29``.
+
+**One card, one state.** The card answers "where are we right now" and nothing
+else, so it may never show two states, two clocks, or a control that does not
+apply. Two rules enforce that here rather than trusting every producer:
+
+* the activity line ("what it is doing right now") is rendered only while the
+  turn is live — a ``done`` line arriving from the renderer moments before the
+  machine finalizes cannot land next to ``working 20s``;
+* a finished card cannot carry Stop, whoever put it in the button tuple.
 
 The machine goes straight from ``queued`` to ``working``: only the kinds in
 :data:`_LIVE_KINDS` are re-rendered on every tick, so anything else would leave
@@ -39,6 +48,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, LinkPrevie
 from ctb.db import NO_THREAD_ID
 from ctb.db.connection import Database
 from ctb.db.repo import sessions as sessions_repo
+from ctb.delivery.render.adapters.result import format_cost
 from ctb.delivery.render.html import escape, strip_html
 from ctb.logging import get_logger
 from ctb.turn.machine import format_duration
@@ -49,6 +59,7 @@ from ctb.turn.state import (
     EditStatusCard,
     Finalize,
     PostStatusCard,
+    SetTurnCost,
     StartTyping,
     StopTyping,
     TurnSummary,
@@ -67,6 +78,7 @@ __all__ = [
     "StatusCards",
     "TERMINAL_KINDS",
     "TYPING_INTERVAL_S",
+    "card_buttons",
     "default_keyboard",
     "render_card",
 ]
@@ -268,6 +280,21 @@ class CardState:
     started_at: float | None = None
     stalled: bool = False
     summary: TurnSummary | None = None
+    #: USD this turn has cost, from the agent's own ``result`` payload. Shown
+    #: only on a finished card, so it can never sit beside a live clock.
+    cost_usd: float = 0.0
+
+
+def card_buttons(state: CardState) -> tuple[CardButton, ...]:
+    """The buttons that actually apply to this state.
+
+    Stop is stripped from a card that is no longer running. Offering it there
+    is worse than useless: it is the control the owner reaches for to answer
+    "is this still going?", so its presence is itself a status claim.
+    """
+    if state.kind not in TERMINAL_KINDS:
+        return state.buttons
+    return tuple(button for button in state.buttons if button is not CardButton.STOP)
 
 
 def render_card(state: CardState, *, now: float) -> str:
@@ -295,13 +322,16 @@ def _segments(state: CardState, *, now: float) -> list[str]:
             segments[0] = elapsed
         else:
             segments.insert(0, elapsed)
-    if state.activity:
+    if state.activity and state.kind not in TERMINAL_KINDS:
+        # "What it is doing right now" only makes sense while there is a now.
         segments.append(state.activity)
     if state.stalled or state.kind is CardKind.STALLED:
         segments.append(_STALLED_SEGMENT)
     summary = state.summary
     if summary is not None and state.kind is CardKind.DONE and summary.files_changed:
         segments.append(f"{summary.files_changed} files")
+    if state.kind in TERMINAL_KINDS and state.cost_usd > 0:
+        segments.append(format_cost(state.cost_usd))
     return [segment[:MAX_CARD_TEXT_CHARS] for segment in segments]
 
 
@@ -533,6 +563,7 @@ class StatusCards:
                 previous = card.state.kind
                 card.message_id = None
                 card.retire_when_clean = False
+                # A new turn: last turn's money is not this turn's money.
                 card.state = CardState(kind=kind, text=text, buttons=buttons)
                 self._on_kind(card, kind, now, previous=previous)
                 card.dirty = True
@@ -565,6 +596,14 @@ class StatusCards:
                     return False
                 card.state = replace(card.state, activity=activity)
                 card.last_change_at = now
+                card.dirty = True
+                return True
+            case SetTurnCost(cost_usd=cost_usd):
+                card = self._cards.get((chat_id, thread_id))
+                if card is None:
+                    return False
+                # Stored, not shown: only a terminal card renders it.
+                card.state = replace(card.state, cost_usd=max(0.0, cost_usd))
                 card.dirty = True
                 return True
             case StartTyping():
@@ -708,7 +747,7 @@ class StatusCards:
         if (
             card.message_id is not None
             and rendered == card.rendered
-            and card.state.buttons == card.rendered_buttons
+            and card_buttons(card.state) == card.rendered_buttons
         ):
             card.dirty = False
             return
@@ -742,7 +781,7 @@ class StatusCards:
         message_id = getattr(result, "message_id", None)
         card.message_id = message_id if isinstance(message_id, int) else None
         card.rendered = rendered
-        card.rendered_buttons = card.state.buttons
+        card.rendered_buttons = card_buttons(card.state)
         card.last_edit_at = now
         card.dirty = False
         self._counters["posted"] += 1
@@ -768,7 +807,7 @@ class StatusCards:
             message = str(exc.message or exc).lower()
             if _NOT_MODIFIED in message:
                 card.rendered = rendered
-                card.rendered_buttons = card.state.buttons
+                card.rendered_buttons = card_buttons(card.state)
                 card.last_edit_at = now
                 card.dirty = False
                 return
@@ -787,7 +826,7 @@ class StatusCards:
             self._fail(card, "edit", exc)
             return
         card.rendered = rendered
-        card.rendered_buttons = card.state.buttons
+        card.rendered_buttons = card_buttons(card.state)
         card.last_edit_at = now
         card.dirty = False
         self._counters["edits"] += 1
@@ -807,7 +846,7 @@ class StatusCards:
             self._fail(card, "edit_plain", exc)
             return
         card.rendered = rendered
-        card.rendered_buttons = card.state.buttons
+        card.rendered_buttons = card_buttons(card.state)
         card.last_edit_at = now
         card.dirty = False
         self._counters["edits"] += 1
@@ -854,7 +893,7 @@ class StatusCards:
     def _markup(self, card: _Card) -> InlineKeyboardMarkup | None:
         try:
             return self._keyboard(
-                card.state.buttons,
+                card_buttons(card.state),
                 session_id=card.session_id,
                 deep_link=card.deep_link,
             )

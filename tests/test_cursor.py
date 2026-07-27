@@ -400,6 +400,26 @@ async def test_drain_honours_chat_verbosity(
     assert "Bash" in (loud_result.latest_activity or "")
 
 
+async def test_drain_reports_the_turn_cost_separately_from_activity(
+    db: Database, fake: FakeConductor, client: ConductorClient
+) -> None:
+    """The money is the one fact the state machine cannot derive for itself.
+
+    It rides its own field so the card can hold it back until the turn is
+    actually finished — as an activity line it landed next to ``working 20s``.
+    """
+    session = fake.add_session(
+        seed=(tool_use("Bash", tool_input={"command": "pytest"}), result("done"))
+    )
+    await bind(db, session)
+
+    drained = await cursor.drain(client, db, session.session_id)
+
+    assert drained.latest_cost_usd == pytest.approx(0.0123)
+    assert drained.latest_activity == "Bash · pytest"
+    assert "done" not in (drained.latest_activity or "")
+
+
 async def test_drain_requires_a_session_row(
     db: Database, fake: FakeConductor, client: ConductorClient
 ) -> None:

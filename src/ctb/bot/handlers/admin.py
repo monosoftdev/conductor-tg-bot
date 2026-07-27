@@ -15,7 +15,7 @@ from ctb.db.backup import create_backup
 from ctb.db.connection import Database
 from ctb.db.repo import allowlist, deliveries, events, lease
 from ctb.delivery.render.html import escape
-from ctb.health import HealthMonitor
+from ctb.health import HealthMonitor, lease_line
 from ctb.settings import Settings
 
 router = Router(name=__name__)
@@ -99,14 +99,16 @@ async def health(
             status = str(report.status)
             uptime = f"{int(report.uptime_s)}s"
             lag = int(report.polling.get("overdue", 0) or 0)
-            lease_holder = str(report.lease.get("holder") or "none")
+            # The holder is a random instance token; "who is polling" is the
+            # only part of it the owner can act on. See health.lease_line.
+            driver = lease_line(report.lease)
             unknown = len(report.unknown_content_types)
         else:
             status = "ok"
             uptime = "n/a"
             lag = 0
             held = await lease.get(database)
-            lease_holder = held.holder if held else "none"
+            driver = "held" if held else "<i>unheld</i>"
             unknown = len(await events.list_unknown_content_types(database, limit=20))
         counts = await deliveries.counts_by_state(database)
         api = resolve_client(client).health()
@@ -123,7 +125,7 @@ async def health(
         f"<b>{escape(status)}</b> · uptime {escape(uptime)}\n"
         f"circuit {escape(circuit)} · poll lag {lag}\n"
         f"deliveries {pending} pending · unknown {unknown}\n"
-        f"lease <code>{escape(lease_holder[:36])}</code>\n"
+        f"lease {driver}\n"
         f"last error: {escape((last or 'none')[:180])}",
     )
 

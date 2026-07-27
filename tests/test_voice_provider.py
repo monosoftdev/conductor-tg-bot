@@ -105,7 +105,10 @@ async def test_an_unrelated_4xx_is_still_an_error_and_is_not_retried() -> None:
 @pytest.mark.parametrize(
     ("status", "message"),
     (
-        (401, "key is invalid"),
+        # 401 and 403 are deliberately different sentences: re-paste the key
+        # vs. tick Speech-to-Text on a key that was fine. See provider.py.
+        (401, "rejected the key"),
+        (403, "lacks Speech-to-Text"),
         (429, "rate-limited"),
         (500, "rejected"),
     ),

@@ -110,8 +110,16 @@ class ElevenLabsProvider:
             )
         if response.status_code == 429:
             raise TranscriptionError("Speech service is rate-limited. Retry shortly.")
-        if response.status_code in {401, 403}:
-            raise TranscriptionError("Speech service key is invalid.")
+        # 401 and 403 are different problems with different fixes, and saying
+        # "key is invalid" for a 403 sends you to re-paste a key that was fine.
+        # ElevenLabs scopes each key per product, so a real key with
+        # Speech-to-Text unticked is the likelier of the two.
+        if response.status_code == 401:
+            raise TranscriptionError("ElevenLabs rejected the key. Check the value.")
+        if response.status_code == 403:
+            raise TranscriptionError(
+                "ElevenLabs key lacks Speech-to-Text. Enable it on the key."
+            )
         if response.status_code >= 400:
             raise TranscriptionError(
                 f"Speech service rejected the note ({response.status_code})."

@@ -54,6 +54,18 @@ _REQUIRED_HINT = {
 _UNSET = "unset"
 
 
+def _stripped(value: SecretStr) -> SecretStr:
+    """Drop whitespace a paste into a hosting dashboard leaves behind.
+
+    A trailing newline or space rides into the auth header verbatim and comes
+    back as a 401 that looks exactly like a wrong key — observed with
+    ``ELEVENLABS_API_KEY``. Cheaper to strip than to diagnose.
+    """
+    raw = value.get_secret_value()
+    trimmed = raw.strip()
+    return value if trimmed == raw else SecretStr(trimmed)
+
+
 class Settings(BaseSettings):
     """Everything the bot reads from the environment.
 
@@ -175,7 +187,12 @@ class Settings(BaseSettings):
         # failure would otherwise arrive later, from Telegram, as a 401.
         if not value.get_secret_value().strip():
             raise ValueError(_UNSET)
-        return value
+        return _stripped(value)
+
+    @field_validator("elevenlabs_api_key", mode="after")
+    @classmethod
+    def _strip_optional_secret(cls, value: SecretStr | None) -> SecretStr | None:
+        return None if value is None else _stripped(value)
 
     @field_validator("voice_wake_phrases", mode="before")
     @classmethod

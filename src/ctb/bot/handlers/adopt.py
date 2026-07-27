@@ -190,13 +190,17 @@ def snapshot_card(
         lines.append("💤 Sleeping. A prompt may wake it — unverified.")
     prompt = next((m for m in reversed(messages) if m.is_user_echo), None)
     answer = cursor.pick_preview([m for m in messages if not m.is_user_echo])
-    if prompt is not None:
-        lines.append(f"👤 {escape(_gist(prompt))}")
-    if answer is not None:
-        lines.append(f"🤖 {escape(_gist(answer))}")
+    asked = _gist(prompt) if prompt is not None else ""
+    replied = _gist(answer) if answer is not None else ""
+    if asked:
+        lines.append(f"👤 {escape(asked)}")
+    if replied:
+        lines.append(f"🤖 {escape(replied)}")
+    # An empty gist means the tail held nothing sayable — a lifecycle event, a
+    # shape we do not know. Say that, rather than printing a bare "🤖".
     lines.append(
         "<i>Snapshot · live from here</i>"
-        if prompt is not None or answer is not None
+        if asked or replied
         else "<i>Nothing yet · live from here</i>"
     )
     return "\n".join(lines)

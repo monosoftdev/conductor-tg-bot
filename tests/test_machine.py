@@ -616,9 +616,13 @@ def test_rule_17_status_error_drains_before_surfacing(start: TurnState) -> None:
         a for a in result.actions if isinstance(a, PostStatusCard | EditStatusCard)
     ][0]
     assert card.kind is CardKind.ERROR
-    # The card is a short marker plus Retry; the detail is printed once, in the
-    # bubble that actually pushes, and stays on the session row for /health.
-    assert card.text == "error"
+    # The card says what failed in the agent's own words — it is the surface the
+    # owner reads to answer "is it broken?", and "error" is not an answer. It
+    # stays one clipped line; the full text pushes once, in the Notify bubble,
+    # and stays on the session row for /health.
+    assert card.text == "Codex ChatGPT auth not found"
+    assert "\n" not in card.text
+    assert len(card.text) <= 90
     assert CardButton.RETRY in card.buttons
     notify = actions_of(result, Notify)[0]
     assert notify.level is NotifyLevel.LOUD

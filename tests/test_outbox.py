@@ -71,6 +71,7 @@ from ctb.delivery.render.types import CodeBlock, TextBlock
 from ctb.delivery.status_card import (
     CardState,
     StatusCards,
+    card_buttons,
     default_keyboard,
     render_card,
 )
@@ -80,9 +81,11 @@ from ctb.turn.state import (
     EditStatusCard,
     Finalize,
     PostStatusCard,
+    SetTurnCost,
     StartTyping,
     StopTyping,
     TurnSummary,
+    UpdateActivity,
 )
 from tests.conftest import FakeClock
 
@@ -910,6 +913,50 @@ def test_render_card_walks_the_documented_states() -> None:
     assert done == "<b>✅ done in 1m32s</b> · 3 files"
 
 
+def test_a_finished_card_shows_exactly_one_state() -> None:
+    """Exhibit B: ``⚙️ working 20s · ✅ done · 45.8s · 12 turns · $0.2887``.
+
+    Three claims in one line — working *and* done, two clocks, four decimals.
+    A terminal card drops the activity line whatever the renderer sent, and
+    rounds the money to something readable on a phone.
+    """
+    card = CardState(
+        kind=CardKind.DONE,
+        text="done in 46s · 12 tools",
+        activity="✅ done · 45.8s · 12 turns",
+        started_at=20.0,
+        cost_usd=0.2887,
+        buttons=(CardButton.TRANSCRIPT, CardButton.RETRY, CardButton.OPEN),
+    )
+    rendered = render_card(card, now=100.0)
+
+    assert rendered == "<b>✅ done in 46s</b> · 12 tools · $0.29"
+    assert "working" not in rendered
+    assert "45.8s" not in rendered
+    assert "0.2887" not in rendered
+
+
+def test_a_finished_card_never_offers_stop() -> None:
+    running = CardState(kind=CardKind.WORKING, buttons=(CardButton.STOP,))
+    assert card_buttons(running) == (CardButton.STOP,)
+
+    for kind in (CardKind.DONE, CardKind.ERROR, CardKind.CANCELLED, CardKind.DEAD):
+        finished = CardState(
+            kind=kind,
+            buttons=(CardButton.STOP, CardButton.RETRY, CardButton.TRANSCRIPT),
+        )
+        assert CardButton.STOP not in card_buttons(finished)
+        assert CardButton.RETRY in card_buttons(finished)
+
+
+def test_cost_is_never_shown_beside_a_live_clock() -> None:
+    live = render_card(
+        CardState(kind=CardKind.WORKING, text="working 4s", cost_usd=0.2887),
+        now=0.0,
+    )
+    assert "$" not in live
+
+
 def test_render_card_escapes_the_activity_line() -> None:
     text = render_card(
         CardState(kind=CardKind.WORKING, text="working 1s", activity="grep <a> & b"),
@@ -1052,6 +1099,48 @@ async def test_a_finished_card_lands_immediately_and_is_retired(
     assert cards.state_for(CHAT) is None, "the card is retired for the next turn"
     row = await sessions_repo.get(db, SESSION)
     assert row is not None and row.status_card_msg_id is None
+
+
+async def test_the_turn_price_waits_for_the_turn_to_finish(
+    cards: StatusCards, bot: FakeBot, clock: FakeClock, session: str
+) -> None:
+    """Money is a finished-turn fact, so it never sits beside a live clock."""
+    await cards.apply(
+        PostStatusCard(CardKind.WORKING, "working 0s", (CardButton.STOP,)),
+        session_id=SESSION,
+        chat_id=CHAT,
+    )
+    await cards.handle(
+        (UpdateActivity("Bash · pytest -q"), SetTurnCost(0.2887)),
+        session_id=SESSION,
+        chat_id=CHAT,
+    )
+    clock.advance(5.0)
+    await cards.tick()
+
+    live = bot.calls_to("edit_message_text")[-1]["text"]
+    assert "Bash · pytest -q" in live
+    assert "$" not in live
+
+    await cards.handle(
+        (
+            EditStatusCard(
+                CardKind.DONE,
+                "done in 46s · 12 tools",
+                (CardButton.STOP, CardButton.TRANSCRIPT, CardButton.RETRY),
+            ),
+            Finalize(TurnSummary(duration_ms=46_000, tool_calls=12)),
+        ),
+        session_id=SESSION,
+        chat_id=CHAT,
+    )
+
+    finished = bot.calls_to("edit_message_text")[-1]
+    assert finished["text"] == "<b>✅ done in 46s</b> · 12 tools · $0.29"
+    labels = [
+        cell.text for row in finished["reply_markup"].inline_keyboard for cell in row
+    ]
+    assert not any("Stop" in label for label in labels)
 
 
 async def test_a_new_turn_posts_a_fresh_card(

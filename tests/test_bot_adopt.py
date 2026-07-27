@@ -589,6 +589,59 @@ def test_the_card_clips_each_side_to_a_phone_length() -> None:
     assert len(line) <= EXCHANGE_CHARS + 3
 
 
+def test_the_card_says_what_a_tool_call_did_not_what_it_was_called() -> None:
+    """Exhibit A, end to end.
+
+    The live card read: ``🤖 claude-opus-5 msg_011Cd… message assistant
+    tool_use toolu_01Jz… Bash git add app/models/org.py && git commit -q -m
+    "$(cat <<'EOF' chore:…``. Every token in that string is machine
+    bookkeeping the owner cannot act on.
+    """
+    tool_call = TranscriptMessage(
+        id="m-1",
+        session_id="session-1",
+        type="agentMessage",
+        content={
+            "type": "agentMessage",
+            "rawPayload": {
+                "type": "assistant",
+                "message": {
+                    "id": "msg_011CdRjDXXYG6KcJeuk1oXiu",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-opus-5",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_01Jzh4cfPmYAZJLZK4CKTXN1",
+                            "name": "Bash",
+                            "input": {
+                                "command": (
+                                    "git add app/models/org.py && git commit "
+                                    "-q -m \"$(cat <<'EOF'\n"
+                                    "chore: add hello world comment to Org "
+                                    "model (Conductor)\n"
+                                    "EOF\n"
+                                    ')"'
+                                )
+                            },
+                        }
+                    ],
+                },
+            },
+        },
+    )
+
+    card = snapshot_card([tool_call])
+    line = card.splitlines()[0]
+
+    assert line == "🤖 Bash · git add app/models/org.py"
+    for token in ("msg_011", "toolu_", "claude-opus-5", "EOF", "<<"):
+        assert token not in card
+    for word in ("tool_use", "assistant", "message"):
+        assert word not in card
+
+
 def test_the_card_escapes_transcript_html() -> None:
     reply = TranscriptMessage(
         id="m-1",

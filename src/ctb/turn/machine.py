@@ -291,6 +291,25 @@ def _waking_text(context: TurnContext) -> str:
     return "waking"
 
 
+#: An error card is one phone line. The full text is the ``Notify`` bubble.
+_ERROR_HEADLINE_CHARS: Final = 90
+
+
+def _error_headline(message: str) -> str:
+    """The agent's own first line, short enough to read at a glance.
+
+    The card is where the owner looks to answer "is it broken?", so a bare
+    ``error`` is not an answer. The full message still goes out exactly once as
+    the ``Notify`` bubble and is persisted on the session row for ``/health``.
+    """
+    line = " ".join(message.split())
+    if not line:
+        return "error"
+    if len(line) <= _ERROR_HEADLINE_CHARS:
+        return line
+    return line[: _ERROR_HEADLINE_CHARS - 1].rstrip() + "…"
+
+
 def _cancelled_text(context: TurnContext) -> str:
     dropped = context.canceled_queued_messages
     if dropped:
@@ -474,17 +493,18 @@ def _enter_error(
     *,
     kind: CardKind = CardKind.ERROR,
     buttons: tuple[CardButton, ...] = _ERROR_BUTTONS,
-    card_text: str = "error",
+    card_text: str = "",
     drain: bool = True,
 ) -> None:
     """Surface an error. ``drain`` first — partial output may still be pending.
 
     The full ``message`` goes out exactly once, as the ``Notify`` bubble — that
-    is what pushes and what the user reads. The card carries only ``card_text``,
-    a short marker plus the Retry button, because printing the same 300
-    characters twice in one topic costs a screen and buys nothing. The detail
-    stays reachable: it is persisted as ``error_message`` on the session row and
-    surfaced by ``/health``.
+    is what pushes and what the user reads. The card carries ``card_text`` — a
+    caller-supplied phrase, or the first 90 characters of the agent's own words
+    — plus the Retry button, because printing the same 300 characters twice in
+    one topic costs a screen and buys nothing. The detail stays reachable: it is
+    persisted as ``error_message`` on the session row and surfaced by
+    ``/health``.
 
     The session status ``error`` persists indefinitely while the session still
     accepts POSTs (measured: 241 consecutive polls), so this is not a terminal
@@ -501,7 +521,7 @@ def _enter_error(
         consecutive_idle=0,
         idle_decay_step=0,
     )
-    tick.card(kind, card_text, buttons)
+    tick.card(kind, card_text or _error_headline(message), buttons)
     tick.do(
         StopTyping(),
         SetTopicMarker(TopicMarker.ERROR),
