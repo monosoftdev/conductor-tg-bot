@@ -61,6 +61,7 @@ from ctb.logging import get_logger
 from ctb.runtime import client_pool, provider_pool, secret_box, system_database
 from ctb.settings import Settings
 from ctb.voice.pool import ELEVENLABS_KEY_PURPOSE
+from ctb.voice.provider import check_elevenlabs_key
 
 router = Router(name=__name__)
 register_router(router, order=5)
@@ -482,9 +483,18 @@ async def set_key(
         await tell(message, "That is already the stored key. Nothing changed." + note)
         return
 
-    if not speech:
-        # Validate before storing: a typo should be an answer now, not a
-        # mysterious auth failure an hour later.
+    # Validate before storing, either way: a typo should be an answer now, not a
+    # mysterious auth failure an hour later. `/voicekey` used to skip this, so a
+    # mistyped speech key was accepted with "Speech key stored" and only failed
+    # at the first voice note — which reads as "voice is broken".
+    if speech:
+        checked = await check_elevenlabs_key(value)
+        if checked is not None:
+            await tell(
+                message, f"ElevenLabs rejected that key · {escape(checked)}" + note
+            )
+            return
+    else:
         checked = await _check_conductor_key(value, tenant.row.conductor_api_url)
         if checked is not None:
             await tell(
@@ -505,7 +515,11 @@ async def set_key(
             kid=box.active_kid,
             fingerprint=fingerprint,
         )
-        await tell(message, "Speech key stored. Turn voice on with /voice." + note)
+        await tell(
+            message,
+            "Speech key stored and checked. Turn it on with "
+            "<code>/voice on</code>." + note,
+        )
         return
 
     await tenancy.set_conductor_key(

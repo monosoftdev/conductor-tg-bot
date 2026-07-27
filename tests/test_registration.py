@@ -726,3 +726,72 @@ class TestVoiceToggle:
         )
 
         assert said[-1] == "Owners only."
+
+
+class TestSpeechKeyIntake:
+    """`/voicekey` used to accept anything and fail at the first voice note."""
+
+    async def _tenant(self, system_db: Database) -> TenantRow:
+        row = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
+        assert row is not None
+        return row
+
+    async def test_a_rejected_key_is_not_stored(
+        self,
+        db: Database,
+        system_db: Database,
+        said: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        async def refuse(_key: str, **_kw: Any) -> str:
+            return "invalid_api_key"
+
+        monkeypatch.setattr(registration, "check_elevenlabs_key", refuse)
+        row = await self._tenant(system_db)
+
+        await registration.set_key(dm("/voicekey sk_typo"), context(row), NullState())
+
+        assert "ElevenLabs rejected" in said[-1]
+        after = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
+        assert after is not None and after.elevenlabs_key_ct is None
+
+    async def test_a_good_key_is_stored_and_points_at_the_next_step(
+        self,
+        db: Database,
+        system_db: Database,
+        said: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        async def accept(_key: str, **_kw: Any) -> None:
+            return None
+
+        monkeypatch.setattr(registration, "check_elevenlabs_key", accept)
+        row = await self._tenant(system_db)
+
+        await registration.set_key(dm("/voicekey sk_good"), context(row), NullState())
+
+        assert "/voice on" in said[-1], "say what to do next"
+        after = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
+        assert after is not None and after.elevenlabs_key_ct is not None
+
+    async def test_the_message_carrying_it_is_still_deleted(
+        self,
+        db: Database,
+        system_db: Database,
+        said: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Validation must not come before getting the key out of Telegram."""
+
+        async def refuse(_key: str, **_kw: Any) -> str:
+            return "invalid_api_key"
+
+        monkeypatch.setattr(registration, "check_elevenlabs_key", refuse)
+        bot = FakeBot()
+        row = await self._tenant(system_db)
+
+        await registration.set_key(
+            dm("/voicekey sk_typo", bot=bot), context(row), NullState()
+        )
+
+        assert bot.deleted, "a refused key must still be deleted"
