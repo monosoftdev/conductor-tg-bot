@@ -5,12 +5,16 @@
 
 **One card, one state.** The card answers "where are we right now" and nothing
 else, so it may never show two states, two clocks, or a control that does not
-apply. Two rules enforce that here rather than trusting every producer:
+apply. Three rules enforce that here rather than trusting every producer:
 
 * the activity line ("what it is doing right now") is rendered only while the
   turn is live — a ``done`` line arriving from the renderer moments before the
   machine finalizes cannot land next to ``working 20s``;
-* a finished card cannot carry Stop, whoever put it in the button tuple.
+* a finished card cannot carry Stop, whoever put it in the button tuple;
+* a new card supersedes an *unfinished* old one — the old message is deleted,
+  not orphaned. A workspace that wakes and then takes a prompt used to leave
+  ``⏳ waking`` on screen with a working Stop while ``⚙️ working`` ran below it,
+  and two Stops is two answers to "is this still going?".
 
 The machine goes straight from ``queued`` to ``working``: only the kinds in
 :data:`_LIVE_KINDS` are re-rendered on every tick, so anything else would leave
@@ -203,6 +207,13 @@ class CardSender(Protocol):
         parse_mode: str | None = None,
         link_preview_options: LinkPreviewOptions | None = None,
         reply_markup: InlineKeyboardMarkup | None = None,
+    ) -> Any: ...
+
+    async def delete_message(
+        self,
+        *,
+        chat_id: int,
+        message_id: int,
     ) -> Any: ...
 
     async def send_chat_action(
@@ -417,6 +428,7 @@ class StatusCards:
             "edits": 0,
             "coalesced": 0,
             "typing": 0,
+            "superseded": 0,
             "errors": 0,
         }
 
@@ -572,8 +584,10 @@ class StatusCards:
                     deep_link=deep_link,
                 )
                 # A PostStatusCard means a new turn: drop the previous card's
-                # id so the finished one stays in the chat as history.
+                # id. A *finished* one stays in the chat as history; an
+                # unfinished one is taken away, because it still has Stop on it.
                 previous = card.state.kind
+                await self._supersede(card)
                 card.message_id = None
                 card.retire_when_clean = False
                 # A new turn: last turn's money is not this turn's money.
@@ -854,6 +868,57 @@ class StatusCards:
         card.last_edit_at = now
         card.dirty = False
         self._counters["edits"] += 1
+
+    async def _supersede(self, card: _Card) -> None:
+        """Remove the unfinished card a new turn is about to replace.
+
+        Only an *unfinished* one. A terminal card is history and already
+        Stop-free, so it stays where it is; a ``⏳ waking`` or ``⏳ queued`` card
+        is progress chrome that never resolved, and it still carries Stop. Left
+        behind it puts two live Stops in one topic — and Stop's presence is
+        itself a claim that something is running, which is why this is a
+        correctness bug and not a stray pixel.
+
+        Delete rather than edit: no rewrite of "waking · preparing" is true a
+        turn later. When the chat will not let us delete, strip the keyboard
+        instead — a stale *line* is cosmetic, a stale control is not.
+        """
+        message_id = card.message_id
+        if message_id is None or card.state.kind in TERMINAL_KINDS:
+            return
+        await self._spend()
+        try:
+            await self._bot.delete_message(chat_id=card.chat_id, message_id=message_id)
+        except Exception as exc:
+            _log.info(
+                "status_card.supersede_failed",
+                chat_id=card.chat_id,
+                error=repr(exc),
+            )
+            await self._strip_buttons(card, message_id)
+            return
+        self._counters["superseded"] += 1
+        # Deleting a pinned message unpins it. Forget the pin so the card that
+        # replaces this one claims it, instead of the topic losing its pin for
+        # the rest of the session.
+        self._pinned.discard(card.key)
+
+    async def _strip_buttons(self, card: _Card, message_id: int) -> None:
+        """Last resort when the delete is refused: take the controls away."""
+        if not card.rendered:
+            return
+        await self._spend()
+        try:
+            await self._bot.edit_message_text(
+                text=card.rendered,
+                chat_id=card.chat_id,
+                message_id=message_id,
+                parse_mode="HTML",
+                link_preview_options=_NO_PREVIEW,
+                reply_markup=None,
+            )
+        except Exception as exc:
+            _log.info("status_card.strip_failed", chat_id=card.chat_id, error=repr(exc))
 
     async def _edit_plain(self, card: _Card, rendered: str, now: float) -> None:
         """The one unformatted retry. Not itself retried."""

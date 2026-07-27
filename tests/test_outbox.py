@@ -48,6 +48,7 @@ from ctb.bot.keyboards import (
     NonceStore,
     confirm_keyboard,
     parse,
+    quick_reply_keyboard,
     read_stateless,
     resolve,
     stateless_payload,
@@ -125,6 +126,9 @@ class FakeBot:
 
     async def edit_message_text(self, **kwargs: Any) -> Any:
         return self._record("edit_message_text", kwargs)
+
+    async def delete_message(self, **kwargs: Any) -> Any:
+        return self._record("delete_message", kwargs)
 
     async def send_chat_action(self, **kwargs: Any) -> Any:
         return self._record("send_chat_action", kwargs)
@@ -362,6 +366,47 @@ async def test_decision_result_carries_one_tap_replies(
         "2 · Use Postgres",
     ]
     assert markup.inline_keyboard[0][0].style == "success"
+
+
+def test_options_too_long_to_spell_out_become_bare_numbers() -> None:
+    """The old label was a tail-truncated copy of a list already on screen.
+
+    ``truncate_label`` keeps the end, so ``1 · `` was the first thing cut and
+    three buttons all read like the ends of sentences. The prose stays (the
+    cursor only strips it when the options fit), so the numbers are enough.
+    """
+    long_options = (
+        "Delete the duplicate placeholder ## Testing section at line 89.",
+        "Tell me which file you meant — there are 9 other root-level .md files.",
+        "Leave it as-is.",
+    )
+
+    markup = quick_reply_keyboard(long_options, SESSION)
+
+    assert markup is not None
+    assert len(markup.inline_keyboard) == 1, "bare numbers belong on one row"
+    assert [b.text for b in markup.inline_keyboard[0]] == ["1", "2", "3"]
+
+
+def test_every_option_in_a_block_gets_its_own_colour() -> None:
+    """Two buttons that look the same are two buttons you have to read twice."""
+    markup = quick_reply_keyboard(("a" * 60, "b" * 60, "c" * 60, "d" * 60), SESSION)
+
+    assert markup is not None
+    styles = [button.style for button in markup.inline_keyboard[0]]
+    assert len(set(styles)) == len(styles) == 4
+    # `None` is the client's own chrome, not a fallback to Action.SEND's blue.
+    assert styles == ["success", "primary", None, "danger"]
+
+
+def test_options_that_fit_are_still_spelled_out_one_per_row() -> None:
+    markup = quick_reply_keyboard(("Use SQLite", "Use Postgres"), SESSION)
+
+    assert markup is not None
+    assert [row[0].text for row in markup.inline_keyboard] == [
+        "✓ 1 · Use SQLite",
+        "2 · Use Postgres",
+    ]
 
 
 async def test_link_previews_are_disabled_everywhere(
@@ -1063,6 +1108,85 @@ async def test_the_card_is_posted_once_then_edited(
     assert len(bot.calls_to("edit_message_text")) == 1
 
 
+async def test_a_new_card_deletes_the_unfinished_one_it_replaces(
+    cards: StatusCards, bot: FakeBot, clock: FakeClock, session: str
+) -> None:
+    """Two Stops in one topic is two answers to "is this still going?".
+
+    A workspace that wakes and *then* takes a prompt walks this path: rule 9
+    posts ``⏳ waking``, and the prompt that follows starts a turn with no card
+    id, so the machine posts a second one. The waking card kept a working Stop.
+    """
+    await cards.apply(
+        PostStatusCard(CardKind.WAKING, "waking · preparing", (CardButton.STOP,)),
+        session_id=SESSION,
+        chat_id=CHAT,
+    )
+    clock.advance(4.0)
+    await cards.apply(
+        PostStatusCard(CardKind.QUEUED, "queued", (CardButton.STOP,)),
+        session_id=SESSION,
+        chat_id=CHAT,
+    )
+
+    deleted = bot.calls_to("delete_message")
+    assert [call["message_id"] for call in deleted] == [1001]
+    assert len(bot.calls_to("send_message")) == 2
+    assert cards.health()["superseded"] == 1
+
+
+async def test_a_refused_delete_still_takes_the_stale_stop_away(
+    cards: StatusCards, bot: FakeBot, clock: FakeClock, session: str
+) -> None:
+    """A stale *line* is cosmetic. A stale control is a status claim."""
+    await cards.apply(
+        PostStatusCard(CardKind.WAKING, "waking", (CardButton.STOP,)),
+        session_id=SESSION,
+        chat_id=CHAT,
+    )
+    bot.queue("delete_message", bad_request("Bad Request: message can't be deleted"))
+
+    clock.advance(4.0)
+    await cards.apply(
+        PostStatusCard(CardKind.QUEUED, "queued", (CardButton.STOP,)),
+        session_id=SESSION,
+        chat_id=CHAT,
+    )
+
+    stripped = bot.calls_to("edit_message_text")
+    assert len(stripped) == 1
+    assert stripped[0]["message_id"] == 1001
+    assert stripped[0]["reply_markup"] is None
+    assert "waking" in stripped[0]["text"]
+
+
+async def test_a_finished_card_is_left_in_the_chat_as_history(
+    cards: StatusCards, bot: FakeBot, clock: FakeClock, session: str
+) -> None:
+    """``done`` already has no Stop, and the turn it summarises really happened."""
+    await cards.apply(
+        PostStatusCard(CardKind.QUEUED, "queued", (CardButton.STOP,)),
+        session_id=SESSION,
+        chat_id=CHAT,
+    )
+    clock.advance(4.0)
+    await cards.apply(
+        EditStatusCard(CardKind.DONE, "done in 3s", (CardButton.RETRY,)),
+        session_id=SESSION,
+        chat_id=CHAT,
+    )
+
+    clock.advance(4.0)
+    await cards.apply(
+        PostStatusCard(CardKind.QUEUED, "queued", (CardButton.STOP,)),
+        session_id=SESSION,
+        chat_id=CHAT,
+    )
+
+    assert bot.calls_to("delete_message") == []
+    assert len(bot.calls_to("send_message")) == 2
+
+
 async def test_queued_edits_coalesce_to_the_last_one(
     cards: StatusCards, bot: FakeBot, clock: FakeClock, session: str
 ) -> None:
@@ -1389,6 +1513,31 @@ async def test_pinning_failure_does_not_lose_the_card(
         PostStatusCard(CardKind.QUEUED, "queued"), session_id=SESSION, chat_id=CHAT
     )
     assert pinning.message_id_for(CHAT) is not None
+
+
+async def test_deleting_the_pinned_card_hands_the_pin_to_its_replacement(
+    bot: FakeBot, db: Database, clock: FakeClock, sleeper: Sleeper, session: str
+) -> None:
+    """A topic pins its first card once. Deleting that card unpins the topic.
+
+    Without handing the pin on, superseding the very first card would leave the
+    topic pinless for the rest of the session — the card is pinned exactly so
+    it stays reachable under a long transcript.
+    """
+    pinning = StatusCards(bot, db, clock=clock, sleep=sleeper, pin=True)
+    await pinning.apply(
+        PostStatusCard(CardKind.WAKING, "waking"), session_id=SESSION, chat_id=CHAT
+    )
+    clock.advance(4.0)
+
+    await pinning.apply(
+        PostStatusCard(CardKind.QUEUED, "queued"), session_id=SESSION, chat_id=CHAT
+    )
+
+    pins = bot.calls_to("pin_chat_message")
+    assert len(pins) == 2, "the replacement claims the pin the delete released"
+    assert pins[0]["message_id"] != pins[1]["message_id"]
+    assert pins[1]["message_id"] == pinning.message_id_for(CHAT)
 
 
 async def test_unknown_actions_are_left_alone(
