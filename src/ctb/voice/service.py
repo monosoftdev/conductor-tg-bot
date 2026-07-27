@@ -57,7 +57,6 @@ from ctb.voice.intent import (
 from ctb.bot.middleware.tenancy import TenantSettings
 from ctb.conductor.pool import ClientPool
 from ctb.db.repo import tenancy
-from ctb.runtime import secret_box
 from ctb.voice.pool import ProviderPool
 from ctb.voice.provider import SpeechProvider, TranscriptionError
 
@@ -118,17 +117,12 @@ class VoiceService:
     clients: ClientPool
     supervisor: CancelDispatcher
     nonces: NonceStore
+    #: ``None`` means the platform has no speech vendor configured at all.
     providers: ProviderPool | None = None
     _stop: asyncio.Event = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._stop = asyncio.Event()
-        if self.providers is None:
-            self.providers = ProviderPool(
-                secret_box(),
-                model=self.settings.voice_stt_model,
-                language=self.settings.voice_language,
-            )
 
     @property
     def available(self) -> bool:
@@ -433,7 +427,8 @@ class VoiceService:
                 f"🎙 <b>Needs clarification</b>\n{escape(self._audit(intent.text))}",
             )
             return False
-        if self.settings.voice_mode == "shadow":
+        mode = (await self._defaults(row)).voice_mode
+        if mode == "shadow":
             await self._send(
                 row,
                 f"🎙 <b>Heard</b>\n{escape(self._audit(intent.text))}\n"
@@ -441,7 +436,7 @@ class VoiceService:
             )
             return True
         if intent.kind is VoiceIntentKind.COMMAND:
-            if self.settings.voice_mode != "commands":
+            if mode != "commands":
                 await voice_repo.wait_for_user(
                     self.db, row, reason="voice commands are in preview mode"
                 )

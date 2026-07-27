@@ -113,9 +113,14 @@ def _seed_tenants(conn: psycopg.Connection[object]) -> None:
         (OTHER_TENANT_ID, "other"),
     ):
         conn.execute(
-            "INSERT INTO tenants (id, slug, name, status) "
-            "VALUES (%s, %s, %s, 'active') ON CONFLICT (id) DO NOTHING",
-            (tenant_id, slug, slug.title()),
+            # A placeholder sealed key, so the seeded tenants look configured.
+            # Nothing decrypts it: the pools under test are fakes, and the real
+            # SecretBox is exercised directly in tests/test_crypto.py.
+            "INSERT INTO tenants (id, slug, name, status, conductor_key_ct, "
+            "                     conductor_key_kid, conductor_key_fp) "
+            "VALUES (%s, %s, %s, 'active', %s, 'v2', %s) "
+            "ON CONFLICT (id) DO NOTHING",
+            (tenant_id, slug, slug.title(), b"sealed-placeholder", f"fp-{slug}"),
         )
         conn.execute(
             "INSERT INTO tenant_members (tenant_id, user_id, role) "

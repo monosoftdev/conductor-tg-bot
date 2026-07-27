@@ -420,8 +420,23 @@ def _default_make_voice(
     supervisor: Any,
 ) -> Any:
     from ctb.bot.keyboards import NonceStore
+    from ctb.runtime import secret_box
+    from ctb.voice.pool import ProviderPool
     from ctb.voice.service import VoiceService
 
+    # One provider per tenant, built from that tenant's own sealed speech key.
+    # There is deliberately no platform-wide fallback key: voice is the one
+    # feature whose data leaves the perimeter, so nobody is billed — or
+    # exposed — through somebody else's account.
+    providers = (
+        ProviderPool(
+            secret_box(),
+            model=settings.voice_stt_model,
+            language=settings.voice_language,
+        )
+        if settings.voice_enabled
+        else None
+    )
     return VoiceService(
         settings,
         db,
@@ -430,6 +445,7 @@ def _default_make_voice(
         clients,
         supervisor,
         NonceStore(),
+        providers,
     )
 
 

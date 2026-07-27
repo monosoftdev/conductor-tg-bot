@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import io
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -16,12 +16,14 @@ from ctb.conductor.models import PostMessageResult, PostState, SqlResult
 from ctb.db.connection import Database, now_ms
 from ctb.db.repo import prompts as prompts_repo
 from ctb.db.repo import sessions as sessions_repo
+from ctb.db.repo import tenancy
 from ctb.db.repo import voice_inputs as voice_repo
 from ctb.db.repo import workspaces as workspaces_repo
 from ctb.settings import Settings
 from ctb.voice import service as voice_service_module
 from ctb.voice.provider import Transcription
 from ctb.voice.service import VoiceEnqueueStatus, VoiceService
+from tests.pg import BOOTSTRAP_TENANT_ID
 
 
 class FakeBot:
@@ -94,10 +96,44 @@ class FakeSupervisor:
         return object()
 
 
+class FakeProviderPool:
+    """A :class:`ProviderPool` stand-in: every tenant gets the same fake.
+
+    In production each tenant's provider is built from *their* sealed speech
+    key, and a tenant without one simply has none.
+    """
+
+    def __init__(self, provider: FakeProvider | None) -> None:
+        self._provider = provider
+
+    async def get(self, _tenant: object) -> FakeProvider | None:
+        return self._provider
+
+    async def aclose(self) -> None:
+        return None
+
+
+class FakeClientPool:
+    def __init__(self, client: FakeClient) -> None:
+        self._client = client
+
+    async def get(self, _tenant: object) -> FakeClient:
+        return self._client
+
+    def peek(self, _tenant_id: object) -> FakeClient:
+        return self._client
+
+
+async def set_voice_mode(system_db: Database, mode: str) -> None:
+    """Voice mode is a tenant setting, not an environment variable."""
+    await tenancy.update_defaults(system_db, BOOTSTRAP_TENANT_ID, voice_mode=mode)
+
+
 def make_service(
     settings: Settings,
     db: Database,
     *,
+    system_db: Database | None = None,
     bot: FakeBot | None = None,
     provider: FakeProvider | None = None,
     client: FakeClient | None = None,
@@ -106,11 +142,12 @@ def make_service(
     return VoiceService(
         settings,
         db,
+        system_db or db,
         bot or FakeBot(),  # type: ignore[arg-type]
-        client or FakeClient(),  # type: ignore[arg-type]
+        cast(Any, FakeClientPool(client or FakeClient())),
         supervisor or FakeSupervisor(),  # type: ignore[arg-type]
         NonceStore(),
-        provider or FakeProvider(),
+        cast(Any, FakeProviderPool(provider or FakeProvider())),
     )
 
 
@@ -136,6 +173,7 @@ async def test_replayed_update_keeps_one_job_and_operation_id(
     service = make_service(settings, db)
     message = voice_message()
     route = Route(
+        tenant_voice_enabled=True,
         chat_id=-1001,
         thread_id=7,
         kind="topic",
@@ -172,7 +210,7 @@ async def test_uploaded_audio_preserves_filename_and_mime(
 
     status = await service.enqueue(
         message,  # type: ignore[arg-type]
-        Route(chat_id=-1001, thread_id=7, kind="topic"),
+        Route(chat_id=-1001, thread_id=7, kind="topic", tenant_voice_enabled=True),
     )
 
     row = await voice_repo.get(db, -1001, 55)
@@ -192,7 +230,7 @@ async def test_size_and_duration_reject_before_download(
     )
     bot = FakeBot()
     service = make_service(settings, db, bot=bot)
-    route = Route(chat_id=-1001, thread_id=7, kind="topic")
+    route = Route(chat_id=-1001, thread_id=7, kind="topic", tenant_voice_enabled=True)
 
     large = await service.enqueue(
         voice_message(size=1_001),
@@ -212,7 +250,7 @@ async def test_size_and_duration_reject_before_download(
 async def test_voice_prompt_uses_snapshot_id_once_and_mobile_instruction(
     db: Database, settings_factory: Any
 ) -> None:
-    settings = settings_factory(voice_enabled=True, voice_mode="prompts")
+    settings = settings_factory(voice_enabled=True)
     await sessions_repo.upsert(
         db,
         "session-voice",
@@ -268,7 +306,7 @@ async def test_voice_prompt_uses_snapshot_id_once_and_mobile_instruction(
 async def test_general_voice_searches_and_never_posts(
     db: Database, settings_factory: Any
 ) -> None:
-    settings = settings_factory(voice_enabled=True, voice_mode="prompts")
+    settings = settings_factory(voice_enabled=True)
     bot = FakeBot()
     client = FakeClient()
     service = make_service(settings, db, bot=bot, client=client)
@@ -306,7 +344,7 @@ async def test_general_voice_searches_and_never_posts(
 async def test_recovery_reuses_conductor_message_id(
     db: Database, settings_factory: Any
 ) -> None:
-    settings = settings_factory(voice_enabled=True, voice_mode="prompts")
+    settings = settings_factory(voice_enabled=True)
     await sessions_repo.upsert(db, "session-voice")
     client = FakeClient()
     service = make_service(settings, db, client=client)
@@ -363,15 +401,17 @@ async def test_recovery_reuses_conductor_message_id(
 
 
 async def test_exact_spoken_stop_uses_the_supervisor(
-    db: Database, settings_factory: Any
+    db: Database, system_db: Database, settings_factory: Any
 ) -> None:
-    settings = settings_factory(voice_enabled=True, voice_mode="commands")
+    settings = settings_factory(voice_enabled=True)
+    await set_voice_mode(system_db, "commands")
     await sessions_repo.upsert(db, "session-stop")
     supervisor = FakeSupervisor()
     client = FakeClient()
     service = make_service(
         settings,
         db,
+        system_db=system_db,
         provider=FakeProvider("command stop"),
         client=client,
         supervisor=supervisor,
@@ -408,9 +448,10 @@ async def test_exact_spoken_stop_uses_the_supervisor(
 
 
 async def test_spoken_done_only_creates_named_confirmation(
-    db: Database, settings_factory: Any
+    db: Database, system_db: Database, settings_factory: Any
 ) -> None:
-    settings = settings_factory(voice_enabled=True, voice_mode="commands")
+    settings = settings_factory(voice_enabled=True)
+    await set_voice_mode(system_db, "commands")
     await workspaces_repo.upsert(db, "workspace-done", name="api/fix")
     bot = FakeBot()
     service = make_service(
@@ -512,11 +553,14 @@ async def test_unavailable_voice_starts_no_workers_and_polls_nothing(
     service = VoiceService(
         settings,
         db,
+        db,
         bot,  # type: ignore[arg-type]
-        FakeClient(),  # type: ignore[arg-type]
+        cast(Any, FakeClientPool(FakeClient())),
         FakeSupervisor(),  # type: ignore[arg-type]
         NonceStore(),
-        FakeProvider() if configured else None,
+        cast(Any, FakeProviderPool(FakeProvider() if configured else None))
+        if configured
+        else None,
     )
     await seed(db, tg_message_id=70)
     before = len(asyncio.all_tasks())
