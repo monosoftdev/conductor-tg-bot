@@ -279,19 +279,22 @@ async def test_a_second_adoption_jumps_to_the_topic_it_already_opened(
     assert len(bot.cards_in(FIRST_TOPIC)) == 1
 
 
-async def test_two_concurrent_adoptions_create_only_one_topic(
+async def test_three_concurrent_adoptions_create_only_one_topic(
     db: Database, client: ConductorClient, fake: FakeConductor
 ) -> None:
     session = _seeded(fake)
     bot = _Bot()
 
-    first, second = await asyncio.gather(
+    outcomes = await asyncio.gather(
+        _adopt(bot, db, client, session),
         _adopt(bot, db, client, session),
         _adopt(bot, db, client, session),
     )
 
     assert bot.topics == [FIRST_TOPIC]
-    assert {first.already, second.already} == {False, True}
+    assert [outcome.already for outcome in outcomes].count(False) == 1
+    assert [outcome.already for outcome in outcomes].count(True) == 2
+    assert session.workspace_id not in adopt_handlers._locks
 
 
 async def test_a_second_adoption_keeps_the_visible_and_stored_prefix_in_sync(

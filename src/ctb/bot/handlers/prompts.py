@@ -392,6 +392,18 @@ async def edited_text(message: Message) -> None:
     )
 
 
+@router.edited_message()
+async def edited_payload(message: Message) -> None:
+    """Captions and future editable payloads follow the same explicit rule."""
+    if message.content_type in _SERVICE_CONTENT:
+        return
+    await tell(
+        message,
+        "Edit not resent · send the correction as a new message.",
+        silent=False,
+    )
+
+
 @router.callback_query()
 async def unknown_callback(query: CallbackQuery) -> None:
     """Never leave an old or malformed inline button spinning forever."""

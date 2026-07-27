@@ -562,12 +562,16 @@ async def test_edit_and_stale_callback_never_fail_silently(monkeypatch: Any) -> 
 
     monkeypatch.setattr(prompt_handlers, "tell", fake_tell)
     await prompt_handlers.edited_text(SimpleNamespace())  # type: ignore[arg-type]
+    await prompt_handlers.edited_payload(
+        SimpleNamespace(content_type=ContentType.PHOTO)  # type: ignore[arg-type]
+    )
     await prompt_handlers.unknown_callback(
         SimpleNamespace(answer=answer)  # type: ignore[arg-type]
     )
 
     assert replies == [
-        ("Edit not resent · send the correction as a new message.", False)
+        ("Edit not resent · send the correction as a new message.", False),
+        ("Edit not resent · send the correction as a new message.", False),
     ]
     assert answers == [("Expired control · run /mode for fresh buttons.", True)]
 
@@ -1261,3 +1265,67 @@ async def test_branch_step_still_offers_both_when_they_differ(
     monkeypatch: Any,
 ) -> None:
     assert await _branch_buttons("dev", monkeypatch) == ["main", "dev"]
+
+
+async def _run_setup(bot: Any, db: Database, monkeypatch: Any) -> list[str]:
+    """Drive ``/setup`` and return the lines it sent."""
+    from ctb.bot.handlers import power as power_handlers
+
+    sent: list[str] = []
+
+    async def fake_tell(_message: Any, text: str, **_kwargs: Any) -> None:
+        sent.append(text)
+
+    monkeypatch.setattr(power_handlers, "tell", fake_tell)
+    message = SimpleNamespace(
+        text="/setup",
+        chat=SimpleNamespace(id=-1001, type="supergroup"),
+        message_thread_id=None,
+        message_id=7,
+        from_user=SimpleNamespace(id=1001),
+        bot=bot,
+    )
+    await power_handlers.setup(
+        message,  # type: ignore[arg-type]
+        Route(chat_id=-1001, kind="general"),
+        _NullState(),  # type: ignore[arg-type]
+        db=db,
+    )
+    return sent
+
+
+async def test_setup_proves_the_topic_right_instead_of_trusting_the_flag(
+    db: Database, monkeypatch: Any
+) -> None:
+    """The live failure: ``can_manage_topics`` true, ``createForumTopic`` refused.
+
+    /setup used to answer "Ready" here while every /new failed, leaving no way
+    to tell which answer was lying.
+    """
+    bot = _ForumBot(
+        can_manage_topics=True,
+        create_error=TelegramBadRequest(
+            method=CreateForumTopic(chat_id=-1001, name="x"),
+            message="Bad Request: not enough rights to create a topic",
+        ),
+    )
+    assert (await bot.get_chat_member(-1001, 42)).can_manage_topics is True
+
+    sent = await _run_setup(bot, db, monkeypatch)
+
+    assert sent == ["Setup blocked · not enough rights to create a topic."]
+    assert not any("Ready" in line for line in sent)
+
+
+async def test_setup_deletes_the_topic_it_probed_with(
+    db: Database, monkeypatch: Any
+) -> None:
+    bot = _ForumBot(can_manage_topics=True)
+
+    sent = await _run_setup(bot, db, monkeypatch)
+
+    assert sent == ["Ready · General is search-only; /new creates topics."]
+    assert bot.topics == 1, "the probe really created a topic"
+    # 99 is the id the stub hands back from create_forum_topic — so this asserts
+    # it deleted the very topic it made, not merely that it deleted something.
+    assert bot.deleted == [99], "and cleaned it up, leaving no residue"

@@ -44,7 +44,7 @@ Offline:
 
 - Ruff format/check: clean.
 - Pyright: zero errors.
-- Pytest: 1,649 tests passing.
+- Pytest: 1,660 tests passing in three consecutive full-suite runs.
 - Docker image builds from the checked-in files.
 - Production image smoke:
   - runs as non-root UID 10001;

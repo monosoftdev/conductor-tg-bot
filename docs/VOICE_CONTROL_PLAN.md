@@ -146,7 +146,7 @@ delivery, or turn-state semantics.
 
 ## Repository integration
 
-Suggested files:
+Implemented files:
 
 ```text
 src/ctb/

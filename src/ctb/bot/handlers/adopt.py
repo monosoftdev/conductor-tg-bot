@@ -106,7 +106,13 @@ _CONTRACT_MARK: Final = "OUTPUT CONTRACT"
 SESSION_SCAN: Final = 20
 SESSION_SCAN_PAGES: Final = 5
 
-_locks: dict[str, asyncio.Lock] = {}
+@dataclass(slots=True)
+class _WorkspaceLock:
+    lock: asyncio.Lock
+    users: int = 0
+
+
+_locks: dict[str, _WorkspaceLock] = {}
 _TOPIC_GONE: Final = ("topic not found", "message thread not found", "thread not found")
 
 
@@ -249,9 +255,12 @@ async def adopt_workspace(
     never duplicated. A deleted topic is replaced; a binding in another chat
     is refused so opening it here cannot silently break the original route.
     """
-    lock = _locks.setdefault(workspace_id, asyncio.Lock())
+    entry = _locks.setdefault(workspace_id, _WorkspaceLock(asyncio.Lock()))
+    # Increment before the first await. A waiter therefore keeps the entry in
+    # the registry, closing the release/pop/new-lock race with a third tap.
+    entry.users += 1
     try:
-        async with lock:
+        async with entry.lock:
             return await _adopt_workspace(
                 bot=bot,
                 db=db,
@@ -262,7 +271,8 @@ async def adopt_workspace(
                 session_hint=session_hint,
             )
     finally:
-        if not lock.locked() and _locks.get(workspace_id) is lock:
+        entry.users -= 1
+        if entry.users == 0 and _locks.get(workspace_id) is entry:
             _locks.pop(workspace_id, None)
 
 

@@ -31,11 +31,14 @@ from ctb.bot.handlers.common import (
 )
 from ctb.bot.handlers.core import adoptable_rows, status_icon
 from ctb.bot.handlers.topics import (
+    TopicCreateError,
     apply_marker,
+    discard_topic,
     edit_html,
     forum_support,
     jump_url,
     marker_for,
+    require_topic,
     resolve_client,
     resolve_db,
     topic_label,
@@ -82,6 +85,10 @@ Voice commands need “command” or “команда”."""
 
 #: Buttons ``/s`` shows in General before it says how many it hid.
 GENERAL_VISIBLE: Final = 12
+
+#: Name of the throwaway topic ``/setup`` creates to prove it can. Deleted
+#: immediately; only ever visible if the delete itself is refused.
+_SETUP_PROBE_LABEL: Final = "setup check"
 
 _SWITCH_ACTIVE = frozenset(
     {
@@ -138,6 +145,18 @@ async def setup(
         detail = support.detail or "forum topics and topic permissions"
         await tell(message, f"Setup blocked · {escape(detail)}.", silent=False)
         return
+    # Then PROVE it. `can_manage_topics` has been observed `true` on a chat that
+    # then refused `createForumTopic` with "not enough rights to create a topic"
+    # — so /setup reported Ready while every /new failed, and the owner had no
+    # way to tell which answer was lying. A check that does not perform the
+    # capability is a guess; the only proof a topic can exist is a topic that
+    # exists. Create a throwaway one and delete it. Two calls, no residue.
+    try:
+        probe = await require_topic(message.bot, message.chat.id, _SETUP_PROBE_LABEL)
+    except TopicCreateError as exc:
+        await tell(message, f"Setup blocked · {escape(exc.reason)}.", silent=False)
+        return
+    await discard_topic(message.bot, message.chat.id, probe)
     await chats_repo.ensure(
         database,
         message.chat.id,
