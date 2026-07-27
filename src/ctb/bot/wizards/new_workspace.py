@@ -398,6 +398,20 @@ async def _ask_prompt(message: Message, state: FSMContext, nonces: NonceStore) -
     await _edit(message, "Send the first prompt.", markup)
 
 
+def _card(query: CallbackQuery) -> Message:
+    """The wizard card, re-attributed to the person who tapped it.
+
+    ``_button`` mints each ticket for ``message.from_user``. On a tap that
+    message is the card *the bot sent*, so ``from_user`` is the bot — every
+    step drawn in response to a tap was bound to the bot's id and then refused
+    the owner, as ``wrong_user``, which reads as "This button has expired".
+    Only the first card, drawn from the owner's own ``/new``, ever worked.
+    """
+    card = query.message
+    assert isinstance(card, Message)  # guarded by the caller
+    return card.model_copy(update={"from_user": query.from_user})
+
+
 async def _reask(
     step: str,
     message: Message,
@@ -467,7 +481,7 @@ async def wizard_callback(
             exc.reason == "unknown"
             and step
             and isinstance(query.message, Message)
-            and await _reask(step, query.message, state, nonces, settings)
+            and await _reask(step, _card(query), state, nonces, settings)
         ):
             await query.answer(REFRESHED_MESSAGE, show_alert=True)
             return
@@ -495,7 +509,7 @@ async def wizard_callback(
             await query.answer("Pick a project first.", show_alert=True)
             return
         await query.answer()
-        await _ask_prompt(query.message, state, nonces)
+        await _ask_prompt(_card(query), state, nonces)
         return
     picked = _pick(code, data)
     if isinstance(picked, str):
@@ -505,18 +519,18 @@ async def wizard_callback(
     await state.update_data({"project_id" if step == "project" else step: selected})
     await query.answer()
     if step == "project":
-        await _ask_branch(query.message, state, nonces, settings)
+        await _ask_branch(_card(query), state, nonces, settings)
     elif step == "branch":
-        await _ask_agent(query.message, state, nonces)
+        await _ask_agent(_card(query), state, nonces)
     elif step == "agent":
         await state.update_data({"model": default_model_for(selected)})
-        await _ask_model(query.message, state, nonces)
+        await _ask_model(_card(query), state, nonces)
     elif step == "model":
-        await _ask_effort(query.message, state, nonces)
+        await _ask_effort(_card(query), state, nonces)
     else:
         if selected == "default":
             await state.update_data({"effort": None})
-        await _ask_prompt(query.message, state, nonces)
+        await _ask_prompt(_card(query), state, nonces)
 
 
 @router.message(NewWorkspace.branch, F.text & ~F.text.startswith("/"))

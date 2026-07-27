@@ -14,7 +14,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.methods import CreateForumTopic, SendMessage
-from aiogram.types import Chat, Message
+from aiogram.types import Chat, Message, User
 
 from ctb.bot.app import SqliteStorage
 from ctb.bot.handlers import core as core_handlers
@@ -1342,10 +1342,14 @@ class _Tap:
     def __init__(self, data: str, *, user_id: int = 1001) -> None:
         self.data = data
         self.from_user = SimpleNamespace(id=user_id)
+        # Telegram fills ``from_user`` on a card the bot itself sent — with the
+        # BOT. Leaving it unset made every wizard button look owner-less and
+        # hid the live "Model?" failure, so the double must carry it.
         self.message = Message(
             message_id=3,
             date=datetime.now(UTC),
             chat=Chat(id=-1001, type="supergroup"),
+            from_user=User(id=42, is_bot=True, first_name="Conductor"),
         )
         self.answers: list[str] = []
 
@@ -1735,3 +1739,47 @@ async def test_a_stale_button_with_no_wizard_open_still_says_so(
 
     assert stale.answers == ["This button has expired. Run the command again."]
     assert edits == []
+
+
+async def test_the_step_after_a_tap_is_tappable_by_the_owner(
+    db: Database, settings: Settings, monkeypatch: Any
+) -> None:
+    """The live "Model?" failure: card two was minted for the wrong user.
+
+    ``_button`` reads ``message.from_user``. When a step is drawn in response
+    to a *tap*, that message is the bot's own card, so every button after the
+    first was bound to the bot's id and refused the owner who tapped it.
+    """
+    data = await _mint_branch_card(db, NonceStore(), settings, monkeypatch)
+
+    cards: list[Any] = []
+
+    async def fake_edit(_message: Any, _text: str, markup: Any) -> None:
+        cards.append(markup)
+
+    monkeypatch.setattr(new_workspace, "_edit", fake_edit)
+    store = NonceStore()
+    # Tap "dev" — this draws the *next* card, whose buttons are the bug.
+    await new_workspace.wizard_callback(
+        _Tap(data),  # type: ignore[arg-type]
+        _seat(db),
+        store,
+        settings,
+    )
+
+    nxt = next(
+        item
+        for row in cards[-1].inline_keyboard
+        for item in row
+        if item.text not in ("Go with defaults →", "Cancel")
+    )
+    assert nxt.callback_data is not None
+    second = _Tap(nxt.callback_data)
+    await new_workspace.wizard_callback(
+        second,  # type: ignore[arg-type]
+        _seat(db),
+        store,
+        settings,
+    )
+
+    assert second.answers == [""], "the owner must be able to tap the card it drew"
