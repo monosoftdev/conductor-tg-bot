@@ -1,0 +1,53 @@
+# The same four gates the CONTRIBUTING checklist asks for locally, in the same
+# order, against the same PostgreSQL image `compose.yaml` uses. One source of
+# truth for the database flags: a green CI and a green laptop mean the same
+# thing.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+
+      # Not GitHub's `services:` shorthand: compose.yaml already encodes the
+      # fsync=off + tmpfs flags that keep the suite under a minute, and running
+      # it here means CI and a laptop use identical settings.
+      - name: Start PostgreSQL
+        run: docker compose up -d --wait db
+
+      - name: Format
+        run: ruff format --check src scripts tests
+
+      - name: Lint
+        run: ruff check src scripts tests
+
+      - name: Types
+        run: pyright
+
+      - name: Tests
+        run: pytest -q
+
+      # A regression here means the pure-logic half of the suite has quietly
+      # grown a database dependency, which would make it useless offline.
+      - name: Tests without a database
+        run: pytest -q -m "not db"

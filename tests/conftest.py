@@ -258,3 +258,20 @@ def probe_transcripts() -> list[TranscriptMessage]:
         if line.strip():
             messages.append(TranscriptMessage.model_validate(json.loads(line)))
     return messages
+
+
+#: Fixtures that need the PostgreSQL server from ``compose.yaml``.
+_DB_FIXTURES = frozenset({"db", "system_db", "pg_reset", "pg_schema"})
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    """Mark database tests automatically, so ``-m "not db"`` really is offline.
+
+    Applying the marker by hand would rot: a test that grows a ``db`` fixture
+    later would silently join the database set while still claiming not to be
+    in it, and the offline subset would fail on a machine with no server.
+    """
+    for item in items:
+        fixtures = getattr(item, "fixturenames", ())
+        if _DB_FIXTURES.intersection(fixtures):
+            item.add_marker(pytest.mark.db)
