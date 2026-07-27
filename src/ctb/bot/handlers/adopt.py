@@ -106,6 +106,7 @@ _CONTRACT_MARK: Final = "OUTPUT CONTRACT"
 SESSION_SCAN: Final = 20
 SESSION_SCAN_PAGES: Final = 5
 
+
 @dataclass(slots=True)
 class _WorkspaceLock:
     lock: asyncio.Lock

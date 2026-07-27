@@ -40,6 +40,17 @@ The trade is explicit: after a restart a restartable button is no longer
 single-use, so a double tap can act twice. Stop, Retry, Transcript and Check
 are all safe to repeat; ``clearq`` deletes queued prompts and is deliberately
 left store-only.
+
+``wiz`` joined that list for the same reason and pays the same price. The
+``/new`` wizard's *state* is already DB-backed (``wizard_state``), so a redeploy
+left a live wizard behind dead buttons. Its payload cannot name the choice —
+branch names are arbitrary user text and the target charset has no ``:`` — so
+the target is a wizard id plus a step letter and an option index
+(``.<expiry>.<wid>b1``), and ``ctb.bot.wizards.new_workspace`` resolves that
+index against the offered options it persisted in the FSM. The per-user check
+lost with the store is *not* lost here: the FSM row is keyed by
+``(chat_id, thread_id, user_id)``, so a tap by anyone else reads an empty
+wizard and is refused.
 """
 
 from __future__ import annotations
@@ -134,6 +145,8 @@ class Action(StrEnum):
     ADOPT = "adopt"
     DIFF = "diff"
     CHANGE = "change"
+    #: A step of the bare ``/new`` wizard. See the module docstring.
+    WIZARD = "wiz"
     DEFAULTS = "defaults"
     PICK = "pick"
     SEND = "send"
@@ -163,10 +176,10 @@ _CARD_LABELS: Final[dict[CardButton, str]] = {
 
 _ALLOWED_ACTION_CHARS: Final = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_-")
 
-#: Card controls whose payload is allowed to outlive the process that minted it.
-#: Every one of them is non-destructive: it stops, repeats, reads, or *opens a
-#: named confirm*. Nothing here deletes anything. ``clearq`` and ``archive`` are
-#: deliberately absent — see the module docstring.
+#: Controls whose payload is allowed to outlive the process that minted it.
+#: Every one of them is non-destructive: it stops, repeats, reads, picks a
+#: wizard option, or *opens a named confirm*. Nothing here deletes anything.
+#: ``clearq`` and ``archive`` are deliberately absent — see the module docstring.
 RESTARTABLE_ACTIONS: Final[frozenset[str]] = frozenset(
     {
         Action.STOP.value,
@@ -174,6 +187,7 @@ RESTARTABLE_ACTIONS: Final[frozenset[str]] = frozenset(
         Action.TRANSCRIPT.value,
         Action.CHECK.value,
         Action.ARCHIVE_REQUEST.value,
+        Action.WIZARD.value,
     }
 )
 
@@ -746,11 +760,12 @@ def resolve(
     no "just this once" path — a payload that does not resolve is not acted on.
 
     A :data:`RESTARTABLE_ACTIONS` payload the store has never heard of is
-    re-derived from the payload itself — that, and only that, is how a card
-    button minted before a redeploy still works after it. It is not a hole in
-    the allow-list: this runs behind ``AuthMiddleware``, so anyone who can
-    present a payload at all is already allow-listed. The per-user check is the
-    one thing lost with the store, and only for these five safe actions.
+    re-derived from the payload itself — that, and only that, is how a card or
+    wizard button minted before a redeploy still works after it. It is not a
+    hole in the allow-list: this runs behind ``AuthMiddleware``, so anyone who
+    can present a payload at all is already allow-listed. The per-user check is
+    the one thing lost with the store; ``wiz`` gets it back from the FSM row,
+    which is keyed by ``(chat_id, thread_id, user_id)``.
 
     Order matters: the store is asked first, so a ticket it *does* know — spent,
     expired, revoked, or minted for someone else — is refused as before. Only
@@ -769,7 +784,9 @@ def resolve(
         ticket = read_stateless(payload.nonce, payload.action)
         # Record the spend so a double tap inside this process still says
         # "already done"; after the next restart it is single-use no more.
-        registry.mark_used(ticket.nonce, ttl=CONTROL_TTL_S)
+        # Held for exactly as long as the payload itself would have lived —
+        # a 30-minute wizard button must not become re-tappable at 15.
+        registry.mark_used(ticket.nonce, ttl=max(0.0, ticket.expires_at - time.time()))
         return ticket
 
 

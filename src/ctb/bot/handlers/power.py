@@ -86,6 +86,11 @@ Voice commands need “command” or “команда”."""
 #: Buttons ``/s`` shows in General before it says how many it hid.
 GENERAL_VISIBLE: Final = 12
 
+#: One line, both forms — the second is the only way to set a branch by hand.
+_DEFAULTS_USAGE: Final = (
+    "<code>/defaults agent model effort</code> · <code>/defaults branch name</code>"
+)
+
 #: Name of the throwaway topic ``/setup`` creates to prove it can. Deleted
 #: immediately; only ever visible if the delete itself is refused.
 _SETUP_PROBE_LABEL: Final = "setup check"
@@ -662,8 +667,17 @@ async def defaults(
     )
     if raw:
         fields = raw.split()
+        # The branch is remembered from the last create, but it has to be
+        # settable without creating anything — that is the whole cold start.
+        if len(fields) == 2 and fields[0].casefold() == "branch":
+            branch = fields[1][:160]
+            await chats_repo.set_defaults(
+                database, message.chat.id, route.thread_id, branch=branch
+            )
+            await tell(message, f"Default branch: <b>{escape(branch)}</b>.")
+            return
         if len(fields) != 3:
-            await tell(message, "Usage: <code>/defaults agent model effort</code>")
+            await tell(message, _DEFAULTS_USAGE)
             return
         try:
             agent, model, effort = validate_pairing(*fields)
@@ -685,10 +699,11 @@ async def defaults(
     agent = chat.default_agent or settings.default_agent
     model = chat.default_model or settings.default_model
     effort = chat.default_effort or settings.default_effort
+    branch = chat.default_branch or settings.default_branch
     await tell(
         message,
-        f"Defaults: <b>{escape(agent)}</b> · {escape(model)}/{escape(effort)}\n"
-        "<code>/defaults agent model effort</code>",
+        f"Defaults: <b>{escape(agent)}</b> · {escape(model)}/{escape(effort)} · "
+        f"<b>{escape(branch)}</b>\n" + _DEFAULTS_USAGE,
     )
 
 

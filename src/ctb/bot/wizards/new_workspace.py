@@ -1,6 +1,35 @@
-"""Bare ``/new``: one edited card, state persisted in ``wizard_state``."""
+"""Bare ``/new``: one edited card, state persisted in ``wizard_state``.
+
+The card's state is DB-backed and the buttons have to match it, or a redeploy
+leaves a live wizard behind dead buttons — which is exactly what happened. So
+the buttons are ``restartable`` (see ``ctb.bot.keyboards``), and since a
+restart-proof payload has to be a bare id in a charset without ``:``, the
+button does **not** carry the choice. It carries a reference to it:
+
+``ctb:wiz:.<expiry-base36>.<wid><step><index>``
+
+``wid`` identifies this run of the wizard, ``step`` is one letter, and ``index``
+picks from the options the step persisted in the FSM. Resolution is therefore
+identical before and after a restart — the store, while it lives, still makes
+the button single-use, and nothing else changes.
+
+Three things fall out of that, all of them wanted:
+
+* **Ownership survives.** ``wizard_state`` is keyed by ``(chat_id, thread_id,
+  user_id)``, so a tap from another seat reads no wizard and is refused, with
+  or without the store.
+* **A stale button is refused.** The step in the payload must be the step the
+  FSM is on, and ``wid`` must be this run — a button from a finished wizard
+  resolves to nothing.
+* **Nothing destructive is reachable.** Every option only advances a form;
+  ``Cancel`` abandons it.
+"""
 
 from __future__ import annotations
+
+import secrets
+from collections.abc import Mapping, Sequence
+from typing import Any, Final
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
@@ -14,6 +43,7 @@ from aiogram.types import (
 
 from ctb.bot.app import register_router
 from ctb.bot.handlers.common import (
+    DEFAULT_BRANCH,
     CreateRequest,
     all_projects,
     create_and_bind,
@@ -22,6 +52,7 @@ from ctb.bot.handlers.common import (
 )
 from ctb.bot.handlers.topics import edit_html, jump_url, resolve_client, resolve_db
 from ctb.bot.keyboards import (
+    Action,
     Cb,
     NonceError,
     NonceStore,
@@ -45,6 +76,35 @@ register_router(router, order=5)
 
 WIZARD_TTL = 30 * 60.0
 
+#: One letter per step. The whole payload has 64 bytes and the restart-proof
+#: charset has no ``:``, so the step is a letter and the choice is an index.
+_STEP_CODES: Final[dict[str, str]] = {
+    "project": "p",
+    "branch": "b",
+    "agent": "a",
+    "model": "m",
+    "effort": "e",
+}
+_STEP_BY_CODE: Final[dict[str, str]] = {v: k for k, v in _STEP_CODES.items()}
+#: Step-independent codes. Neither collides with a step letter.
+_DEFAULTS_CODE: Final = "d"
+_CANCEL_CODE: Final = "c"
+#: ``secrets.token_urlsafe(4)`` is always six url-safe characters, so the
+#: wizard id can be split off the target by position.
+_WID_LEN: Final = 6
+_WID_BYTES: Final = 4
+#: The index is the rest of the code. No step offers ten options today, but a
+#: multi-digit index costs nothing and parses the same.
+_DIGITS: Final = frozenset("0123456789")
+
+#: The wizard is over — its state expired, it finished, or this is an older
+#: run's button. Nothing to resume, so say so instead of blaming the button.
+GONE_MESSAGE: Final = "Wizard closed · /new to start again."
+#: The wizard moved on (typed branch, another tap) before this tap landed.
+STALE_MESSAGE: Final = "That step is done · use the buttons on the card."
+#: The payload decodes but names nothing this wizard offered.
+INVALID_MESSAGE: Final = "Not a choice on this card."
+
 
 class NewWorkspace(StatesGroup):
     project = State()
@@ -55,80 +115,126 @@ class NewWorkspace(StatesGroup):
     prompt = State()
 
 
-def _unique(options: list[tuple[str, str]]) -> list[tuple[str, str]]:
+def new_wizard_id() -> str:
+    """Identifies one run of the wizard, so an older run's button is refused."""
+    return secrets.token_urlsafe(_WID_BYTES)
+
+
+def _unique(options: Sequence[tuple[str, str]]) -> list[tuple[str, str]]:
     """Two buttons that do the same thing are one button.
 
-    The branch step offers ``main`` *and* the remembered default, which is
-    usually also ``main`` — a bare ``/new`` rendered "main" twice. Options that
-    genuinely differ (``main`` and ``dev``) are both kept, in order.
+    The branch step offers the configured default *and* the remembered one,
+    which is usually the same branch — a bare ``/new`` rendered "main" twice.
+    Options that genuinely differ (``dev`` and ``main``) are both kept, in
+    order.
     """
     seen: set[str] = set()
     unique: list[tuple[str, str]] = []
-    for label, target in options:
-        if target in seen:
+    for label, value in options:
+        if value in seen:
             continue
-        seen.add(target)
-        unique.append((label, target))
+        seen.add(value)
+        unique.append((label, value))
     return unique
 
 
-def _rows(
-    options: list[tuple[str, str]],
+def _button(
+    label: str,
+    code: str,
     *,
     nonces: NonceStore,
     message: Message,
-    columns: int = 2,
-) -> list[list[InlineKeyboardButton]]:
-    items = [
-        button(
-            label,
-            "wiz",
-            target,
-            store=nonces,
-            user_id=message.from_user.id if message.from_user else None,
-            chat_id=message.chat.id,
-            thread_id=message.message_thread_id or NO_THREAD_ID,
-            ttl=WIZARD_TTL,
-            style=(
-                "danger"
-                if target == "cancel"
-                else "success"
-                if target == "defaults"
-                else "primary"
-            ),
-        )
-        for label, target in _unique(options)
-    ]
-    return [items[index : index + columns] for index in range(0, len(items), columns)]
+    wid: str,
+) -> InlineKeyboardButton:
+    return button(
+        label,
+        Action.WIZARD,
+        f"{wid}{code}",
+        store=nonces,
+        user_id=message.from_user.id if message.from_user else None,
+        chat_id=message.chat.id,
+        thread_id=message.message_thread_id or NO_THREAD_ID,
+        ttl=WIZARD_TTL,
+        style=(
+            "danger"
+            if code == _CANCEL_CODE
+            else "success"
+            if code == _DEFAULTS_CODE
+            else "primary"
+        ),
+        # The owner redeploys constantly, and the FSM behind this card already
+        # survives that. The buttons have to as well.
+        restartable=True,
+    )
 
 
 def _wizard_keyboard(
-    options: list[tuple[str, str]],
+    options: Sequence[tuple[str, str]],
     *,
+    step: str,
+    wid: str,
     nonces: NonceStore,
     message: Message,
     defaults: bool = True,
     columns: int = 2,
 ) -> InlineKeyboardMarkup:
-    rows = _rows(options, nonces=nonces, message=message, columns=columns)
+    """Render the deduped ``options`` — the caller persists the same list."""
+    letter = _STEP_CODES.get(step, "")
+    items = [
+        _button(label, f"{letter}{index}", nonces=nonces, message=message, wid=wid)
+        for index, (label, _value) in enumerate(options)
+    ]
+    rows = [items[index : index + columns] for index in range(0, len(items), columns)]
     if defaults:
         rows.append(
-            _rows(
-                [("Go with defaults →", "defaults")],
-                nonces=nonces,
-                message=message,
-                columns=1,
-            )[0]
+            [
+                _button(
+                    "Go with defaults →",
+                    _DEFAULTS_CODE,
+                    nonces=nonces,
+                    message=message,
+                    wid=wid,
+                )
+            ]
         )
     rows.append(
-        _rows(
-            [("Cancel", "cancel")],
-            nonces=nonces,
-            message=message,
-            columns=1,
-        )[0]
+        [_button("Cancel", _CANCEL_CODE, nonces=nonces, message=message, wid=wid)]
     )
     return keyboard(rows)
+
+
+async def _offer(
+    message: Message,
+    state: FSMContext,
+    nonces: NonceStore,
+    *,
+    step: str,
+    fsm_state: State,
+    options: Sequence[tuple[str, str]],
+    defaults: bool = True,
+    columns: int = 2,
+) -> InlineKeyboardMarkup:
+    """Persist the offered options, then draw exactly those buttons.
+
+    The list written here is the one the payload's index refers to; writing it
+    anywhere else would let the two drift.
+    """
+    data = await state.get_data()
+    wid = str(data.get("wid") or "") or new_wizard_id()
+    offered = _unique(options)
+    await state.set_state(fsm_state)
+    await state.update_data(
+        {"wid": wid, "step": step, "options": [value for _label, value in offered]}
+    )
+    return _wizard_keyboard(
+        offered,
+        step=step,
+        wid=wid,
+        nonces=nonces,
+        message=message,
+        defaults=defaults,
+        columns=columns,
+    )
 
 
 async def start_wizard(
@@ -158,31 +264,28 @@ async def start_wizard(
     chat = route.chat or await chats_repo.ensure(
         database, message.chat.id, route.thread_id, kind=route.kind
     )
-    await state.set_state(NewWorkspace.project)
     await state.set_data(
         {
+            "wid": new_wizard_id(),
             "projects": {item.id: item.name or item.id[:8] for item in projects},
             "project_id": chat.default_project_id,
-            "branch": chat.default_branch or "main",
+            "branch": chat.default_branch or settings.default_branch,
             "agent": chat.default_agent or settings.default_agent,
             "model": chat.default_model or settings.default_model,
             "effort": chat.default_effort or settings.default_effort,
         }
     )
-    options = [
-        (item.name or item.id[:8], f"project:{item.id}") for item in projects[:10]
-    ]
-    sent = await tell(
+    markup = await _offer(
         message,
-        "Project?",
-        reply_markup=_wizard_keyboard(
-            options,
-            nonces=store,
-            message=message,
-            defaults=bool(chat.default_project_id),
-            columns=1,
-        ),
+        state,
+        store,
+        step="project",
+        fsm_state=NewWorkspace.project,
+        options=[(item.name or item.id[:8], item.id) for item in projects[:10]],
+        defaults=bool(chat.default_project_id),
+        columns=1,
     )
+    sent = await tell(message, "Project?", reply_markup=markup)
     if sent and message.from_user:
         await wizard_repo.merge_data(
             database,
@@ -210,83 +313,109 @@ async def _edit(
     )
 
 
-async def _ask_branch(message: Message, state: FSMContext, nonces: NonceStore) -> None:
+async def _ask_branch(
+    message: Message,
+    state: FSMContext,
+    nonces: NonceStore,
+    settings: Settings,
+) -> None:
+    """Offer the configured default first, then the last-used branch.
+
+    ``DEFAULT_BRANCH=dev`` is the whole point: the branch you almost always
+    want is the first button, and the remembered one only earns a second button
+    when it is genuinely different.
+    """
     data = await state.get_data()
-    current = str(data.get("branch") or "main")
-    await state.set_state(NewWorkspace.branch)
-    await _edit(
+    configured = settings.default_branch or DEFAULT_BRANCH
+    current = str(data.get("branch") or configured)
+    markup = await _offer(
         message,
-        "Branch? Type it or tap.",
-        _wizard_keyboard(
-            [("main", "branch:main"), (current, f"branch:{current}")],
-            nonces=nonces,
-            message=message,
-        ),
+        state,
+        nonces,
+        step="branch",
+        fsm_state=NewWorkspace.branch,
+        options=[(configured, configured), (current, current)],
     )
+    await _edit(message, "Branch? Type it or tap.", markup)
 
 
 async def _ask_agent(message: Message, state: FSMContext, nonces: NonceStore) -> None:
-    await state.set_state(NewWorkspace.agent)
-    await _edit(
+    markup = await _offer(
         message,
-        "Agent?",
-        _wizard_keyboard(
-            [(name, f"agent:{name}") for name in ("claude", "codex", "cursor")],
-            nonces=nonces,
-            message=message,
-            columns=3,
-        ),
+        state,
+        nonces,
+        step="agent",
+        fsm_state=NewWorkspace.agent,
+        options=[(name, name) for name in ("claude", "codex", "cursor")],
+        columns=3,
     )
+    await _edit(message, "Agent?", markup)
 
 
 async def _ask_model(message: Message, state: FSMContext, nonces: NonceStore) -> None:
     data = await state.get_data()
     agent = str(data.get("agent") or "claude")
-    await state.set_state(NewWorkspace.model)
-    await _edit(
+    markup = await _offer(
         message,
-        "Model?",
-        _wizard_keyboard(
-            [(name, f"model:{name}") for name in models_for(agent)[:8]],
-            nonces=nonces,
-            message=message,
-            columns=1,
-        ),
+        state,
+        nonces,
+        step="model",
+        fsm_state=NewWorkspace.model,
+        options=[(name, name) for name in models_for(agent)[:8]],
+        columns=1,
     )
+    await _edit(message, "Model?", markup)
 
 
 async def _ask_effort(message: Message, state: FSMContext, nonces: NonceStore) -> None:
     data = await state.get_data()
     agent = str(data.get("agent") or "claude")
-    options = efforts_for(agent) or ("default",)
-    await state.set_state(NewWorkspace.effort)
-    await _edit(
+    markup = await _offer(
         message,
-        "Effort?",
-        _wizard_keyboard(
-            [(name, f"effort:{name}") for name in options],
-            nonces=nonces,
-            message=message,
-            columns=3,
-        ),
+        state,
+        nonces,
+        step="effort",
+        fsm_state=NewWorkspace.effort,
+        options=[(name, name) for name in efforts_for(agent) or ("default",)],
+        columns=3,
     )
+    await _edit(message, "Effort?", markup)
 
 
 async def _ask_prompt(message: Message, state: FSMContext, nonces: NonceStore) -> None:
-    await state.set_state(NewWorkspace.prompt)
-    await _edit(
+    markup = await _offer(
         message,
-        "Send the first prompt.",
-        _wizard_keyboard(
-            [],
-            nonces=nonces,
-            message=message,
-            defaults=False,
-        ),
+        state,
+        nonces,
+        step="prompt",
+        fsm_state=NewWorkspace.prompt,
+        options=(),
+        defaults=False,
     )
+    await _edit(message, "Send the first prompt.", markup)
 
 
-@router.callback_query(Cb.filter(F.action == "wiz"))
+def _pick(code: str, data: Mapping[str, Any]) -> tuple[str, str] | str:
+    """``(step, value)`` for a tapped option, or the line to answer with.
+
+    Everything the payload claims is checked against the FSM: the run, the
+    step, and the index. A payload that survives all three named an option this
+    wizard is offering right now.
+    """
+    step = _STEP_BY_CODE.get(code[:1], "")
+    index = code[1:]
+    if not step or not index or not set(index) <= _DIGITS:
+        return INVALID_MESSAGE
+    if data.get("step") != step:
+        return STALE_MESSAGE
+    options = data.get("options")
+    position = int(index)
+    if not isinstance(options, list) or position >= len(options):
+        return INVALID_MESSAGE
+    return step, str(options[position])
+
+
+@router.callback_query(Cb.filter(F.action == Action.WIZARD.value))
 async def wizard_callback(
     query: CallbackQuery,
     state: FSMContext,
@@ -294,52 +423,54 @@ async def wizard_callback(
     settings: Settings,
 ) -> None:
     try:
-        ticket = resolve(query, expect="wiz", store=nonces)
+        ticket = resolve(query, expect=Action.WIZARD, store=nonces)
     except NonceError as exc:
         await query.answer(exc.user_message, show_alert=True)
         return
     if not isinstance(query.message, Message):
         await query.answer("Open /new again.", show_alert=True)
         return
-    value = ticket.target
-    if value == "cancel":
+    # ``state`` is keyed by (chat, thread, user), so this read is also the
+    # ownership check the in-memory store used to make — and unlike the store
+    # it is still here after a redeploy.
+    data = await state.get_data()
+    wid = str(data.get("wid") or "")
+    if not wid or ticket.target[:_WID_LEN] != wid:
+        await query.answer(GONE_MESSAGE, show_alert=True)
+        return
+    code = ticket.target[_WID_LEN:]
+    if code == _CANCEL_CODE:
         await state.clear()
         await query.answer("Cancelled")
         await _edit(query.message, "New workspace cancelled.", None)
         return
-    data = await state.get_data()
-    if value == "defaults":
+    if code == _DEFAULTS_CODE:
         if not data.get("project_id"):
             await query.answer("Pick a project first.", show_alert=True)
             return
         await query.answer()
         await _ask_prompt(query.message, state, nonces)
         return
-    kind, separator, selected = value.partition(":")
-    if not separator:
-        await query.answer("Expired. Run /new again.", show_alert=True)
+    picked = _pick(code, data)
+    if isinstance(picked, str):
+        await query.answer(picked, show_alert=True)
         return
-    await state.update_data({f"{kind}_id" if kind == "project" else kind: selected})
-    if kind == "project":
-        await query.answer()
-        await _ask_branch(query.message, state, nonces)
-    elif kind == "branch":
-        await query.answer()
+    step, selected = picked
+    await state.update_data({"project_id" if step == "project" else step: selected})
+    await query.answer()
+    if step == "project":
+        await _ask_branch(query.message, state, nonces, settings)
+    elif step == "branch":
         await _ask_agent(query.message, state, nonces)
-    elif kind == "agent":
+    elif step == "agent":
         await state.update_data({"model": default_model_for(selected)})
-        await query.answer()
         await _ask_model(query.message, state, nonces)
-    elif kind == "model":
-        await query.answer()
+    elif step == "model":
         await _ask_effort(query.message, state, nonces)
-    elif kind == "effort":
+    else:
         if selected == "default":
             await state.update_data({"effort": None})
-        await query.answer()
         await _ask_prompt(query.message, state, nonces)
-    else:
-        await query.answer("Invalid choice.", show_alert=True)
 
 
 @router.message(NewWorkspace.branch, F.text & ~F.text.startswith("/"))
@@ -388,7 +519,7 @@ async def typed_prompt(
     request = CreateRequest(
         project_id=project_id,
         project_name=str(projects.get(project_id) or project_id[:8]),
-        branch=str(data.get("branch") or "main"),
+        branch=str(data.get("branch") or settings.default_branch or DEFAULT_BRANCH),
         agent=str(data.get("agent") or settings.default_agent),
         model=str(data.get("model") or settings.default_model),
         effort=str(data.get("effort") or settings.default_effort),

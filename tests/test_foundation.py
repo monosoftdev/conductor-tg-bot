@@ -88,6 +88,15 @@ class TestSettings:
     def test_me_lives_at_the_api_root_not_under_v0(self, settings: Settings) -> None:
         assert settings.me_url == "https://api.conductor.build/me"
 
+    def test_default_branch_is_settable_and_never_blank(
+        self, settings_factory: Callable[..., Settings]
+    ) -> None:
+        """``DEFAULT_BRANCH=dev`` is what makes ``dev`` the offered button."""
+        assert settings_factory().default_branch == "main"
+        assert settings_factory(default_branch="dev").default_branch == "dev"
+        # `cp .env.example .env` leaves `DEFAULT_BRANCH=` behind.
+        assert settings_factory(default_branch="  ").default_branch == "main"
+
     def test_bad_default_pairing_is_caught_at_boot(self) -> None:
         with pytest.raises(SettingsError, match="not a valid"):
             load_settings(

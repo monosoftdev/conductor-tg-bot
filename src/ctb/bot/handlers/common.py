@@ -43,6 +43,8 @@ from ctb.turn import cursor
 from ctb.turn.state import Cancel, Evidence, TopicMarker, TurnState
 
 FOCUS_MS: Final = 30 * 60 * 1000
+#: Last resort only. Precedence is chat default → ``DEFAULT_BRANCH`` env →
+#: this, so the owner changes the offered branch from Railway, not from code.
 DEFAULT_BRANCH: Final = "main"
 #: Appended to every Telegram prompt. The delimiter matters: without it a long
 #: task that carries its own style guidance averages this away instead of
@@ -254,7 +256,9 @@ async def resolve_new_request(
     agent = (chat.default_agent if chat else None) or settings.default_agent
     model = (chat.default_model if chat else None) or settings.default_model
     effort = (chat.default_effort if chat else None) or settings.default_effort
-    branch = (chat.default_branch if chat else None) or DEFAULT_BRANCH
+    branch = (
+        (chat.default_branch if chat else None) or settings.default_branch
+    ) or DEFAULT_BRANCH
     validate_pairing(agent, model, effort)
     return CreateRequest(
         project_id=project.id,

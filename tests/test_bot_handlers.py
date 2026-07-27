@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import replace
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from aiogram.enums import ContentType
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.base import StorageKey
 from aiogram.methods import CreateForumTopic, SendMessage
+from aiogram.types import Chat, Message
 
+from ctb.bot.app import SqliteStorage
 from ctb.bot.handlers import core as core_handlers
 from ctb.bot.handlers import prompts as prompt_handlers
 from ctb.bot.handlers.common import (
@@ -42,7 +49,13 @@ from ctb.bot.handlers.topics import (
     telegram_reason,
     topic_icon_color,
 )
-from ctb.bot.keyboards import NonceStore
+from ctb.bot.keyboards import (
+    RESTARTABLE_ACTIONS,
+    Action,
+    NonceError,
+    NonceStore,
+    read_stateless,
+)
 from ctb.bot.middleware.routing import Route
 from ctb.bot.wizards import new_workspace
 from ctb.conductor.models import (
@@ -65,6 +78,7 @@ from ctb.db.repo import workspaces as workspaces_repo
 from ctb.db.repo.chats import ChatRow
 from ctb.db.repo.sessions import SessionRow
 from ctb.db.repo.workspaces import WorkspaceRow
+from ctb.settings import Settings
 from ctb.turn.cursor import quick_replies_for
 from ctb.turn.state import Cancel, TurnState
 
@@ -1227,24 +1241,38 @@ class _WizardState:
     async def set_state(self, state: Any) -> None:
         self.state = state
 
+    async def update_data(self, data: dict[str, Any]) -> dict[str, Any]:
+        self._data.update(data)
+        return self._data
 
-async def _branch_buttons(branch: str, monkeypatch: Any) -> list[str]:
+
+def _wizard_message(chat_id: int = -1001, user_id: int = 1001) -> Any:
+    return SimpleNamespace(
+        chat=SimpleNamespace(id=chat_id),
+        message_thread_id=None,
+        message_id=3,
+        from_user=SimpleNamespace(id=user_id),
+    )
+
+
+async def _branch_buttons(
+    branch: str,
+    monkeypatch: Any,
+    settings_factory: Callable[..., Settings],
+    *,
+    configured: str = "main",
+) -> list[str]:
     cards: list[Any] = []
 
     async def fake_edit(_message: Any, _text: str, markup: Any) -> None:
         cards.append(markup)
 
     monkeypatch.setattr(new_workspace, "_edit", fake_edit)
-    message = SimpleNamespace(
-        chat=SimpleNamespace(id=-1001),
-        message_thread_id=None,
-        message_id=3,
-        from_user=SimpleNamespace(id=1001),
-    )
     await new_workspace._ask_branch(
-        message,  # type: ignore[arg-type]
+        _wizard_message(),  # type: ignore[arg-type]
         _WizardState({"branch": branch}),  # type: ignore[arg-type]
         NonceStore(),
+        settings_factory(default_branch=configured),
     )
     return [
         item.text
@@ -1255,16 +1283,339 @@ async def _branch_buttons(branch: str, monkeypatch: Any) -> list[str]:
 
 
 async def test_branch_step_offers_main_once_when_it_is_also_the_default(
-    monkeypatch: Any,
+    monkeypatch: Any, settings_factory: Callable[..., Settings]
 ) -> None:
     """Two taps that do the same thing were rendering as two buttons."""
-    assert await _branch_buttons("main", monkeypatch) == ["main"]
+    assert await _branch_buttons("main", monkeypatch, settings_factory) == ["main"]
 
 
 async def test_branch_step_still_offers_both_when_they_differ(
-    monkeypatch: Any,
+    monkeypatch: Any, settings_factory: Callable[..., Settings]
 ) -> None:
-    assert await _branch_buttons("dev", monkeypatch) == ["main", "dev"]
+    assert await _branch_buttons("dev", monkeypatch, settings_factory) == [
+        "main",
+        "dev",
+    ]
+
+
+async def test_branch_step_offers_the_configured_default_first(
+    monkeypatch: Any, settings_factory: Callable[..., Settings]
+) -> None:
+    """``DEFAULT_BRANCH=dev`` is how the owner stops being shown ``main``."""
+    assert await _branch_buttons(
+        "dev", monkeypatch, settings_factory, configured="dev"
+    ) == ["dev"]
+    assert await _branch_buttons(
+        "release", monkeypatch, settings_factory, configured="dev"
+    ) == ["dev", "release"]
+
+
+async def test_a_created_workspace_makes_its_branch_the_next_offer(
+    db: Database, monkeypatch: Any, settings_factory: Callable[..., Settings]
+) -> None:
+    """Type ``dev`` once and it is the button from then on."""
+    await create_and_bind_input(
+        bot=None,
+        chat_id=1001,
+        chat_type="private",
+        tg_message_id=5,
+        route=Route(chat_id=1001, kind="dm"),
+        request=replace(_REQUEST, branch="dev"),
+        db=db,
+        client=_CountingClient(),  # type: ignore[arg-type]
+    )
+
+    chat = await chats_repo.get(db, 1001, 0)
+    assert chat is not None and chat.default_branch == "dev"
+    # Seeded exactly as ``start_wizard`` seeds it: chat default beats settings.
+    assert await _branch_buttons(
+        chat.default_branch or "", monkeypatch, settings_factory
+    ) == ["main", "dev"]
+
+
+# ── the wizard's buttons have to outlive the process ─────────────────────────
+
+
+class _Tap:
+    """Just enough ``CallbackQuery``. A real one refuses to answer unbound."""
+
+    def __init__(self, data: str, *, user_id: int = 1001) -> None:
+        self.data = data
+        self.from_user = SimpleNamespace(id=user_id)
+        self.message = Message(
+            message_id=3,
+            date=datetime.now(UTC),
+            chat=Chat(id=-1001, type="supergroup"),
+        )
+        self.answers: list[str] = []
+
+    async def answer(self, text: str = "", **_kwargs: Any) -> None:
+        self.answers.append(text)
+
+
+def _seat(db: Database, *, user_id: int = 1001, thread_id: int | None = None) -> Any:
+    """A DB-backed FSM context — the thing that already survived the redeploy."""
+    return FSMContext(
+        storage=SqliteStorage(db),
+        key=StorageKey(bot_id=0, chat_id=-1001, user_id=user_id, thread_id=thread_id),
+    )
+
+
+async def _mint_branch_card(
+    db: Database,
+    store: NonceStore,
+    settings: Settings,
+    monkeypatch: Any,
+) -> str:
+    """Draw the branch step and return the ``dev`` button's callback_data."""
+    cards: list[Any] = []
+
+    async def fake_edit(_message: Any, _text: str, markup: Any) -> None:
+        cards.append(markup)
+
+    monkeypatch.setattr(new_workspace, "_edit", fake_edit)
+    state = _seat(db)
+    await state.set_data({"project_id": "project-1", "branch": "dev"})
+    await new_workspace._ask_branch(
+        _wizard_message(),  # type: ignore[arg-type]
+        state,
+        store,
+        settings,
+    )
+    button = next(
+        item for row in cards[0].inline_keyboard for item in row if item.text == "dev"
+    )
+    assert button.callback_data is not None
+    assert len(button.callback_data.encode()) <= 64  # Telegram's hard cap
+    cards.clear()
+    return button.callback_data
+
+
+async def test_a_wizard_button_minted_before_a_redeploy_still_works(
+    db: Database, settings: Settings, monkeypatch: Any
+) -> None:
+    """The FSM survived the restart; the buttons used to die with the store."""
+    data = await _mint_branch_card(db, NonceStore(), settings, monkeypatch)
+
+    edits: list[str] = []
+
+    async def fake_edit(_message: Any, text: str, _markup: Any) -> None:
+        edits.append(text)
+
+    monkeypatch.setattr(new_workspace, "_edit", fake_edit)
+    tap = _Tap(data)
+    # The redeploy: a brand-new empty registry, the same SQLite file.
+    await new_workspace.wizard_callback(
+        tap,  # type: ignore[arg-type]
+        _seat(db),
+        NonceStore(),
+        settings,
+    )
+
+    assert tap.answers == [""]
+    assert edits == ["Agent?"]
+    assert (await _seat(db).get_data())["branch"] == "dev"
+
+
+async def test_a_wizard_button_is_still_single_use_while_the_process_lives(
+    db: Database, settings: Settings, monkeypatch: Any
+) -> None:
+    store = NonceStore()
+    data = await _mint_branch_card(db, store, settings, monkeypatch)
+
+    async def fake_edit(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(new_workspace, "_edit", fake_edit)
+    taps = [_Tap(data), _Tap(data)]
+    for tap in taps:
+        await new_workspace.wizard_callback(
+            tap,  # type: ignore[arg-type]
+            _seat(db),
+            store,
+            settings,
+        )
+
+    assert taps[0].answers == [""]
+    assert taps[1].answers == ["Already done — that button was single-use."]
+
+
+async def test_a_wizard_button_for_a_step_already_passed_is_refused(
+    db: Database, settings: Settings, monkeypatch: Any
+) -> None:
+    """Typing the branch moves the FSM on; the branch button must go stale."""
+    data = await _mint_branch_card(db, NonceStore(), settings, monkeypatch)
+
+    async def fake_edit(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(new_workspace, "_edit", fake_edit)
+    state = _seat(db)
+    await state.update_data({"branch": "release"})
+    await new_workspace._ask_agent(
+        _wizard_message(),  # type: ignore[arg-type]
+        state,
+        NonceStore(),
+    )
+
+    tap = _Tap(data)
+    await new_workspace.wizard_callback(
+        tap,  # type: ignore[arg-type]
+        _seat(db),
+        NonceStore(),
+        settings,
+    )
+
+    assert tap.answers == [new_workspace.STALE_MESSAGE]
+    assert (await _seat(db).get_data())["branch"] == "release"
+
+
+async def test_a_wizard_button_says_closed_when_the_wizard_is_gone(
+    db: Database, settings: Settings, monkeypatch: Any
+) -> None:
+    """A finished wizard is not an expired button; the line has to say so."""
+    data = await _mint_branch_card(db, NonceStore(), settings, monkeypatch)
+    await _seat(db).clear()
+
+    tap = _Tap(data)
+    await new_workspace.wizard_callback(
+        tap,  # type: ignore[arg-type]
+        _seat(db),
+        NonceStore(),
+        settings,
+    )
+
+    assert tap.answers == [new_workspace.GONE_MESSAGE]
+
+
+async def test_a_wizard_button_is_useless_to_another_seat(
+    db: Database, settings: Settings, monkeypatch: Any
+) -> None:
+    """Ownership is the FSM key, so it survives the restart the store did not."""
+    store = NonceStore()
+    data = await _mint_branch_card(db, store, settings, monkeypatch)
+
+    # Store alive: the ticket itself remembers who it was minted for.
+    intruder = _Tap(data, user_id=2002)
+    await new_workspace.wizard_callback(
+        intruder,  # type: ignore[arg-type]
+        _seat(db, user_id=2002),
+        store,
+        settings,
+    )
+    assert intruder.answers == ["This button has expired. Run the command again."]
+
+    # Store gone: a different user, and a different thread of the same user,
+    # both read an empty wizard.
+    for seat in (_seat(db, user_id=2002), _seat(db, thread_id=77)):
+        tap = _Tap(data, user_id=2002)
+        await new_workspace.wizard_callback(
+            tap,  # type: ignore[arg-type]
+            seat,
+            NonceStore(),
+            settings,
+        )
+        assert tap.answers == [new_workspace.GONE_MESSAGE]
+
+    # And the real owner is untouched by any of it.
+    assert (await _seat(db).get_data())["step"] == "branch"
+
+
+async def test_the_whole_wizard_survives_a_redeploy_at_every_step(
+    db: Database, settings: Settings, monkeypatch: Any
+) -> None:
+    """The owner redeploys constantly. Restart before every single tap."""
+    cards: list[Any] = []
+
+    async def fake_edit(_message: Any, _text: str, markup: Any) -> None:
+        cards.append(markup)
+
+    async def fake_tell(_message: Any, _text: str, **kwargs: Any) -> Any:
+        cards.append(kwargs.get("reply_markup"))
+        return SimpleNamespace(message_id=3)
+
+    monkeypatch.setattr(new_workspace, "_edit", fake_edit)
+    monkeypatch.setattr(new_workspace, "tell", fake_tell)
+    await new_workspace.start_wizard(
+        _wizard_message(),  # type: ignore[arg-type]
+        route=Route(chat_id=-1001, kind="topic"),
+        settings=settings,
+        state=_seat(db),
+        db=db,
+        client=_CountingClient(),  # type: ignore[arg-type]
+        nonces=NonceStore(),
+    )
+
+    for _step in range(5):
+        first = cards[-1].inline_keyboard[0][0]
+        tap = _Tap(str(first.callback_data))
+        await new_workspace.wizard_callback(
+            tap,  # type: ignore[arg-type]
+            _seat(db),  # the DB is all that carried over
+            NonceStore(),  # the registry did not
+            settings,
+        )
+        assert tap.answers == [""], f"step {_step} refused a live button"
+
+    data = await _seat(db).get_data()
+    assert data["step"] == "prompt"
+    assert (data["project_id"], data["branch"], data["agent"]) == (
+        "project-1",
+        "main",
+        "claude",
+    )
+
+
+async def test_a_wizard_payload_cannot_be_repointed_at_a_destructive_action(
+    db: Database, settings: Settings, monkeypatch: Any
+) -> None:
+    """Making ``wiz`` restart-proof must not make ``archive`` restart-proof."""
+    data = await _mint_branch_card(db, NonceStore(), settings, monkeypatch)
+    nonce = data.split(":")[-1]
+
+    assert Action.ARCHIVE.value not in RESTARTABLE_ACTIONS
+    assert Action.CLEAR_QUEUE.value not in RESTARTABLE_ACTIONS
+    with pytest.raises(NonceError) as caught:
+        read_stateless(nonce, Action.ARCHIVE.value)
+    assert caught.value.reason == "mismatch"
+
+
+async def test_defaults_can_set_and_show_the_branch(
+    db: Database, settings: Settings, monkeypatch: Any
+) -> None:
+    """The branch is remembered from a create; it must be settable without one."""
+    from ctb.bot.handlers import power as power_handlers
+
+    sent: list[str] = []
+
+    async def fake_tell(_message: Any, text: str, **_kwargs: Any) -> None:
+        sent.append(text)
+
+    monkeypatch.setattr(power_handlers, "tell", fake_tell)
+    route = Route(chat_id=-1001, kind="topic", thread_id=99)
+
+    async def run(text: str) -> None:
+        await power_handlers.defaults(
+            SimpleNamespace(  # type: ignore[arg-type]
+                text=text,
+                chat=SimpleNamespace(id=-1001, type="supergroup"),
+                message_thread_id=99,
+                message_id=7,
+                from_user=SimpleNamespace(id=1001),
+            ),
+            route,
+            settings,
+            _NullState(),  # type: ignore[arg-type]
+            db=db,
+        )
+
+    await run("/defaults branch dev")
+    await run("/defaults")
+
+    chat = await chats_repo.get(db, -1001, 99)
+    assert chat is not None and chat.default_branch == "dev"
+    assert sent[0] == "Default branch: <b>dev</b>."
+    assert sent[1].startswith("Defaults: <b>claude</b> · opus-5-1m/high · <b>dev</b>")
 
 
 async def _run_setup(bot: Any, db: Database, monkeypatch: Any) -> list[str]:

@@ -109,6 +109,10 @@ class Settings(BaseSettings):
     default_agent: str = "claude"
     default_model: str = "opus-5-1m"
     default_effort: str = "high"
+    #: Cold start only. A chat that has created a workspace remembers the branch
+    #: it used (``chats.default_branch``) and that wins; this is what the very
+    #: first ``/new`` offers, and the button the wizard puts first.
+    default_branch: str = "main"
 
     # -- logging ---------------------------------------------------------------
     #: Transcript content is the user's source code. Keep this false outside of
@@ -197,6 +201,12 @@ class Settings(BaseSettings):
         if not out:
             raise ValueError("VOICE_WAKE_PHRASES must contain at least one phrase")
         return out
+
+    @field_validator("default_branch", mode="after")
+    @classmethod
+    def _branch_or_main(cls, value: str) -> str:
+        # ``DEFAULT_BRANCH=`` in a copied .env must not offer a nameless button.
+        return value.strip() or "main"
 
     @field_validator("log_level", mode="after")
     @classmethod
