@@ -17,7 +17,10 @@ ENV DB_PATH=/data/ctb.db
 RUN useradd --create-home --uid 10001 ctb \
     && mkdir -p /data \
     && chown -R ctb:ctb /app /data
-VOLUME ["/data"]
+# Deliberately NO `VOLUME ["/data"]`. Railway attaches volumes at runtime from
+# the dashboard, so the instruction buys nothing here, and Railway's builder
+# rejects it — the image build fails in seconds with only "Failed to build an
+# image". Plain directory + a runtime writability check (below) instead.
 USER ctb
 
 # Preflight, then hand the PID to Python. The `chown` above only covers the

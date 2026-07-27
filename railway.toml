@@ -11,7 +11,10 @@ dockerfilePath = "Dockerfile"
 # Exactly one instance, always. Two would fight over Telegram's getUpdates
 # (409 Conflict) and the SQLite volume can only attach to one anyway. The
 # singleton lease in the DB is the belt to this braces.
-numReplicas = 1
+#
+# Replica count is NOT settable from this file: `numReplicas` is only valid
+# nested under `multiRegionConfig.<region>`, never at the top of [deploy].
+# One replica is the service default — confirm the UI reads "1 Replica".
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
 healthcheckPath = "/health"
