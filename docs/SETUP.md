@@ -177,6 +177,22 @@ API key.
 
 ## 6 · Service variables — you
 
+> **Railway injects `DATABASE_URL` and `PGHOST`/`PGUSER`/`PGPASSWORD`/… when
+> you link a database. Do not rely on any of them.**
+>
+> The injected `DATABASE_URL` is the **`postgres` superuser**, and row-level
+> security does not apply to a superuser — not with `ENABLE`, not with `FORCE`.
+> Every query would keep working while every workspace read every other
+> workspace's transcripts and sealed keys. The isolation in this codebase is a
+> property of *which role connects*, so connecting as the wrong one removes it
+> entirely and nothing else changes.
+>
+> The bot refuses to start in that configuration (`_assert_app_role_is_confined`),
+> which is the intended outcome but looks like a bug until you know why.
+>
+> The `PG*` variables are ignored — nothing in the code reads them. Leave them;
+> they are harmless. **Overwrite `DATABASE_URL`** with the `ctb_app` URL.
+
 Railway → the bot service → **Variables** → *Raw Editor*, and paste:
 
 ```env

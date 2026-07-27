@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import signal
+import sys
 import uuid
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager, suppress
@@ -721,9 +722,41 @@ def _null_context() -> Iterator[None]:
 
 
 def main() -> None:
-    """Console/module entry point."""
+    """Console/module entry point.
+
+    A misconfiguration is not a crash, so it does not print like one. Raising
+    ``SettingsError`` through ``asyncio.run`` buried the one line that matters
+    under forty lines of pydantic and asyncio frames — and on a hosting
+    platform, where the deploy log is a scrolling box next to a red
+    "healthcheck failed", that reads as *no error at all*. Every report of this
+    has been "it does not work and there are no logs".
+
+    So: print the reason, unmissably, and exit 1. A real crash still gets its
+    traceback, which is what tracebacks are for.
+    """
     with suppress(KeyboardInterrupt):
-        asyncio.run(run())
+        try:
+            asyncio.run(run())
+        except SettingsError as exc:
+            _report_bad_configuration(exc)
+            raise SystemExit(1) from None
+
+
+def _report_bad_configuration(exc: SettingsError) -> None:
+    """One block, on stderr, saying what to fix and where it comes from."""
+    rule = "-" * 68
+    print(
+        f"\n{rule}\n"
+        f"  conductor-tg-bot cannot start: configuration\n"
+        f"{rule}\n\n"
+        f"{exc}\n\n"
+        f"{rule}\n"
+        f"  Nothing is wrong with the code or the image. Set the variables\n"
+        f"  named above and redeploy. docs/SETUP.md says where each one\n"
+        f"  comes from.\n"
+        f"{rule}\n",
+        file=sys.stderr,
+    )
 
 
 if __name__ == "__main__":

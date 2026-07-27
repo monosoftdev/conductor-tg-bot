@@ -19,6 +19,8 @@ __all__ = [
 log = get_logger(__name__)
 
 ELEVENLABS_STT_URL = "https://api.elevenlabs.io/v1/speech-to-text"
+#: Cheapest authenticated call there is. Used only to check a key at intake.
+ELEVENLABS_USER_URL = "https://api.elevenlabs.io/v1/user"
 
 # ``enable_logging=false`` is a *query* parameter, not a form field, and selects
 # ElevenLabs' zero-retention mode: neither the audio nor the transcript is kept.
@@ -222,3 +224,25 @@ def _valid_keyterms(values: list[str]) -> list[str]:
         if len(out) == 100:
             break
     return out
+
+
+async def check_elevenlabs_key(api_key: str, *, timeout: float = 10.0) -> str | None:
+    """``None`` when the key works; a short reason when it does not.
+
+    ``/key`` has validated since the beginning and ``/voicekey`` did not, so a
+    mistyped speech key was accepted with "Speech key stored" and surfaced much
+    later as a failed voice note — which reads as "voice is broken", not "the
+    key is wrong". Same check, same moment, same wording as the Conductor one.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.get(
+                ELEVENLABS_USER_URL, headers={"xi-api-key": api_key}
+            )
+    except Exception as exc:  # network, DNS, timeout
+        return f"could not reach ElevenLabs ({type(exc).__name__})"
+    if response.status_code == 200:
+        return None
+    if response.status_code in (401, 403):
+        return _reason(response)
+    return f"HTTP {response.status_code}"

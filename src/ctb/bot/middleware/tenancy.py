@@ -521,7 +521,7 @@ class TenantMiddleware(BaseMiddleware):
             await bot.send_message(
                 chat_id=chat.id,
                 text=(
-                    "This workspace is suspended, so I am not acting on "
+                    "This team is suspended, so I am not acting on "
                     "messages here. Contact whoever runs this instance."
                 ),
                 message_thread_id=None,

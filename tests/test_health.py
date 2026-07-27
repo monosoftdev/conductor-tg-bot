@@ -1061,3 +1061,38 @@ def test_health_answers_what_where_when_and_what_next() -> None:
     # Silence when there is nothing to report.
     assert _delivery_line({"count": 0}, now_ms_=now) == ""
     assert _ago(0, now_ms_=now) == "unknown"
+
+
+class TestHealthTokenComparison:
+    """The token arrives off the wire, so every byte sequence must be a no."""
+
+    TOKEN = "ae4da669cb67edde9845797ffdd71638"
+
+    def test_the_right_token_opens_the_detailed_body(self) -> None:
+        assert detail_allowed(
+            remote="1.2.3.4", expected_token=self.TOKEN, provided_token=self.TOKEN
+        )
+
+    @pytest.mark.parametrize(
+        "provided",
+        ["", "wrong", "é", "🔑", "ae4da669cb67edde9845797ffdd7163", "\udcff"],
+        ids=["empty", "wrong", "accent", "emoji", "prefix", "lone-surrogate"],
+    )
+    def test_anything_else_is_refused_without_raising(self, provided: str) -> None:
+        """`compare_digest` raises TypeError on non-ASCII `str`.
+
+        That made `GET /health?token=é` a 500 from any unauthenticated caller —
+        the gate is evaluated before the handler's try/except, so it took the
+        whole response with it rather than falling back to the summary.
+        """
+        assert not detail_allowed(
+            remote="1.2.3.4", expected_token=self.TOKEN, provided_token=provided
+        )
+
+    def test_no_token_configured_falls_back_to_loopback(self) -> None:
+        assert detail_allowed(
+            remote="127.0.0.1", expected_token=None, provided_token=None
+        )
+        assert not detail_allowed(
+            remote="8.8.8.8", expected_token=None, provided_token=None
+        )

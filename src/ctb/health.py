@@ -845,10 +845,19 @@ def detail_allowed(
     Without ``HEALTH_TOKEN`` the body is loopback-only: a Railway service with a
     generated domain is reachable by anyone, and its edge arrives on a private
     address, so private peers cannot be trusted with session ids and API logs.
+
+    Compared as **bytes**. ``compare_digest`` raises ``TypeError`` on two
+    ``str`` when either holds a non-ASCII character, and this one comes
+    straight off the wire — so ``GET /health?token=e`` with any accented letter,
+    from anybody, turned a public endpoint into a 500. Encoding first keeps the
+    comparison constant-time and makes every possible input a plain no.
     """
     if expected_token:
-        return provided_token is not None and compare_digest(
-            provided_token, expected_token
+        if provided_token is None:
+            return False
+        return compare_digest(
+            provided_token.encode("utf-8", "surrogatepass"),
+            expected_token.encode("utf-8", "surrogatepass"),
         )
     return is_loopback_remote(remote)
 

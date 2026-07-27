@@ -72,7 +72,7 @@ class BotActionSink:
     ) -> None:
         for chat_id in targets:
             await self._outbox.enqueue_notice(
-                "Conductor rejected this workspace's API key. Send "
+                "Conductor rejected this team's API key. Send "
                 "<code>/key</code> in a private message to set a new one; "
                 "polling is paused until you do.",
                 session_id=session_id,

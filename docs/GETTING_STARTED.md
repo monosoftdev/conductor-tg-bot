@@ -15,6 +15,11 @@ run. This bot adds nothing.
 
 ---
 
+> **A note on words.** Conductor calls a checkout-plus-agent a *workspace*, and
+> `/new` creates those all day. The thing you create below is a **team**: it
+> owns one Conductor API key, the people allowed to use it, and one Telegram
+> group. One team, many workspaces.
+
 ## Step 1 — Say hello to the bot
 
 Open Telegram, search for the bot's handle (whoever runs the instance will have
@@ -30,15 +35,43 @@ Replace `acme` with a short name for your workspace. Letters, numbers and
 hyphens; anything else is turned into a hyphen. It appears in `/members` and in
 logs, so keep it boring.
 
-The bot replies with a **setup code** and three instructions. The code is good
-for **15 minutes** and works **once**.
-
-> **Lost the code, or ran out of time?** Send `/register` again. It gives you a
-> fresh code and quietly retires the old one. You cannot lock yourself out.
+The bot asks for your Conductor key next — everything private happens here,
+before you touch a group.
 
 ---
 
-## Step 2 — Make a group for your work
+## Step 2 — Give it your keys
+
+Still in the private chat:
+
+```
+/key cnd_live_xxxxxxxxxxxxxxxxxxxx
+```
+
+From Conductor → Settings → API keys. The bot checks the key works, encrypts
+it, and **deletes your message**.
+
+Optionally, to talk to it:
+
+```
+/voicekey sk_xxxxxxxxxxxx
+```
+
+That one turns voice on by itself — there is no second switch. `/voice off`
+pauses it later without throwing the key away.
+
+> **Never send a key to a group.** If you do, the bot deletes it and tells you
+> to rotate it — but other members may have already seen it. It catches a key
+> typed on the wrong command too, so `/voice sk_...` is handled the same way.
+
+Now the bot hands you a **setup code**, good for **15 minutes**, once.
+
+> **Ran out of time?** Send `/register` again for a fresh one. You cannot lock
+> yourself out.
+
+---
+
+## Step 3 — Make a group for your work
 
 Everything happens in one Telegram group, and each of your Conductor workspaces
 gets its own **topic** inside it. That is what lets you have five things running
@@ -68,7 +101,7 @@ Give it these four permissions and no others:
 
 ---
 
-## Step 3 — Link the group
+## Step 4 — Link the group
 
 In the group you just made, send the code from step 1:
 
@@ -92,29 +125,6 @@ You should see **Ready**.
 | *No topic permission (forum topics are off)* | Turn on **Topics** in the group's Edit screen |
 | *…already bound to another tenant* | This group belongs to a different workspace. Use a new group. |
 | Nothing at all | The bot is not an admin, or was never added |
-
----
-
-## Step 4 — Give it your Conductor key
-
-Get a key from Conductor (**Settings → API keys**), then send it to the bot in a
-**private chat** — not the group:
-
-```
-/key cnd_live_xxxxxxxxxxxxxxxxxxxx
-```
-
-The bot checks the key works, encrypts it, stores it, and **deletes your
-message**. It replies confirming all three.
-
-> **Never send a key to the group.** If you do, the bot deletes it and tells you
-> to rotate it — but Telegram keeps history forever and other members may have
-> already seen it. Rotate it at Conductor if this happens.
->
-> If the bot says it could **not** delete your message, delete it yourself and
-> rotate the key. It will always tell you which happened.
-
-Your workspace is now **active**.
 
 ---
 

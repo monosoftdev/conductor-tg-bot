@@ -1,4 +1,16 @@
-"""Self-serve sign-up: become a workspace, bind a group, store a key.
+"""Self-serve sign-up: create a team, store its keys, bind its group.
+
+**"Team", not "workspace".** Conductor already calls a checkout-plus-agent a
+*workspace*, and ``/new`` creates those by the dozen. Using the same word for
+the thing that owns the API key and the people produced sentences like "this
+workspace is at its limit of 50 workspaces". The container is a **team**; a
+*workspace* is always the Conductor one.
+
+The order is private-first on purpose. Both keys are secrets and a group is the
+one place they must never be typed, so everything private happens in the
+private chat and the owner switches to the group exactly once — which is also
+when the binding code's 15-minute clock starts, rather than while they are
+still hunting for an API key.
 
 These are the only commands a non-member can reach, and only in a private
 chat — :class:`~ctb.bot.middleware.tenancy.TenantMiddleware` lets exactly this
@@ -7,12 +19,12 @@ silence.
 
 The flow is deliberately three explicit steps rather than one wizard:
 
-1. ``/register <name>`` creates a *pending* workspace with you as its owner.
-2. ``/setup <code>`` in your supergroup binds that chat. The code is issued in
+1. ``/register <name>`` creates a *pending* team with you as its owner.
+2. ``/key`` stores its Conductor API key; ``/voicekey`` its speech key.
+3. ``/setup <code>`` in your supergroup binds that chat. The code is issued in
    the private chat and hashed at rest, because a shared bot can be added to
    any group by anyone — being added is not consent, and without the code
-   somebody could bind the bot to a workspace that is not theirs.
-3. ``/key`` stores your Conductor API key and activates the workspace.
+   somebody could bind the bot to a team that is not theirs.
 
 **The key never stays in Telegram.** Sent in a group it is refused *and*
 deleted, with a rotate-it warning. Sent in a private chat it is validated,
@@ -61,6 +73,7 @@ from ctb.logging import get_logger
 from ctb.runtime import client_pool, provider_pool, secret_box, system_database
 from ctb.settings import Settings
 from ctb.voice.pool import ELEVENLABS_KEY_PURPOSE
+from ctb.voice.provider import check_elevenlabs_key
 
 router = Router(name=__name__)
 register_router(router, order=5)
@@ -92,12 +105,41 @@ _CLOSED: Final = (
     "Sign-up is closed on this instance. Ask whoever runs it for an invitation."
 )
 
-_NEXT_STEPS: Final = (
-    "1 · Create a <b>private supergroup</b> and turn on <b>Topics</b>.\n"
-    "2 · Add this bot as an administrator: manage topics, pin, delete, send.\n"
-    "3 · In that group send <code>/setup {code}</code>\n\n"
-    "The code expires in 15 minutes and works once."
+#: Asked for *in this chat*, before the group exists. Both keys are private by
+#: nature and a group is the one place they must never be typed, so finishing
+#: the private half first means the owner switches to the group exactly once —
+#: and the code's 15-minute clock starts when they are ready to use it, not
+#: while they are still hunting for an API key.
+_ASK_FOR_KEY: Final = (
+    "<b>{slug}</b> is your team. Two things, both here in this chat:\n\n"
+    "1 · <code>/key &lt;your Conductor API key&gt;</code>\n"
+    "   From conductor.build → Settings → API keys. I check it, encrypt it, "
+    "and delete your message.\n"
+    "2 · <i>optional</i> <code>/voicekey &lt;your ElevenLabs key&gt;</code> "
+    "if you want to talk to it.\n\n"
+    "Then I will set you up with a group."
 )
+
+_NEXT_STEPS: Final = (
+    "Now the group — this is the only part that happens outside this chat.\n\n"
+    "1 · Create a <b>private supergroup</b> and turn on <b>Topics</b>.\n"
+    "2 · Add <b>this bot</b> as an administrator: manage topics, pin, delete, "
+    "send.\n"
+    "3 · In that group send <code>/setup {code}</code>\n\n"
+    "The code expires in 15 minutes and works once. Send "
+    "<code>/register</code> here for a fresh one."
+)
+
+
+#: Anything this long, unbroken and key-shaped is a credential, whatever
+#: command it arrived on. Deliberately loose: the cost of a false positive is
+#: deleting one odd-looking message, and the cost of a false negative is a live
+#: API key sitting in Telegram history forever.
+_SECRET_RE: Final = re.compile(r"^[A-Za-z0-9_\-]{24,}$")
+
+
+def looks_like_secret(text: str) -> bool:
+    return bool(_SECRET_RE.match(text.strip()))
 
 
 def slugify(name: str) -> str:
@@ -159,7 +201,7 @@ async def register(
     state: FSMContext,
     tenant: TenantContext | None = None,
 ) -> None:
-    """Create a workspace and return the code that binds a group to it.
+    """Create a team and return the code that binds a group to it.
 
     Re-running it is how you get another code. The first version refused
     outright once you had a workspace, which dead-ended anybody who took longer
@@ -223,59 +265,52 @@ async def register(
         await tell(message, f"Could not register: {escape(short_error(exc))}")
         return
 
-    code = await issue_code(
-        system,
-        tenant_id=created.id,
-        user_id=message.from_user.id,
-        purpose="bind_chat",
-    )
     log.info("registration.created", tenant=created.slug)
-    await tell(
-        message,
-        f"Workspace <b>{escape(created.slug)}</b> created.\n\n"
-        + _NEXT_STEPS.format(code=escape(code)),
-    )
+    await tell(message, _ASK_FOR_KEY.format(slug=escape(created.slug)))
 
 
 async def _resume_registration(message: Message, tenant: TenantContext) -> None:
     """Pick up where an interrupted sign-up left off, with a fresh code.
 
-    The three states worth distinguishing: no group yet (issue another code),
-    a group but no key, and finished. Each ends with the one thing to do next,
-    because "you already have a workspace" is not an instruction.
+    Three states, answered in the order the setup happens: no key yet, a key but
+    no group, and finished. Each ends with the one thing to do next, because
+    "you already have a team" is not an instruction.
     """
     if message.from_user is None:  # pragma: no cover - private chats have one
         return
     system = system_database()
+    if not tenant.row.has_conductor_key:
+        await tell(message, _ASK_FOR_KEY.format(slug=escape(tenant.slug)))
+        return
     bound = await tenancy.primary_chat(system, tenant.tenant_id)
     if bound is None:
-        code = await issue_code(
-            system,
-            tenant_id=tenant.tenant_id,
-            user_id=message.from_user.id,
-            purpose="bind_chat",
-        )
-        log.info("registration.code_reissued", tenant=tenant.slug)
-        await tell(
-            message,
-            f"<b>{escape(tenant.slug)}</b> has no group yet. Here is a new "
-            "code — the previous one no longer works.\n\n"
-            + _NEXT_STEPS.format(code=escape(code)),
-        )
-        return
-    if not tenant.row.has_conductor_key:
-        await tell(
-            message,
-            f"<b>{escape(tenant.slug)}</b> is bound to your group and needs a "
-            "key. Send <code>/key &lt;your Conductor API key&gt;</code> here.",
-        )
+        await tell(message, await _group_instructions(message, tenant))
         return
     await tell(
         message,
-        f"<b>{escape(tenant.slug)}</b> is set up and active. "
-        "Run <code>/new &lt;prompt&gt;</code> in your group, or "
+        f"<b>{escape(tenant.slug)}</b> is set up and running. "
+        "Send <code>/new &lt;prompt&gt;</code> in your group, or "
         "<code>/members</code> to see who is in.",
     )
+
+
+async def _group_instructions(message: Message, tenant: TenantContext) -> str:
+    """A fresh binding code and what to do with it.
+
+    Minted here rather than at ``/register`` so the 15-minute clock starts when
+    the owner is actually ready to create a group — not while they are still
+    looking for an API key.
+    """
+    if message.from_user is None:  # pragma: no cover - private chats have one
+        return ""
+    code = await issue_code(
+        system_database(),
+        tenant_id=tenant.tenant_id,
+        user_id=message.from_user.id,
+        purpose="bind_chat",
+    )
+    log.info("registration.code_issued", tenant=tenant.slug)
+    return _NEXT_STEPS.format(code=escape(code))
 
 
 @router.message(Command("setup"))
@@ -429,6 +464,7 @@ async def _setup_dm(
 async def set_key(
     message: Message,
     tenant: TenantContext,
+    settings: Settings,
     state: FSMContext,
 ) -> None:
     """Store a sealed API key, and get it out of Telegram immediately."""
@@ -460,7 +496,7 @@ async def set_key(
     if not tenant.is_owner:
         await tell(
             message,
-            "Only this workspace's owners can store its key." + note,
+            "Only this team's owners can store its key." + note,
             silent=not note,
         )
         return
@@ -482,9 +518,18 @@ async def set_key(
         await tell(message, "That is already the stored key. Nothing changed." + note)
         return
 
-    if not speech:
-        # Validate before storing: a typo should be an answer now, not a
-        # mysterious auth failure an hour later.
+    # Validate before storing, either way: a typo should be an answer now, not a
+    # mysterious auth failure an hour later. `/voicekey` used to skip this, so a
+    # mistyped speech key was accepted with "Speech key stored" and only failed
+    # at the first voice note — which reads as "voice is broken".
+    if speech:
+        checked = await check_elevenlabs_key(value)
+        if checked is not None:
+            await tell(
+                message, f"ElevenLabs rejected that key · {escape(checked)}" + note
+            )
+            return
+    else:
         checked = await _check_conductor_key(value, tenant.row.conductor_api_url)
         if checked is not None:
             await tell(
@@ -498,6 +543,11 @@ async def set_key(
         purpose=ELEVENLABS_KEY_PURPOSE if speech else CONDUCTOR_KEY_PURPOSE,
     )
     if speech:
+        # Storing a key *is* the request to use it. Two switches in series made
+        # a dead end: "/voice on" said store a key, and storing a key said turn
+        # voice on. The platform kill switch still wins, and `/voice off` still
+        # pauses it without throwing the key away.
+        enable = settings.voice_enabled
         await tenancy.set_elevenlabs_key(
             system,
             tenant.tenant_id,
@@ -505,7 +555,21 @@ async def set_key(
             kid=box.active_kid,
             fingerprint=fingerprint,
         )
-        await tell(message, "Speech key stored. Turn voice on with /voice." + note)
+        if enable:
+            await tenancy.update_defaults(system, tenant.tenant_id, voice_enabled=True)
+        forget_cached(tenant.tenant_id)
+        await tell(
+            message,
+            (
+                "🎙 Speech key stored, checked, and <b>voice is on</b>.\n"
+                "Send a voice note in a topic and it becomes a prompt. "
+                "<code>/voice off</code> pauses it."
+                if enable
+                else "Speech key stored and checked. Voice is switched off for "
+                "this whole instance, so nothing will use it yet."
+            )
+            + note,
+        )
         return
 
     await tenancy.set_conductor_key(
@@ -520,11 +584,62 @@ async def set_key(
         await tenancy.set_status(system, tenant.tenant_id, "active")
     log.info("registration.key_stored", tenant=tenant.slug)
     forget_cached(tenant.tenant_id)
+    stored = "Key stored and your message deleted." if not note else "Key stored."
+
+    # Hand straight on to the next step rather than ending the conversation.
+    # The owner is here, in the private chat, with nothing else to do — making
+    # them run /register again to find out what happens next is the round trip
+    # this ordering exists to remove.
+    bound = await tenancy.primary_chat(system, tenant.tenant_id)
+    if bound is None:
+        tail = "\n\n" + await _group_instructions(message, tenant)
+    else:
+        tail = (
+            " Your team is active — send <code>/new &lt;prompt&gt;</code> "
+            "in your group."
+        )
+    await tell(message, stored + tail + note)
+
+
+async def _store_speech_key(
+    message: Message,
+    tenant: TenantContext,
+    settings: Settings,
+    value: str,
+) -> None:
+    """A speech key that arrived on ``/voice`` instead of ``/voicekey``.
+
+    Deleting it is the urgent half — it is a live credential in a chat log —
+    so that happens before anything that can refuse.
+    """
+    deleted = await _delete(message)
+    note = _delete_note(deleted)
+    if not tenant.is_owner:
+        await tell(message, "Only this team's owners can store its key." + note)
+        return
+    checked = await check_elevenlabs_key(value)
+    if checked is not None:
+        await tell(message, f"ElevenLabs rejected that key · {escape(checked)}" + note)
+        return
+    box = secret_box()
+    system = system_database()
+    await tenancy.set_elevenlabs_key(
+        system,
+        tenant.tenant_id,
+        ciphertext=box.seal(
+            value, tenant_id=tenant.tenant_id, purpose=ELEVENLABS_KEY_PURPOSE
+        ),
+        kid=box.active_kid,
+        fingerprint=box.fingerprint_of(value, tenant_id=tenant.tenant_id),
+    )
+    if settings.voice_enabled:
+        await tenancy.update_defaults(system, tenant.tenant_id, voice_enabled=True)
+    forget_cached(tenant.tenant_id)
+    log.info("registration.speech_key_stored", tenant=tenant.slug, via="/voice")
     await tell(
         message,
-        ("Key stored and your message deleted. " if not note else "Key stored. ")
-        + "Your workspace is active — run <code>/new &lt;prompt&gt;</code> "
-        "in your group." + note,
+        "🎙 That was a key, so I deleted your message and stored it. "
+        "<b>Voice is on</b> — send a voice note in a topic." + note,
     )
 
 
@@ -548,13 +663,24 @@ async def voice(
         await tell(message, "Owners only.")
         return
 
-    want = command_text(message).strip().casefold()
+    argument = command_text(message).strip()
+    want = argument.casefold()
+
+    # `/voice sk_...` — the key typed on the neighbouring command. This used to
+    # fall through to the status line, which left a live credential in the chat
+    # and told the reader nothing was wrong. Treat it as what it obviously is.
+    if want not in {"on", "off", ""} and looks_like_secret(argument):
+        await _store_speech_key(message, tenant, settings, argument)
+        return
+
     if want not in {"on", "off"}:
         state_now = "on" if tenant.settings.voice_enabled else "off"
+        stored = "a key is stored" if tenant.row.elevenlabs_key_fp else "no key yet"
         await tell(
             message,
-            f"Voice is <b>{state_now}</b> for this workspace.\n"
-            "<code>/voice on</code> · <code>/voice off</code>",
+            f"Voice is <b>{state_now}</b> · {stored}\n"
+            "<code>/voice off</code> to pause it · "
+            "<code>/voicekey &lt;key&gt;</code> to replace the key",
         )
         return
 
@@ -564,9 +690,9 @@ async def voice(
     if want == "on" and not tenant.row.elevenlabs_key_fp:
         await tell(
             message,
-            "Store a speech key first: send <code>/voicekey &lt;key&gt;</code> "
-            "to me privately. There is no shared key — voice is billed to your "
-            "own account, and only yours.",
+            "Send me your speech key and voice turns itself on: "
+            "<code>/voicekey &lt;key&gt;</code>, here in this chat. "
+            "There is no shared key — voice is billed to your own account.",
         )
         return
 
@@ -713,7 +839,7 @@ async def use(
 
     target = await tenancy.get_by_slug(system, slug)
     if target is None or all(seat.tenant_id != target.id for seat in seats):
-        await tell(message, "You are not in a workspace by that name.")
+        await tell(message, "You are not in a team by that name.")
         return
     if target.id == tenant.tenant_id:
         await tell(message, f"Already using <b>{escape(target.slug)}</b>.")

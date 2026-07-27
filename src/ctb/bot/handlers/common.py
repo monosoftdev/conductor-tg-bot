@@ -231,7 +231,7 @@ async def quota_error(db: Database, defaults: TenantSettings) -> str | None:
     if live < defaults.max_workspaces:
         return None
     return (
-        f"This workspace is at its limit of {defaults.max_workspaces} "
+        f"Your team is at its limit of {defaults.max_workspaces} "
         "Conductor workspaces. Finish one with /done first."
     )
 
