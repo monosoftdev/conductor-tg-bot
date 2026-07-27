@@ -658,6 +658,8 @@ BEGIN
         -- Read-only on the tables that decide scope; TenantMiddleware uses the
         -- worker pool for them, but a stray read must not be a write.
         EXECUTE 'GRANT SELECT ON tenants, tenant_members, tenant_chats TO ctb_app';
+        -- /health reports the applied version on every request.
+        EXECUTE 'GRANT SELECT ON schema_version TO ctb_app';
     END IF;
 
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ctb_worker') THEN

@@ -311,7 +311,7 @@ def load_settings(**overrides: Any) -> Settings:
             if err["type"] == "missing" or (msg == _UNSET and key in _REQUIRED_HINT):
                 lines.append(f"  missing: {_REQUIRED_HINT.get(key, key.upper())}")
             elif loc:
-                lines.append(f"  {key.upper()}: {msg}")
+                lines.append(f"  {_FIELD_TO_ENV.get(key, key.upper())}: {msg}")
             else:
                 lines.append(f"  {msg}")
         raise SettingsError(
@@ -320,8 +320,10 @@ def load_settings(**overrides: Any) -> Settings:
         ) from exc
 
 
-#: pydantic reports the alias, not the field name, when an aliased field fails.
+#: Field name <-> environment variable, for aliased fields. pydantic reports
+#: whichever name the caller used; the operator only knows the env var.
 _ALIAS_TO_FIELD = {"ctb_master_keys": "master_keys"}
+_FIELD_TO_ENV = {"master_keys": "CTB_MASTER_KEYS"}
 
 
 _settings: Settings | None = None
