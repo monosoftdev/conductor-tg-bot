@@ -144,6 +144,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The default builder is the plain `docker` driver, which cannot export
+      # to a cache backend — `cache-to: type=gha` fails it before it builds
+      # anything. buildx gives the `docker-container` driver, which supports
+      # both that and `load: true`.
+      - uses: docker/setup-buildx-action@v3
+
       # The `boot` job installs from a full checkout, so it proves the runtime
       # works and says nothing about the image. The Dockerfile copies a
       # *subset* of the tree, and a file it forgot to copy fails only here —
