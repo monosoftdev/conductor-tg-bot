@@ -236,6 +236,12 @@ class ClientPool:
 
     # -- introspection --------------------------------------------------------
 
+    def clients(self) -> tuple[tuple[str, ConductorClient], ...]:
+        """Live clients as ``(tenant id, client)``, for health aggregation."""
+        return tuple(
+            (str(key.tenant_id), entry.client) for key, entry in self._entries.items()
+        )
+
     def health(self) -> dict[str, object]:
         return {
             "clients": len(self._entries),

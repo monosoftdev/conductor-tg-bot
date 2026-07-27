@@ -62,6 +62,7 @@ from ctb.bot.keyboards import (
     url_button,
 )
 from ctb.bot.middleware.routing import Route
+from ctb.bot.middleware.tenancy import TenantContext, TenantSettings
 from ctb.conductor.client import ConductorClient
 from ctb.conductor.models import default_model_for, efforts_for, models_for
 from ctb.db import NO_THREAD_ID
@@ -69,7 +70,6 @@ from ctb.db.connection import Database
 from ctb.db.repo import chats as chats_repo
 from ctb.db.repo import wizard as wizard_repo
 from ctb.delivery.render.html import escape
-from ctb.settings import Settings
 
 router = Router(name=__name__)
 register_router(router, order=5)
@@ -241,7 +241,7 @@ async def start_wizard(
     message: Message,
     *,
     route: Route,
-    settings: Settings,
+    tenant: TenantContext,
     state: FSMContext,
     db: Database | None = None,
     client: ConductorClient | None = None,
@@ -251,8 +251,9 @@ async def start_wizard(
 
     store = nonces or get_nonce_store()
     database = resolve_db(db)
+    defaults = tenant.settings
     try:
-        projects = await all_projects(resolve_client(client))
+        projects = await all_projects(resolve_client(client, tenant))
     except Exception as exc:
         await tell(
             message, f"Projects failed: {escape(short_error(exc))}", silent=False
@@ -317,7 +318,7 @@ async def _ask_branch(
     message: Message,
     state: FSMContext,
     nonces: NonceStore,
-    settings: Settings,
+    defaults: TenantSettings,
 ) -> None:
     """Offer the configured default first, then the last-used branch.
 
@@ -420,7 +421,7 @@ async def wizard_callback(
     query: CallbackQuery,
     state: FSMContext,
     nonces: NonceStore,
-    settings: Settings,
+    tenant: TenantContext,
 ) -> None:
     try:
         ticket = resolve(query, expect=Action.WIZARD, store=nonces)
@@ -459,7 +460,7 @@ async def wizard_callback(
     await state.update_data({"project_id" if step == "project" else step: selected})
     await query.answer()
     if step == "project":
-        await _ask_branch(query.message, state, nonces, settings)
+        await _ask_branch(query.message, state, nonces, tenant.settings)
     elif step == "branch":
         await _ask_agent(query.message, state, nonces)
     elif step == "agent":
@@ -497,7 +498,7 @@ async def typed_prompt(
     message: Message,
     state: FSMContext,
     route: Route,
-    settings: Settings,
+    tenant: TenantContext,
     db: Database | None = None,
     client: ConductorClient | None = None,
 ) -> None:
@@ -516,6 +517,7 @@ async def typed_prompt(
             message, "Wizard expired. Run <code>/new</code> again.", silent=False
         )
         return
+    defaults = tenant.settings
     request = CreateRequest(
         project_id=project_id,
         project_name=str(projects.get(project_id) or project_id[:8]),

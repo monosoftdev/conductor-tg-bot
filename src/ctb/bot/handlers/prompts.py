@@ -33,6 +33,7 @@ from ctb.bot.keyboards import (
     resolve,
 )
 from ctb.bot.middleware.routing import Route
+from ctb.bot.middleware.tenancy import TenantContext
 from ctb.conductor.client import ConductorClient
 from ctb.db.connection import Database
 from ctb.db.repo import chats as chats_repo
@@ -107,6 +108,7 @@ async def unsupported_attachment(message: Message) -> None:
 async def plain_text(
     message: Message,
     route: Route,
+    tenant: TenantContext,
     nonces: NonceStore,
     db: Database | None = None,
     client: ConductorClient | None = None,
@@ -150,7 +152,7 @@ async def plain_text(
                     ]
                 ]
             )
-        await run_find(message, text, client=client, reply_markup=markup)
+        await run_find(message, text, client=tenant.client, reply_markup=markup)
         return
 
     if not route.session_id:
@@ -162,7 +164,7 @@ async def plain_text(
     try:
         _, state = await submit_prompt(
             db=database,
-            client=resolve_client(client),
+            client=resolve_client(client, tenant),
             session_id=route.session_id,
             text=text,
             chat_id=message.chat.id,
@@ -231,6 +233,7 @@ async def stop_callback(
 async def retry_callback(
     query: CallbackQuery,
     nonces: NonceStore,
+    tenant: TenantContext,
     db: Database | None = None,
     client: ConductorClient | None = None,
 ) -> None:
@@ -248,7 +251,7 @@ async def retry_callback(
     try:
         await submit_prompt(
             db=database,
-            client=resolve_client(client),
+            client=resolve_client(client, tenant),
             session_id=ticket.target,
             text=source.body,
             chat_id=ticket.chat_id
@@ -296,6 +299,7 @@ async def clear_queue_callback(
 async def check_callback(
     query: CallbackQuery,
     nonces: NonceStore,
+    tenant: TenantContext,
     client: ConductorClient | None = None,
 ) -> None:
     try:
@@ -304,7 +308,7 @@ async def check_callback(
         await query.answer(exc.user_message, show_alert=True)
         return
     try:
-        status = await resolve_client(client).get_session_status(ticket.target)
+        status = await resolve_client(client, tenant).get_session_status(ticket.target)
     except Exception as exc:
         await query.answer(f"Check failed: {short_error(exc)}", show_alert=True)
         return
@@ -352,6 +356,7 @@ async def transcript_callback(
 async def send_callback(
     query: CallbackQuery,
     nonces: NonceStore,
+    tenant: TenantContext,
     db: Database | None = None,
     client: ConductorClient | None = None,
 ) -> None:
@@ -367,7 +372,7 @@ async def send_callback(
     try:
         await submit_prompt(
             db=resolve_db(db),
-            client=resolve_client(client),
+            client=resolve_client(client, tenant),
             session_id=session_id,
             text=text,
             chat_id=ticket.chat_id or query.from_user.id,

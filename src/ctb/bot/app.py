@@ -14,7 +14,7 @@ with ``link_preview_is_disabled`` (PLAN §Telegram formatting).
 
 **FSM state in SQLite.** aiogram ships ``MemoryStorage``; a redeploy in the
 middle of the ``/new`` wizard would drop you back to step one.
-:class:`SqliteStorage` puts it in ``wizard_state``, where it also picks up the
+:class:`PostgresStorage` puts it in ``wizard_state``, where it also picks up the
 30-minute expiry — yesterday's half-finished wizard must not hijack today's
 button press.
 
@@ -48,10 +48,11 @@ from aiogram.types import BotCommand, CallbackQuery, ErrorEvent, Message
 
 from ctb.bot.keyboards import NonceStore, get_nonce_store, set_nonce_store
 from ctb.bot.middleware import (
-    AuthMiddleware,
     LogContextMiddleware,
     RoutingMiddleware,
+    TenantMiddleware,
 )
+from ctb.conductor.pool import ClientPool
 from ctb.db import NO_THREAD_ID
 from ctb.db.connection import Database, get_database
 from ctb.db.repo import wizard as wizard_repo
@@ -65,7 +66,7 @@ __all__ = [
     "BotApp",
     "ConflictGuard",
     "RouterEntry",
-    "SqliteStorage",
+    "PostgresStorage",
     "build_app",
     "clear_routers",
     "create_bot",
@@ -157,7 +158,7 @@ async def unexpected_update_error(
     return True
 
 
-#: Reserved key inside ``wizard_state.data_json``; see :class:`SqliteStorage`.
+#: Reserved key inside ``wizard_state.data_json``; see :class:`PostgresStorage`.
 _NAMESPACE_KEY: Final = "__ns__"
 
 
@@ -215,7 +216,8 @@ def register_router(
     (:class:`~ctb.db.connection.Database`) · ``nonces``
     (:class:`~ctb.bot.keyboards.NonceStore`) · ``route``
     (:class:`~ctb.bot.middleware.routing.Route`) · ``principal``
-    (:class:`~ctb.bot.middleware.auth.Principal`) · ``is_owner`` (bool) ·
+    (:class:`~ctb.bot.middleware.tenancy.Principal`) · ``tenant``
+    (:class:`~ctb.bot.middleware.tenancy.TenantContext`) · ``is_owner`` (bool) ·
     ``request_id`` (str) · ``bot`` · ``state`` (aiogram ``FSMContext``).
 
     Idempotent: registering the same router twice is a no-op.
@@ -283,7 +285,7 @@ def _state_str(state: StateType) -> str | None:
     return state.state if isinstance(state, State) else state
 
 
-class SqliteStorage(BaseStorage):
+class PostgresStorage(BaseStorage):
     """aiogram FSM storage over ``wizard_state``, so wizards survive a restart.
 
     aiogram's :class:`~aiogram.fsm.storage.base.StorageKey` has six fields; the
@@ -530,56 +532,71 @@ def install_middleware(
     dispatcher: Dispatcher,
     *,
     settings: Settings,
+    system_db: Database,
+    clients: ClientPool,
     db: Database | None = None,
-    auth: AuthMiddleware | None = None,
-) -> AuthMiddleware:
+    tenancy: TenantMiddleware | None = None,
+) -> TenantMiddleware:
     """Register the three outer middlewares, in the one correct order.
 
-    Log context first (so a rejection is traceable), then the allow-list (so a
-    stranger's update never reaches a lookup), then routing.
+    Log context first (so a rejection is traceable), then tenancy (so an
+    unresolved update never reaches a lookup, and so the database scope exists
+    before anything queries), then routing.
 
     ``Dispatcher.__init__`` registers its FSM middleware before anything we can
     add, and that middleware *reads the storage* (``await context.get_state()``)
-    on every update. That would put a SQLite read from an unauthenticated
-    stranger ahead of the security check, so it is moved behind us — via the
-    manager's own ``unregister``/``register``, no private state touched.
+    on every update. That would put a database read from an unauthenticated
+    stranger ahead of the security check — and, worse, an unscoped read that
+    now raises — so it is moved behind us via the manager's own
+    ``unregister``/``register``, no private state touched.
     """
-    auth_middleware = auth or AuthMiddleware(settings, db=db)
+    tenant_middleware = tenancy or TenantMiddleware(
+        system_db=system_db, clients=clients, settings=settings
+    )
     manager = dispatcher.update.outer_middleware
     manager.register(LogContextMiddleware())
-    manager.register(auth_middleware)
+    manager.register(tenant_middleware)
     manager.register(RoutingMiddleware(db=db))
     if dispatcher.fsm in manager:
         manager.unregister(dispatcher.fsm)
         manager.register(dispatcher.fsm)
-    return auth_middleware
+    return tenant_middleware
 
 
 def create_dispatcher(
     *,
     settings: Settings,
+    system_db: Database,
+    clients: ClientPool,
     db: Database | None = None,
     storage: BaseStorage | None = None,
     nonces: NonceStore | None = None,
     routers: Sequence[Router] = (),
-    auth: AuthMiddleware | None = None,
+    tenancy: TenantMiddleware | None = None,
     **workflow: Any,
-) -> tuple[Dispatcher, AuthMiddleware]:
+) -> tuple[Dispatcher, TenantMiddleware]:
     """Build a Dispatcher with our storage, middleware and workflow data."""
     dispatcher = Dispatcher(
-        storage=storage or SqliteStorage(db),
+        storage=storage or PostgresStorage(db),
         settings=settings,
         db=db,
+        system_db=system_db,
+        clients=clients,
         nonces=nonces if nonces is not None else get_nonce_store(),
         **workflow,
     )
-    auth_middleware = install_middleware(
-        dispatcher, settings=settings, db=db, auth=auth
+    tenant_middleware = install_middleware(
+        dispatcher,
+        settings=settings,
+        system_db=system_db,
+        clients=clients,
+        db=db,
+        tenancy=tenancy,
     )
     dispatcher.errors.register(unexpected_update_error)
     for router in routers:
         dispatcher.include_router(router)
-    return dispatcher, auth_middleware
+    return dispatcher, tenant_middleware
 
 
 @dataclass(slots=True)
@@ -591,7 +608,7 @@ class BotApp:
     settings: Settings
     storage: BaseStorage
     nonces: NonceStore
-    auth: AuthMiddleware
+    tenancy: TenantMiddleware
     conflicts: ConflictGuard
     routers: tuple[Router, ...] = field(default_factory=tuple)
 
@@ -603,14 +620,15 @@ class BotApp:
         return {
             "routers": [r.name for r in self.routers],
             "conflicts": self.conflicts.conflicts,
-            "rejected_updates": self.auth.rejected,
-            "owner_notices": self.auth.notices_sent,
+            **self.tenancy.health(),
             "live_nonces": len(self.nonces),
         }
 
 
 def build_app(
     *,
+    system_db: Database,
+    clients: ClientPool,
     settings: Settings | None = None,
     db: Database | None = None,
     bot: Bot | None = None,
@@ -639,8 +657,10 @@ def build_app(
     guard = ConflictGuard()
     telegram_bot.session.middleware(guard)
 
-    dispatcher, auth = create_dispatcher(
+    dispatcher, tenancy = create_dispatcher(
         settings=resolved,
+        system_db=system_db,
+        clients=clients,
         db=db,
         storage=storage,
         nonces=store,
@@ -658,7 +678,7 @@ def build_app(
         settings=resolved,
         storage=dispatcher.storage,
         nonces=store,
-        auth=auth,
+        tenancy=tenancy,
         conflicts=guard,
         routers=found,
     )

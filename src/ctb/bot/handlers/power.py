@@ -54,6 +54,7 @@ from ctb.bot.keyboards import (
     url_button,
 )
 from ctb.bot.middleware.routing import Route
+from ctb.bot.middleware.tenancy import TenantContext
 from ctb.conductor.client import ConductorClient
 from ctb.conductor.models import validate_pairing
 from ctb.db.connection import Database
@@ -174,10 +175,10 @@ async def setup(
 async def switch_session(
     message: Message,
     route: Route,
+    tenant: TenantContext,
     state: FSMContext,
     nonces: NonceStore,
     db: Database | None = None,
-    client: ConductorClient | None = None,
 ) -> None:
     await abandon_wizard(state)
     database = resolve_db(db)
@@ -238,7 +239,9 @@ async def switch_session(
                 )
         # "I know its name" also has to reach a workspace made on the laptop,
         # which has no topic and therefore no local session to switch to.
-        for row in await adoptable_rows(database, client, query=query, exclude=seen):
+        for row in await adoptable_rows(
+            database, tenant.client, query=query, exclude=seen
+        ):
             workspace_id = str(row.get("workspace_id") or "")
             entries.append(
                 adopt_button(
@@ -389,7 +392,7 @@ async def fork(
     session_id = new_session_id()
     try:
         session = await turn_cursor.create_session(
-            resolve_client(client),
+            resolve_client(client, tenant),
             database,
             workspace_id=route.workspace_id,
             session_id=session_id,
@@ -430,6 +433,7 @@ async def fork(
 async def rename(
     message: Message,
     route: Route,
+    tenant: TenantContext,
     state: FSMContext,
     db: Database | None = None,
     client: ConductorClient | None = None,
@@ -443,7 +447,7 @@ async def rename(
             message, "Usage: <code>/name text</code> or <code>/name -w text</code>"
         )
         return
-    conductor = resolve_client(client)
+    conductor = resolve_client(client, tenant)
     database = resolve_db(db)
     try:
         if workspace_mode:
@@ -709,6 +713,7 @@ async def defaults(
 @router.message(Command("sql"))
 async def sql_command(
     message: Message,
+    tenant: TenantContext,
     state: FSMContext,
     is_owner: bool,
     client: ConductorClient | None = None,
@@ -727,7 +732,7 @@ async def sql_command(
         await tell(message, "Read-only single <code>SELECT</code> required.")
         return
     try:
-        result = await resolve_client(client).sql(query)
+        result = await resolve_client(client, tenant).sql(query)
     except Exception as exc:
         await tell(message, f"SQL failed: {escape(short_error(exc))}", silent=False)
         return

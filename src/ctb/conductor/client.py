@@ -248,6 +248,26 @@ class TokenBucket:
     def tokens(self) -> float:
         return self._tokens
 
+    def try_acquire(self, tokens: float = 1.0) -> bool:
+        """Take ``tokens`` if they are already there. Never sleeps.
+
+        The outbox uses this to *skip* a saturated destination and serve
+        another one, instead of blocking the whole queue behind one busy chat.
+        """
+        now = self._clock()
+        elapsed = max(0.0, now - self._updated)
+        self._updated = now
+        self._tokens = min(self._capacity, self._tokens + elapsed * self._rate)
+        if self._tokens >= tokens - _TOKEN_EPSILON:
+            self._tokens -= tokens
+            return True
+        return False
+
+    def drain(self) -> None:
+        """Spend every saved token. Used after a 429 from this destination."""
+        self._updated = self._clock()
+        self._tokens = 0.0
+
     async def acquire(self, tokens: float = 1.0) -> float:
         """Block until ``tokens`` are available. Returns the seconds waited."""
         waited = 0.0

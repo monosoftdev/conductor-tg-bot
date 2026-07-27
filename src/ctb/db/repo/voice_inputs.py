@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 from typing import Final, Self
 
@@ -36,7 +37,7 @@ MAX_ATTEMPTS: Final = 3
 _TERMINAL_STATES: Final[tuple[str, ...]] = ("completed", "failed", "waiting_for_user")
 
 _COLUMNS = """
-    chat_id, tg_message_id, thread_id, user_id, file_id, file_unique_id,
+    tenant_id, chat_id, tg_message_id, thread_id, user_id, file_id, file_unique_id,
     file_name, mime_type, duration_seconds, file_size, route_kind, route_session_id,
     route_workspace_id, provider, model, state, transcript, language,
     intent_json, action_id, ack_message_id, attempts, last_error, created_at,
@@ -75,11 +76,14 @@ class VoiceInputRow:
     created_at: int
     updated_at: int
     completed_at: int | None
+    #: Filled by row-level security's column default; read for fan-out.
+    tenant_id: uuid.UUID | None = None
 
     @classmethod
     def from_row(cls, row: Row) -> Self:
         return cls(
             chat_id=as_int(row["chat_id"]),
+            tenant_id=row["tenant_id"],
             tg_message_id=as_int(row["tg_message_id"]),
             thread_id=as_int(row["thread_id"]),
             user_id=as_int(row["user_id"]),

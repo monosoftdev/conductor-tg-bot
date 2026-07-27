@@ -162,9 +162,27 @@ async def record_api_event(
 
 
 async def recent_api_events(
-    db: Database, *, limit: int = 50, only_failed: bool = False
+    db: Database,
+    *,
+    limit: int = 50,
+    only_failed: bool = False,
+    tenant_id: uuid.UUID | None = None,
 ) -> list[ApiEvent]:
-    where = "WHERE NOT ok" if only_failed else ""
+    """The tail of the ring buffer.
+
+    ``api_events`` is a system table with no row-level security — a request can
+    fail before a tenant is resolved — so a caller answering *one tenant's*
+    ``/health`` must pass ``tenant_id`` explicitly.
+    """
+    clauses: list[str] = []
+    params: list[Any] = []
+    if only_failed:
+        clauses.append("NOT ok")
+    if tenant_id is not None:
+        clauses.append("tenant_id = ?")
+        params.append(tenant_id)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    params.append(max(1, limit))
     rows = await db.fetch_all(
         f"""
         SELECT {_EVENT_COLUMNS} FROM api_events
@@ -172,35 +190,39 @@ async def recent_api_events(
          ORDER BY id DESC
          LIMIT ?
         """,
-        (max(1, limit),),
+        tuple(params),
     )
     return [ApiEvent.from_row(row) for row in rows]
 
 
-async def stats(db: Database, *, since_ms: int) -> ApiEventStats:
+async def stats(
+    db: Database, *, since_ms: int, tenant_id: uuid.UUID | None = None
+) -> ApiEventStats:
+    scope = "" if tenant_id is None else "AND tenant_id = ?"
+    scope_params: tuple[Any, ...] = () if tenant_id is None else (tenant_id,)
     row = await db.fetch_one(
-        """
+        f"""
         SELECT COUNT(*)                            AS total,
                COUNT(*) FILTER (WHERE ok)          AS ok,
                COALESCE(AVG(duration_ms), 0)       AS avg_ms,
                COALESCE(MAX(duration_ms), 0)       AS max_ms
           FROM api_events
-         WHERE at >= ?
+         WHERE at >= ? {scope}
         """,
-        (since_ms,),
+        (since_ms, *scope_params),
     )
     if row is None:  # pragma: no cover - an aggregate always returns one row
         return ApiEventStats()
     total = as_int(row["total"])
     ok = as_int(row["ok"])
     failure = await db.fetch_one(
-        """
+        f"""
         SELECT error, at FROM api_events
-         WHERE at >= ? AND NOT ok AND error IS NOT NULL
+         WHERE at >= ? AND NOT ok AND error IS NOT NULL {scope}
          ORDER BY id DESC
          LIMIT 1
         """,
-        (since_ms,),
+        (since_ms, *scope_params),
     )
     return ApiEventStats(
         total=total,

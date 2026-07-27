@@ -35,6 +35,7 @@ import asyncio
 import contextlib
 import json
 import time
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass
 from enum import IntEnum
@@ -51,7 +52,12 @@ from aiogram.exceptions import (
 )
 from aiogram.types import BufferedInputFile, InlineKeyboardMarkup, LinkPreviewOptions
 
-from ctb.conductor.client import TokenBucket
+from ctb.delivery.pacing import (
+    CHAT_BURST,
+    CHAT_RATE_PER_MINUTE,
+    DestinationRotor,
+    TelegramPacer,
+)
 from ctb.db import NO_THREAD_ID
 from ctb.db.connection import Database
 from ctb.db.repo import deliveries as deliveries_repo
@@ -92,11 +98,10 @@ _log = get_logger(__name__)
 
 # ── policy constants (PLAN §Notifications) ───────────────────────────────────
 
-#: "One global send queue ~15 msg/min". Telegram's own group ceiling is ~20/min;
-#: this sits under it with room for the status card's edits.
-SEND_RATE_PER_MINUTE: Final = 15.0
-#: A three-part answer should still arrive as one burst rather than over 12s.
-SEND_BURST: Final = 3.0
+#: Retained as the historical names for the per-chat budget, which now lives
+#: in :mod:`ctb.delivery.pacing` alongside the separate global one.
+SEND_RATE_PER_MINUTE: Final = CHAT_RATE_PER_MINUTE
+SEND_BURST: Final = CHAT_BURST
 #: Rows claimed per pass. Small on purpose: a claimed row is unavailable to the
 #: priority sort, so a big batch would let an error queue behind stale bulk.
 CLAIM_BATCH: Final = 5
@@ -149,12 +154,17 @@ class Priority(IntEnum):
 
 
 class FocusTracker:
-    """The ``(chat_id, thread_id)`` the user last acted in.
+    """The ``(chat_id, thread_id)`` pairs users last acted in, and when.
 
     PLAN §Notifications ranks the topic you are *in* ahead of everything else,
     which means the queue has to learn something only the bot layer knows. This
-    is that seam, and it is deliberately the whole seam: two attribute writes,
-    no lock, no I/O — it runs on every incoming update.
+    is that seam, and it is deliberately the whole seam: one dict write, no
+    lock, no I/O — it runs on every incoming update.
+
+    It holds *many* entries rather than one. With a single shared bot, one
+    slot would mean every customer's thumb overwriting every other customer's;
+    ``chat_id`` is already globally tenant-unique (see ``tenant_chats``), so no
+    tenant plumbing is needed here.
 
     The routing middleware writes it, the outbox reads it, and in production
     both take the process-wide :func:`focus_tracker` — there is no wiring to
@@ -162,29 +172,35 @@ class FocusTracker:
     same tracker on a fake clock instead of racing a global.
     """
 
-    __slots__ = ("_at", "_clock", "_key")
+    __slots__ = ("_clock", "_entries", "_max")
 
-    def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(
+        self, *, clock: Callable[[], float] = time.monotonic, max_entries: int = 256
+    ) -> None:
         self._clock = clock
-        self._key: tuple[int, int] | None = None
-        self._at = float("-inf")
+        self._max = max(1, max_entries)
+        self._entries: OrderedDict[tuple[int, int], float] = OrderedDict()
 
     def note(self, chat_id: int, thread_id: int = NO_THREAD_ID) -> None:
-        self._key = (chat_id, thread_id)
-        self._at = self._clock()
+        key = (chat_id, thread_id)
+        self._entries[key] = self._clock()
+        self._entries.move_to_end(key)
+        while len(self._entries) > self._max:
+            self._entries.popitem(last=False)
 
     @property
     def current(self) -> tuple[int, int] | None:
-        return self._key
+        """The most recently touched topic. Diagnostics only."""
+        if not self._entries:
+            return None
+        return next(reversed(self._entries))
 
     def is_focused(self, chat_id: int, thread_id: int, window: float) -> bool:
-        return (
-            self._key == (chat_id, thread_id) and (self._clock() - self._at) <= window
-        )
+        at = self._entries.get((chat_id, thread_id))
+        return at is not None and (self._clock() - at) <= window
 
     def clear(self) -> None:
-        self._key = None
-        self._at = float("-inf")
+        self._entries.clear()
 
 
 _focus = FocusTracker()
@@ -342,17 +358,16 @@ def _plain_of(part: MessagePart) -> str:
 
 
 class Outbox:
-    """Claims delivery rows and sends them, one global paced queue."""
+    """Claims delivery rows and sends them, fairly, under two rate budgets."""
 
     def __init__(
         self,
         bot: TelegramSender,
         db: Database,
         *,
+        pacer: TelegramPacer | None = None,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
-        rate_per_minute: float = SEND_RATE_PER_MINUTE,
-        burst: float = SEND_BURST,
         batch_size: int = CLAIM_BATCH,
         idle_interval: float = IDLE_INTERVAL_S,
         focus_window: float = FOCUS_WINDOW_S,
@@ -371,14 +386,11 @@ class Outbox:
         self._max_attempts = max(1, max_attempts)
         self._claim_id = claim_id or deliveries_repo.new_claim_id()
         self._quick_replies = quick_replies
-        self._pacer = TokenBucket(
-            rate=max(rate_per_minute, 1.0) / 60.0,
-            burst=max(burst, 1.0),
-            clock=clock,
-            sleep=sleep,
+        self._pacer = pacer if pacer is not None else TelegramPacer(
+            clock=clock, sleep=sleep
         )
+        self._rotor = DestinationRotor(clock=clock)
         self._focus = focus if focus is not None else focus_tracker()
-        self._pause_until = float("-inf")
         self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._recovered = False
@@ -401,8 +413,12 @@ class Outbox:
 
     @property
     def paused_for(self) -> float:
-        """Seconds left on a Telegram-imposed global pause. 0 when running."""
-        return max(0.0, self._pause_until - self._clock())
+        """Seconds left on a Telegram-imposed *global* pause. 0 when running.
+
+        A single group's 429 pauses only that group; see
+        :meth:`ctb.delivery.pacing.TelegramPacer.pause_chat`.
+        """
+        return self._pacer.global_paused_for
 
     def health(self) -> dict[str, Any]:
         """Counters for ``/health``. No content, ever."""
@@ -411,6 +427,7 @@ class Outbox:
             "claim_id": self._claim_id,
             "paused_for": round(self.paused_for, 3),
             "focus": self._focus.current,
+            **self._pacer.health(),
             "running": self._task is not None and not self._task.done(),
         }
 
@@ -521,7 +538,7 @@ class Outbox:
         sent: list[int] = []
         chunks = chunk_html(html)
         for index, chunk in enumerate(chunks):
-            await self._pacer.acquire()
+            await self._pacer.acquire_global()
             try:
                 message_id = await self._send_html(
                     chat_id=chat_id,
@@ -605,33 +622,57 @@ class Outbox:
             )
         sent = 0
         for job in self._prioritize(self._prepare(result.claimed)):
-            await self._pacer.acquire()
+            await self._pacer.acquire_global()
             if await self._deliver(job):
                 sent += 1
                 self._counters["recovered"] += 1
         return sent
 
     async def run_once(self) -> int:
-        """Claim one batch and send it. Returns the number of messages sent."""
+        """Serve each destination in turn. Returns the number of messages sent.
+
+        Claiming is scoped to one ``(chat, topic)`` at a time, so ordering
+        within a topic is exact while several topics drain in parallel — and
+        one tenant's ten-thousand-row backlog cannot monopolise the sender.
+        A destination that has spent its per-chat budget is *skipped*, not
+        waited on.
+        """
         if self.paused_for > 0:
             return 0
-        rows = await deliveries_repo.claim(
-            self._db, claim_id=self._claim_id, limit=self._batch_size
+        destinations = self._rotor.order(
+            await deliveries_repo.pending_destinations(self._db, limit=64),
+            key=lambda item: (item.chat_id, item.thread_id),
+            promote=lambda item: self._focus.is_focused(
+                item.chat_id, item.thread_id, self._focus_window
+            ),
         )
-        if not rows:
-            return 0
-        jobs = self._prioritize(self._prepare(rows))
         sent = 0
-        for index, job in enumerate(jobs):
+        for destination in destinations:
             if self.paused_for > 0:
-                # Telegram told us to back off. Hand the rest of the batch back
-                # so a restart (or the next pass) re-orders it with fresh
-                # priorities instead of replaying a stale ordering.
-                await self._requeue_all(jobs[index:])
                 break
-            await self._pacer.acquire()
-            if await self._deliver(job):
-                sent += 1
+            if not self._pacer.chat_ready(destination.chat_id):
+                continue
+            rows = await deliveries_repo.claim(
+                self._db,
+                claim_id=self._claim_id,
+                limit=self._batch_size,
+                chat_id=destination.chat_id,
+                thread_id=destination.thread_id,
+            )
+            self._rotor.served((destination.chat_id, destination.thread_id))
+            if not rows:
+                continue
+            jobs = self._prioritize(self._prepare(rows))
+            for index, job in enumerate(jobs):
+                if self.paused_for > 0:
+                    # Telegram told us to back off. Hand the rest of the batch
+                    # back so the next pass re-orders it with fresh priorities
+                    # instead of replaying a stale ordering.
+                    await self._requeue_all(jobs[index:])
+                    break
+                await self._pacer.acquire_global()
+                if await self._deliver(job):
+                    sent += 1
         return sent
 
     async def flush(self, *, max_passes: int = 100) -> int:
@@ -746,11 +787,13 @@ class Outbox:
                     attempt=attempt,
                 )
                 if attempt == 0:
-                    # Sends are sequential, so sleeping here pauses the whole
-                    # queue, which is exactly what a 429 asks for.
                     await self._sleep(delay + RETRY_AFTER_PADDING_S)
                     continue
-                self._pause_until = self._clock() + delay
+                # Pause *this chat*, not the queue. One customer's group
+                # hitting a limit is not everyone else's outage; the pacer
+                # escalates to a global pause only when several distinct chats
+                # 429 at once, which is the signature of a token-level limit.
+                self._pacer.pause_chat(row.chat_id, delay)
                 raise
         return None
 

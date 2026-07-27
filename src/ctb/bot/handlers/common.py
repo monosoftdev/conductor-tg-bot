@@ -23,12 +23,12 @@ from ctb.bot.handlers.topics import (
     discard_topic,
     forum_support,
     require_topic,
-    resolve_client,
     resolve_db,
     send_html,
     topic_label,
 )
 from ctb.bot.middleware.routing import Route
+from ctb.bot.middleware.tenancy import TenantSettings
 from ctb.conductor.client import ConductorClient
 from ctb.conductor.models import Project, validate_pairing
 from ctb.db import NO_THREAD_ID
@@ -369,7 +369,7 @@ async def create_and_bind_input(
 ) -> CreatedBinding:
     """Create/bind from typed or voice input without manufacturing an update."""
     database = resolve_db(db)
-    conductor = resolve_client(client)
+    conductor = client
     validate_pairing(request.agent, request.model, request.effort)
     label = topic_label(request.project_name, request.branch)
 

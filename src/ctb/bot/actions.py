@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import uuid
 from collections.abc import Sequence
 
 from aiogram import Bot
@@ -13,7 +14,7 @@ from aiogram.types import ReactionTypeEmoji
 from ctb.bot.handlers import topics
 from ctb.db import NO_THREAD_ID
 from ctb.db.connection import Database
-from ctb.db.repo import prompts, sessions
+from ctb.db.repo import prompts, sessions, tenancy
 from ctb.delivery.outbox import Outbox, Priority
 from ctb.delivery.render.html import escape
 from ctb.delivery.status_card import StatusCards
@@ -37,31 +38,40 @@ class BotActionSink:
         self,
         bot: Bot,
         db: Database,
+        system_db: Database,
         outbox: Outbox,
         status_cards: StatusCards,
-        *,
-        owner_id: int | None = None,
     ) -> None:
         self._bot = bot
         self._db = db
+        self._system_db = system_db
         self._outbox = outbox
         self._cards = status_cards
-        self._owner_id = owner_id
 
-    async def auth_fatal(self, session_id: str) -> None:
-        """Durably tell the owner once that the Conductor key was rejected."""
-        if self._owner_id is None:
-            return
-        await self._outbox.enqueue_notice(
-            "Conductor API key rejected. Update "
-            "<code>CONDUCTOR_API_KEY</code>; session polling is paused.",
-            session_id=session_id,
-            key="conductor-auth-fatal",
-            chat_id=self._owner_id,
-            thread_id=NO_THREAD_ID,
-            priority=Priority.ERROR,
-            silent=False,
-        )
+    async def auth_fatal(self, session_id: str, tenant_id: uuid.UUID) -> None:
+        """Tell *this tenant's* owners, once, that their key was rejected.
+
+        Every other tenant keeps polling, so the message says "your workspace",
+        not "the bot", and names the fix the person reading it can actually
+        perform.
+        """
+        recipients = await tenancy.list_owner_ids(self._system_db, tenant_id)
+        primary = await tenancy.primary_chat(self._system_db, tenant_id)
+        targets: list[int] = list(recipients)
+        if primary is not None and primary.chat_id not in targets:
+            targets.append(primary.chat_id)
+        for chat_id in targets:
+            await self._outbox.enqueue_notice(
+                "Conductor rejected this workspace's API key. Send "
+                "<code>/key</code> in a private message to set a new one; "
+                "polling is paused until you do.",
+                session_id=session_id,
+                key=f"conductor-auth-fatal:{tenant_id}",
+                chat_id=chat_id,
+                thread_id=NO_THREAD_ID,
+                priority=Priority.ERROR,
+                silent=False,
+            )
 
     async def handle(
         self,

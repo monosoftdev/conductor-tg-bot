@@ -24,6 +24,8 @@ routing hiccup cannot cost the ordering.
 
 from __future__ import annotations
 
+import uuid
+
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Final
@@ -76,6 +78,13 @@ async def default_reply_resolver(
 class Route:
     """Where this update came from and which session it drives."""
 
+    #: Which workspace owns this update. Stamped by
+    #: :class:`~ctb.bot.middleware.tenancy.TenantMiddleware`, and used for
+    #: logging and fan-out — never for filtering, which row-level security
+    #: already does.
+    tenant_id: uuid.UUID | None = None
+    #: Whether *this tenant* has voice on. The platform switch is separate.
+    tenant_voice_enabled: bool = False
     chat_id: int | None = None
     thread_id: int = NO_THREAD_ID
     #: ``"dm"`` · ``"general"`` · ``"topic"`` · ``"unknown"``.
@@ -162,7 +171,12 @@ class RoutingMiddleware(BaseMiddleware):
         kind = _chat_kind(context, thread_id)
         reply_to = _reply_to_message_id(event)
 
+        tenant = data.get("tenant")
         route = Route(
+            tenant_id=getattr(tenant, "tenant_id", None),
+            tenant_voice_enabled=bool(
+                getattr(getattr(tenant, "settings", None), "voice_enabled", False)
+            ),
             chat_id=chat_id,
             thread_id=thread_id,
             kind=kind,
@@ -171,7 +185,9 @@ class RoutingMiddleware(BaseMiddleware):
         if chat_id is not None:
             self._focus.note(chat_id, thread_id)
         db = self._resolve_db(data)
-        if db is not None and chat_id is not None:
+        # No tenant means TenantMiddleware let this through unresolved (the
+        # registration path). There is no scope, so there is nothing to read.
+        if db is not None and chat_id is not None and route.tenant_id is not None:
             route = await self._resolve(db, route)
 
         data[ROUTE_KEY] = route

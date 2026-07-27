@@ -28,7 +28,6 @@ import signal
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
-from pathlib import Path
 from types import FrameType
 from typing import Any, Final, cast
 
@@ -79,9 +78,9 @@ class RuntimeFactories:
 
     load_settings: Callable[[], Settings]
     configure_logging: Callable[[Settings], None]
-    open_database: Callable[[str | Path], Awaitable[Any]]
+    open_databases: Callable[[Settings], Awaitable[tuple[Any, Any]]]
     apply_migrations: Callable[[Any], Awaitable[Any]]
-    make_client: Factory
+    make_client_pool: Factory
     make_bot: Factory
     make_outbox: Factory
     make_status_cards: Factory
@@ -101,7 +100,8 @@ class RuntimeServices:
     settings: Settings
     holder: str
     db: Any | None = None
-    client: Any | None = None
+    system_db: Any | None = None
+    clients: Any | None = None
     bot: Any | None = None
     outbox: Any | None = None
     status_cards: Any | None = None
@@ -190,8 +190,8 @@ class RuntimeServices:
                         "runtime.close_failed", component="telegram", error=repr(exc)
                     )
 
-        if self.client is not None:
-            close = getattr(self.client, "aclose", None)
+        if self.clients is not None:
+            close = getattr(self.clients, "aclose", None)
             if callable(close):
                 try:
                     await _maybe_await(close())
@@ -200,24 +200,24 @@ class RuntimeServices:
                     log.error(
                         "runtime.close_failed", component="conductor", error=repr(exc)
                     )
-        if self.db is not None:
-            close = getattr(self.db, "close", None)
+        for name, pool in (("database", self.db), ("system_database", self.system_db)):
+            if pool is None:
+                continue
+            close = getattr(pool, "close", None)
             if callable(close):
                 try:
                     await _maybe_await(close())
                 except BaseException as exc:
                     failures.append(exc)
-                    log.error(
-                        "runtime.close_failed", component="database", error=repr(exc)
-                    )
+                    log.error("runtime.close_failed", component=name, error=repr(exc))
 
         # These imports are cheap and kept here to avoid hidden global ownership.
-        from ctb.conductor.client import set_client
         from ctb.db.connection import set_database
+        from ctb.runtime import reset_runtime
         from ctb.settings import reset_settings
 
-        set_client(None)
         set_database(None)
+        reset_runtime()
         reset_settings()
         if failures:
             raise BaseExceptionGroup("runtime cleanup failed", failures)
@@ -288,10 +288,24 @@ def _default_configure_logging(settings: Settings) -> None:
     configure_logging(settings)
 
 
-async def _default_open_database(path: str | Path) -> Any:
+async def _default_open_databases(settings: Settings) -> tuple[Any, Any]:
+    """Two pools: the tenant-scoped app role, then the BYPASSRLS worker role.
+
+    Both are opened here so a bad DSN fails at boot rather than on the first
+    update, and so shutdown has one owner for both.
+    """
     from ctb.db.connection import open_database
 
-    return await open_database(path)
+    app = await open_database(
+        settings.database_url.get_secret_value(),
+        max_size=settings.db_pool_max,
+    )
+    system = await open_database(
+        settings.system_database_url.get_secret_value(),
+        max_size=settings.system_db_pool_max,
+        system=True,
+    )
+    return app, system
 
 
 async def _default_apply_migrations(db: Any) -> Any:
@@ -300,14 +314,20 @@ async def _default_apply_migrations(db: Any) -> Any:
     return await apply_migrations(db)
 
 
-def _default_make_client(settings: Settings, db: Any) -> Any:
-    from ctb.conductor.client import ConductorClient
+def _default_make_client_pool(settings: Settings, system_db: Any) -> Any:
+    """One Conductor client per tenant, sharing one HTTP transport.
+
+    API events are recorded on the **system** pool: ``api_events`` has no
+    row-level security precisely because a request can fail before a tenant is
+    resolved, and the sink must never be the thing that raises.
+    """
+    from ctb.conductor.pool import ClientPool
     from ctb.db.repo import events as events_repo
 
     async def record(event: Any) -> None:
-        await events_repo.record_api_event(db, **event.as_row())
+        await events_repo.record_api_event(system_db, **event.as_row())
 
-    return ConductorClient(settings, on_event=record)
+    return ClientPool(settings.secret_box(), on_event=record)
 
 
 def _default_make_bot(settings: Settings) -> Any:
@@ -338,8 +358,9 @@ def _default_make_status_cards(bot: Any, db: Any) -> Any:
 
 
 def _default_make_supervisor(
-    client: Any,
+    clients: Any,
     db: Any,
+    system_db: Any,
     bot: Any,
     outbox: Any,
     status_cards: Any,
@@ -348,29 +369,29 @@ def _default_make_supervisor(
     # The poller is intentionally a late import: lifecycle tests do not need it,
     # and it lets its implementation evolve behind the documented constructor.
     from ctb.bot.actions import BotActionSink
-    from ctb.settings import get_settings
     from ctb.turn.supervisor import Supervisor
 
     return Supervisor(
-        client,
+        clients,
         db,
+        system_db,
         action_sink=BotActionSink(
             bot,
             db,
+            system_db,
             outbox,
             status_cards,
-            owner_id=get_settings().owner_id,
         ),
         holder=holder,
     )
 
 
-def _default_make_health_monitor(db: Any, client: Any, holder: str) -> Any:
+def _default_make_health_monitor(system_db: Any, clients: Any, holder: str) -> Any:
     from ctb.health import HealthMonitor
 
     return HealthMonitor(
-        database=lambda: db,
-        client=lambda: client,
+        database=lambda: system_db,
+        clients=lambda: clients,
         holder=holder,
         instance=holder,
     )
@@ -379,8 +400,9 @@ def _default_make_health_monitor(db: Any, client: Any, holder: str) -> Any:
 def _default_make_voice(
     settings: Settings,
     db: Any,
+    system_db: Any,
     bot: Any,
-    client: Any,
+    clients: Any,
     supervisor: Any,
 ) -> Any:
     from ctb.bot.keyboards import NonceStore
@@ -389,8 +411,9 @@ def _default_make_voice(
     return VoiceService(
         settings,
         db,
+        system_db,
         bot,
-        client,
+        clients,
         supervisor,
         NonceStore(),
     )
@@ -405,8 +428,9 @@ def _default_make_health_server(monitor: Any) -> Any:
 def _default_make_app(
     settings: Settings,
     db: Any,
+    system_db: Any,
     bot: Any,
-    client: Any,
+    clients: Any,
     outbox: Any,
     status_cards: Any,
     supervisor: Any,
@@ -418,8 +442,9 @@ def _default_make_app(
     return build_app(
         settings=settings,
         db=db,
+        system_db=system_db,
+        clients=clients,
         bot=bot,
-        client=client,
         outbox=outbox,
         status_cards=status_cards,
         supervisor=supervisor,
@@ -440,9 +465,9 @@ def production_factories() -> RuntimeFactories:
     return RuntimeFactories(
         load_settings=_default_load_settings,
         configure_logging=_default_configure_logging,
-        open_database=_default_open_database,
+        open_databases=_default_open_databases,
         apply_migrations=_default_apply_migrations,
-        make_client=_default_make_client,
+        make_client_pool=_default_make_client_pool,
         make_bot=_default_make_bot,
         make_outbox=_default_make_outbox,
         make_status_cards=_default_make_status_cards,
@@ -465,27 +490,34 @@ async def build_runtime(
     made = factories or production_factories()
     runtime = RuntimeServices(settings=settings, holder=made.make_holder())
     try:
-        runtime.db = await made.open_database(settings.db_path)
+        runtime.db, runtime.system_db = await made.open_databases(settings)
 
         from ctb.db.connection import set_database
+        from ctb.runtime import set_client_pool, set_secret_box, set_system_database
         from ctb.settings import set_settings
 
         set_database(runtime.db)
+        set_system_database(runtime.system_db)
         set_settings(settings)
-        migrations = await made.apply_migrations(runtime.db)
+        # The canary runs before anything can need a key: a bad
+        # CTB_MASTER_KEYS must kill the boot, not the first user's first prompt.
+        secrets = settings.secret_box()
+        secrets.self_check()
+        set_secret_box(secrets)
+
+        migrations = await made.apply_migrations(runtime.system_db)
         log.info("runtime.database_ready", migrations=len(migrations or ()))
 
-        runtime.client = made.make_client(settings, runtime.db)
+        runtime.clients = made.make_client_pool(settings, runtime.system_db)
+        set_client_pool(runtime.clients)
 
-        from ctb.conductor.client import set_client
-
-        set_client(runtime.client)
         runtime.bot = made.make_bot(settings)
-        runtime.outbox = made.make_outbox(runtime.bot, runtime.db)
+        runtime.outbox = made.make_outbox(runtime.bot, runtime.system_db)
         runtime.status_cards = made.make_status_cards(runtime.bot, runtime.db)
         runtime.supervisor = made.make_supervisor(
-            runtime.client,
+            runtime.clients,
             runtime.db,
+            runtime.system_db,
             runtime.bot,
             runtime.outbox,
             runtime.status_cards,
@@ -494,21 +526,23 @@ async def build_runtime(
         runtime.voice = made.make_voice(
             settings,
             runtime.db,
+            runtime.system_db,
             runtime.bot,
-            runtime.client,
+            runtime.clients,
             runtime.supervisor,
         )
         runtime.health_monitor = made.make_health_monitor(
-            runtime.db,
-            runtime.client,
+            runtime.system_db,
+            runtime.clients,
             runtime.holder,
         )
         runtime.health_server = made.make_health_server(runtime.health_monitor)
         runtime.app = made.make_app(
             settings,
             runtime.db,
+            runtime.system_db,
             runtime.bot,
-            runtime.client,
+            runtime.clients,
             runtime.outbox,
             runtime.status_cards,
             runtime.supervisor,
@@ -583,7 +617,6 @@ async def run(
             runtime = await build_runtime(resolved, factories=made)
             log.info(
                 "runtime.ready",
-                database=str(resolved.db_path),
                 holder=runtime.holder,
             )
             await run_services(runtime, stop_event=shutdown)

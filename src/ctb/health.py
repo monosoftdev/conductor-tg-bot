@@ -58,8 +58,9 @@ from typing import Any, Final, Self
 from aiohttp import web
 
 from ctb import __version__
-from ctb.conductor.client import ConductorClient, get_client
+from ctb.conductor.pool import ClientPool
 from ctb.db.connection import Database, get_database, now_ms
+from ctb.runtime import client_pool, system_database
 from ctb.db.migrate import current_schema_version
 from ctb.db.repo import deliveries as deliveries_repo
 from ctb.db.repo import events as events_repo
@@ -269,7 +270,7 @@ def reset_telegram_health() -> None:
 # ── providers ────────────────────────────────────────────────────────────────
 
 type DatabaseProvider = Callable[[], Database | None]
-type ClientProvider = Callable[[], ConductorClient | None]
+type PoolProvider = Callable[[], ClientPool | None]
 type TelegramProvider = Callable[[], TelegramHealth | None]
 
 
@@ -282,11 +283,20 @@ def default_database_provider() -> Database | None:
     return db if db.is_connected else None
 
 
-def default_client_provider() -> ConductorClient | None:
-    """The process-wide Conductor client, or ``None`` if it cannot be built."""
+def default_database_provider_system() -> Database | None:
+    """The worker pool, which is what the cross-tenant sections read."""
     try:
-        return get_client()
-    except Exception:  # pragma: no cover - settings are validated at boot
+        db = system_database()
+    except RuntimeError:
+        return None
+    return db if db.is_connected else None
+
+
+def default_pool_provider() -> ClientPool | None:
+    """The process-wide client pool, or ``None`` before boot installed one."""
+    try:
+        return client_pool()
+    except RuntimeError:
         return None
 
 
@@ -322,7 +332,7 @@ class HealthMonitor:
         self,
         *,
         database: DatabaseProvider = default_database_provider,
-        client: ClientProvider = default_client_provider,
+        clients: PoolProvider = default_pool_provider,
         telegram: TelegramProvider = telegram_health,
         holder: str | None = None,
         instance: str | None = None,
@@ -333,7 +343,7 @@ class HealthMonitor:
         db_timeout_s: float = DB_TIMEOUT_S,
     ) -> None:
         self._db_provider = database
-        self._client_provider = client
+        self._pool_provider = clients
         self._telegram_provider = telegram
         self._holder = holder
         self._instance = instance if instance is not None else (holder or "")
@@ -412,41 +422,65 @@ class HealthMonitor:
     # -- Conductor client (in-memory, cannot block) ---------------------------
 
     def _collect_conductor(self, degradations: list[Degradation]) -> dict[str, Any]:
-        client = _call_safely(self._client_provider)
-        if client is None:
+        """Aggregate across every live tenant client.
+
+        There is no single Conductor client any more, so this reports the pool
+        plus the *worst* state any tenant is in. Naming which tenant is
+        deliberate — an operator needs to know who to contact — and safe,
+        because a slug is not identifying the way a name or a key would be.
+        """
+        pool = _call_safely(self._pool_provider)
+        if pool is None:
             return {"available": False}
         try:
-            section: dict[str, Any] = dict(client.health())
-            recent = client.recent_events()
+            section: dict[str, Any] = dict(pool.health())
+            clients = pool.clients()
         except Exception as exc:  # pragma: no cover - health() is pure reads
             return {"available": False, "error": _reason(exc)}
         section["available"] = True
-        throttled = sum(1 for event in recent if event.status_code == 429)
-        section["rate_limited_recent"] = throttled
 
-        auth_failures = int(section.get("auth_failures", 0) or 0)
+        throttled = 0
+        auth_failures = 0
+        open_circuits: list[str] = []
+        rejected: list[str] = []
+        for slug, client in clients:
+            try:
+                stats = client.health()
+                recent = client.recent_events()
+            except Exception:  # pragma: no cover - pure reads
+                continue
+            throttled += sum(1 for event in recent if event.status_code == 429)
+            failures = int(stats.get("auth_failures", 0) or 0)
+            if failures:
+                auth_failures += failures
+                rejected.append(slug)
+            circuit = stats.get("circuit")
+            if isinstance(circuit, Mapping) and circuit.get("state") != "closed":
+                open_circuits.append(slug)
+        section["rate_limited_recent"] = throttled
+        section["auth_failures"] = auth_failures
+        section["auth_rejected_tenants"] = tuple(sorted(rejected))
+        section["open_circuit_tenants"] = tuple(sorted(open_circuits))
+
         if auth_failures:
             degradations.append(
                 Degradation(
                     DEGRADATION_AUTH_FATAL,
-                    "Conductor rejected the API key (401/403); pollers are stopped. "
-                    "Replace CONDUCTOR_API_KEY and redeploy — restarting will not "
-                    "fix it, so this does not fail the healthcheck.",
+                    "Conductor rejected an API key (401/403) for "
+                    f"{', '.join(sorted(rejected))}; those tenants' pollers are "
+                    "stopped. They must set a new key with /key — restarting "
+                    "will not fix it, so this does not fail the healthcheck.",
                 )
             )
-        circuit = section.get("circuit")
-        if isinstance(circuit, Mapping):
-            state = str(circuit.get("state", "closed"))
-            if state != "closed":
-                retry_after = circuit.get("retry_after", 0)
-                degradations.append(
-                    Degradation(
-                        DEGRADATION_CIRCUIT_OPEN,
-                        f"Conductor API circuit is {state}; "
-                        f"retrying in {retry_after}s "
-                        f"(opened by {circuit.get('opened_by') or 'unknown'}).",
-                    )
+        if open_circuits:
+            degradations.append(
+                Degradation(
+                    DEGRADATION_CIRCUIT_OPEN,
+                    "Conductor API circuit is open for "
+                    f"{', '.join(open_circuits)}. Each tenant has its own "
+                    "breaker, so this affects only them.",
                 )
+            )
         if throttled:
             degradations.append(
                 Degradation(
@@ -1096,7 +1130,7 @@ __all__ = [
     "TelegramHealth",
     "TelegramProvider",
     "create_app",
-    "default_client_provider",
+    "default_pool_provider",
     "default_database_provider",
     "default_detail_policy",
     "detail_allowed",

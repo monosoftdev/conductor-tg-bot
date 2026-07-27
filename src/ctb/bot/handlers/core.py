@@ -45,6 +45,7 @@ from ctb.bot.keyboards import (
     url_button,
 )
 from ctb.bot.middleware.routing import Route
+from ctb.bot.middleware.tenancy import TenantContext
 from ctb.conductor.client import ConductorClient
 from ctb.db.connection import Database
 from ctb.db.repo import prompts as prompts_repo
@@ -159,6 +160,7 @@ def find_query(value: str) -> str:
 async def new_workspace(
     message: Message,
     route: Route,
+    tenant: TenantContext,
     settings: Settings,
     state: FSMContext,
     db: Database | None = None,
@@ -180,11 +182,11 @@ async def new_workspace(
         return
     try:
         database = resolve_db(db)
-        conductor = resolve_client(client)
+        conductor = tenant.client
         request = await resolve_new_request(
             text=text,
             route=route,
-            settings=settings,
+            defaults=tenant.settings,
             db=database,
             client=conductor,
         )
@@ -213,6 +215,7 @@ async def new_workspace(
 @router.message(Command("board"))
 async def board(
     message: Message,
+    tenant: TenantContext,
     state: FSMContext,
     nonces: NonceStore,
     db: Database | None = None,
@@ -220,7 +223,7 @@ async def board(
 ) -> None:
     await abandon_wizard(state)
     database = resolve_db(db)
-    rows = await board_rows(database, resolve_client(client))
+    rows = await board_rows(database, resolve_client(client, tenant))
     if not rows:
         await tell(message, "No live workspaces.")
         return
@@ -306,7 +309,7 @@ async def board_rows(
 
 async def adoptable_rows(
     database: Database,
-    client: ConductorClient | None,
+    client: ConductorClient,
     *,
     query: str = "",
     exclude: Collection[str] = (),
@@ -319,7 +322,7 @@ async def adoptable_rows(
     and anything past that degrades to "no suggestions".
     """
     try:
-        rows = await board_rows(database, resolve_client(client))
+        rows = await board_rows(database, client)
     except Exception:
         return []
     needle = query.strip().casefold()
@@ -438,11 +441,11 @@ async def run_find(
     message: Message,
     text: str,
     *,
-    client: ConductorClient | None = None,
+    client: ConductorClient,
     reply_markup: InlineKeyboardMarkup | None = None,
 ) -> None:
     try:
-        rendered = await find_text(resolve_client(client), text)
+        rendered = await find_text(client, text)
     except Exception as exc:
         await tell(message, f"Find failed: {escape(short_error(exc))}", silent=False)
         return
@@ -471,15 +474,15 @@ async def find_text(client: ConductorClient, text: str) -> str:
 @router.message(Command("find"))
 async def find(
     message: Message,
+    tenant: TenantContext,
     state: FSMContext,
-    client: ConductorClient | None = None,
 ) -> None:
     await abandon_wizard(state)
     text = command_text(message)
     if not text:
         await tell(message, "Usage: <code>/find text</code>")
         return
-    await run_find(message, text, client=client)
+    await run_find(message, text, client=tenant.client)
 
 
 @router.message(Command("mode", "here"))
@@ -587,6 +590,7 @@ async def done(
 async def confirm_archive(
     query: CallbackQuery,
     nonces: NonceStore,
+    tenant: TenantContext,
     db: Database | None = None,
     client: ConductorClient | None = None,
 ) -> None:
@@ -607,7 +611,7 @@ async def confirm_archive(
             if session is None or session.workspace_id is None:
                 raise RuntimeError("Workspace is no longer available.")
             workspace_id = session.workspace_id
-        await resolve_client(client).archive_workspace(workspace_id)
+        await resolve_client(client, tenant).archive_workspace(workspace_id)
         await workspaces_repo.mark_archived(database, workspace_id)
         await close_topic(query.bot, database, workspace_id)
     except Exception as exc:
