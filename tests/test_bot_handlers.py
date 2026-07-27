@@ -16,7 +16,7 @@ from aiogram.fsm.storage.base import StorageKey
 from aiogram.methods import CreateForumTopic, SendMessage
 from aiogram.types import Chat, Message, User
 
-from ctb.bot.app import SqliteStorage
+from ctb.bot.app import PostgresStorage
 from ctb.bot.handlers import core as core_handlers
 from ctb.bot.handlers import prompts as prompt_handlers
 from ctb.bot.handlers.common import (
@@ -57,6 +57,7 @@ from ctb.bot.keyboards import (
     read_stateless,
 )
 from ctb.bot.middleware.routing import Route
+from ctb.bot.middleware.tenancy import TenantContext, TenantSettings
 from ctb.bot.wizards import new_workspace
 from ctb.conductor.models import (
     PostMessageResult,
@@ -77,10 +78,39 @@ from ctb.db.repo import sessions as sessions_repo
 from ctb.db.repo import workspaces as workspaces_repo
 from ctb.db.repo.chats import ChatRow
 from ctb.db.repo.sessions import SessionRow
+from ctb.db.repo.tenancy import TenantRow
 from ctb.db.repo.workspaces import WorkspaceRow
 from ctb.settings import Settings
 from ctb.turn.cursor import quick_replies_for
 from ctb.turn.state import Cancel, TurnState
+from tests.pg import BOOTSTRAP_TENANT_ID
+
+
+def fake_tenant(
+    client: Any = None,
+    *,
+    role: str = "owner",
+    user_id: int = 1001,
+    slug: str = "test",
+    settings: TenantSettings | None = None,
+) -> TenantContext:
+    """The context TenantMiddleware would have injected.
+
+    Handlers reach the Conductor API only through this, which is what makes a
+    cross-organisation read impossible to write by accident.
+    """
+    return TenantContext(
+        tenant_id=BOOTSTRAP_TENANT_ID,
+        slug=slug,
+        status="active",
+        role=role,
+        user_id=user_id,
+        owner_ids=(user_id,),
+        primary_chat_id=None,
+        settings=settings or TenantSettings(),
+        row=TenantRow(id=BOOTSTRAP_TENANT_ID, slug=slug, name=slug, status="active"),
+        _client=client,
+    )
 
 
 class PromptClient:
@@ -501,9 +531,9 @@ async def test_general_plain_text_searches_and_never_posts(
     await prompt_handlers.plain_text(
         message,  # type: ignore[arg-type]
         Route(chat_id=-1001, kind="general"),
+        fake_tenant(_CountingClient()),
         NonceStore(),
         db=db,
-        client=None,
     )
 
     # One typed line, one bubble: the Send button rides on the search results
@@ -752,10 +782,10 @@ async def test_board_sends_one_line_and_buttons_never_both_lists(
 
     await core_handlers.board(
         message,  # type: ignore[arg-type]
+        fake_tenant(_CountingClient()),
         _NullState(),  # type: ignore[arg-type]
         NonceStore(),
         db=db,
-        client=_CountingClient(),  # type: ignore[arg-type]
     )
 
     text, markup = sent[0]
@@ -798,10 +828,10 @@ async def test_board_offers_one_tap_adoption_for_a_topicless_workspace(
 
     await core_handlers.board(
         message,  # type: ignore[arg-type]
+        fake_tenant(_CountingClient()),
         _NullState(),  # type: ignore[arg-type]
         store,
         db=db,
-        client=_CountingClient(),  # type: ignore[arg-type]
     )
 
     text, markup = sent[0]
@@ -1195,10 +1225,9 @@ async def test_new_tells_the_owner_what_telegram_actually_said(
     await core_handlers.new_workspace(
         message,  # type: ignore[arg-type]
         Route(chat_id=-1001, kind="general"),
-        settings,
+        fake_tenant(client),
         _NullState(),  # type: ignore[arg-type]
         db=db,
-        client=client,  # type: ignore[arg-type]
     )
 
     assert client.creates == 0
@@ -1272,7 +1301,7 @@ async def _branch_buttons(
         _wizard_message(),  # type: ignore[arg-type]
         _WizardState({"branch": branch}),  # type: ignore[arg-type]
         NonceStore(),
-        settings_factory(default_branch=configured),
+        TenantSettings(default_branch=configured),
     )
     return [
         item.text
@@ -1360,7 +1389,7 @@ class _Tap:
 def _seat(db: Database, *, user_id: int = 1001, thread_id: int | None = None) -> Any:
     """A DB-backed FSM context — the thing that already survived the redeploy."""
     return FSMContext(
-        storage=SqliteStorage(db),
+        storage=PostgresStorage(db),
         key=StorageKey(bot_id=0, chat_id=-1001, user_id=user_id, thread_id=thread_id),
     )
 
@@ -1384,7 +1413,7 @@ async def _mint_branch_card(
         _wizard_message(),  # type: ignore[arg-type]
         state,
         store,
-        settings,
+        TenantSettings(),
     )
     button = next(
         item for row in cards[0].inline_keyboard for item in row if item.text == "dev"
@@ -1413,7 +1442,7 @@ async def test_a_wizard_button_minted_before_a_redeploy_still_works(
         tap,  # type: ignore[arg-type]
         _seat(db),
         NonceStore(),
-        settings,
+        fake_tenant(),
     )
 
     assert tap.answers == [""]
@@ -1437,7 +1466,7 @@ async def test_a_wizard_button_is_still_single_use_while_the_process_lives(
             tap,  # type: ignore[arg-type]
             _seat(db),
             store,
-            settings,
+            fake_tenant(),
         )
 
     assert taps[0].answers == [""]
@@ -1467,7 +1496,7 @@ async def test_a_wizard_button_for_a_step_already_passed_is_refused(
         tap,  # type: ignore[arg-type]
         _seat(db),
         NonceStore(),
-        settings,
+        fake_tenant(),
     )
 
     assert tap.answers == [new_workspace.STALE_MESSAGE]
@@ -1486,7 +1515,7 @@ async def test_a_wizard_button_says_closed_when_the_wizard_is_gone(
         tap,  # type: ignore[arg-type]
         _seat(db),
         NonceStore(),
-        settings,
+        fake_tenant(),
     )
 
     assert tap.answers == [new_workspace.GONE_MESSAGE]
@@ -1505,7 +1534,7 @@ async def test_a_wizard_button_is_useless_to_another_seat(
         intruder,  # type: ignore[arg-type]
         _seat(db, user_id=2002),
         store,
-        settings,
+        fake_tenant(),
     )
     assert intruder.answers == ["This button has expired. Run the command again."]
 
@@ -1517,7 +1546,7 @@ async def test_a_wizard_button_is_useless_to_another_seat(
             tap,  # type: ignore[arg-type]
             seat,
             NonceStore(),
-            settings,
+            fake_tenant(),
         )
         assert tap.answers == [new_workspace.GONE_MESSAGE]
 
@@ -1543,10 +1572,9 @@ async def test_the_whole_wizard_survives_a_redeploy_at_every_step(
     await new_workspace.start_wizard(
         _wizard_message(),  # type: ignore[arg-type]
         route=Route(chat_id=-1001, kind="topic"),
-        settings=settings,
+        tenant=fake_tenant(_CountingClient()),
         state=_seat(db),
         db=db,
-        client=_CountingClient(),  # type: ignore[arg-type]
         nonces=NonceStore(),
     )
 
@@ -1555,9 +1583,9 @@ async def test_the_whole_wizard_survives_a_redeploy_at_every_step(
         tap = _Tap(str(first.callback_data))
         await new_workspace.wizard_callback(
             tap,  # type: ignore[arg-type]
-            _seat(db),  # the DB is all that carried over
+            _seat(db),  # the database is all that carried over
             NonceStore(),  # the registry did not
-            settings,
+            fake_tenant(),
         )
         assert tap.answers == [""], f"step {_step} refused a live button"
 
@@ -1608,7 +1636,7 @@ async def test_defaults_can_set_and_show_the_branch(
                 from_user=SimpleNamespace(id=1001),
             ),
             route,
-            settings,
+            fake_tenant(),
             _NullState(),  # type: ignore[arg-type]
             db=db,
         )
@@ -1623,27 +1651,33 @@ async def test_defaults_can_set_and_show_the_branch(
 
 
 async def _run_setup(bot: Any, db: Database, monkeypatch: Any) -> list[str]:
-    """Drive ``/setup`` and return the lines it sent."""
-    from ctb.bot.handlers import power as power_handlers
+    """Drive ``/setup`` in an already-bound group and return what it said."""
+    from ctb.bot.handlers import registration as registration_handlers
+    from ctb.db.repo import tenancy as tenancy_repo
+    from ctb.runtime import system_database
+
+    await tenancy_repo.bind_chat(
+        system_database(), -1001, BOOTSTRAP_TENANT_ID, is_primary=True
+    )
 
     sent: list[str] = []
 
     async def fake_tell(_message: Any, text: str, **_kwargs: Any) -> None:
         sent.append(text)
 
-    monkeypatch.setattr(power_handlers, "tell", fake_tell)
+    monkeypatch.setattr(registration_handlers, "tell", fake_tell)
     message = SimpleNamespace(
         text="/setup",
-        chat=SimpleNamespace(id=-1001, type="supergroup"),
+        chat=SimpleNamespace(id=-1001, type="supergroup", title="Acme"),
         message_thread_id=None,
         message_id=7,
         from_user=SimpleNamespace(id=1001),
         bot=bot,
     )
-    await power_handlers.setup(
+    await registration_handlers.setup(
         message,  # type: ignore[arg-type]
-        Route(chat_id=-1001, kind="general"),
         _NullState(),  # type: ignore[arg-type]
+        tenant=fake_tenant(),
         db=db,
     )
     return sent
@@ -1679,7 +1713,9 @@ async def test_setup_deletes_the_topic_it_probed_with(
 
     sent = await _run_setup(bot, db, monkeypatch)
 
-    assert sent == ["Ready · General is search-only; /new creates topics."]
+    assert sent == [
+        "Ready ·\nGeneral is search-only; <code>/new</code> creates topics."
+    ]
     assert bot.topics == 1, "the probe really created a topic"
     # 99 is the id the stub hands back from create_forum_topic — so this asserts
     # it deleted the very topic it made, not merely that it deleted something.
@@ -1710,7 +1746,7 @@ async def test_a_button_from_an_older_build_redraws_the_card_instead_of_dead_end
         stale,  # type: ignore[arg-type]
         _seat(db),
         NonceStore(),
-        settings,
+        fake_tenant(),
     )
 
     assert stale.answers == [new_workspace.REFRESHED_MESSAGE]
@@ -1734,7 +1770,7 @@ async def test_a_stale_button_with_no_wizard_open_still_says_so(
         stale,  # type: ignore[arg-type]
         _seat(db),
         NonceStore(),
-        settings,
+        fake_tenant(),
     )
 
     assert stale.answers == ["This button has expired. Run the command again."]
@@ -1764,7 +1800,7 @@ async def test_the_step_after_a_tap_is_tappable_by_the_owner(
         _Tap(data),  # type: ignore[arg-type]
         _seat(db),
         store,
-        settings,
+        fake_tenant(),
     )
 
     nxt = next(
@@ -1779,14 +1815,54 @@ async def test_the_step_after_a_tap_is_tappable_by_the_owner(
         second,  # type: ignore[arg-type]
         _seat(db),
         store,
-        settings,
+        fake_tenant(),
     )
 
     assert second.answers == [""], "the owner must be able to tap the card it drew"
 
 
+async def test_the_branch_card_after_the_project_tap_is_tappable(
+    db: Database, monkeypatch: Any
+) -> None:
+    """The *first* transition, which the other card test does not reach.
+
+    Each ``_ask_*`` is a separate call site and each one has to re-attribute
+    the card to whoever tapped, because ``_button`` mints for
+    ``message.from_user`` — on a tap that is the bot. Project → branch is the
+    one every wizard run passes through, and it was the last to be fixed.
+    """
+    # One store for both taps. A fresh one would fall through to
+    # `read_stateless`, which deliberately has no per-user check — so the
+    # mis-attribution this test exists for would be invisible.
+    store = NonceStore()
+    cards = await _wizard_to_branch(db, monkeypatch, store=store)
+
+    project = _Tap(str(cards[-1].inline_keyboard[0][0].callback_data))
+    await new_workspace.wizard_callback(
+        project,  # type: ignore[arg-type]
+        _seat(db),
+        store,
+        fake_tenant(),
+    )
+    assert project.answers == [""]
+
+    branch = _Tap(str(cards[-1].inline_keyboard[0][0].callback_data))
+    await new_workspace.wizard_callback(
+        branch,  # type: ignore[arg-type]
+        _seat(db),
+        store,
+        fake_tenant(),
+    )
+
+    assert branch.answers == [""], "the branch card was minted for the bot"
+
+
 async def _wizard_to_branch(
-    db: Database, settings: Settings, monkeypatch: Any
+    db: Database,
+    monkeypatch: Any,
+    *,
+    settings: TenantSettings | None = None,
+    store: NonceStore | None = None,
 ) -> list[Any]:
     """Start the wizard and answer the project step. Returns the cards drawn."""
     cards: list[Any] = []
@@ -1803,11 +1879,10 @@ async def _wizard_to_branch(
     await new_workspace.start_wizard(
         _wizard_message(),  # type: ignore[arg-type]
         route=Route(chat_id=-1001, kind="topic"),
-        settings=settings,
+        tenant=fake_tenant(_CountingClient(), settings=settings),
         state=_seat(db),
         db=db,
-        client=_CountingClient(),  # type: ignore[arg-type]
-        nonces=NonceStore(),
+        nonces=store or NonceStore(),
     )
     return cards
 
@@ -1829,13 +1904,14 @@ async def test_go_with_defaults_mid_wizard_keeps_the_answers_already_given(
     every question after it is answered from configuration and every question
     before it keeps what was chosen.
     """
-    settings = settings_factory(
+    # The defaults are the workspace's, not the platform's.
+    defaults_of = TenantSettings(
         default_branch="dev",
         default_agent="claude",
         default_model="opus-5-1m",
         default_effort="high",
     )
-    cards = await _wizard_to_branch(db, settings, monkeypatch)
+    cards = await _wizard_to_branch(db, monkeypatch, settings=defaults_of)
 
     # Project step → branch step.
     project = _Tap(str(cards[-1].inline_keyboard[0][0].callback_data))
@@ -1843,7 +1919,7 @@ async def test_go_with_defaults_mid_wizard_keeps_the_answers_already_given(
         project,  # type: ignore[arg-type]
         _seat(db),
         NonceStore(),
-        settings,
+        fake_tenant(),
     )
     # Choose dev explicitly, then bail out to defaults on the *next* question.
     branch = _Tap(_labelled(cards[-1], "dev"))
@@ -1851,14 +1927,14 @@ async def test_go_with_defaults_mid_wizard_keeps_the_answers_already_given(
         branch,  # type: ignore[arg-type]
         _seat(db),
         NonceStore(),
-        settings,
+        fake_tenant(),
     )
     defaults = _Tap(_labelled(cards[-1], "Go with defaults →"))
     await new_workspace.wizard_callback(
         defaults,  # type: ignore[arg-type]
         _seat(db),
         NonceStore(),
-        settings,
+        fake_tenant(),
     )
 
     data = await _seat(db).get_data()

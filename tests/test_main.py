@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, cast
 
 import pytest
@@ -14,12 +13,15 @@ from aiogram.exceptions import TelegramUnauthorizedError
 from ctb.__main__ import (
     RuntimeFactories,
     ServiceStoppedError,
+    _assert_app_role_is_confined,
     build_runtime,
     run,
 )
 from ctb.bot.app import BotApp, run_polling
+from ctb.db.connection import Database as PgDatabase
 from ctb.health import TelegramHealth, reset_telegram_health, telegram_health
-from ctb.settings import Settings
+from ctb.settings import Settings, SettingsError
+from tests import pg
 
 
 class Runner:
@@ -83,7 +85,7 @@ class Client:
         self.events = events
 
     async def aclose(self) -> None:
-        self.events.append("close:client")
+        self.events.append("close:clients")
 
 
 class Database:
@@ -97,7 +99,8 @@ class Database:
 @dataclass
 class Built:
     db: Database
-    client: Client
+    system_db: Database
+    clients: Client
     bot: Bot
     outbox: Runner
     cards: Runner
@@ -125,7 +128,8 @@ def fake_factories(
 
     built = Built(
         db=Database(events),
-        client=Client(events),
+        system_db=Database(events),
+        clients=Client(events),
         bot=Bot(events),
         outbox=runner("outbox"),
         cards=runner("status_cards"),
@@ -135,17 +139,17 @@ def fake_factories(
         app=App(events),
     )
 
-    async def open_database(path: str | Path) -> Database:
-        assert path == settings.db_path
+    async def open_databases(_settings: Settings) -> tuple[Database, Database]:
         events.append("build:db")
-        return built.db
+        return built.db, built.system_db
 
-    async def migrate(db: Database) -> tuple[str, ...]:
-        assert db is built.db
+    async def verify(db: Database) -> int:
+        # The schema is checked on the worker pool; nothing here applies DDL.
+        assert db is built.system_db
         events.append("build:migrate")
         if fail_at == "migrate":
             raise RuntimeError("bad migration")
-        return ("001",)
+        return 1
 
     def make(name: str, value: Any) -> Callable[..., Any]:
         def factory(*_args: Any) -> Any:
@@ -159,9 +163,9 @@ def fake_factories(
     factories = RuntimeFactories(
         load_settings=lambda: settings,
         configure_logging=lambda _settings: events.append("build:logging"),
-        open_database=open_database,
-        apply_migrations=migrate,
-        make_client=make("client", built.client),
+        open_databases=open_databases,
+        verify_schema=verify,
+        make_client_pool=make("clients", built.clients),
         make_bot=make("bot", built.bot),
         make_outbox=make("outbox", built.outbox),
         make_status_cards=make("status_cards", built.cards),
@@ -199,7 +203,7 @@ async def test_boot_order_and_signal_style_shutdown_are_clean(
         "build:logging",
         "build:db",
         "build:migrate",
-        "build:client",
+        "build:clients",
         "build:bot",
         "build:outbox",
         "build:status_cards",
@@ -219,15 +223,16 @@ async def test_boot_order_and_signal_style_shutdown_are_clean(
     ):
         assert service.started.is_set()
         assert service.cancelled
-    assert events[-8:] == [
+    assert events[-9:] == [
         "stop:voice",
         "stop:supervisor",
         "stop:status_cards",
         "stop:outbox",
         "stop:health",
         "close:telegram",
-        "close:client",
+        "close:clients",
         "close:db",
+        "close:db",  # both pools: the app one, then the worker one
     ]
 
 
@@ -303,7 +308,12 @@ async def test_partial_build_failure_closes_only_constructed_resources(
         await run(settings, factories=factories, install_signals=False)
 
     assert "build:status_cards" not in events
-    assert events[-3:] == ["close:bot-session", "close:client", "close:db"]
+    assert events[-4:] == [
+        "close:bot-session",
+        "close:clients",
+        "close:db",
+        "close:db",
+    ]
 
 
 async def test_invalid_configuration_fails_before_logging_or_io(
@@ -319,9 +329,9 @@ async def test_invalid_configuration_fails_before_logging_or_io(
     factories = RuntimeFactories(
         load_settings=invalid,
         configure_logging=factories.configure_logging,
-        open_database=factories.open_database,
-        apply_migrations=factories.apply_migrations,
-        make_client=factories.make_client,
+        open_databases=factories.open_databases,
+        verify_schema=factories.verify_schema,
+        make_client_pool=factories.make_client_pool,
         make_bot=factories.make_bot,
         make_outbox=factories.make_outbox,
         make_status_cards=factories.make_status_cards,
@@ -445,12 +455,16 @@ async def _never_sleeps(_delay: float) -> None:
 
 
 async def test_production_factories_build_every_component_without_network(
-    settings: Settings,
+    settings_factory: Callable[..., Settings],
+    pg_reset: object,
 ) -> None:
+    """The whole runtime, wired for real, with no socket to Telegram."""
+    settings = settings_factory()
     runtime = await build_runtime(settings)
     assert runtime.supervisor is not None
-    assert runtime.client is not None
+    assert runtime.clients is not None
     assert runtime.db is not None
+    assert runtime.system_db is not None
     db = runtime.db
     try:
         assert [name for name, _runner in runtime.runners()] == [
@@ -462,8 +476,41 @@ async def test_production_factories_build_every_component_without_network(
             "health",
         ]
         assert runtime.supervisor.holder == runtime.holder
-        assert runtime.client.settings is settings
+        # No process-wide Conductor client exists any more: one per tenant,
+        # built on demand from that tenant's sealed key.
+        assert runtime.clients.health()["clients"] == 0
         assert db.is_connected
     finally:
         await runtime.close()
     assert not db.is_connected
+
+
+class TestAppRoleConfinement:
+    """The one misconfiguration that fails silently in the worst direction.
+
+    Row-level security does not apply to a superuser or a ``BYPASSRLS`` role,
+    not even with ``FORCE``. Point ``DATABASE_URL`` at a managed provider's
+    default ``postgres`` user and everything keeps working while every tenant
+    reads every other tenant's transcripts.
+    """
+
+    async def check(self, dsn: str) -> None:
+        pool = await PgDatabase(dsn, min_size=1, max_size=2).connect()
+        try:
+            await _assert_app_role_is_confined(pool)
+        finally:
+            await pool.close()
+
+    async def test_the_app_role_is_accepted(self, pg_reset: object) -> None:
+        await self.check(pg.app_dsn())
+
+    async def test_a_superuser_dsn_refuses_to_boot(self, pg_reset: object) -> None:
+        with pytest.raises(SettingsError, match="bypasses row-level security"):
+            await self.check(pg.admin_dsn())
+
+    async def test_the_worker_role_refuses_to_boot_as_the_app_pool(
+        self, pg_reset: object
+    ) -> None:
+        """BYPASSRLS without superuser is the subtler half of the same mistake."""
+        with pytest.raises(SettingsError, match="bypasses row-level security"):
+            await self.check(pg.worker_dsn())

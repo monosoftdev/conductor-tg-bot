@@ -2,11 +2,25 @@
 name = "conductor-tg-bot"
 version = "0.1.0"
 description = "Drive Conductor cloud coding agents from Telegram."
+readme = "README.md"
+authors = [{ name = "Reclaimly, Inc.", email = "info@reclaimly.com" }]
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.13"
+keywords = ["telegram", "bot", "conductor", "coding-agent", "aiogram"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications :: Chat",
+    "Topic :: Software Development :: Build Tools",
+]
 dependencies = [
     "aiogram>=3.30.0",
     "httpx>=0.28.1",
-    "aiosqlite>=0.20.0",
+    "psycopg[binary,pool]>=3.2.0",
+    "cryptography>=44.0.0",
     "pydantic>=2.10.0",
     "pydantic-settings>=2.7.0",
     "structlog>=24.4.0",
@@ -17,9 +31,17 @@ dependencies = [
 dev = [
     "pytest>=8.3.0",
     "pytest-asyncio>=0.25.0",
+    # Shards the suite across CI runners by collection order. Deterministic for
+    # a given commit, so a failing shard reproduces locally with the same flags.
+    "pytest-split>=0.10.0",
     "ruff>=0.9.0",
     "pyright>=1.1.390",
 ]
+
+[project.urls]
+Homepage = "https://github.com/reclaimly/conductor-tg-bot"
+Source = "https://github.com/reclaimly/conductor-tg-bot"
+Issues = "https://github.com/reclaimly/conductor-tg-bot/issues"
 
 [build-system]
 requires = ["hatchling"]
@@ -41,6 +63,9 @@ asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 # `import ctb` works without an editable install.
 pythonpath = ["src"]
+markers = [
+    "db: needs the PostgreSQL server from compose.yaml (deselect with -m 'not db')",
+]
 
 [tool.pyright]
 include = ["src", "scripts", "tests"]

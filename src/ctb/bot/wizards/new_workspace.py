@@ -62,6 +62,7 @@ from ctb.bot.keyboards import (
     url_button,
 )
 from ctb.bot.middleware.routing import Route
+from ctb.bot.middleware.tenancy import TenantContext, TenantSettings
 from ctb.conductor.client import ConductorClient
 from ctb.conductor.models import default_model_for, efforts_for, models_for
 from ctb.db import NO_THREAD_ID
@@ -69,7 +70,6 @@ from ctb.db.connection import Database
 from ctb.db.repo import chats as chats_repo
 from ctb.db.repo import wizard as wizard_repo
 from ctb.delivery.render.html import escape
-from ctb.settings import Settings
 
 router = Router(name=__name__)
 register_router(router, order=5)
@@ -124,7 +124,7 @@ PROMPT_STATE_KEY: Final = NewWorkspace.prompt.state
 
 
 def request_from_wizard(
-    data: Mapping[str, Any], text: str, *, settings: Settings
+    data: Mapping[str, Any], text: str, *, settings: TenantSettings
 ) -> CreateRequest | None:
     """The wizard's answers plus this prompt, or ``None`` if it lost its project.
 
@@ -272,7 +272,7 @@ async def start_wizard(
     message: Message,
     *,
     route: Route,
-    settings: Settings,
+    tenant: TenantContext,
     state: FSMContext,
     db: Database | None = None,
     client: ConductorClient | None = None,
@@ -282,8 +282,9 @@ async def start_wizard(
 
     store = nonces or get_nonce_store()
     database = resolve_db(db)
+    defaults = tenant.settings
     try:
-        projects = await all_projects(resolve_client(client))
+        projects = await all_projects(resolve_client(client, tenant))
     except Exception as exc:
         await tell(
             message, f"Projects failed: {escape(short_error(exc))}", silent=False
@@ -300,10 +301,10 @@ async def start_wizard(
             "wid": new_wizard_id(),
             "projects": {item.id: item.name or item.id[:8] for item in projects},
             "project_id": chat.default_project_id,
-            "branch": chat.default_branch or settings.default_branch,
-            "agent": chat.default_agent or settings.default_agent,
-            "model": chat.default_model or settings.default_model,
-            "effort": chat.default_effort or settings.default_effort,
+            "branch": chat.default_branch or defaults.default_branch,
+            "agent": chat.default_agent or defaults.default_agent,
+            "model": chat.default_model or defaults.default_model,
+            "effort": chat.default_effort or defaults.default_effort,
         }
     )
     markup = await _offer(
@@ -348,7 +349,7 @@ async def _ask_branch(
     message: Message,
     state: FSMContext,
     nonces: NonceStore,
-    settings: Settings,
+    defaults: TenantSettings,
 ) -> None:
     """Offer the configured default first, then the last-used branch.
 
@@ -357,7 +358,7 @@ async def _ask_branch(
     when it is genuinely different.
     """
     data = await state.get_data()
-    configured = settings.default_branch or DEFAULT_BRANCH
+    configured = defaults.default_branch or DEFAULT_BRANCH
     current = str(data.get("branch") or configured)
     markup = await _offer(
         message,
@@ -445,7 +446,7 @@ async def _reask(
     message: Message,
     state: FSMContext,
     nonces: NonceStore,
-    settings: Settings,
+    settings: TenantSettings,
 ) -> bool:
     """Redraw the step the wizard is on, with buttons this process minted.
 
@@ -495,7 +496,7 @@ async def wizard_callback(
     query: CallbackQuery,
     state: FSMContext,
     nonces: NonceStore,
-    settings: Settings,
+    tenant: TenantContext,
 ) -> None:
     try:
         ticket = resolve(query, expect=Action.WIZARD, store=nonces)
@@ -509,7 +510,7 @@ async def wizard_callback(
             exc.reason == "unknown"
             and step
             and isinstance(query.message, Message)
-            and await _reask(step, _card(query), state, nonces, settings)
+            and await _reask(step, _card(query), state, nonces, tenant.settings)
         ):
             await query.answer(REFRESHED_MESSAGE, show_alert=True)
             return
@@ -547,7 +548,7 @@ async def wizard_callback(
     await state.update_data({"project_id" if step == "project" else step: selected})
     await query.answer()
     if step == "project":
-        await _ask_branch(_card(query), state, nonces, settings)
+        await _ask_branch(_card(query), state, nonces, tenant.settings)
     elif step == "branch":
         await _ask_agent(_card(query), state, nonces)
     elif step == "agent":
@@ -585,7 +586,7 @@ async def typed_prompt(
     message: Message,
     state: FSMContext,
     route: Route,
-    settings: Settings,
+    tenant: TenantContext,
     db: Database | None = None,
     client: ConductorClient | None = None,
 ) -> None:
@@ -596,7 +597,7 @@ async def typed_prompt(
         message.message_thread_id or NO_THREAD_ID,
         user_id=message.from_user.id if message.from_user else 0,
     )
-    request = request_from_wizard(data, message.text or "", settings=settings)
+    request = request_from_wizard(data, message.text or "", settings=tenant.settings)
     if request is None:
         await state.clear()
         await tell(
@@ -609,10 +610,21 @@ async def typed_prompt(
             route=route,
             request=request,
             db=db,
-            client=client,
+            client=tenant.client,
         )
     except Exception as exc:
-        await tell(message, f"New failed: {escape(short_error(exc))}", silent=False)
+        # Clear first. The message reads terminal ("at its limit of 50
+        # workspaces"), so the next thing typed is meant for a session — but a
+        # live wizard would swallow it and try to create another workspace,
+        # silently, for the next thirty minutes. The sibling failure branch
+        # above already clears; this one forgetting to was an oversight.
+        await state.clear()
+        await tell(
+            message,
+            f"New failed: {escape(short_error(exc))}\n"
+            "Nothing was created. Run <code>/new</code> to try again.",
+            silent=False,
+        )
         return
     await state.clear()
     target = (

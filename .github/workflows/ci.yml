@@ -1,0 +1,204 @@
+# The gates, run in parallel. Nothing merges until every one is green.
+#
+# The split is by *feedback speed*, not by tidiness. `lint` needs no database
+# and finishes in seconds, so a formatting mistake is reported while the test
+# shards are still installing. The shards exist because the suite is the slowest
+# gate and it parallelises cleanly — each gets its own throwaway PostgreSQL, so
+# they cannot see each other's rows.
+#
+# `gate` is the single required check. Adding a job here is enough: it fails if
+# *any* dependency failed, so nobody has to update a branch protection rule.
+name: CI
+
+on:
+  # `pull_request` is the gate — it is the event branch protection reads, and
+  # it runs against the merge result rather than the branch tip. `push` covers
+  # only the long-lived branches, so a PR branch does not run the matrix twice
+  # and then report the loser as a cancelled check.
+  push:
+    branches: [main, dev]
+  pull_request:
+  merge_group:
+
+concurrency:
+  # `ref_name`, not `ref`: a push gives `postgres-multi-tenant` and a pull
+  # request's `head_ref` gives the same string, so the two events for one
+  # branch land in one group and the second cancels the first. With `ref` they
+  # differed (`refs/heads/x` vs `x`) and every push ran the whole matrix twice.
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  # Turns a missing database from a silent skip into a failure. Without it a
+  # DSN typo hides every RLS, isolation, crypto-binding and claim test behind a
+  # green tick. See `tests/pg.py:_no_server`.
+  CI: "true"
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  lint:
+    name: format · lint · types
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -e '.[dev]'
+
+      # All three run even if an earlier one fails: one push should report
+      # every problem, not just the first.
+      - name: Format
+        if: always()
+        run: ruff format --check src scripts tests
+      - name: Lint
+        if: always()
+        run: ruff check src scripts tests
+      - name: Types
+        if: always()
+        run: pyright
+
+      # A workflow with a syntax error is not a failing build — GitHub rejects
+      # the file and runs *nothing*, which looks identical to "no checks yet".
+      # A double-quoted string in a `${{ }}` expression did exactly that here
+      # once. Lint the pipeline with the pipeline.
+      - name: Workflows
+        if: always()
+        uses: docker://rhysd/actionlint:latest
+        with:
+          args: -color
+
+  offline:
+    name: tests (no database)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -e '.[dev]'
+
+      # Deliberately runs with no server anywhere near it. A regression here
+      # means the pure-logic half of the suite has grown a database dependency
+      # and stopped being runnable on a laptop without Docker.
+      - name: Tests without a database
+        run: pytest -q -m "not db" -p no:cacheprovider
+
+  tests:
+    name: tests ${{ matrix.shard }}/4
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    env:
+      CTB_TEST_DSN: "host=127.0.0.1 port=5433 dbname=ctb_test user=postgres password=postgres"
+      PGPASSWORD: postgres
+    services:
+      # Each shard gets its own database. The suite truncates between tests but
+      # migrates once per session, so two shards sharing a server would race on
+      # the schema.
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ctb_test
+          # `lc_collate=C` matters: the suite asserts on ordering, and a locale
+          # collation would sort differently from a developer's machine.
+          POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=C --lc-ctype=C"
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+        ports:
+          - 5433:5432
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -e '.[dev]'
+
+      # The same durability trade compose.yaml makes. This database is deleted
+      # when the job ends, so fsync buys nothing and costs most of the runtime.
+      - name: Loosen durability
+        run: |
+          psql "$CTB_TEST_DSN" -c "ALTER SYSTEM SET fsync = off"
+          psql "$CTB_TEST_DSN" -c "ALTER SYSTEM SET synchronous_commit = off"
+          psql "$CTB_TEST_DSN" -c "ALTER SYSTEM SET full_page_writes = off"
+          psql "$CTB_TEST_DSN" -c "SELECT pg_reload_conf()"
+
+      # Splits by collection order, which is stable for a given commit — so a
+      # failing shard reproduces locally with the same two flags.
+      - name: Tests
+        run: pytest -q --splits 4 --group ${{ matrix.shard }} -p no:cacheprovider
+
+  smoke:
+    name: boot
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ctb
+          POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=C --lc-ctype=C"
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+        ports:
+          - 5433:5432
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -e '.[dev]'
+
+      # The tests never run `python -m ctb`. This does: bootstrap for real, boot
+      # the real runtime against a real database, confirm the six services start
+      # and /health answers. It catches what a unit test cannot — a broken
+      # factory, a missing grant, an import cycle that only bites at startup.
+      - name: Bootstrap
+        run: |
+          python -m ctb.db.bootstrap \
+            --admin-dsn "postgresql://postgres:postgres@127.0.0.1:5433/ctb" \
+            --app-password ci-app --worker-password ci-worker
+
+      - name: Boot
+        run: python scripts/smoke_boot.py
+        env:
+          DATABASE_URL: "postgresql://ctb_app:ci-app@127.0.0.1:5433/ctb"
+          SYSTEM_DATABASE_URL: "postgresql://ctb_worker:ci-worker@127.0.0.1:5433/ctb"
+
+  gate:
+    name: all gates
+    runs-on: ubuntu-latest
+    needs: [lint, offline, tests, smoke]
+    if: always()
+    steps:
+      # Checked explicitly because a skipped or cancelled dependency does not
+      # fail this job by default — and "skipped" must never read as "passed" to
+      # a branch protection rule.
+      - name: Verify
+        run: |
+          # Single quotes: GitHub expressions have no double-quoted strings,
+          # and the whole workflow is rejected — no jobs run at all — rather
+          # than failing the one step that uses it.
+          results='${{ join(needs.*.result, ' ') }}'
+          echo "results: $results"
+          for result in $results; do
+            if [ "$result" != "success" ]; then
+              echo "::error::a required gate did not pass ($result)"
+              exit 1
+            fi
+          done

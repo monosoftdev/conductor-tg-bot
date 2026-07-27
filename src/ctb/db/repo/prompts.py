@@ -25,10 +25,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Self
 
-import aiosqlite
-
 from ctb.db import NO_THREAD_ID
-from ctb.db.connection import Database, now_ms
+from ctb.db.connection import Database, Row, now_ms
 from ctb.db.repo._util import as_int, as_opt_int, as_opt_str, as_str, update_sql
 
 __all__ = [
@@ -84,7 +82,7 @@ class PromptRow:
     witnessed_at: int | None = None
 
     @classmethod
-    def from_row(cls, row: aiosqlite.Row) -> Self:
+    def from_row(cls, row: Row) -> Self:
         return cls(
             message_id=str(row["message_id"]),
             session_id=str(row["session_id"]),

@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 from typing import Final, Self
 
-import aiosqlite
-
-from ctb.db.connection import Database, now_ms
+from ctb.db.connection import Database, Row, now_ms
 from ctb.db.repo._util import as_int, as_opt_int, as_opt_str, as_str
 
 __all__ = [
     "MAX_ATTEMPTS",
+    "ORPHAN_AFTER_MS",
     "Recovery",
     "VoiceInputRow",
     "claim_next",
@@ -35,15 +35,24 @@ __all__ = [
 #: that has burned this many claims is abandoned instead of requeued.
 MAX_ATTEMPTS: Final = 3
 
+#: A claimed voice job younger than this may still be in flight on a live peer
+#: during a deploy overlap. Same guard, same reasoning as
+#: :data:`ctb.db.repo.deliveries.ORPHAN_AFTER_MS` — but here a wrong recovery
+#: costs the customer a second speech-vendor bill, not just a duplicate message.
+ORPHAN_AFTER_MS: Final = 150_000
+
 _TERMINAL_STATES: Final[tuple[str, ...]] = ("completed", "failed", "waiting_for_user")
 
 _COLUMNS = """
-    chat_id, tg_message_id, thread_id, user_id, file_id, file_unique_id,
+    tenant_id, chat_id, tg_message_id, thread_id, user_id, file_id, file_unique_id,
     file_name, mime_type, duration_seconds, file_size, route_kind, route_session_id,
     route_workspace_id, provider, model, state, transcript, language,
     intent_json, action_id, ack_message_id, attempts, last_error, created_at,
     updated_at, completed_at
 """
+
+#: The same list aliased for a ``RETURNING`` clause inside :func:`claim_next`.
+_QUALIFIED_COLUMNS = ", ".join(f"v.{name.strip()}" for name in _COLUMNS.split(","))
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,11 +83,14 @@ class VoiceInputRow:
     created_at: int
     updated_at: int
     completed_at: int | None
+    #: Filled by row-level security's column default; read for fan-out.
+    tenant_id: uuid.UUID | None = None
 
     @classmethod
-    def from_row(cls, row: aiosqlite.Row) -> Self:
+    def from_row(cls, row: Row) -> Self:
         return cls(
             chat_id=as_int(row["chat_id"]),
+            tenant_id=row["tenant_id"],
             tg_message_id=as_int(row["tg_message_id"]),
             thread_id=as_int(row["thread_id"]),
             user_id=as_int(row["user_id"]),
@@ -172,13 +184,14 @@ async def create(
     stamp = now_ms() if at is None else at
     changed = await db.execute(
         """
-        INSERT OR IGNORE INTO voice_inputs
+        INSERT INTO voice_inputs
             (chat_id, tg_message_id, thread_id, user_id, file_id,
              file_unique_id, file_name, mime_type, duration_seconds, file_size,
              route_kind,
              route_session_id, route_workspace_id, provider, model, state,
              action_id, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'received', ?, ?, ?)
+        ON CONFLICT DO NOTHING
         """,
         (
             chat_id,
@@ -208,47 +221,42 @@ async def create(
 
 
 async def claim_next(db: Database, *, at: int | None = None) -> VoiceInputRow | None:
-    """Conditionally claim one transcription or recovered dispatch job."""
+    """Claim the oldest transcription or recovered dispatch job.
+
+    One statement. ``FOR UPDATE SKIP LOCKED`` means concurrent workers pick
+    *different* rows instead of all converging on the head of the queue and all
+    but one losing a compare-and-swap.
+    """
     stamp = now_ms() if at is None else at
-    async with db.transaction():
-        candidate = await db.fetch_one(
-            """
+    row = await db.fetch_one(
+        f"""
+        WITH candidate AS (
             SELECT chat_id, tg_message_id, state
               FROM voice_inputs
              WHERE state IN ('received', 'transcribed')
              ORDER BY created_at
              LIMIT 1
-            """
-        )
-        if candidate is None:
-            return None
-        old_state = as_str(candidate["state"])
-        new_state = "transcribing" if old_state == "received" else "dispatching"
-        changed = await db.execute(
-            """
-            UPDATE voice_inputs
-               SET state = ?,
-                   attempts = attempts + CASE WHEN ? = 'transcribing' THEN 1 ELSE 0 END,
+               FOR UPDATE SKIP LOCKED
+        ),
+        claimed AS (
+            UPDATE voice_inputs v
+               SET state = CASE WHEN c.state = 'received'
+                                THEN 'transcribing' ELSE 'dispatching' END,
+                   attempts = v.attempts
+                              + CASE WHEN c.state = 'received' THEN 1 ELSE 0 END,
                    updated_at = ?,
                    last_error = NULL
-             WHERE chat_id = ? AND tg_message_id = ? AND state = ?
-            """,
-            (
-                new_state,
-                new_state,
-                stamp,
-                as_int(candidate["chat_id"]),
-                as_int(candidate["tg_message_id"]),
-                old_state,
-            ),
+              FROM candidate c
+             WHERE v.chat_id = c.chat_id
+               AND v.tg_message_id = c.tg_message_id
+               AND v.state = c.state
+            RETURNING {_QUALIFIED_COLUMNS}
         )
-        if changed != 1:
-            return None
-        return await get(
-            db,
-            as_int(candidate["chat_id"]),
-            as_int(candidate["tg_message_id"]),
-        )
+        SELECT {_COLUMNS} FROM claimed
+        """,
+        (stamp,),
+    )
+    return None if row is None else VoiceInputRow.from_row(row)
 
 
 async def mark_transcribed(
@@ -360,6 +368,7 @@ async def recover_stale(
     db: Database,
     *,
     max_attempts: int = MAX_ATTEMPTS,
+    orphan_after_ms: int = ORPHAN_AFTER_MS,
     at: int | None = None,
 ) -> Recovery:
     """Recover jobs whose process died after a conditional claim.
@@ -367,16 +376,26 @@ async def recover_stale(
     A job is requeued only while it still has attempts left. One that has
     already burned ``max_attempts`` is marked ``failed`` instead: the note is
     reproducibly killing the process, and every replay costs the owner money.
+
+    **Only jobs older than ``orphan_after_ms`` are touched.** This runs at
+    boot, and a Railway deploy overlaps the old container with the new one: a
+    row still marked ``transcribing`` may have a live speech-vendor request in
+    flight on the peer. Requeueing it transcribes the same note twice, bills
+    the customer twice and dispatches the prompt twice. ``deliveries`` has the
+    same guard for the same reason — and voice is the path that costs real
+    money per call, so it needs it more, not less.
     """
     stamp = now_ms() if at is None else at
+    cutoff = stamp - max(0, orphan_after_ms)
     exhausted = await db.fetch_all(
         f"""
         SELECT {_COLUMNS}
           FROM voice_inputs
          WHERE state IN ('transcribing', 'dispatching')
            AND attempts >= ?
+           AND updated_at <= ?
         """,
-        (max_attempts,),
+        (max_attempts, cutoff),
     )
     abandoned: list[VoiceInputRow] = []
     for raw in exhausted:
@@ -395,8 +414,9 @@ async def recover_stale(
                             ELSE 'transcribed' END,
                updated_at = ?
          WHERE state IN ('transcribing', 'dispatching')
+           AND updated_at <= ?
         """,
-        (stamp,),
+        (stamp, cutoff),
     )
     return Recovery(requeued=requeued, abandoned=tuple(abandoned))
 

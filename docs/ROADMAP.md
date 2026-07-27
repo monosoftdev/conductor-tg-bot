@@ -74,10 +74,10 @@ while a turn is running, reply still arrives exactly once.
 
 ## Phase 4 — Deploy
 
-- [ ] Railway service, volume at `/data`, `numReplicas=1`, secrets set
+- [ ] Railway service + PostgreSQL, `numReplicas=1`, secrets set
 - [ ] Confirm `overlapSeconds=0` genuinely stops the old instance first
-- [ ] Watch `/health` for 429s and tune the token bucket up from its conservative 5 req/s
-- [x] Nightly `VACUUM INTO` snapshot + `/backup`
+- [ ] Watch `/health` for 429s and tune the two rate budgets
+- [x] Per-workspace `/export`; the database's own backups replace `VACUUM INTO`
 
 ## Phase 5 — Voice and audio
 
@@ -96,8 +96,8 @@ while a turn is running, reply still arrives exactly once.
 
 Recorded so they don't get re-litigated:
 
-- **Multi-user / multi-tenant.** Single owner plus a small allowlist. SQLite and the single-instance
-  lease both assume this; revisit only if that changes.
+- ~~Multi-user / multi-tenant.~~ **Done** — see `TENANCY.md`. One bot serves many workspaces,
+  isolated by PostgreSQL row-level security, each with its own Conductor key.
 - **Attributing replies to specific prompts.** The chat mirrors the transcript stream, which is what
   a chat UI should do.
 - **Moving a prompt to another session after sending.** Would require un-sending from a running
@@ -105,3 +105,15 @@ Recorded so they don't get re-litigated:
 - **A hard spend cap.** Visible counters, not paternalism.
 - **Branch discovery.** The API exposes no branch listing; last-used memory plus free text, and we
   accept the gap rather than fake it.
+
+## Phase 6 — Multi-tenancy on PostgreSQL
+
+- [x] PostgreSQL replaces SQLite: psycopg pool, `?`→`%s` translator, squashed DDL
+- [x] `FOR UPDATE SKIP LOCKED` claims, orphan window, per-session cursor lock
+- [x] `tenants` / `tenant_members` / `tenant_chats`, row-level security, two roles
+- [x] AES-256-GCM envelope encryption for stored keys, with rotation
+- [x] `TenantMiddleware`, `TenantContext`, per-tenant `ClientPool` and `ProviderPool`
+- [x] Per-tenant auth-fatal and poller fair share; global + per-chat rate budgets
+- [x] Self-serve `/register` → `/setup <code>` → `/key`, and `/invite` for teammates
+- [x] `/backup` deleted; `/export` is per workspace
+- [ ] Live: two real workspaces, two real keys, on one deployment

@@ -11,16 +11,27 @@ into a test run and make an offline test pass for the wrong reason.
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from ctb.bot.keyboards import set_signing_key
 from ctb.conductor.models import TranscriptMessage
-from ctb.db.connection import Database, set_database
-from ctb.db.migrate import apply_migrations
+from ctb.crypto import SecretBox
 from ctb.settings import Settings, reset_settings, set_settings
+from tests.pg import (  # noqa: F401 - fixtures are used by name
+    BOOTSTRAP_TENANT_ID,
+    OTHER_TENANT_ID,
+    TEST_MASTER_KEYS,
+    app_dsn,
+    db,
+    pg_reset,
+    pg_schema,
+    system_db,
+    worker_dsn,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PROBE_OUT = REPO_ROOT / "probe-out"
@@ -28,11 +39,12 @@ PROBE_OUT = REPO_ROOT / "probe-out"
 #: Env vars that must never bleed in from the developer's shell.
 _LEAKY_ENV = (
     "TELEGRAM_BOT_TOKEN",
-    "CONDUCTOR_API_KEY",
+    "CTB_MASTER_KEYS",
+    "DATABASE_URL",
+    "SYSTEM_DATABASE_URL",
     "CONDUCTOR_API_URL",
-    "ALLOWED_TELEGRAM_USER_IDS",
-    "TELEGRAM_CHAT_ID",
-    "DB_PATH",
+    "PLATFORM_ADMIN_IDS",
+    "REGISTRATION_OPEN",
     "DEFAULT_AGENT",
     "DEFAULT_MODEL",
     "DEFAULT_EFFORT",
@@ -56,6 +68,9 @@ _LEAKY_ENV = (
 FAKE_BOT_TOKEN = "1234567890:TESTtokenTESTtokenTESTtokenTESTtoken12"
 FAKE_API_KEY = "ctb_test_api_key_0000000000"
 
+#: Deterministic so a failing test is reproducible; never used anywhere real.
+FAKE_MASTER_KEYS = TEST_MASTER_KEYS
+
 
 @pytest.fixture(autouse=True)
 def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -63,19 +78,32 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(name, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _signing_key() -> Iterator[None]:
+    """Callback payloads are signed, so every test needs the key.
+
+    Deterministic and installed everywhere, because a payload minted in one
+    test and read in another must verify — which is exactly what a redeploy
+    does, and what these payloads exist for.
+    """
+    set_signing_key(SecretBox.from_env_value(TEST_MASTER_KEYS).derive("callback"))
+    yield
+    set_signing_key(None)
+
+
 @pytest.fixture
-def settings_factory(tmp_path: Path) -> Callable[..., Settings]:
+def settings_factory() -> Callable[..., Settings]:
     """Build a :class:`Settings` with safe defaults and no ``.env`` on disk."""
 
     def make(**overrides: Any) -> Settings:
         base: dict[str, Any] = {
             "_env_file": None,
             "telegram_bot_token": FAKE_BOT_TOKEN,
-            "conductor_api_key": FAKE_API_KEY,
+            "master_keys": FAKE_MASTER_KEYS,
+            "database_url": app_dsn(),
+            "system_database_url": worker_dsn(),
             "conductor_api_url": "https://api.conductor.build/v0",
-            "allowed_telegram_user_ids": "1001,1002",
-            "telegram_chat_id": -1002000000000,
-            "db_path": tmp_path / "ctb.db",
+            "platform_admin_ids": "1001,1002",
             "log_transcript_content": False,
             "log_level": "DEBUG",
         }
@@ -86,30 +114,18 @@ def settings_factory(tmp_path: Path) -> Callable[..., Settings]:
 
 
 @pytest.fixture
+def secret_box() -> SecretBox:
+    """A real :class:`SecretBox` over throwaway keys."""
+    return SecretBox.from_env_value(FAKE_MASTER_KEYS)
+
+
+@pytest.fixture
 def settings(settings_factory: Callable[..., Settings]) -> Iterator[Settings]:
     """Install process-wide settings for the duration of one test."""
     value = settings_factory()
     set_settings(value)
     yield value
     reset_settings()
-
-
-@pytest.fixture
-def db_path(tmp_path: Path) -> Path:
-    return tmp_path / "ctb.db"
-
-
-@pytest.fixture
-async def db(db_path: Path) -> AsyncIterator[Database]:
-    """A real SQLite file with every migration applied, installed globally."""
-    database = await Database(db_path).connect()
-    await apply_migrations(database)
-    set_database(database)
-    try:
-        yield database
-    finally:
-        set_database(None)
-        await database.close()
 
 
 class FakeClock:
@@ -256,3 +272,20 @@ def probe_transcripts() -> list[TranscriptMessage]:
         if line.strip():
             messages.append(TranscriptMessage.model_validate(json.loads(line)))
     return messages
+
+
+#: Fixtures that need the PostgreSQL server from ``compose.yaml``.
+_DB_FIXTURES = frozenset({"db", "system_db", "pg_reset", "pg_schema"})
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    """Mark database tests automatically, so ``-m "not db"`` really is offline.
+
+    Applying the marker by hand would rot: a test that grows a ``db`` fixture
+    later would silently join the database set while still claiming not to be
+    in it, and the offline subset would fail on a machine with no server.
+    """
+    for item in items:
+        fixtures = getattr(item, "fixturenames", ())
+        if _DB_FIXTURES.intersection(fixtures):
+            item.add_marker(pytest.mark.db)

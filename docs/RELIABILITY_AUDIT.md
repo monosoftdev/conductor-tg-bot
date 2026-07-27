@@ -67,9 +67,13 @@ now fails the deployment instead of presenting a false-green service.
 | Voice | Too large/long, disabled, missing key, empty/ambiguous transcript | One concrete result; no command or prompt executes |
 | Voice | Speech resembles a command without wake phrase | Treated as ordinary speech; destructive action cannot fire |
 | Voice | Spoken archive command | Named confirmation is still required |
-| SQLite | Restart/redeploy during work | WAL database, migrations, prompt/cursor/outbox rows, and voice jobs resume |
-| SQLite | Two runtime instances overlap | Singleton lease gates pollers; Railway must still run one replica |
-| Railway volume | `/data` is root-owned | Startup fails with the exact fix; set `RAILWAY_RUN_UID=0` |
+| PostgreSQL | Restart/redeploy during work | Prompt/cursor/outbox rows and voice jobs resume; the container holds no state |
+| PostgreSQL | Two runtime instances overlap | Singleton lease gates pollers; claims use `FOR UPDATE SKIP LOCKED`, and recovery leaves a peer's fresh claim alone |
+| PostgreSQL | Schema missing or older than the code | Boot fails naming `python -m ctb.db.bootstrap`; the app never applies DDL |
+| PostgreSQL | Connection pool exhausted | `PoolTimeout` raises with a stack; pool stats are in `/health` |
+| Tenancy | A query forgets its tenant filter | Row-level security returns zero rows, not another workspace's data |
+| Tenancy | One workspace's Conductor key is rejected | Only that workspace's pollers stop; its owners are told |
+| Tenancy | One workspace floods Telegram | Its chats are paused; the rotor keeps serving everyone else |
 | Runtime | Any long-lived critical service exits | Structured runtime exits so Railway restarts the complete unit |
 | Maintenance | Retention or backup fails | Delivery continues; maintenance retries on the next reconciliation |
 
@@ -95,7 +99,7 @@ Automated tests use faithful scripted transports, but the following require the
 real deployment:
 
 - bot admin permissions and Telegram forum behavior in the actual supergroup;
-- real Railway `/data` ownership and persistence across a redeploy;
+- real PostgreSQL behaviour under a redeploy, and two workspaces at once;
 - real Conductor credentials, sleeping-workspace wake behavior, and account
   rate limits;
 - Telegram/Conductor outage duration beyond the bounded command-reply window;

@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
+import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
 from typing import Any, Final, Protocol
@@ -46,8 +47,9 @@ from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
 
 from ctb.db import NO_THREAD_ID
-from ctb.db.connection import Database
+from ctb.db.connection import Database, current_tenant, tenant_scope
 from ctb.db.repo import sessions as sessions_repo
+from ctb.delivery.pacing import TelegramPacer
 from ctb.delivery.render.adapters.result import format_cost
 from ctb.delivery.render.html import escape, strip_html
 from ctb.logging import get_logger
@@ -346,6 +348,9 @@ class _Card:
     chat_id: int
     thread_id: int
     state: CardState
+    #: Whose card this is. The tick loop is process-wide, so persisting the
+    #: card's message id needs the owning tenant's scope explicitly.
+    tenant_id: uuid.UUID | None = None
     deep_link: str | None = None
     message_id: int | None = None
     typing: bool = False
@@ -381,6 +386,7 @@ class StatusCards:
         stall_after: float = CARD_STALL_AFTER_S,
         tick_interval: float = CARD_TICK_S,
         pin: bool = True,
+        pacer: TelegramPacer | None = None,
     ) -> None:
         self._bot = bot
         self._db = db
@@ -392,6 +398,13 @@ class StatusCards:
         self._stall_after = max(0.0, stall_after)
         self._tick_interval = max(0.01, tick_interval)
         self._pin = pin
+        #: The *same* instance the outbox uses, in production. Cards are a
+        #: second uncontrolled stream against one shared bot token: an edit
+        #: every 3s plus a typing action every 4s, per live topic. At thirty
+        #: concurrent turns that is more Bot API calls per second than the
+        #: outbox's whole budget, spent invisibly. Sharing the pacer makes both
+        #: streams draw on one account of what Telegram will accept.
+        self._pacer = pacer
         self._cards: dict[tuple[int, int], _Card] = {}
         #: Topics whose card has already been pinned once. Every turn posts a
         #: fresh card, and pinning each one makes Telegram inject a "pinned a
@@ -666,7 +679,7 @@ class StatusCards:
             return
         self._cards.pop(card.key, None)
         card.typing = False
-        await self._persist_card_id(card.session_id, None)
+        await self._persist_card_id(card, None)
 
     # -- the periodic pass ------------------------------------------------
 
@@ -724,12 +737,16 @@ class StatusCards:
                 chat_id=chat_id,
                 thread_id=thread_id,
                 state=CardState(),
+                # Captured here, where a scope exists: `handle` runs inside the
+                # poller's tenant, `tick` does not.
+                tenant_id=current_tenant(),
                 deep_link=deep_link,
                 last_change_at=self._clock(),
             )
             self._cards[key] = card
         else:
             card.session_id = session_id
+            card.tenant_id = card.tenant_id or current_tenant()
             if deep_link is not None:
                 card.deep_link = deep_link
         return card
@@ -760,8 +777,14 @@ class StatusCards:
             return
         await self._edit(card, rendered, now)
 
+    async def _spend(self) -> None:
+        """One Bot API call against the shared per-token budget."""
+        if self._pacer is not None:
+            await self._pacer.acquire_global()
+
     async def _post(self, card: _Card, rendered: str, now: float) -> None:
         markup = self._markup(card)
+        await self._spend()
         try:
             result = await self._bot.send_message(
                 chat_id=card.chat_id,
@@ -787,10 +810,11 @@ class StatusCards:
         self._counters["posted"] += 1
         if card.message_id is not None:
             await self._pin_card(card)
-            await self._persist_card_id(card.session_id, card.message_id)
+            await self._persist_card_id(card, card.message_id)
 
     async def _edit(self, card: _Card, rendered: str, now: float) -> None:
         markup = self._markup(card)
+        await self._spend()
         try:
             await self._bot.edit_message_text(
                 text=rendered,
@@ -833,6 +857,7 @@ class StatusCards:
 
     async def _edit_plain(self, card: _Card, rendered: str, now: float) -> None:
         """The one unformatted retry. Not itself retried."""
+        await self._spend()
         try:
             await self._bot.edit_message_text(
                 text=strip_html(rendered),
@@ -853,6 +878,7 @@ class StatusCards:
 
     async def _send_typing(self, card: _Card, now: float) -> None:
         card.last_typing_at = now
+        await self._spend()
         try:
             await self._bot.send_chat_action(
                 chat_id=card.chat_id,
@@ -872,6 +898,7 @@ class StatusCards:
         # Marked before the call, not after: a chat where we lack the pin
         # permission must not re-ask on every turn.
         self._pinned.add(card.key)
+        await self._spend()
         try:
             await self._bot.pin_chat_message(
                 chat_id=card.chat_id,
@@ -882,12 +909,28 @@ class StatusCards:
             # Pinning needs a permission we may not have. The card still works.
             _log.info("status_card.pin_failed", chat_id=card.chat_id, error=repr(exc))
 
-    async def _persist_card_id(self, session_id: str, message_id: int | None) -> None:
+    async def _persist_card_id(self, card: _Card, message_id: int | None) -> None:
+        """Remember (or forget) which message is this session's card.
+
+        Runs from the process-wide tick loop, so it enters the card's own
+        tenant scope. Without that the write is rejected and the id goes stale
+        across a redeploy — the card is then edited into a message that is no
+        longer the newest thing in the topic.
+        """
+        tenant_id = card.tenant_id or current_tenant()
+        if tenant_id is None:
+            _log.warning("status_card.unscoped", session_id=card.session_id)
+            return
         try:
-            await sessions_repo.set_status_card(self._db, session_id, message_id)
+            async with tenant_scope(tenant_id):
+                await sessions_repo.set_status_card(
+                    self._db, card.session_id, message_id
+                )
         except Exception as exc:
             _log.warning(
-                "status_card.persist_failed", session_id=session_id, error=repr(exc)
+                "status_card.persist_failed",
+                session_id=card.session_id,
+                error=repr(exc),
             )
 
     def _markup(self, card: _Card) -> InlineKeyboardMarkup | None:
@@ -902,6 +945,11 @@ class StatusCards:
             return None
 
     def _back_off(self, card: _Card, exc: TelegramRetryAfter) -> None:
+        # Tell the pacer too. Otherwise the outbox keeps pushing transcript
+        # chunks into a chat Telegram has already started throttling, turning
+        # one 429 into a run of them.
+        if self._pacer is not None:
+            self._pacer.pause_chat(card.chat_id, max(float(exc.retry_after), 0.0))
         card.suppressed_until = self._clock() + max(float(exc.retry_after), 0.0)
         card.dirty = True
         self._counters["errors"] += 1

@@ -13,7 +13,7 @@ Resolution order, cheapest first:
    pointer).
 
 The middleware is **read-only by default**. Creating a ``chats`` row on every
-incoming update would write to SQLite for every keystroke in a group the bot
+incoming update would write to the database for every keystroke in a group
 merely watches; the handlers that actually need a row call ``chats.ensure``.
 
 It is also the one place that knows, for every update, which topic the thumb is
@@ -24,8 +24,9 @@ routing hiccup cannot cost the ordering.
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Final
 
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
@@ -76,6 +77,13 @@ async def default_reply_resolver(
 class Route:
     """Where this update came from and which session it drives."""
 
+    #: Which workspace owns this update. Stamped by
+    #: :class:`~ctb.bot.middleware.tenancy.TenantMiddleware`, and used for
+    #: logging and fan-out — never for filtering, which row-level security
+    #: already does.
+    tenant_id: uuid.UUID | None = None
+    #: Whether *this tenant* has voice on. The platform switch is separate.
+    tenant_voice_enabled: bool = False
     chat_id: int | None = None
     thread_id: int = NO_THREAD_ID
     #: ``"dm"`` · ``"general"`` · ``"topic"`` · ``"unknown"``.
@@ -162,7 +170,12 @@ class RoutingMiddleware(BaseMiddleware):
         kind = _chat_kind(context, thread_id)
         reply_to = _reply_to_message_id(event)
 
+        tenant = data.get("tenant")
         route = Route(
+            tenant_id=getattr(tenant, "tenant_id", None),
+            tenant_voice_enabled=bool(
+                getattr(getattr(tenant, "settings", None), "voice_enabled", False)
+            ),
             chat_id=chat_id,
             thread_id=thread_id,
             kind=kind,
@@ -171,7 +184,9 @@ class RoutingMiddleware(BaseMiddleware):
         if chat_id is not None:
             self._focus.note(chat_id, thread_id)
         db = self._resolve_db(data)
-        if db is not None and chat_id is not None:
+        # No tenant means TenantMiddleware let this through unresolved (the
+        # registration path). There is no scope, so there is nothing to read.
+        if db is not None and chat_id is not None and route.tenant_id is not None:
             route = await self._resolve(db, route)
 
         data[ROUTE_KEY] = route
@@ -196,15 +211,7 @@ class RoutingMiddleware(BaseMiddleware):
         # `chats.kind` is authoritative once a row exists (a DM row is written
         # as kind='dm'), but the live Telegram chat type wins for General vs
         # topic because a topic can be deleted out from under us.
-        return Route(
-            chat_id=chat_id,
-            thread_id=route.thread_id,
-            kind=route.kind,
-            chat=chat,
-            session=session,
-            reply_to_message_id=route.reply_to_message_id,
-            via_reply=via_reply,
-        )
+        return replace(route, chat=chat, session=session, via_reply=via_reply)
 
     async def _session_for(
         self, db: Database, chat: ChatRow | None, chat_id: int, thread_id: int

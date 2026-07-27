@@ -19,7 +19,8 @@ Four jobs, in order of how badly getting them wrong hurts:
    server-side regression and re-posting a whole transcript. A 404 on ``after``
    is repaired by offset paging, not by concluding the session is dead.
 3. **The advance is atomic.** ``transcript_messages`` + ``deliveries`` + the
-   cursor move happen in one ``BEGIN IMMEDIATE`` inside
+   cursor move happen in one transaction, behind a ``SELECT … FOR UPDATE`` on
+   the session, inside
    :func:`ctb.db.repo.transcript.advance_cursor`. The cursor never passes an
    unrecorded message (no drops) and a replayed page inserts nothing (no
    duplicates, even with two pollers overlapping across a redeploy).
@@ -724,6 +725,7 @@ async def drain(
     planner: DeliveryPlanner = plan_deliveries,
     max_pages: int = MAX_PAGES_PER_TICK,
     page_limit: int = PAGE_LIMIT,
+    max_pending: int | None = None,
 ) -> DrainResult:
     """Fetch, validate, record and queue everything new. Runs every tick.
 
@@ -832,7 +834,9 @@ async def drain(
                         deliveries=drafts,
                     )
                 )
-            result = await transcript.advance_cursor(db, session_id, tuple(items))
+            result = await transcript.advance_cursor(
+                db, session_id, tuple(items), max_pending=max_pending
+            )
             recorded += result.recorded
             duplicates += result.duplicates
             created += result.deliveries_created

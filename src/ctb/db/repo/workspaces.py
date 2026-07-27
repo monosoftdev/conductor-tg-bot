@@ -12,10 +12,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Self
 
-import aiosqlite
-
 from ctb.conductor.models import WorkspaceStatusValue
-from ctb.db.connection import Database, now_ms
+from ctb.db.connection import Database, Row, now_ms
 from ctb.db.repo._util import (
     UNSET,
     Maybe,
@@ -33,6 +31,7 @@ __all__ = [
     "get",
     "get_by_nonce",
     "get_by_topic",
+    "count_live",
     "list_all",
     "list_for_project",
     "mark_archived",
@@ -77,7 +76,7 @@ class WorkspaceRow:
     archived_at: int | None = None
 
     @classmethod
-    def from_row(cls, row: aiosqlite.Row) -> Self:
+    def from_row(cls, row: Row) -> Self:
         return cls(
             id=str(row["id"]),
             project_id=as_opt_str(row["project_id"]),
@@ -306,6 +305,15 @@ async def mark_archived(
         at=stamp,
         status=str(WorkspaceStatusValue.ARCHIVED),
         archived_at=stamp,
+    )
+
+
+async def count_live(db: Database) -> int:
+    """Unarchived workspaces in this tenant. Tenant-scoped by row-level security."""
+    return as_int(
+        await db.fetch_val(
+            "SELECT COUNT(*) FROM workspaces WHERE archived_at IS NULL", default=0
+        )
     )
 
 

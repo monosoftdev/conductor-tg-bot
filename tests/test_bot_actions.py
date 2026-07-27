@@ -58,11 +58,13 @@ async def _bound(db: Database) -> None:
     )
 
 
-async def test_sink_fans_out_cards_notice_and_topic_marker(db: Database) -> None:
+async def test_sink_fans_out_cards_notice_and_topic_marker(
+    db: Database, system_db: Database
+) -> None:
     await _bound(db)
     recorder = Recorder()
     bot = Bot()
-    sink = BotActionSink(bot, db, recorder, recorder)  # type: ignore[arg-type]
+    sink = BotActionSink(bot, db, system_db, recorder, recorder)  # type: ignore[arg-type]
 
     await sink.handle(
         (
@@ -94,10 +96,11 @@ async def test_sink_fans_out_cards_notice_and_topic_marker(db: Database) -> None
 
 async def test_quiet_notice_is_silent_and_deduped_by_stable_key(
     db: Database,
+    system_db: Database,
 ) -> None:
     await _bound(db)
     recorder = Recorder()
-    sink = BotActionSink(Bot(), db, recorder, recorder)  # type: ignore[arg-type]
+    sink = BotActionSink(Bot(), db, system_db, recorder, recorder)  # type: ignore[arg-type]
 
     action = Notify("Still working", NotifyLevel.QUIET)
     await sink.handle(
@@ -120,6 +123,7 @@ async def test_quiet_notice_is_silent_and_deduped_by_stable_key(
 
 async def test_finalize_turns_prompt_receipt_into_completion_reaction(
     db: Database,
+    system_db: Database,
 ) -> None:
     await _bound(db)
     prompt = await prompts.create(
@@ -133,7 +137,7 @@ async def test_finalize_turns_prompt_receipt_into_completion_reaction(
     await prompts.mark_witnessed(db, prompt.message_id)
     recorder = Recorder()
     bot = Bot()
-    sink = BotActionSink(bot, db, recorder, recorder)  # type: ignore[arg-type]
+    sink = BotActionSink(bot, db, system_db, recorder, recorder)  # type: ignore[arg-type]
 
     await sink.handle(
         (Finalize(TurnSummary(prompts=1, ok=True)),),

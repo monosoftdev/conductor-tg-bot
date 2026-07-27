@@ -5,16 +5,16 @@ whether a deploy is promoted and whether a running instance is restarted. That
 makes the definition of *unhealthy* a policy decision, not a formality:
 
 **Only a dead database fails the check.** A restart re-runs the boot path —
-open the SQLite file on the volume, migrate, take the lease, spawn pollers — so
+open both pools, verify the schema, take the lease, spawn pollers — so
 a restart is a plausible fix for exactly one class of failure: the process
 cannot reach its own state. Everything else is reported in the body at HTTP
 200, because a restart loop would make it *worse*:
 
-* **auth fatal (401/403).** ``client.py`` stops every poller and keeps the bot
-  alive on purpose. Cycling the process cannot conjure a valid
-  ``CONDUCTOR_API_KEY``; it would only lose the in-memory state that lets the
-  owner see *why* the bot went quiet. Reported as the ``auth_fatal``
-  degradation, HTTP 200.
+* **auth fatal (401/403).** The supervisor stops *that tenant's* pollers and
+  keeps the bot alive on purpose — everyone else is unaffected. Cycling the
+  process cannot conjure a valid key; it would only lose the in-memory state
+  that lets the owner see *why* their workspace went quiet. Reported as the
+  ``auth_fatal`` degradation, HTTP 200.
 * **circuit open / rate limited.** Conductor is down or throttling us. A
   restart re-opens the circuit against the same unhealthy upstream and drops
   the backoff window. Reported, HTTP 200.
@@ -58,7 +58,7 @@ from typing import Any, Final, Self
 from aiohttp import web
 
 from ctb import __version__
-from ctb.conductor.client import ConductorClient, get_client
+from ctb.conductor.pool import ClientPool
 from ctb.db.connection import Database, get_database, now_ms
 from ctb.db.migrate import current_schema_version
 from ctb.db.repo import deliveries as deliveries_repo
@@ -68,6 +68,7 @@ from ctb.db.repo import sessions as sessions_repo
 from ctb.db.repo import voice_inputs as voice_repo
 from ctb.delivery.render.html import escape
 from ctb.logging import get_logger, scrub_secrets
+from ctb.runtime import client_pool, system_database
 from ctb.turn.machine import format_duration
 
 log = get_logger(__name__)
@@ -81,7 +82,7 @@ PORT_ENV_VARS: Final[tuple[str, ...]] = ("PORT", "HEALTH_PORT")
 TOKEN_ENV_VAR: Final[str] = "HEALTH_TOKEN"
 TOKEN_HEADER: Final[str] = "X-Health-Token"
 
-#: A wedged SQLite file must fail the check rather than hang Railway's probe.
+#: An exhausted pool must fail the check rather than hang Railway's probe.
 DB_TIMEOUT_S: Final[float] = 5.0
 #: The endpoint may be public; collecting a report costs ~6 queries.
 CACHE_TTL_S: Final[float] = 2.0
@@ -269,8 +270,21 @@ def reset_telegram_health() -> None:
 # ── providers ────────────────────────────────────────────────────────────────
 
 type DatabaseProvider = Callable[[], Database | None]
-type ClientProvider = Callable[[], ConductorClient | None]
+type PoolProvider = Callable[[], ClientPool | None]
 type TelegramProvider = Callable[[], TelegramHealth | None]
+
+
+def _pool_stats(db: Database) -> dict[str, Any]:
+    """Pool counters. Exhaustion is the new deadlock class; make it visible."""
+    try:
+        stats = db.stats()
+    except Exception:  # pragma: no cover - stats are best effort
+        return {}
+    return {
+        "pool_size": stats.get("pool_size", 0),
+        "pool_available": stats.get("pool_available", 0),
+        "pool_waiting": stats.get("requests_waiting", 0),
+    }
 
 
 def default_database_provider() -> Database | None:
@@ -282,11 +296,20 @@ def default_database_provider() -> Database | None:
     return db if db.is_connected else None
 
 
-def default_client_provider() -> ConductorClient | None:
-    """The process-wide Conductor client, or ``None`` if it cannot be built."""
+def default_database_provider_system() -> Database | None:
+    """The worker pool, which is what the cross-tenant sections read."""
     try:
-        return get_client()
-    except Exception:  # pragma: no cover - settings are validated at boot
+        db = system_database()
+    except RuntimeError:
+        return None
+    return db if db.is_connected else None
+
+
+def default_pool_provider() -> ClientPool | None:
+    """The process-wide client pool, or ``None`` before boot installed one."""
+    try:
+        return client_pool()
+    except RuntimeError:
         return None
 
 
@@ -306,7 +329,7 @@ class HealthMonitor:
         "_cache",
         "_cache_ttl",
         "_cached_at",
-        "_client_provider",
+        "_pool_provider",
         "_clock",
         "_db_provider",
         "_db_timeout",
@@ -322,7 +345,7 @@ class HealthMonitor:
         self,
         *,
         database: DatabaseProvider = default_database_provider,
-        client: ClientProvider = default_client_provider,
+        clients: PoolProvider = default_pool_provider,
         telegram: TelegramProvider = telegram_health,
         holder: str | None = None,
         instance: str | None = None,
@@ -333,7 +356,7 @@ class HealthMonitor:
         db_timeout_s: float = DB_TIMEOUT_S,
     ) -> None:
         self._db_provider = database
-        self._client_provider = client
+        self._pool_provider = clients
         self._telegram_provider = telegram
         self._holder = holder
         self._instance = instance if instance is not None else (holder or "")
@@ -412,46 +435,86 @@ class HealthMonitor:
     # -- Conductor client (in-memory, cannot block) ---------------------------
 
     def _collect_conductor(self, degradations: list[Degradation]) -> dict[str, Any]:
-        client = _call_safely(self._client_provider)
-        if client is None:
+        """Aggregate across every live tenant client.
+
+        There is no single Conductor client any more, so this reports the pool
+        plus the *worst* state any tenant is in. Naming which tenant is
+        deliberate — an operator needs to know who to contact — and safe,
+        because a slug is not identifying the way a name or a key would be.
+        """
+        pool = _call_safely(self._pool_provider)
+        if pool is None:
             return {"available": False}
         try:
-            section: dict[str, Any] = dict(client.health())
-            recent = client.recent_events()
+            section: dict[str, Any] = dict(pool.health())
+            clients = pool.clients()
         except Exception as exc:  # pragma: no cover - health() is pure reads
             return {"available": False, "error": _reason(exc)}
         section["available"] = True
-        throttled = sum(1 for event in recent if event.status_code == 429)
-        section["rate_limited_recent"] = throttled
 
-        auth_failures = int(section.get("auth_failures", 0) or 0)
+        throttled = 0
+        recent_total = 0
+        auth_failures = 0
+        failures_total = 0
+        requests_total = 0
+        retries_total = 0
+        open_circuits: list[str] = []
+        rejected: list[str] = []
+        for slug, client in clients:
+            try:
+                stats: Mapping[str, Any] = client.health()
+                recent: tuple[Any, ...] = client.recent_events()
+            except Exception:  # pragma: no cover - pure reads
+                continue
+            recent_total += len(recent)
+            throttled += sum(1 for event in recent if event.status_code == 429)
+            failures_total += int(stats.get("failures", 0) or 0)
+            requests_total += int(stats.get("requests", 0) or 0)
+            retries_total += int(stats.get("retries", 0) or 0)
+            failures = int(stats.get("auth_failures", 0) or 0)
+            if failures:
+                auth_failures += failures
+                rejected.append(slug)
+            circuit = stats.get("circuit")
+            if isinstance(circuit, Mapping) and circuit.get("state") != "closed":
+                open_circuits.append(slug)
+        section["rate_limited_recent"] = throttled
+        section["auth_failures"] = auth_failures
+        section["failures"] = failures_total
+        section["requests"] = requests_total
+        section["retries"] = retries_total
+        section["auth_rejected_tenants"] = tuple(sorted(rejected))
+        section["open_circuit_tenants"] = tuple(sorted(open_circuits))
+        # One summary line for the operator: the worst breaker anyone is in.
+        section["circuit"] = {
+            "state": "open" if open_circuits else "closed",
+            "open_tenants": len(open_circuits),
+        }
+
         if auth_failures:
             degradations.append(
                 Degradation(
                     DEGRADATION_AUTH_FATAL,
-                    "Conductor rejected the API key (401/403); pollers are stopped. "
-                    "Replace CONDUCTOR_API_KEY and redeploy — restarting will not "
-                    "fix it, so this does not fail the healthcheck.",
+                    "Conductor rejected an API key (401/403) for "
+                    f"{', '.join(sorted(rejected))}; those tenants' pollers are "
+                    "stopped. They must set a new key with /key — restarting "
+                    "will not fix it, so this does not fail the healthcheck.",
                 )
             )
-        circuit = section.get("circuit")
-        if isinstance(circuit, Mapping):
-            state = str(circuit.get("state", "closed"))
-            if state != "closed":
-                retry_after = circuit.get("retry_after", 0)
-                degradations.append(
-                    Degradation(
-                        DEGRADATION_CIRCUIT_OPEN,
-                        f"Conductor API circuit is {state}; "
-                        f"retrying in {retry_after}s "
-                        f"(opened by {circuit.get('opened_by') or 'unknown'}).",
-                    )
+        if open_circuits:
+            degradations.append(
+                Degradation(
+                    DEGRADATION_CIRCUIT_OPEN,
+                    "Conductor API circuit is open for "
+                    f"{', '.join(open_circuits)}. Each tenant has its own "
+                    "breaker, so this affects only them.",
                 )
+            )
         if throttled:
             degradations.append(
                 Degradation(
                     DEGRADATION_RATE_LIMITED,
-                    f"{throttled} of the last {len(recent)} API attempts were 429s; "
+                    f"{throttled} of the last {recent_total} API attempts were 429s; "
                     "the token bucket may need tuning.",
                 )
             )
@@ -500,28 +563,26 @@ class HealthMonitor:
             degradations.append(
                 Degradation(
                     DEGRADATION_DATABASE,
-                    f"SQLite did not answer within {self._db_timeout:g}s.",
+                    f"PostgreSQL did not answer within {self._db_timeout:g}s.",
                 )
             )
-            return (
-                {"ok": False, "path": str(db.path), "error": "timeout"},
-                {},
-            )
+            return ({"ok": False, "error": "timeout", **_pool_stats(db)}, {})
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             degradations.append(
                 Degradation(
-                    DEGRADATION_DATABASE, f"SQLite is unreadable: {_reason(exc)}"
+                    DEGRADATION_DATABASE,
+                    f"PostgreSQL is unreadable: {_reason(exc)}",
                 )
             )
-            return {"ok": False, "path": str(db.path), "error": _reason(exc)}, {}
+            return {"ok": False, "error": _reason(exc), **_pool_stats(db)}, {}
 
         db_section = {
             "ok": True,
-            "path": str(db.path),
             "schema_version": schema_version,
             "query_ms": int((self._clock() - started) * 1000),
+            **_pool_stats(db),
         }
         return db_section, sections
 
@@ -580,6 +641,10 @@ class HealthMonitor:
             "voice": voice,
             "lease": lease_section,
             "api_events": [_event_dict(event, at=at) for event in recent],
+            # Cross-tenant on purpose: this is renderer coverage, not customer
+            # data. The rows' `sample_session_id`/`sample_message_id` *are* a
+            # pointer into one tenant's transcripts, so they are deliberately
+            # not surfaced here — only the shape and the count.
             "unknown_content_types": [
                 {
                     "type": row.type,
@@ -1099,7 +1164,7 @@ __all__ = [
     "POLL_LAG_FACTOR",
     "POLL_LAG_GRACE_MS",
     "TELEGRAM_FAILURE_THRESHOLD",
-    "ClientProvider",
+    "PoolProvider",
     "DatabaseProvider",
     "Degradation",
     "DetailPolicy",
@@ -1110,7 +1175,7 @@ __all__ = [
     "TelegramHealth",
     "TelegramProvider",
     "create_app",
-    "default_client_provider",
+    "default_pool_provider",
     "default_database_provider",
     "default_detail_policy",
     "detail_allowed",

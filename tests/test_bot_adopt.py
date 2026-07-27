@@ -19,7 +19,7 @@ import asyncio
 import random
 from collections.abc import AsyncIterator, Callable
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
@@ -40,14 +40,17 @@ from ctb.bot.handlers.adopt import (
 from ctb.bot.handlers.common import MOBILE_REPLY_INSTRUCTION, augment_prompt
 from ctb.bot.keyboards import NonceStore
 from ctb.bot.middleware.routing import Route
+from ctb.bot.middleware.tenancy import TenantContext, TenantSettings
 from ctb.conductor.client import ConductorClient
 from ctb.conductor.models import TranscriptMessage, WorkspaceStatusValue
 from ctb.db.connection import Database
 from ctb.db.repo import chats as chats_repo
 from ctb.db.repo import sessions as sessions_repo
 from ctb.db.repo import workspaces as workspaces_repo
+from ctb.db.repo.tenancy import TenantRow
 from ctb.settings import Settings
 from ctb.turn.state import TopicMarker
+from tests.conftest import FAKE_API_KEY
 from tests.fakes.fake_conductor import (
     FakeConductor,
     FakeSession,
@@ -55,6 +58,34 @@ from tests.fakes.fake_conductor import (
     result,
     user_message,
 )
+from tests.pg import BOOTSTRAP_TENANT_ID
+
+
+def fake_tenant(
+    client: Any = None,
+    *,
+    role: str = "owner",
+    user_id: int = 1001,
+    slug: str = "test",
+) -> TenantContext:
+    """The context TenantMiddleware would have injected.
+
+    Handlers reach the Conductor API only through this, which is what makes a
+    cross-organisation read impossible to write by accident.
+    """
+    return TenantContext(
+        tenant_id=BOOTSTRAP_TENANT_ID,
+        slug=slug,
+        status="active",
+        role=role,
+        user_id=user_id,
+        owner_ids=(user_id,),
+        primary_chat_id=None,
+        settings=TenantSettings(),
+        row=TenantRow(id=BOOTSTRAP_TENANT_ID, slug=slug, name=slug, status="active"),
+        _client=client,
+    )
+
 
 CHAT_ID = -1002000000000
 FIRST_TOPIC = 101
@@ -146,7 +177,8 @@ async def client(
     settings: Settings, fake: FakeConductor
 ) -> AsyncIterator[ConductorClient]:
     instance = ConductorClient(
-        settings,
+        api_key=FAKE_API_KEY,
+        api_url=settings.conductor_api_url,
         transport=fake.transport(),
         sleep=_no_sleep,
         rng=random.Random(20260726),
@@ -202,7 +234,7 @@ async def _adopt(
 
 
 async def test_adopting_a_remote_workspace_opens_one_topic_and_binds_it(
-    db: Database, client: ConductorClient, fake: FakeConductor
+    db: Database, system_db: Database, client: ConductorClient, fake: FakeConductor
 ) -> None:
     session = _seeded(fake)
     bot = _Bot()
@@ -230,7 +262,9 @@ async def test_adopting_a_remote_workspace_opens_one_topic_and_binds_it(
         session.session_id,
     )
     # Bound is all the supervisor asks for; the poller follows within 5s.
-    assert [r.id for r in await sessions_repo.list_bound(db)] == [session.session_id]
+    assert [r.id for r in await sessions_repo.list_bound(system_db)] == [
+        session.session_id
+    ]
 
 
 async def test_the_snapshot_card_creates_no_deliveries_and_never_moves_the_cursor(
@@ -700,9 +734,9 @@ async def test_a_prompt_in_the_adopted_topic_reaches_the_adopted_session(
             chat=chat,
             session=row,
         ),
+        fake_tenant(client),
         NonceStore(),
         db=db,
-        client=client,
     )
 
     posted = session.posted_ids
@@ -737,10 +771,10 @@ async def test_attach_command_lists_only_matching_unattached_workspaces(
 
     await core_handlers.attach_workspace(
         message,  # type: ignore[arg-type]
+        fake_tenant(client),
         _NullState(),  # type: ignore[arg-type]
         NonceStore(),
         db=db,
-        client=client,
     )
 
     text, markup = sent[0]
@@ -771,10 +805,10 @@ async def test_general_switch_offers_adoption_and_says_what_it_capped(
     await power_handlers.switch_session(
         message,  # type: ignore[arg-type]
         Route(chat_id=CHAT_ID, kind="general"),
+        fake_tenant(client),
         _NullState(),  # type: ignore[arg-type]
         NonceStore(),
         db=db,
-        client=client,
     )
 
     text, markup = sent[0]
@@ -809,10 +843,10 @@ async def test_general_switch_filters_adoptable_workspaces_by_name(
     await power_handlers.switch_session(
         message,  # type: ignore[arg-type]
         Route(chat_id=CHAT_ID, kind="general"),
+        fake_tenant(client),
         _NullState(),  # type: ignore[arg-type]
         NonceStore(),
         db=db,
-        client=client,
     )
 
     _, markup = sent[0]
@@ -856,10 +890,10 @@ async def test_general_switch_finds_an_attached_topic_by_workspace_name(
     await power_handlers.switch_session(
         message,  # type: ignore[arg-type]
         Route(chat_id=CHAT_ID, kind="general"),
+        fake_tenant(client),
         _NullState(),  # type: ignore[arg-type]
         NonceStore(),
         db=db,
-        client=client,
     )
 
     _, markup = sent[0]
@@ -877,7 +911,7 @@ async def test_the_view_being_down_leaves_general_switch_working(
 
     monkeypatch.setattr(core_handlers, "board_rows", boom)
 
-    assert await core_handlers.adoptable_rows(db, None) == []
+    assert await core_handlers.adoptable_rows(db, cast(ConductorClient, None)) == []
 
 
 async def test_the_callback_opens_the_topic_and_answers_with_a_jump(
@@ -898,8 +932,8 @@ async def test_the_callback_opens_the_topic_and_answers_with_a_jump(
     await adopt_handlers.adopt_callback(
         query,  # type: ignore[arg-type]
         store,
+        fake_tenant(client),
         db=db,
-        client=client,
     )
 
     assert query.answers == ["Opening…"]
@@ -923,8 +957,8 @@ async def test_a_refused_adoption_answers_in_the_chat_not_only_the_toast(
     await adopt_handlers.adopt_callback(
         query,  # type: ignore[arg-type]
         store,
+        fake_tenant(client),
         db=db,
-        client=client,
     )
 
     assert bot.topics == []

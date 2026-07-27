@@ -40,7 +40,8 @@ from aiogram.exceptions import (
 )
 from aiogram.types import InlineKeyboardMarkup, Message
 
-from ctb.conductor.client import ConductorClient, get_client
+from ctb.bot.middleware.tenancy import TenantContext
+from ctb.conductor.client import ConductorClient
 from ctb.conductor.models import SessionStatusValue, WorkspaceStatusValue
 from ctb.db import NO_THREAD_ID
 from ctb.db.connection import Database, get_database
@@ -133,9 +134,23 @@ def resolve_db(db: Database | None) -> Database:
     return db if db is not None else get_database()
 
 
-def resolve_client(client: ConductorClient | None = None) -> ConductorClient:
-    """The Conductor client. Handlers never construct one."""
-    return client if client is not None else get_client()
+def resolve_client(
+    client: ConductorClient | None = None,
+    tenant: TenantContext | None = None,
+) -> ConductorClient:
+    """The *tenant's* Conductor client. There is no process-wide fallback.
+
+    Deleting the global was the point: a handler that forgets to take
+    ``tenant`` now fails by name here instead of quietly reading another
+    organisation's data with the wrong API key.
+    """
+    if tenant is not None:
+        return tenant.client
+    if client is not None:
+        return client
+    raise RuntimeError(
+        "no Conductor client in scope; the handler must take `tenant: TenantContext`"
+    )
 
 
 # ── naming ───────────────────────────────────────────────────────────────────

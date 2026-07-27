@@ -3,14 +3,13 @@ builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-# Service variables cannot be set from this file. Set them in the Railway UI —
-# and set RAILWAY_RUN_UID=0 first: the image runs as UID 10001 and the volume
-# mounts root-owned, so without it the container cannot open /data/ctb.db and
-# burns all ten restarts below. See README "Before your first deploy".
+# Service variables cannot be set from this file; set them in the Railway UI.
+# There is no volume any more — all state is in PostgreSQL — so the old
+# `RAILWAY_RUN_UID=0` ownership trap is gone with it.
 #
 # Exactly one instance, always. Two would fight over Telegram's getUpdates
-# (409 Conflict) and the SQLite volume can only attach to one anyway. The
-# singleton lease in the DB is the belt to this braces.
+# (409 Conflict), and only one process may hold the supervisor lease. The
+# lease in the database is the belt to this braces.
 #
 # Replica count is NOT settable from this file: `numReplicas` is only valid
 # nested under `multiRegionConfig.<region>`, never at the top of [deploy].
@@ -21,5 +20,7 @@ healthcheckPath = "/health"
 healthcheckTimeout = 30
 
 # Stop the old instance before starting the new one, so a redeploy never has
-# two pollers live at once.
+# two pollers live at once. Delivery claims tolerate an overlap anyway
+# (`FOR UPDATE SKIP LOCKED` plus a 60s orphan window), but not overlapping is
+# still cheaper than recovering from it.
 overlapSeconds = 0

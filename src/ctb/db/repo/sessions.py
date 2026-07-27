@@ -18,14 +18,13 @@ boot anyway, so a rebased age is a hint, never a conclusion.
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 from typing import Any, Self
 
-import aiosqlite
-
 from ctb.conductor.models import SessionStatusValue, WorkspaceStatusValue
 from ctb.db import NO_THREAD_ID
-from ctb.db.connection import Database, now_ms
+from ctb.db.connection import Database, Row, now_ms
 from ctb.db.repo._util import (
     UNSET,
     Maybe,
@@ -64,7 +63,8 @@ __all__ = [
 ]
 
 _COLUMNS = """
-    id, workspace_id, title, agent, model, effort, fast_mode, chat_id, thread_id,
+    tenant_id, id, workspace_id, title, agent, model, effort, fast_mode,
+    chat_id, thread_id,
     is_bound, cursor_message_id, cursor_session_index, seeded, turn_state,
     start_witnessed, index_at_post, last_delta_at, entered_state_at,
     turn_started_at, consecutive_idle, consecutive_status_failures, cursor_only,
@@ -81,6 +81,8 @@ _ACTIVE_STATES_SQL = "('QUEUED', 'WAKING', 'WORKING', 'DRAINING', 'CANCELLING')"
 @dataclass(frozen=True, slots=True)
 class SessionRow:
     id: str
+    #: Filled by row-level security's column default; read for fan-out.
+    tenant_id: uuid.UUID | None = None
     workspace_id: str | None = None
     title: str | None = None
     agent: str | None = None
@@ -118,9 +120,10 @@ class SessionRow:
     updated_at: int = 0
 
     @classmethod
-    def from_row(cls, row: aiosqlite.Row) -> Self:
+    def from_row(cls, row: Row) -> Self:
         return cls(
             id=str(row["id"]),
+            tenant_id=row["tenant_id"],
             workspace_id=as_opt_str(row["workspace_id"]),
             title=as_opt_str(row["title"]),
             agent=as_opt_str(row["agent"]),
@@ -214,7 +217,7 @@ async def get_bound_for(
     row = await db.fetch_one(
         f"""
         SELECT {_COLUMNS} FROM sessions
-         WHERE chat_id = ? AND thread_id = ? AND is_bound = 1
+         WHERE chat_id = ? AND thread_id = ? AND is_bound
          ORDER BY created_at DESC
          LIMIT 1
         """,
@@ -224,14 +227,30 @@ async def get_bound_for(
 
 
 async def list_bound(db: Database) -> list[SessionRow]:
-    """What the supervisor reconciles its task set against, every 5s."""
+    """What the supervisor reconciles its task set against, every 5s.
+
+    Cross-tenant by design, so it runs on the **system** pool. The join is the
+    whole suspension mechanism: setting ``tenants.status`` to anything but
+    ``active``, or stamping ``auth_failed_at``, stops that tenant's polling on
+    the next pass with no code path involved and nobody else affected.
+
+    Ordered by tenant so the supervisor can round-robin, and by turn state
+    within each tenant so a starved tenant still gets its *busy* sessions
+    polled.
+    """
+    qualified = ", ".join(f"s.{name.strip()}" for name in _COLUMNS.split(","))
     rows = await db.fetch_all(
         f"""
-        SELECT {_COLUMNS} FROM sessions
-         WHERE is_bound = 1 AND turn_state != 'DEAD'
+        SELECT {qualified} FROM sessions s
+          JOIN tenants t ON t.id = s.tenant_id
+         WHERE s.is_bound
+           AND s.turn_state != 'DEAD'
+           AND t.status = 'active'
+           AND t.auth_failed_at IS NULL
          ORDER BY
-            CASE WHEN turn_state IN {_ACTIVE_STATES_SQL} THEN 0 ELSE 1 END,
-            updated_at DESC
+            s.tenant_id,
+            CASE WHEN s.turn_state IN {_ACTIVE_STATES_SQL} THEN 0 ELSE 1 END,
+            s.updated_at DESC
         """
     )
     return [SessionRow.from_row(row) for row in rows]
@@ -341,7 +360,7 @@ async def bind(
         at=at,
         chat_id=chat_id,
         thread_id=thread_id,
-        is_bound=1,
+        is_bound=True,
     )
 
 
@@ -349,7 +368,7 @@ async def unbind(
     db: Database, session_id: str, *, at: int | None = None
 ) -> SessionRow | None:
     """Stop polling. The cursor is kept so a re-bind resumes where it left off."""
-    return await update(db, session_id, at=at, is_bound=0)
+    return await update(db, session_id, at=at, is_bound=False)
 
 
 async def mark_dead(
@@ -359,7 +378,7 @@ async def mark_dead(
     stamp = now_ms() if at is None else at
     columns: dict[str, Any] = {
         "turn_state": str(TurnState.DEAD),
-        "is_bound": 0,
+        "is_bound": False,
         "dead_at": stamp,
         "entered_state_at": stamp,
     }
@@ -415,7 +434,7 @@ async def clear_cursor_only(
 ) -> SessionRow | None:
     """``/status`` works again: leave the degraded fixed-cadence mode."""
     return await update(
-        db, session_id, at=at, cursor_only=0, consecutive_status_failures=0
+        db, session_id, at=at, cursor_only=False, consecutive_status_failures=0
     )
 
 
@@ -446,7 +465,7 @@ async def seek_to_end(
         at=at,
         cursor_message_id=message_id,
         cursor_session_index=session_index,
-        seeded=1,
+        seeded=True,
     )
 
 
@@ -580,7 +599,7 @@ async def save_turn_context(
     if context.last_status is not None:
         columns["last_status"] = str(context.last_status)
     if context.state is TurnState.DEAD:
-        columns["is_bound"] = 0
+        columns["is_bound"] = False
         columns["dead_at"] = wall
     await db.execute(
         update_sql("sessions", columns, "id = ?"), (*columns.values(), session_id)

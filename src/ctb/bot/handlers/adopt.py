@@ -59,6 +59,7 @@ from ctb.bot.keyboards import (
     resolve,
     url_button,
 )
+from ctb.bot.middleware.tenancy import TenantContext
 from ctb.conductor.client import ConductorClient
 from ctb.conductor.models import Session, TranscriptMessage, Workspace
 from ctb.db import NO_THREAD_ID
@@ -621,6 +622,7 @@ async def _bind(
 async def adopt_callback(
     query: CallbackQuery,
     nonces: NonceStore,
+    tenant: TenantContext,
     db: Database | None = None,
     client: ConductorClient | None = None,
 ) -> None:
@@ -640,7 +642,7 @@ async def adopt_callback(
         result = await adopt_workspace(
             bot=query.bot,
             db=resolve_db(db),
-            client=resolve_client(client),
+            client=resolve_client(client, tenant),
             chat_id=chat_id,
             chat_type=_chat_type(query, chat_id),
             workspace_id=workspace_id,

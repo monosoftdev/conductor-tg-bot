@@ -37,6 +37,7 @@ from ctb.delivery.render.types import Verbosity
 from ctb.settings import Settings
 from ctb.turn import cursor
 from ctb.turn.state import PostOk
+from tests.conftest import FAKE_API_KEY
 from tests.fakes.fake_conductor import (
     SCENARIOS,
     Advance,
@@ -80,7 +81,8 @@ async def clients(settings: Settings) -> AsyncIterator[ClientFactory]:
 
     def make(target: FakeConductor) -> ConductorClient:
         instance = ConductorClient(
-            settings,
+            api_key=FAKE_API_KEY,
+            api_url=settings.conductor_api_url,
             transport=target.transport(),
             sleep=_no_sleep,
             rng=random.Random(20260726),

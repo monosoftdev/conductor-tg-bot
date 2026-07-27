@@ -219,6 +219,10 @@ def outbox_factory(
             "sleep": sleeper,
             "batch_size": 20,
             "burst": 1000.0,  # pacing off unless a test asks for it
+            # Recovery normally leaves a fresh claim alone in case an
+            # overlapping deployment is still sending it. These tests set the
+            # scene and recover immediately, so there is no peer to protect.
+            "orphan_after_ms": 0,
             # Its own tracker, on the fake clock: focus is shared process-wide
             # in production, and a test must not inherit another test's thumb.
             "focus": FocusTracker(clock=clock),
@@ -513,51 +517,103 @@ async def test_a_network_blip_goes_back_to_pending(
     assert row is not None and row.state == "sent"
 
 
-async def test_a_transient_failure_never_becomes_permanent_at_max_attempts(
+async def test_a_transient_failure_retries_until_the_attempt_cap(
     outbox_factory: Callable[..., Outbox], bot: FakeBot, db: Database, session: str
 ) -> None:
+    """Retry a blip; give up on a row that fails every single time.
+
+    Both halves matter. A Telegram outage must not abandon a reply after two
+    tries — but a row that fails *reproducibly* is re-claimed first on every
+    pass, because claims are ordered by ``(session_index, part_index)``. With no
+    cap it owns a claim slot and a per-chat token for the life of the process.
+    """
     outbox = outbox_factory(max_attempts=3)
     for _ in range(3):
         bot.queue("send_message", network_error())
     await enqueue(outbox)
 
+    for _ in range(2):
+        await outbox.run_once()
+    row = await deliveries_repo.get(db, (SESSION, "msg-1", 0, CHAT))
+    assert row is not None and row.state == "pending" and row.attempts == 2
+
+    await outbox.run_once()
+    row = await deliveries_repo.get(db, (SESSION, "msg-1", 0, CHAT))
+    assert row is not None and row.state == "failed" and row.attempts == 3
+
+
+async def test_a_poison_row_stops_blocking_the_topic_behind_it(
+    outbox_factory: Callable[..., Outbox], bot: FakeBot, db: Database, session: str
+) -> None:
+    """Head-of-line blocking is the reason the cap exists."""
+    outbox = outbox_factory(max_attempts=2)
+    for _ in range(2):
+        bot.queue("send_message", network_error())
+    await enqueue(outbox, message_id="poison", session_index=1)
+    await enqueue(outbox, message_id="good", session_index=2)
+
     for _ in range(3):
         await outbox.run_once()
 
-    row = await deliveries_repo.get(db, (SESSION, "msg-1", 0, CHAT))
-    assert row is not None
-    assert row.state == "pending"
-    assert row.attempts == 3
+    poison = await deliveries_repo.get(db, (SESSION, "poison", 0, CHAT))
+    good = await deliveries_repo.get(db, (SESSION, "good", 0, CHAT))
+    assert poison is not None and poison.state == "failed"
+    assert good is not None and good.state == "sent"
 
 
 # ── Telegram 429 ─────────────────────────────────────────────────────────────
 
 
-async def test_retry_after_is_honoured_then_the_send_succeeds(
+async def test_a_short_retry_after_is_waited_out_inline(
     outbox: Outbox, bot: FakeBot, sleeper: Sleeper, db: Database, session: str
 ) -> None:
-    bot.queue("send_message", retry_after(7))
+    bot.queue("send_message", retry_after(1))
     await enqueue(outbox)
 
     assert await outbox.run_once() == 1
-    assert 7.0 <= sleeper.total <= 8.0
+    assert 1.0 <= sleeper.total <= 2.0
     row = await deliveries_repo.get(db, (SESSION, "msg-1", 0, CHAT))
     assert row is not None and row.state == "sent"
 
 
-async def test_a_second_429_pauses_the_queue_and_requeues_the_batch(
+async def test_a_long_retry_after_pauses_that_chat_instead_of_stalling_everyone(
+    outbox: Outbox, bot: FakeBot, sleeper: Sleeper, db: Database, session: str
+) -> None:
+    """One outbox task serves every tenant, so an inline sleep is global.
+
+    A group hitting its flood limit with ``retry_after=60`` must not freeze
+    every other workspace's deliveries for a minute.
+    """
+    bot.queue("send_message", retry_after(60))
+    await enqueue(outbox)
+
+    assert await outbox.run_once() == 0
+    assert sleeper.total == 0.0  # nobody waited
+    assert outbox.paused_for_chat(CHAT) >= 60.0  # this chat did
+    assert outbox.paused_for == 0
+    row = await deliveries_repo.get(db, (SESSION, "msg-1", 0, CHAT))
+    assert row is not None and row.state == "pending"
+
+
+async def test_a_second_429_pauses_that_chat_and_requeues_the_batch(
     outbox: Outbox, bot: FakeBot, clock: FakeClock, db: Database, session: str
 ) -> None:
-    bot.queue("send_message", retry_after(5), retry_after(5))
+    """One group's flood limit is that group's problem, not everyone's.
+
+    With a shared bot serving every workspace, a global pause here would let
+    one customer's busy topic stop the whole service.
+    """
+    bot.queue("send_message", retry_after(5))
     await enqueue(outbox, message_id="a", session_index=1)
     await enqueue(outbox, message_id="b", session_index=2)
 
     assert await outbox.run_once() == 0
-    assert outbox.paused_for > 0
+    assert outbox.paused_for_chat(CHAT) > 0
+    assert outbox.paused_for == 0  # …and nobody else is affected
     # The untouched row went back to pending rather than sitting claimed.
     second = await deliveries_repo.get(db, (SESSION, "b", 0, CHAT))
     assert second is not None and second.state == "pending"
-    # And the queue really is paused.
+    # And that chat really is paused.
     assert await outbox.run_once() == 0
 
     clock.advance(10.0)

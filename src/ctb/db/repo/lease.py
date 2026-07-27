@@ -6,8 +6,8 @@ supervisor refuses to spawn a poller without the lease and cancels every task
 the moment it loses it.
 
 The race is decided inside the database, not in Python. :func:`acquire` is a
-single ``INSERT … ON CONFLICT DO UPDATE … WHERE`` inside ``BEGIN IMMEDIATE``:
-the update only fires when the incumbent lease has expired or is already ours,
+single ``INSERT … ON CONFLICT DO UPDATE … WHERE``: the update only fires when
+the incumbent lease has expired or is already ours,
 so of two processes starting together exactly one gets a lease and the loser
 gets ``None``.
 """
@@ -20,9 +20,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Final, Self
 
-import aiosqlite
-
-from ctb.db.connection import Database, now_ms
+from ctb.db.connection import Database, Row, now_ms
 from ctb.db.repo._util import as_int, as_str
 
 __all__ = [
@@ -61,7 +59,7 @@ class Lease:
     expires_at: int = 0
 
     @classmethod
-    def from_row(cls, row: aiosqlite.Row) -> Self:
+    def from_row(cls, row: Row) -> Self:
         return cls(
             name=as_str(row["name"]),
             holder=as_str(row["holder"]),

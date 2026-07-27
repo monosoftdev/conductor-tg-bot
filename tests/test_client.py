@@ -28,9 +28,6 @@ from ctb.conductor.client import (
     ConductorClient,
     TokenBucket,
     TransportFailure,
-    close_client,
-    get_client,
-    set_client,
 )
 from ctb.conductor.errors import (
     Ambiguous,
@@ -132,7 +129,8 @@ def make_client(
     the_clock = clock or FakeClock()
     the_sleeper = sleeper or FakeSleeper(the_clock)
     client = ConductorClient(
-        settings,
+        api_key=FAKE_API_KEY,
+        api_url=settings.conductor_api_url,
         transport=httpx.MockTransport(recorder),
         clock=the_clock,
         sleep=the_sleeper,
@@ -232,7 +230,8 @@ async def test_semaphore_caps_in_flight_requests(settings: Settings) -> None:
 
     clock = FakeClock()
     client = ConductorClient(
-        settings,
+        api_key=FAKE_API_KEY,
+        api_url=settings.conductor_api_url,
         transport=httpx.MockTransport(respond),
         clock=clock,
         sleep=FakeSleeper(clock),
@@ -839,15 +838,36 @@ async def test_an_async_event_hook_is_awaited(settings: Settings) -> None:
     assert len(seen) == 1
 
 
-# ── singleton ────────────────────────────────────────────────────────────────
+# ── no singleton ─────────────────────────────────────────────────────────────
 
 
-async def test_singleton_accessors(settings: Settings) -> None:
-    recorder = always(200, {})
-    client, _, _ = make_client(recorder, settings)
-    set_client(client)
-    try:
-        assert get_client() is client
-    finally:
-        await close_client()
-    assert client._closed is True  # pyright: ignore[reportPrivateUsage]
+def test_the_module_exposes_no_process_wide_client() -> None:
+    """Deleting the global is the whole cross-tenant safety argument.
+
+    While ``get_client()`` existed, a handler that forgot its tenant would
+    silently read another organisation's data. Now it raises by name.
+    """
+    import ctb.conductor.client as module
+
+    assert not hasattr(module, "get_client")
+    assert not hasattr(module, "set_client")
+    assert not hasattr(module, "close_client")
+
+
+async def test_a_client_is_bound_to_the_key_it_was_given(
+    settings: Settings,
+) -> None:
+    seen: list[str] = []
+
+    def record(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("authorization", ""))
+        return httpx.Response(200, json={"data": [], "hasMore": False})
+
+    async with ConductorClient(
+        api_key="tenant-a-key-0001",
+        api_url=settings.conductor_api_url,
+        transport=httpx.MockTransport(record),
+    ) as client:
+        await client.list_projects()
+
+    assert seen == ["Bearer tenant-a-key-0001"]

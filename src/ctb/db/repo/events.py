@@ -14,13 +14,12 @@ no values anywhere near it.
 from __future__ import annotations
 
 import hashlib
+import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Final, Self
 
-import aiosqlite
-
-from ctb.db.connection import Database, now_ms
+from ctb.db.connection import Database, Row, now_ms
 from ctb.db.repo._util import as_int, as_opt_int, as_opt_str, as_str
 
 __all__ = [
@@ -46,8 +45,8 @@ _SIGNATURE_MAX_DEPTH: Final = 6
 _SIGNATURE_MAX_KEYS: Final = 200
 
 _EVENT_COLUMNS = """
-    id, at, method, endpoint, status_code, duration_ms, attempt, ok, error,
-    circuit_state, request_id, session_id
+    id, tenant_id, at, method, endpoint, status_code, duration_ms, attempt, ok,
+    error, circuit_state, request_id, session_id
 """
 
 _UNKNOWN_COLUMNS = """
@@ -59,6 +58,7 @@ _UNKNOWN_COLUMNS = """
 @dataclass(frozen=True, slots=True)
 class ApiEvent:
     id: int
+    tenant_id: uuid.UUID | None = None
     at: int = 0
     method: str | None = None
     endpoint: str | None = None
@@ -72,9 +72,10 @@ class ApiEvent:
     session_id: str | None = None
 
     @classmethod
-    def from_row(cls, row: aiosqlite.Row) -> Self:
+    def from_row(cls, row: Row) -> Self:
         return cls(
             id=as_int(row["id"]),
+            tenant_id=row["tenant_id"],
             at=as_int(row["at"]),
             method=as_opt_str(row["method"]),
             endpoint=as_opt_str(row["endpoint"]),
@@ -119,29 +120,35 @@ async def record_api_event(
     circuit_state: str | None = None,
     request_id: str | None = None,
     session_id: str | None = None,
+    tenant_id: uuid.UUID | None = None,
     at: int | None = None,
 ) -> int:
     """Append one request to the ring buffer. Returns its row id.
+
+    ``tenant_id`` attributes the call, so one tenant's failing key shows up as
+    that tenant's error rate rather than everyone's.
 
     ``endpoint`` must already be templated (``/sessions/{id}/messages``) so the
     buffer groups by route rather than by id, and never records a secret.
     """
     stamp = now_ms() if at is None else at
-    event_id = await db.execute_insert(
+    event_id = await db.fetch_val(
         """
         INSERT INTO api_events
-            (at, method, endpoint, status_code, duration_ms, attempt, ok, error,
-             circuit_state, request_id, session_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (tenant_id, at, method, endpoint, status_code, duration_ms, attempt,
+             ok, error, circuit_state, request_id, session_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        RETURNING id
         """,
         (
+            tenant_id,
             stamp,
             method,
             endpoint,
             status_code,
             duration_ms,
             max(1, attempt),
-            1 if ok else 0,
+            ok,
             error,
             circuit_state,
             request_id,
@@ -155,9 +162,27 @@ async def record_api_event(
 
 
 async def recent_api_events(
-    db: Database, *, limit: int = 50, only_failed: bool = False
+    db: Database,
+    *,
+    limit: int = 50,
+    only_failed: bool = False,
+    tenant_id: uuid.UUID | None = None,
 ) -> list[ApiEvent]:
-    where = "WHERE ok = 0" if only_failed else ""
+    """The tail of the ring buffer.
+
+    ``api_events`` is a system table with no row-level security — a request can
+    fail before a tenant is resolved — so a caller answering *one tenant's*
+    ``/health`` must pass ``tenant_id`` explicitly.
+    """
+    clauses: list[str] = []
+    params: list[Any] = []
+    if only_failed:
+        clauses.append("NOT ok")
+    if tenant_id is not None:
+        clauses.append("tenant_id = ?")
+        params.append(tenant_id)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    params.append(max(1, limit))
     rows = await db.fetch_all(
         f"""
         SELECT {_EVENT_COLUMNS} FROM api_events
@@ -165,35 +190,39 @@ async def recent_api_events(
          ORDER BY id DESC
          LIMIT ?
         """,
-        (max(1, limit),),
+        tuple(params),
     )
     return [ApiEvent.from_row(row) for row in rows]
 
 
-async def stats(db: Database, *, since_ms: int) -> ApiEventStats:
+async def stats(
+    db: Database, *, since_ms: int, tenant_id: uuid.UUID | None = None
+) -> ApiEventStats:
+    scope = "" if tenant_id is None else "AND tenant_id = ?"
+    scope_params: tuple[Any, ...] = () if tenant_id is None else (tenant_id,)
     row = await db.fetch_one(
-        """
+        f"""
         SELECT COUNT(*)                            AS total,
-               COALESCE(SUM(ok), 0)                AS ok,
+               COUNT(*) FILTER (WHERE ok)          AS ok,
                COALESCE(AVG(duration_ms), 0)       AS avg_ms,
                COALESCE(MAX(duration_ms), 0)       AS max_ms
           FROM api_events
-         WHERE at >= ?
+         WHERE at >= ? {scope}
         """,
-        (since_ms,),
+        (since_ms, *scope_params),
     )
     if row is None:  # pragma: no cover - an aggregate always returns one row
         return ApiEventStats()
     total = as_int(row["total"])
     ok = as_int(row["ok"])
     failure = await db.fetch_one(
-        """
+        f"""
         SELECT error, at FROM api_events
-         WHERE at >= ? AND ok = 0 AND error IS NOT NULL
+         WHERE at >= ? AND NOT ok AND error IS NOT NULL {scope}
          ORDER BY id DESC
          LIMIT 1
         """,
-        (since_ms,),
+        (since_ms, *scope_params),
     )
     return ApiEventStats(
         total=total,
@@ -271,7 +300,7 @@ class UnknownContentType:
     last_seen_at: int = 0
 
     @classmethod
-    def from_row(cls, row: aiosqlite.Row) -> Self:
+    def from_row(cls, row: Row) -> Self:
         return cls(
             type=as_str(row["type"]),
             shape_signature=as_str(row["shape_signature"]),
@@ -305,7 +334,7 @@ async def note_unknown_content_type(
                 (type, shape_signature, count, sample_session_id,
                  sample_message_id, first_seen_at, last_seen_at)
             VALUES (?, ?, 1, ?, ?, ?, ?)
-            ON CONFLICT(type, shape_signature) DO UPDATE SET
+            ON CONFLICT (tenant_id, type, shape_signature) DO UPDATE SET
                 count        = unknown_content_types.count + 1,
                 last_seen_at = excluded.last_seen_at
             """,

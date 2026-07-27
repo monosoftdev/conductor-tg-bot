@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import random
 import time
+import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -76,8 +77,8 @@ from ctb.conductor.models import (
     WorkspaceStatus,
     validate_pairing,
 )
-from ctb.logging import get_logger, register_secret
-from ctb.settings import Settings, get_settings
+from ctb.logging import get_logger
+from ctb.settings import DEFAULT_CONDUCTOR_API_URL, conductor_api_root
 
 __all__ = [
     "ApiEvent",
@@ -87,9 +88,6 @@ __all__ = [
     "ConductorClient",
     "TokenBucket",
     "TransportFailure",
-    "close_client",
-    "get_client",
-    "set_client",
 ]
 
 # ── tuning (PLAN §Client) ────────────────────────────────────────────────────
@@ -158,11 +156,16 @@ class ApiEvent:
     circuit_state: str
     request_id: str | None
     session_id: str | None
+    #: Which workspace's key made the call. Without it `api_events.tenant_id`
+    #: is NULL on every row and the per-workspace `/health` error line is
+    #: permanently blank however many 401s that workspace just took.
+    tenant_id: uuid.UUID | None = None
 
     def as_row(self) -> dict[str, Any]:
         """Kwargs for an ``INSERT INTO api_events`` in the repo layer."""
         return {
             "at": self.at,
+            "tenant_id": self.tenant_id,
             "method": self.method,
             "endpoint": self.endpoint,
             "status_code": self.status_code,
@@ -249,6 +252,33 @@ class TokenBucket:
     @property
     def tokens(self) -> float:
         return self._tokens
+
+    def peek(self, tokens: float = 1.0) -> bool:
+        """Would :meth:`try_acquire` succeed right now? Takes nothing."""
+        now = self._clock()
+        elapsed = max(0.0, now - self._updated)
+        available = min(self._capacity, self._tokens + elapsed * self._rate)
+        return available >= tokens - _TOKEN_EPSILON
+
+    def try_acquire(self, tokens: float = 1.0) -> bool:
+        """Take ``tokens`` if they are already there. Never sleeps.
+
+        The outbox uses this to *skip* a saturated destination and serve
+        another one, instead of blocking the whole queue behind one busy chat.
+        """
+        now = self._clock()
+        elapsed = max(0.0, now - self._updated)
+        self._updated = now
+        self._tokens = min(self._capacity, self._tokens + elapsed * self._rate)
+        if self._tokens >= tokens - _TOKEN_EPSILON:
+            self._tokens -= tokens
+            return True
+        return False
+
+    def drain(self) -> None:
+        """Spend every saved token. Used after a 429 from this destination."""
+        self._updated = self._clock()
+        self._tokens = 0.0
 
     async def acquire(self, tokens: float = 1.0) -> float:
         """Block until ``tokens`` are available. Returns the seconds waited."""
@@ -382,31 +412,50 @@ class CircuitBreaker:
         }
 
 
+#: Stands in for the cross-tenant gate when a client is built without a pool.
+_NULL_GATE: Final = asyncio.Semaphore(2**31)
+
+
 # ── the client ───────────────────────────────────────────────────────────────
 
 
 class ConductorClient:
     """Async client for the Conductor v0 API.
 
-    One instance per process (see :func:`get_client`). Construct it with a
-    ``transport`` for tests; construct it with ``clock``/``sleep``/``rng`` to make
-    backoff and the circuit window deterministic.
+    **One instance per API key**, which under multi-tenancy means one per
+    tenant, built and cached by :class:`ctb.conductor.pool.ClientPool`. The
+    rate-limit bucket, the circuit breaker and the auth-failure counter are all
+    per-instance because they are properties of a *key*: one tenant tripping its
+    breaker must not throttle anyone else.
+
+    ``api_key`` and ``api_url`` are explicit. There is no process-wide client
+    and no reading of a key from settings — that is what kept the old
+    single-tenant design honest by construction.
+
+    Construct with a ``transport`` for tests, and with ``clock``/``sleep``/``rng``
+    to make backoff and the circuit window deterministic. ``global_semaphore``
+    caps in-flight requests across *all* tenants; the per-instance one caps a
+    single tenant.
     """
 
     def __init__(
         self,
-        settings: Settings | None = None,
         *,
+        api_key: str,
+        api_url: str = DEFAULT_CONDUCTOR_API_URL,
+        tenant_id: uuid.UUID | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
         http_client: httpx.AsyncClient | None = None,
         on_event: ApiEventHook | None = None,
+        global_semaphore: asyncio.Semaphore | None = None,
         clock: Clock = time.monotonic,
         sleep: Sleeper = asyncio.sleep,
         rng: random.Random | None = None,
         max_attempts: int = MAX_ATTEMPTS,
         event_buffer: int = EVENT_BUFFER,
     ) -> None:
-        self._settings = settings or get_settings()
+        self.api_url = api_url.rstrip("/")
+        self.tenant_id = tenant_id
         self._clock = clock
         self._sleep = sleep
         self._rng = rng or random.Random()
@@ -414,13 +463,8 @@ class ConductorClient:
         self._on_event = on_event
         self._log = get_logger("ctb.conductor.client")
 
-        api_key = self._settings.conductor_api_key.get_secret_value()
-        # Belt and braces: even if a third-party library echoes a header, the log
-        # scrubber will have seen this value.
-        register_secret(api_key)
-
         self._http = http_client or httpx.AsyncClient(
-            base_url=self._settings.conductor_api_url,
+            base_url=self.api_url,
             headers={
                 "Authorization": f"Bearer {api_key}",
                 # Not optional: the proxy 403s some default client signatures.
@@ -436,6 +480,7 @@ class ConductorClient:
             follow_redirects=False,
         )
         self._owns_http = http_client is None
+        self._gate = global_semaphore
         self._semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
         self._bucket = TokenBucket(clock=clock, sleep=sleep)
         self._circuit = CircuitBreaker(clock=clock, rng=self._rng)
@@ -472,8 +517,9 @@ class ConductorClient:
     # -- introspection --------------------------------------------------------
 
     @property
-    def settings(self) -> Settings:
-        return self._settings
+    def me_url(self) -> str:
+        """``GET /me`` is at the API root, outside ``/v0``."""
+        return f"{conductor_api_root(self.api_url)}/me"
 
     @property
     def circuit(self) -> CircuitBreaker:
@@ -538,7 +584,7 @@ class ConductorClient:
         limit = self._max_attempts if max_attempts is None else max(1, max_attempts)
         query = {k: v for k, v in (params or {}).items() if v is not None}
 
-        async with self._semaphore:
+        async with self._gate or _NULL_GATE, self._semaphore:
             # Gated once per logical request: an in-flight retry has already been
             # budgeted, and re-checking would turn a 5xx on a write into
             # CircuitOpen, destroying the "this may have landed" information.
@@ -764,6 +810,7 @@ class ConductorClient:
             circuit_state=self._circuit.state.value,
             request_id=request_id,
             session_id=session_id,
+            tenant_id=self.tenant_id,
         )
         self._events.append(event)
         self._log.debug(
@@ -820,7 +867,7 @@ class ConductorClient:
     async def get_me(self) -> Me:
         """``GET /me`` — at the API **root**; ``/v0/me`` 404s (probe-verified)."""
         payload = await self._request(
-            "GET", self._settings.me_url, endpoint="/me", idempotent=True
+            "GET", self.me_url, endpoint="/me", idempotent=True
         )
         return self._model(Me, payload, "/me")
 
@@ -1241,27 +1288,7 @@ def _parse_retry_after(value: str | None) -> float | None:
     return max(0.0, (when - datetime.now(UTC)).total_seconds())
 
 
-# ── process-wide singleton ───────────────────────────────────────────────────
-
-_client: ConductorClient | None = None
-
-
-def get_client() -> ConductorClient:
-    """The process-wide client, built on first use from the process settings."""
-    global _client
-    if _client is None:
-        _client = ConductorClient()
-    return _client
-
-
-def set_client(client: ConductorClient | None) -> None:
-    """Install a client explicitly (boot path and tests)."""
-    global _client
-    _client = client
-
-
-async def close_client() -> None:
-    global _client
-    if _client is not None:
-        await _client.aclose()
-        _client = None
+# There is deliberately no process-wide client. A handler reaches its tenant's
+# client through ``TenantContext.client``; a worker gets one from ``ClientPool``.
+# Deleting the global is what makes a forgotten tenant a loud AttributeError
+# instead of a silent read against the wrong organisation.

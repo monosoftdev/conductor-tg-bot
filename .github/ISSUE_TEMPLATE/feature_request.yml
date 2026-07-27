@@ -1,0 +1,24 @@
+name: Feature request
+description: Something you want the bot to do
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: >-
+        What are you trying to do on your phone that is hard today? Describe
+        the situation, not the solution.
+    validations:
+      required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: What you have in mind
+      description: Optional. A command, a button, a different default.
+
+  - type: textarea
+    id: workaround
+    attributes:
+      label: What you do instead today

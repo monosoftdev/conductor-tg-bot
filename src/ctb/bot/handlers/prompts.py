@@ -24,6 +24,7 @@ from ctb.bot.handlers.common import (
 from ctb.bot.handlers.core import run_find
 from ctb.bot.handlers.topics import resolve_client, resolve_db
 from ctb.bot.keyboards import (
+    CONTROL_TTL_S,
     Action,
     Cb,
     NonceError,
@@ -33,6 +34,7 @@ from ctb.bot.keyboards import (
     resolve,
 )
 from ctb.bot.middleware.routing import Route
+from ctb.bot.middleware.tenancy import TenantContext
 from ctb.conductor.client import ConductorClient
 from ctb.db.connection import Database
 from ctb.db.repo import chats as chats_repo
@@ -40,7 +42,10 @@ from ctb.db.repo import prompts as prompts_repo
 from ctb.db.repo import sessions as sessions_repo
 from ctb.db.repo import transcript as transcript_repo
 from ctb.delivery.render.html import escape
+from ctb.logging import get_logger
 from ctb.turn.supervisor import Supervisor
+
+log = get_logger(__name__)
 
 ROUTER_ORDER = 900
 router = Router(name=__name__)
@@ -107,6 +112,7 @@ async def unsupported_attachment(message: Message) -> None:
 async def plain_text(
     message: Message,
     route: Route,
+    tenant: TenantContext,
     nonces: NonceStore,
     db: Database | None = None,
     client: ConductorClient | None = None,
@@ -150,7 +156,7 @@ async def plain_text(
                     ]
                 ]
             )
-        await run_find(message, text, client=client, reply_markup=markup)
+        await run_find(message, text, client=tenant.client, reply_markup=markup)
         return
 
     if not route.session_id:
@@ -162,7 +168,7 @@ async def plain_text(
     try:
         _, state = await submit_prompt(
             db=database,
-            client=resolve_client(client),
+            client=resolve_client(client, tenant),
             session_id=route.session_id,
             text=text,
             chat_id=message.chat.id,
@@ -192,6 +198,12 @@ async def plain_text(
                     user_id=message.from_user.id if message.from_user else None,
                     chat_id=message.chat.id,
                     thread_id=message.message_thread_id or 0,
+                    # A turn outlives the 60-second default many times over,
+                    # and this bubble is the fallback shown precisely where the
+                    # 👀 reaction was refused — i.e. where it is the only Stop
+                    # the user has. Same lifetime as every other control.
+                    ttl=CONTROL_TTL_S,
+                    restartable=True,
                 )
             ]
         ]
@@ -206,13 +218,31 @@ async def plain_text(
 @router.callback_query(Cb.filter(F.action == Action.STOP.value))
 async def stop_callback(
     query: CallbackQuery,
+    tenant: TenantContext,
     nonces: NonceStore,
+    db: Database | None = None,
     supervisor: Supervisor | None = None,
 ) -> None:
+    """Cancel a running turn.
+
+    The session id is read back through the **tenant-scoped** pool before the
+    supervisor is asked to do anything. ``Supervisor.dispatch`` looks up a
+    process-global task map with no tenant of its own, so this lookup is the
+    only thing standing between a stray payload and somebody else's agent.
+    """
     try:
         ticket = resolve(query, expect=Action.STOP, store=nonces)
     except NonceError as exc:
         await query.answer(exc.user_message, show_alert=True)
+        return
+    if await sessions_repo.get(resolve_db(db), ticket.target) is None:
+        log.warning(
+            "prompts.stop_foreign_session",
+            session_id=ticket.target,
+            tenant=tenant.slug,
+            user_id=query.from_user.id,
+        )
+        await query.answer("That session is not in this workspace.", show_alert=True)
         return
     try:
         accepted = await request_cancel(
@@ -231,6 +261,7 @@ async def stop_callback(
 async def retry_callback(
     query: CallbackQuery,
     nonces: NonceStore,
+    tenant: TenantContext,
     db: Database | None = None,
     client: ConductorClient | None = None,
 ) -> None:
@@ -248,7 +279,7 @@ async def retry_callback(
     try:
         await submit_prompt(
             db=database,
-            client=resolve_client(client),
+            client=resolve_client(client, tenant),
             session_id=ticket.target,
             text=source.body,
             chat_id=ticket.chat_id
@@ -296,6 +327,7 @@ async def clear_queue_callback(
 async def check_callback(
     query: CallbackQuery,
     nonces: NonceStore,
+    tenant: TenantContext,
     client: ConductorClient | None = None,
 ) -> None:
     try:
@@ -304,7 +336,7 @@ async def check_callback(
         await query.answer(exc.user_message, show_alert=True)
         return
     try:
-        status = await resolve_client(client).get_session_status(ticket.target)
+        status = await resolve_client(client, tenant).get_session_status(ticket.target)
     except Exception as exc:
         await query.answer(f"Check failed: {short_error(exc)}", show_alert=True)
         return
@@ -352,6 +384,7 @@ async def transcript_callback(
 async def send_callback(
     query: CallbackQuery,
     nonces: NonceStore,
+    tenant: TenantContext,
     db: Database | None = None,
     client: ConductorClient | None = None,
 ) -> None:
@@ -367,7 +400,7 @@ async def send_callback(
     try:
         await submit_prompt(
             db=resolve_db(db),
-            client=resolve_client(client),
+            client=resolve_client(client, tenant),
             session_id=session_id,
             text=text,
             chat_id=ticket.chat_id or query.from_user.id,

@@ -1,26 +1,30 @@
 """Configuration. Secrets come from the environment only, never from code.
 
-Boot fails loudly and immediately if ``TELEGRAM_BOT_TOKEN``,
-``CONDUCTOR_API_KEY`` or ``ALLOWED_TELEGRAM_USER_IDS`` are missing — a bot that
-starts without an allowlist is a bot anyone can drive. All three are checked in
-*field* validators so a first deploy reports every missing variable in one
-message; fixing them one crash at a time is its own kind of outage.
+This is *platform* configuration: the one shared Telegram bot, the two database
+DSNs, and the master keys that seal tenant secrets. Anything a customer can
+change — their Conductor key, their agent/model defaults, whether voice is on —
+lives in the ``tenants`` table and arrives as
+:class:`ctb.bot.middleware.tenancy.TenantSettings`. Nothing in the environment
+identifies a tenant any more.
+
+Boot fails loudly and immediately when a required variable is missing. All of
+them are checked in *field* validators so a first deploy reports every problem
+in one message; fixing them one crash at a time is its own kind of outage.
 """
 
 from __future__ import annotations
 
 import os
-from pathlib import Path
-from typing import Annotated, Any, Literal, Self
+from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 
-from pydantic import Field, SecretStr, ValidationError, field_validator, model_validator
+from pydantic import Field, SecretStr, ValidationError, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
-from ctb.conductor.errors import PairingError
-from ctb.conductor.models import validate_pairing
+from ctb.crypto import SecretBox, SecretError, parse_master_keys
 
 __all__ = [
+    "DEFAULT_CONDUCTOR_API_URL",
     "Settings",
     "SettingsError",
     "env_flag",
@@ -30,6 +34,8 @@ __all__ = [
     "set_settings",
 ]
 
+DEFAULT_CONDUCTOR_API_URL = "https://api.conductor.build/v0"
+
 
 class SettingsError(RuntimeError):
     """Configuration is missing or invalid. Raised at boot, never caught."""
@@ -37,20 +43,25 @@ class SettingsError(RuntimeError):
 
 _REQUIRED_HINT = {
     "telegram_bot_token": "TELEGRAM_BOT_TOKEN — from @BotFather",
-    "conductor_api_key": (
-        "CONDUCTOR_API_KEY — https://app.conductor.build/users/api-keys"
+    "database_url": (
+        "DATABASE_URL — PostgreSQL URL for the ctb_app role (row-level security "
+        "applies)"
     ),
-    "allowed_telegram_user_ids": (
-        "ALLOWED_TELEGRAM_USER_IDS — comma-separated Telegram user ids, "
-        "the first is the owner"
+    "system_database_url": (
+        "SYSTEM_DATABASE_URL — PostgreSQL URL for the ctb_worker role "
+        "(BYPASSRLS; used by the supervisor and claim loops)"
+    ),
+    "master_keys": (
+        "CTB_MASTER_KEYS — '<kid>:<base64 32 bytes>[,<older kid>:...]'; "
+        "generate one with: python -m ctb.rewrap --new-key v1"
     ),
 }
 
 #: Marker a *field* validator raises for "set, but empty". pydantic only reports
 #: ``missing`` for absent fields, and a model validator never runs while another
 #: field is missing — so a blank check that lives anywhere else would surface on
-#: the *next* deploy instead of this one. Field validators all run, so all three
-#: required vars land in one message.
+#: the *next* deploy instead of this one. Field validators all run, so every
+#: required var lands in one message.
 _UNSET = "unset"
 
 
@@ -58,8 +69,9 @@ def _stripped(value: SecretStr) -> SecretStr:
     """Drop whitespace a paste into a hosting dashboard leaves behind.
 
     A trailing newline or space rides into the auth header verbatim and comes
-    back as a 401 that looks exactly like a wrong key — observed with
-    ``ELEVENLABS_API_KEY``. Cheaper to strip than to diagnose.
+    back as a 401 that looks exactly like a wrong key — observed on a real
+    deploy. Cheaper to strip than to diagnose. Tenant API keys get the same
+    treatment in ``/key``, which is where *those* are pasted.
     """
     raw = value.get_secret_value()
     trimmed = raw.strip()
@@ -67,10 +79,10 @@ def _stripped(value: SecretStr) -> SecretStr:
 
 
 class Settings(BaseSettings):
-    """Everything the bot reads from the environment.
+    """Everything the *platform* reads from the environment.
 
     Field names map to the upper-cased env var of the same name (see
-    ``.env.example``).
+    ``.env.example``), except ``master_keys``, which is ``CTB_MASTER_KEYS``.
     """
 
     model_config = SettingsConfigDict(
@@ -78,28 +90,48 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
+        populate_by_name=True,
     )
 
     # -- secrets ---------------------------------------------------------------
+    #: The one shared bot every tenant adds to their own group.
     telegram_bot_token: SecretStr
-    conductor_api_key: SecretStr
+    #: Ordered; the first seals new writes, all of them can open. See ctb.crypto.
+    master_keys: SecretStr = Field(alias="ctb_master_keys")
+
+    # -- storage ---------------------------------------------------------------
+    #: The ``ctb_app`` role. Row-level security applies; every query needs a
+    #: tenant in scope.
+    database_url: SecretStr
+    #: The ``ctb_worker`` role, which holds BYPASSRLS. Cross-tenant workers only.
+    system_database_url: SecretStr
+    db_pool_max: int = Field(default=10, ge=1, le=100)
+    system_db_pool_max: int = Field(default=6, ge=1, le=100)
 
     # -- Conductor -------------------------------------------------------------
-    conductor_api_url: str = "https://api.conductor.build/v0"
+    #: Only the default for a new tenant; each tenant stores its own.
+    conductor_api_url: str = DEFAULT_CONDUCTOR_API_URL
 
-    # -- Telegram --------------------------------------------------------------
-    #: Comma-separated in the environment. The first id is the owner. Required:
-    #: a bot without an allowlist is a bot anyone can drive.
-    allowed_telegram_user_ids: Annotated[list[int], NoDecode]
-    #: The private supergroup the bot operates in. ``None`` until ``/setup`` runs.
-    telegram_chat_id: int | None = None
+    # -- platform operators ----------------------------------------------------
+    #: Who may run platform-wide commands (``/platform``): suspend a tenant, read
+    #: global health. Empty is legitimate — an unattended deployment has none.
+    #: This is *not* an allowlist for using the bot; tenancy decides that.
+    platform_admin_ids: Annotated[list[int], NoDecode] = Field(default_factory=list)
 
-    # -- Telegram voice notes -------------------------------------------------
-    #: Feature-gated so typed control stays available without a speech vendor.
+    # -- registration ----------------------------------------------------------
+    #: Self-serve sign-up. Turn it off to run a closed instance; existing
+    #: tenants keep working either way.
+    registration_open: bool = True
+    #: Ceiling on new tenants per rolling hour, so a script cannot enumerate the
+    #: bot into a support incident.
+    registration_rate_per_hour: int = Field(default=20, ge=1, le=10_000)
+
+    # -- Telegram voice notes --------------------------------------------------
+    #: Platform kill switch. A tenant can still turn voice off for itself, but
+    #: it can never turn it on when this is false.
     voice_enabled: bool = False
     voice_stt_provider: Literal["elevenlabs"] = "elevenlabs"
     voice_stt_model: str = "scribe_v2"
-    voice_mode: Literal["shadow", "prompts", "commands"] = "prompts"
     voice_max_duration_seconds: int = Field(default=180, ge=1, le=3600)
     voice_max_file_bytes: int = Field(
         default=20 * 1024 * 1024,
@@ -112,18 +144,11 @@ class Settings(BaseSettings):
         default_factory=lambda: ["command", "команда", "slash"]
     )
     voice_completed_retention_days: int = Field(default=7, ge=1, le=90)
-    elevenlabs_api_key: SecretStr | None = None
 
-    # -- storage ---------------------------------------------------------------
-    db_path: Path = Path("/data/ctb.db")
-
-    # -- defaults for the zero-tap `/new <prompt>` path -------------------------
+    # -- defaults offered to a brand-new tenant --------------------------------
     default_agent: str = "claude"
     default_model: str = "opus-5-1m"
     default_effort: str = "high"
-    #: Cold start only. A chat that has created a workspace remembers the branch
-    #: it used (``chats.default_branch``) and that wins; this is what the very
-    #: first ``/new`` offers, and the button the wizard puts first.
     default_branch: str = "main"
 
     # -- logging ---------------------------------------------------------------
@@ -132,7 +157,7 @@ class Settings(BaseSettings):
     log_transcript_content: bool = False
     log_level: str = "INFO"
 
-    @field_validator("allowed_telegram_user_ids", mode="before")
+    @field_validator("platform_admin_ids", mode="before")
     @classmethod
     def _parse_id_list(cls, value: Any) -> list[int]:
         if value is None or value == "":
@@ -140,9 +165,8 @@ class Settings(BaseSettings):
         if isinstance(value, int):
             return [value]
         if isinstance(value, str):
-            parts = [p.strip() for p in value.replace(";", ",").split(",")]
             out: list[int] = []
-            for part in parts:
+            for part in (p.strip() for p in value.replace(";", ",").split(",")):
                 if not part:
                     continue
                 try:
@@ -157,7 +181,7 @@ class Settings(BaseSettings):
             return [int(v) for v in value]  # pyright: ignore[reportUnknownVariableType]
         raise ValueError(f"cannot read a user-id list from {value!r}")
 
-    @field_validator("allowed_telegram_user_ids", mode="after")
+    @field_validator("platform_admin_ids", mode="after")
     @classmethod
     def _dedupe_preserving_order(cls, value: list[int]) -> list[int]:
         seen: set[int] = set()
@@ -166,21 +190,11 @@ class Settings(BaseSettings):
             if uid not in seen:
                 seen.add(uid)
                 out.append(uid)
-        if not out:
-            raise ValueError(_UNSET)
         return out
 
-    @field_validator("telegram_chat_id", "elevenlabs_api_key", mode="before")
-    @classmethod
-    def _blank_optional_is_unset(cls, value: Any) -> Any:
-        # ``cp .env.example .env`` leaves ``TELEGRAM_CHAT_ID=`` behind. Empty
-        # means "not set"; without this the first boot dies on "unable to parse
-        # string as an integer" for a variable nobody was asked to fill in.
-        if isinstance(value, str) and not value.strip():
-            return None
-        return value
-
-    @field_validator("telegram_bot_token", "conductor_api_key", mode="after")
+    @field_validator(
+        "telegram_bot_token", "database_url", "system_database_url", mode="after"
+    )
     @classmethod
     def _reject_blank_secret(cls, value: SecretStr) -> SecretStr:
         # ``TELEGRAM_BOT_TOKEN=`` is set as far as pydantic is concerned; the
@@ -189,10 +203,17 @@ class Settings(BaseSettings):
             raise ValueError(_UNSET)
         return _stripped(value)
 
-    @field_validator("elevenlabs_api_key", mode="after")
+    @field_validator("master_keys", mode="after")
     @classmethod
-    def _strip_optional_secret(cls, value: SecretStr | None) -> SecretStr | None:
-        return None if value is None else _stripped(value)
+    def _parse_master_keys(cls, value: SecretStr) -> SecretStr:
+        raw = value.get_secret_value().strip()
+        if not raw:
+            raise ValueError(_UNSET)
+        try:
+            parse_master_keys(raw)
+        except SecretError as exc:
+            raise ValueError(str(exc)) from exc
+        return _stripped(value)
 
     @field_validator("voice_wake_phrases", mode="before")
     @classmethod
@@ -246,58 +267,45 @@ class Settings(BaseSettings):
             )
         return url
 
-    @model_validator(mode="after")
-    def _check_pairing(self) -> Self:
-        try:
-            validate_pairing(
-                self.default_agent, self.default_model, self.default_effort
-            )
-        except PairingError as exc:
-            raise ValueError(
-                f"DEFAULT_AGENT/DEFAULT_MODEL/DEFAULT_EFFORT are not a valid "
-                f"combination: {exc}"
-            ) from exc
-        return self
-
     # -- derived ---------------------------------------------------------------
 
-    @property
-    def owner_id(self) -> int:
-        """The first allow-listed id. Gets the DMs nobody else should see."""
-        return self.allowed_telegram_user_ids[0]
+    def secret_box(self) -> SecretBox:
+        """Build the envelope-encryption box. Validated at load time."""
+        return SecretBox.from_env_value(self.master_keys.get_secret_value())
 
-    @property
-    def conductor_api_root_url(self) -> str:
-        """The API root (no ``/v0``). ``GET /me`` lives here and only here."""
-        parts = urlsplit(self.conductor_api_url)
-        return f"{parts.scheme}://{parts.netloc}"
-
-    @property
-    def me_url(self) -> str:
-        return f"{self.conductor_api_root_url}/me"
-
-    def is_allowed(self, user_id: int | None) -> bool:
-        return user_id is not None and user_id in self.allowed_telegram_user_ids
+    def is_platform_admin(self, user_id: int | None) -> bool:
+        return user_id is not None and user_id in self.platform_admin_ids
 
     def secret_values(self) -> tuple[str, ...]:
-        """Every secret string, for the log scrubber to redact on sight."""
-        values = (
+        """Platform secrets, for the log scrubber to redact on sight.
+
+        Tenant API keys are deliberately absent: registering every tenant's key
+        in a process-wide set would keep plaintext in memory for the life of the
+        process and make scrubbing O(tenants) per log line. Those are redacted
+        by pattern instead — see :mod:`ctb.logging`.
+        """
+        values = [
             self.telegram_bot_token.get_secret_value(),
-            self.conductor_api_key.get_secret_value(),
-            (
-                self.elevenlabs_api_key.get_secret_value()
-                if self.elevenlabs_api_key is not None
-                else ""
-            ),
-        )
+            self.master_keys.get_secret_value(),
+        ]
+        for dsn in (self.database_url, self.system_database_url):
+            password = urlsplit(dsn.get_secret_value()).password
+            if password:
+                values.append(password)
         return tuple(v for v in values if v)
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return (
-            f"Settings(api={self.conductor_api_url!r}, db={self.db_path!s}, "
-            f"owner={self.owner_id}, agent={self.default_agent}/"
-            f"{self.default_model}/{self.default_effort})"
+            f"Settings(api={self.conductor_api_url!r}, "
+            f"registration_open={self.registration_open}, "
+            f"admins={len(self.platform_admin_ids)})"
         )
+
+
+def conductor_api_root(api_url: str) -> str:
+    """The API root (no ``/v0``). ``GET /me`` lives here and only here."""
+    parts = urlsplit(api_url)
+    return f"{parts.scheme}://{parts.netloc}"
 
 
 def load_settings(**overrides: Any) -> Settings:
@@ -311,17 +319,24 @@ def load_settings(**overrides: Any) -> Settings:
         lines: list[str] = []
         for err in exc.errors():
             loc = ".".join(str(part) for part in err["loc"])
+            key = _ALIAS_TO_FIELD.get(loc, loc)
             msg = err["msg"].removeprefix("Value error, ")
-            if err["type"] == "missing" or (msg == _UNSET and loc in _REQUIRED_HINT):
-                lines.append(f"  missing: {_REQUIRED_HINT.get(loc, loc.upper())}")
+            if err["type"] == "missing" or (msg == _UNSET and key in _REQUIRED_HINT):
+                lines.append(f"  missing: {_REQUIRED_HINT.get(key, key.upper())}")
             elif loc:
-                lines.append(f"  {loc.upper()}: {msg}")
+                lines.append(f"  {_FIELD_TO_ENV.get(key, key.upper())}: {msg}")
             else:
                 lines.append(f"  {msg}")
         raise SettingsError(
             "Configuration is invalid. Set these in the environment "
             "(see .env.example):\n" + "\n".join(sorted(set(lines)))
         ) from exc
+
+
+#: Field name <-> environment variable, for aliased fields. pydantic reports
+#: whichever name the caller used; the operator only knows the env var.
+_ALIAS_TO_FIELD = {"ctb_master_keys": "master_keys"}
+_FIELD_TO_ENV = {"master_keys": "CTB_MASTER_KEYS"}
 
 
 _settings: Settings | None = None

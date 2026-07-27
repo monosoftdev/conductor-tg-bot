@@ -31,14 +31,10 @@ from ctb.bot.handlers.common import (
 )
 from ctb.bot.handlers.core import adoptable_rows, status_icon
 from ctb.bot.handlers.topics import (
-    TopicCreateError,
     apply_marker,
-    discard_topic,
     edit_html,
-    forum_support,
     jump_url,
     marker_for,
-    require_topic,
     resolve_client,
     resolve_db,
     topic_label,
@@ -54,6 +50,7 @@ from ctb.bot.keyboards import (
     url_button,
 )
 from ctb.bot.middleware.routing import Route
+from ctb.bot.middleware.tenancy import TenantContext
 from ctb.conductor.client import ConductorClient
 from ctb.conductor.models import validate_pairing
 from ctb.db.connection import Database
@@ -63,7 +60,6 @@ from ctb.db.repo import transcript as transcript_repo
 from ctb.db.repo import workspaces as workspaces_repo
 from ctb.db.repo.sessions import SessionRow
 from ctb.delivery.render.html import escape
-from ctb.settings import Settings
 from ctb.turn import cursor as turn_cursor
 from ctb.turn.state import TurnState
 
@@ -79,6 +75,13 @@ Result · tap a numbered choice; ✓ is recommended
 <code>/s</code> switches only inside this workspace
 <code>/fork</code> starts another session here
 <code>/notify</code> sets topic alerts
+
+<b>This workspace</b>
+<code>/invite id</code> adds someone · <code>/members</code> lists them
+<code>/key</code> (privately) sets your Conductor key
+<code>/export</code> downloads your data · <code>/privacy</code> explains it
+<code>/use name</code> picks which one your DMs mean · <code>/leave</code> exits one
+<code>/voice on</code> needs your own <code>/voicekey</code> first
 
 Stop from the pinned card. /done always confirms.
 Voice commands need “command” or “команда”."""
@@ -125,60 +128,14 @@ async def help_command(message: Message, state: FSMContext) -> None:
     await tell(message, _HELP)
 
 
-@router.message(Command("setup"))
-async def setup(
-    message: Message,
-    route: Route,
-    state: FSMContext,
-    db: Database | None = None,
-) -> None:
-    await abandon_wizard(state)
-    database = resolve_db(db)
-    if message.chat.type == "private":
-        await chats_repo.ensure(database, message.chat.id, 0, kind="dm")
-        await tell(message, "DM mode ready · one session at a time.")
-        return
-    if message.chat.type != "supergroup" or message.bot is None:
-        await tell(
-            message,
-            "Use a private supergroup with Forum Topics enabled.",
-            silent=False,
-        )
-        return
-    support = await forum_support(message.bot, message.chat.id)
-    if support.degraded:
-        detail = support.detail or "forum topics and topic permissions"
-        await tell(message, f"Setup blocked · {escape(detail)}.", silent=False)
-        return
-    # Then PROVE it. `can_manage_topics` has been observed `true` on a chat that
-    # then refused `createForumTopic` with "not enough rights to create a topic"
-    # — so /setup reported Ready while every /new failed, and the owner had no
-    # way to tell which answer was lying. A check that does not perform the
-    # capability is a guess; the only proof a topic can exist is a topic that
-    # exists. Create a throwaway one and delete it. Two calls, no residue.
-    try:
-        probe = await require_topic(message.bot, message.chat.id, _SETUP_PROBE_LABEL)
-    except TopicCreateError as exc:
-        await tell(message, f"Setup blocked · {escape(exc.reason)}.", silent=False)
-        return
-    await discard_topic(message.bot, message.chat.id, probe)
-    await chats_repo.ensure(
-        database,
-        message.chat.id,
-        route.thread_id,
-        kind="general",
-    )
-    await tell(message, "Ready · General is search-only; /new creates topics.")
-
-
 @router.message(Command("s"))
 async def switch_session(
     message: Message,
     route: Route,
+    tenant: TenantContext,
     state: FSMContext,
     nonces: NonceStore,
     db: Database | None = None,
-    client: ConductorClient | None = None,
 ) -> None:
     await abandon_wizard(state)
     database = resolve_db(db)
@@ -239,7 +196,9 @@ async def switch_session(
                 )
         # "I know its name" also has to reach a workspace made on the laptop,
         # which has no topic and therefore no local session to switch to.
-        for row in await adoptable_rows(database, client, query=query, exclude=seen):
+        for row in await adoptable_rows(
+            database, tenant.client, query=query, exclude=seen
+        ):
             workspace_id = str(row.get("workspace_id") or "")
             entries.append(
                 adopt_button(
@@ -359,7 +318,7 @@ async def switch_callback(
 async def fork(
     message: Message,
     route: Route,
-    settings: Settings,
+    tenant: TenantContext,
     state: FSMContext,
     db: Database | None = None,
     client: ConductorClient | None = None,
@@ -374,23 +333,23 @@ async def fork(
     agent = (
         (chat.default_agent if chat else None)
         or (current.agent if current else None)
-        or settings.default_agent
+        or tenant.settings.default_agent
     )
     model = (
         (chat.default_model if chat else None)
         or (current.model if current else None)
-        or settings.default_model
+        or tenant.settings.default_model
     )
     effort = (
         (chat.default_effort if chat else None)
         or (current.effort if current else None)
-        or settings.default_effort
+        or tenant.settings.default_effort
     )
     title = command_text(message) or "Telegram fork"
     session_id = new_session_id()
     try:
         session = await turn_cursor.create_session(
-            resolve_client(client),
+            resolve_client(client, tenant),
             database,
             workspace_id=route.workspace_id,
             session_id=session_id,
@@ -431,6 +390,7 @@ async def fork(
 async def rename(
     message: Message,
     route: Route,
+    tenant: TenantContext,
     state: FSMContext,
     db: Database | None = None,
     client: ConductorClient | None = None,
@@ -444,7 +404,7 @@ async def rename(
             message, "Usage: <code>/name text</code> or <code>/name -w text</code>"
         )
         return
-    conductor = resolve_client(client)
+    conductor = resolve_client(client, tenant)
     database = resolve_db(db)
     try:
         if workspace_mode:
@@ -655,7 +615,7 @@ async def notify_callback(
 async def defaults(
     message: Message,
     route: Route,
-    settings: Settings,
+    tenant: TenantContext,
     state: FSMContext,
     db: Database | None = None,
 ) -> None:
@@ -694,12 +654,18 @@ async def defaults(
             model=model,
             effort=effort,
         )
-        await tell(message, f"Defaults: <b>{agent.value}</b> · {model}/{effort}.")
+        # `effort` is not always allow-listed: an agent with no declared
+        # efforts (cursor) passes any string through validate_pairing.
+        await tell(
+            message,
+            f"Defaults: <b>{escape(agent.value)}</b> · "
+            f"{escape(model or '')}/{escape(effort or '')}.",
+        )
         return
-    agent = chat.default_agent or settings.default_agent
-    model = chat.default_model or settings.default_model
-    effort = chat.default_effort or settings.default_effort
-    branch = chat.default_branch or settings.default_branch
+    agent = chat.default_agent or tenant.settings.default_agent
+    model = chat.default_model or tenant.settings.default_model
+    effort = chat.default_effort or tenant.settings.default_effort
+    branch = chat.default_branch or tenant.settings.default_branch
     await tell(
         message,
         f"Defaults: <b>{escape(agent)}</b> · {escape(model)}/{escape(effort)} · "
@@ -710,6 +676,7 @@ async def defaults(
 @router.message(Command("sql"))
 async def sql_command(
     message: Message,
+    tenant: TenantContext,
     state: FSMContext,
     is_owner: bool,
     client: ConductorClient | None = None,
@@ -728,7 +695,7 @@ async def sql_command(
         await tell(message, "Read-only single <code>SELECT</code> required.")
         return
     try:
-        result = await resolve_client(client).sql(query)
+        result = await resolve_client(client, tenant).sql(query)
     except Exception as exc:
         await tell(message, f"SQL failed: {escape(short_error(exc))}", silent=False)
         return
@@ -744,10 +711,15 @@ async def sql_command(
 @router.message(Command("tidy"))
 async def tidy(
     message: Message,
+    tenant: TenantContext,
     state: FSMContext,
     db: Database | None = None,
 ) -> None:
+    """Close stale and archived topics. Owners only — it closes other people's."""
     await abandon_wizard(state)
+    if not tenant.is_owner:
+        await tell(message, "Owners only.")
+        return
     database = resolve_db(db)
     closed = 0
     cutoff = int(time.time() * 1000) - 7 * 24 * 60 * 60 * 1000

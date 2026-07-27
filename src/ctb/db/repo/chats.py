@@ -2,8 +2,10 @@
 
 The address of a prompt is the forum topic your thumb is in. ``thread_id`` is
 NOT NULL and uses :data:`ctb.db.NO_THREAD_ID` (0) for "no topic" — a DM or the
-supergroup's General — because SQLite permits NULLs inside a PRIMARY KEY and a
-nullable thread would silently destroy the uniqueness of the routing key.
+supergroup's General — so the routing key never contains a NULL.
+
+Rows are tenant-scoped by row-level security: ``tenant_id`` is filled from the
+``ctb.tenant_id`` GUC and every statement here is filtered by it.
 """
 
 from __future__ import annotations
@@ -11,10 +13,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Self
 
-import aiosqlite
-
 from ctb.db import NO_THREAD_ID
-from ctb.db.connection import Database, now_ms
+from ctb.db.connection import Database, Row, now_ms
 from ctb.db.repo._util import (
     UNSET,
     Maybe,
@@ -26,8 +26,19 @@ from ctb.db.repo._util import (
     update_sql,
 )
 
+
+class ChatOwnedElsewhereError(RuntimeError):
+    """A chat id is already routed to a different tenant.
+
+    ``tenant_chats.chat_id`` is a primary key precisely so this cannot happen
+    in production — one Telegram chat belongs to one workspace, forever. This
+    exists so that if the invariant is ever broken, it says so.
+    """
+
+
 __all__ = [
     "ChatKind",
+    "ChatOwnedElsewhereError",
     "ChatRow",
     "bind",
     "delete",
@@ -75,7 +86,7 @@ class ChatRow:
     updated_at: int = 0
 
     @classmethod
-    def from_row(cls, row: aiosqlite.Row) -> Self:
+    def from_row(cls, row: Row) -> Self:
         return cls(
             chat_id=as_int(row["chat_id"]),
             thread_id=as_int(row["thread_id"]),
@@ -139,8 +150,15 @@ async def ensure(
             (chat_id, thread_id, kind, stamp, stamp),
         )
         row = await get(db, chat_id, thread_id)
-    if row is None:  # pragma: no cover - the insert above guarantees a row
-        raise RuntimeError(f"chats row vanished for ({chat_id}, {thread_id})")
+    if row is None:
+        # The insert succeeded-or-conflicted, yet we cannot read it back. The
+        # only way that happens is a row under a *different* tenant: the PK is
+        # (chat_id, thread_id), so the conflict is real while row-level
+        # security hides the winner. Say that, rather than "vanished".
+        raise ChatOwnedElsewhereError(
+            f"chat {chat_id} already belongs to another workspace; a Telegram "
+            "chat can be bound to only one"
+        )
     return row
 
 

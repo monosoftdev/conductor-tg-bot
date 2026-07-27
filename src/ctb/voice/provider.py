@@ -101,7 +101,10 @@ class ElevenLabsProvider:
             #
             # So drop the optional parameter and try again rather than guess
             # what the body will say. One extra call, only on the failure path,
-            # and only until the first refusal latches it off for the process.
+            # and only until the first refusal latches it off — *for this
+            # tenant's provider*, which is the only one holding this key. A
+            # workspace on an enterprise plan keeps zero retention even after
+            # somebody else's plan refuses it.
             log.warning(
                 "voice.zero_retention_unavailable",
                 status=response.status_code,

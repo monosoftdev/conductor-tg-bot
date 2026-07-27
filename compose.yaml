@@ -1,0 +1,32 @@
+# PostgreSQL for the test suite and local development.
+#
+#   docker compose up -d --wait db
+#   .venv/bin/python -m pytest tests/ -q
+#
+# `fsync=off` plus a tmpfs data directory is the single biggest lever on suite
+# runtime: every COMMIT and every per-test TRUNCATE becomes a memory write. This
+# database is disposable by construction — never point it at real data.
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ctb_test
+      # `C` collation keeps ORDER BY stable across machines.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    command: >
+      postgres
+      -c fsync=off
+      -c full_page_writes=off
+      -c synchronous_commit=off
+      -c max_connections=200
+    ports:
+      - "5433:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ctb_test"]
+      interval: 1s
+      timeout: 3s
+      retries: 30

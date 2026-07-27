@@ -8,14 +8,16 @@ actually returns.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
-import sqlite3
+import json
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from ctb.conductor.client import ConductorClient
 from ctb.conductor.errors import (
     Ambiguous,
     ApiError,
@@ -37,7 +39,13 @@ from ctb.conductor.models import (
     validate_pairing,
 )
 from ctb.db.connection import Database, now_ms
-from ctb.db.migrate import apply_migrations, current_schema_version, discover_migrations
+from ctb.db.errors import ForeignKeyViolation, UniqueViolation
+from ctb.db.migrate import (
+    MigrationError,
+    _checked_sql,
+    current_schema_version,
+    discover_migrations,
+)
 from ctb.delivery.render.types import (
     ActivityLine,
     BlockKind,
@@ -58,35 +66,70 @@ from ctb.turn.state import (
     TurnContext,
     TurnState,
 )
+from tests.conftest import FAKE_BOT_TOKEN, FAKE_MASTER_KEYS
+
+API_URL = "https://api.conductor.build/v0"
+
+
+def _env(**overrides: Any) -> dict[str, Any]:
+    """A complete, valid environment, so one override is the only thing wrong."""
+    base: dict[str, Any] = {
+        "_env_file": None,
+        "telegram_bot_token": FAKE_BOT_TOKEN,
+        "master_keys": FAKE_MASTER_KEYS,
+        "database_url": "postgresql://ctb_app@localhost/ctb",
+        "system_database_url": "postgresql://ctb_worker@localhost/ctb",
+    }
+    base.update(overrides)
+    return base
 
 
 class TestSettings:
-    def test_missing_secrets_fail_fast_with_a_useful_message(self) -> None:
+    def test_missing_configuration_fails_fast_in_one_message(self) -> None:
+        """Every missing variable at once. One crash per variable is an outage."""
         with pytest.raises(SettingsError) as exc:
             load_settings(_env_file=None)
         text = str(exc.value)
         assert "TELEGRAM_BOT_TOKEN" in text
-        assert "CONDUCTOR_API_KEY" in text
+        assert "DATABASE_URL" in text
+        assert "SYSTEM_DATABASE_URL" in text
+        assert "CTB_MASTER_KEYS" in text
 
-    def test_empty_allowlist_is_rejected(self) -> None:
-        with pytest.raises(SettingsError, match="ALLOWED_TELEGRAM_USER_IDS"):
-            load_settings(
-                _env_file=None,
-                telegram_bot_token="t" * 10,
-                conductor_api_key="k" * 10,
-                allowed_telegram_user_ids="",
-            )
+    def test_a_blank_secret_counts_as_missing(self) -> None:
+        """``TELEGRAM_BOT_TOKEN=`` is "set" to pydantic; it is not to us."""
+        with pytest.raises(SettingsError, match="TELEGRAM_BOT_TOKEN"):
+            load_settings(**_env(telegram_bot_token="   "))
 
-    def test_owner_is_the_first_id_and_duplicates_collapse(
+    def test_malformed_master_keys_are_rejected_at_boot(self) -> None:
+        """A bad key must kill the boot, not the first user's first prompt."""
+        with pytest.raises(SettingsError, match="CTB_MASTER_KEYS"):
+            load_settings(**_env(master_keys="v1:not-base64!!"))
+
+    def test_the_secret_box_round_trips(
         self, settings_factory: Callable[..., Settings]
     ) -> None:
-        cfg = settings_factory(allowed_telegram_user_ids=" 7 , 8,7 ")
-        assert cfg.allowed_telegram_user_ids == [7, 8]
-        assert cfg.owner_id == 7
-        assert cfg.is_allowed(8) and not cfg.is_allowed(9)
+        box = settings_factory().secret_box()
+        box.self_check()
+        assert box.active_kid == "v2"
 
-    def test_me_lives_at_the_api_root_not_under_v0(self, settings: Settings) -> None:
-        assert settings.me_url == "https://api.conductor.build/me"
+    def test_platform_admins_are_optional_and_deduplicated(
+        self, settings_factory: Callable[..., Settings]
+    ) -> None:
+        """An unattended deployment legitimately has none.
+
+        This is *not* an allow-list for using the bot — tenancy decides that.
+        """
+        assert settings_factory(platform_admin_ids="").platform_admin_ids == []
+        cfg = settings_factory(platform_admin_ids=" 7 , 8,7 ")
+        assert cfg.platform_admin_ids == [7, 8]
+        assert cfg.is_platform_admin(8) and not cfg.is_platform_admin(9)
+
+    def test_me_lives_at_the_api_root_not_under_v0(self) -> None:
+        from ctb.settings import conductor_api_root
+
+        assert conductor_api_root("https://api.conductor.build/v0") == (
+            "https://api.conductor.build"
+        )
 
     def test_default_branch_is_settable_and_never_blank(
         self, settings_factory: Callable[..., Settings]
@@ -97,16 +140,15 @@ class TestSettings:
         # `cp .env.example .env` leaves `DEFAULT_BRANCH=` behind.
         assert settings_factory(default_branch="  ").default_branch == "main"
 
-    def test_bad_default_pairing_is_caught_at_boot(self) -> None:
-        with pytest.raises(SettingsError, match="not a valid"):
-            load_settings(
-                _env_file=None,
-                telegram_bot_token="t" * 10,
-                conductor_api_key="k" * 10,
-                allowed_telegram_user_ids="1",
-                default_agent="claude",
-                default_model="gpt-5.5",
-            )
+    def test_no_tenant_credential_lives_in_the_environment(
+        self, settings_factory: Callable[..., Settings]
+    ) -> None:
+        """The whole point of the split: nothing here names a customer."""
+        cfg = settings_factory()
+        assert not hasattr(cfg, "conductor_api_key")
+        assert not hasattr(cfg, "elevenlabs_api_key")
+        assert not hasattr(cfg, "allowed_telegram_user_ids")
+        assert not hasattr(cfg, "telegram_chat_id")
 
 
 class TestScrubber:
@@ -145,15 +187,19 @@ class TestScrubber:
         assert len(settings.secret_values()) == 2
         assert all(isinstance(v, str) and v for v in settings.secret_values())
 
-    def test_speech_key_joins_secret_scrubbing(
-        self, settings_factory: Callable[..., Settings]
-    ) -> None:
-        key = "elevenlabs_secret_123456"
-        settings = settings_factory(elevenlabs_api_key=key)
-        assert key in settings.secret_values()
+    def test_a_tenant_key_is_never_registered_globally(self) -> None:
+        """Registering every tenant's key would keep plaintext in memory.
 
+        Conductor keys only ever appear in an ``Authorization`` header, which
+        the bearer-token pattern already redacts, so the registry stays
+        platform-only and O(1) in the number of tenants.
+        """
+        from ctb.logging import _secrets
 
-class TestModels:
+        before = set(_secrets)
+        ConductorClient(api_key="cndk_tenant_secret_0001", api_url=API_URL)
+        assert set(_secrets) == before
+
     def test_envelope_helpers_reach_content_turn_id_and_id(
         self, message_factory: Callable[..., TranscriptMessage]
     ) -> None:
@@ -293,20 +339,52 @@ class TestMigrations:
         assert [m.version for m in migrations] == sorted(m.version for m in migrations)
         assert migrations[0].version == 1
 
-    async def test_schema_applies_to_a_real_file(self, db: Database) -> None:
-        assert await current_schema_version(db) == 2
-        rows = await db.fetch_all(
-            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+    def test_a_file_that_opens_its_own_transaction_is_rejected(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / "001_bad.sql").write_text("BEGIN;\nSELECT 1;\nCOMMIT;")
+        with pytest.raises(MigrationError, match="manages its own transaction"):
+            _checked_sql(discover_migrations(tmp_path)[0])
+
+    def test_a_literal_containing_dollars_does_not_disarm_the_guard(
+        self, tmp_path: Path
+    ) -> None:
+        """A single-quoted `$$` used to open a dollar quote that never closed.
+
+        Everything after it was skipped, so the ``BEGIN``/``COMMIT`` the guard
+        exists to catch sailed straight through.
+        """
+        (tmp_path / "001_sneaky.sql").write_text(
+            "SELECT 'costs $$ dollars';\nBEGIN;\nSELECT 1;\nCOMMIT;"
+        )
+        with pytest.raises(MigrationError, match="manages its own transaction"):
+            _checked_sql(discover_migrations(tmp_path)[0])
+
+    def test_a_do_block_is_not_mistaken_for_one(self, tmp_path: Path) -> None:
+        """``DO $$ BEGIN … END $$`` is procedural, not transactional."""
+        (tmp_path / "001_ok.sql").write_text("DO $x$\nBEGIN\n  PERFORM 1;\nEND\n$x$;")
+        assert _checked_sql(discover_migrations(tmp_path)[0])
+
+    async def test_the_schema_is_applied(self, system_db: Database) -> None:
+        assert await current_schema_version(system_db) >= 1
+
+    async def test_every_expected_table_exists(self, system_db: Database) -> None:
+        rows = await system_db.fetch_all(
+            "SELECT tablename AS name FROM pg_tables "
+            "WHERE schemaname = current_schema() ORDER BY name"
         )
         tables = {row["name"] for row in rows}
         assert {
-            "allowed_users",
             "api_events",
             "chats",
             "deliveries",
+            "enrollment_tokens",
             "outbound_prompts",
             "sessions",
             "singleton_lease",
+            "tenant_chats",
+            "tenant_members",
+            "tenants",
             "transcript_messages",
             "unknown_content_types",
             "voice_inputs",
@@ -314,13 +392,15 @@ class TestMigrations:
             "workspaces",
         } <= tables
 
-    async def test_applying_twice_is_a_no_op(self, db: Database) -> None:
-        assert await apply_migrations(db) == ()
+    async def test_the_old_allowlist_table_is_gone(self, system_db: Database) -> None:
+        """``tenant_members`` replaced it; a leftover would be a second door."""
+        assert await system_db.fetch_val("SELECT to_regclass('allowed_users')") is None
 
-    async def test_pragmas(self, db: Database) -> None:
-        assert await db.fetch_val("PRAGMA journal_mode") == "wal"
-        assert await db.fetch_val("PRAGMA foreign_keys") == 1
-        assert await db.fetch_val("PRAGMA busy_timeout") == 5000
+    async def test_reading_the_version_needs_no_write_rights(
+        self, db: Database
+    ) -> None:
+        """``/health`` calls this on every report, as a role that cannot create."""
+        assert await current_schema_version(db) >= 1
 
 
 class TestDatabase:
@@ -338,40 +418,84 @@ class TestDatabase:
                 await db.execute("INSERT INTO workspaces(id) VALUES ('w2')")
         assert await db.fetch_val("SELECT COUNT(*) FROM workspaces") == 2
 
-    async def test_insert_or_ignore_makes_replay_harmless(self, db: Database) -> None:
+    async def test_a_child_task_does_not_borrow_its_parents_connection(
+        self, db: Database
+    ) -> None:
+        """``create_task`` copies the context, connections are not shareable.
+
+        Without the task-identity check on the bound connection, the child
+        would issue statements on the parent's open transaction concurrently.
+        """
+        seen: list[int] = []
+
+        async def child() -> None:
+            seen.append(await db.fetch_val("SELECT COUNT(*) FROM workspaces"))
+
+        async with db.transaction():
+            await db.execute("INSERT INTO workspaces(id) VALUES ('w')")
+            await asyncio.create_task(child())
+        # The child ran on its own connection, so it could not see the
+        # uncommitted row — and, crucially, it did not raise.
+        assert seen == [0]
+        assert await db.fetch_val("SELECT COUNT(*) FROM workspaces") == 1
+
+    async def test_on_conflict_do_nothing_makes_replay_harmless(
+        self, db: Database
+    ) -> None:
         await db.execute("INSERT INTO sessions(id) VALUES ('s')")
         row = ("s", "s:1:0", 0, "agent", now_ms())
         sql = (
-            "INSERT OR IGNORE INTO transcript_messages"
+            "INSERT INTO transcript_messages"
             "(session_id, message_id, session_index, type, received_at_ms)"
-            " VALUES (?, ?, ?, ?, ?)"
+            " VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING"
         )
         await db.execute(sql, row)
         await db.execute(sql, row)
         assert await db.fetch_val("SELECT COUNT(*) FROM transcript_messages") == 1
 
     async def test_foreign_keys_are_enforced(self, db: Database) -> None:
-        with pytest.raises(sqlite3.IntegrityError):
+        with pytest.raises(ForeignKeyViolation):
             await db.execute(
                 "INSERT INTO sessions(id, workspace_id) VALUES ('s', 'missing')"
             )
 
-    async def test_delivery_claim_uses_its_index(self, db: Database) -> None:
+    async def test_the_delivery_claim_can_use_its_index(self, db: Database) -> None:
+        """Asserts the index is *usable*, not that the planner picks it today.
+
+        Disabling sequential scans tests the intent without making the test's
+        stability depend on the cost model at a particular row count.
+        """
+        await db.execute("SET LOCAL enable_seqscan = off")
         plan = await db.fetch_all(
-            "EXPLAIN QUERY PLAN SELECT * FROM deliveries WHERE state='pending' "
+            "EXPLAIN (FORMAT JSON) SELECT * FROM deliveries WHERE state = 'pending' "
             "ORDER BY session_index, part_index"
         )
-        assert any("idx_deliveries_claim" in str(tuple(row)) for row in plan)
+        assert "idx_deliveries_claim" in json.dumps(plan, default=str)
 
     async def test_thread_id_zero_keeps_the_routing_key_unique(
         self, db: Database
     ) -> None:
         await db.execute("INSERT INTO chats(chat_id, thread_id) VALUES (5, 0)")
-        with pytest.raises(sqlite3.IntegrityError):
+        with pytest.raises(UniqueViolation):
             await db.execute("INSERT INTO chats(chat_id, thread_id) VALUES (5, 0)")
 
-    async def test_db_fixture_uses_a_temp_file(
-        self, db: Database, db_path: Path
+    async def test_timestamps_in_one_transaction_are_distinct(
+        self, db: Database
     ) -> None:
-        assert db.path == db_path
-        assert db_path.exists()
+        """``clock_timestamp()``, not ``now()``.
+
+        ``now()`` is fixed at transaction start, which would give every row a
+        batch inserts an identical ``created_at`` and flip every
+        ``ORDER BY created_at`` tiebreak.
+        """
+        async with db.transaction():
+            for index in range(3):
+                await db.execute(
+                    "INSERT INTO workspaces(id) VALUES (?)", (f"w{index}",)
+                )
+        rows = await db.fetch_all("SELECT created_at FROM workspaces")
+        assert len({row["created_at"] for row in rows}) > 1
+
+    async def test_the_pool_reports_its_stats(self, db: Database) -> None:
+        """Exhaustion is the new deadlock class; it must be visible first."""
+        assert db.stats()["pool_size"] >= 1

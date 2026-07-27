@@ -17,7 +17,8 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 from collections.abc import AsyncGenerator, Callable
-from typing import Any, Final
+from types import SimpleNamespace
+from typing import Any, Final, cast
 
 import pytest
 from aiogram import Bot, Dispatcher, Router
@@ -59,7 +60,7 @@ from ctb.bot import app as bot_app
 from ctb.bot.app import (
     BotApp,
     ConflictGuard,
-    SqliteStorage,
+    PostgresStorage,
     build_app,
     clear_routers,
     create_bot,
@@ -87,19 +88,24 @@ from ctb.bot.keyboards import (
     url_button,
 )
 from ctb.bot.middleware import (
-    AuthMiddleware,
     LogContextMiddleware,
     Route,
     RoutingMiddleware,
+    StrangerNotifier,
+    TenantMiddleware,
 )
 from ctb.bot.middleware.context import new_request_id
-from ctb.db.connection import Database
+from ctb.conductor.pool import ClientPool, MissingKeyError
+from ctb.db.connection import Database, tenant_scope
+from ctb.db.errors import DatabaseError
 from ctb.db.repo import chats as chats_repo
 from ctb.db.repo import sessions as sessions_repo
+from ctb.db.repo import tenancy as tenancy_repo
 from ctb.db.repo import workspaces as workspaces_repo
 from ctb.settings import Settings
 from ctb.turn.state import CardButton
 from tests.conftest import FAKE_BOT_TOKEN, FakeClock
+from tests.pg import BOOTSTRAP_TENANT_ID, OTHER_TENANT_ID
 
 OWNER_ID = 1001
 ALLOWED_ID = 1002
@@ -169,8 +175,7 @@ def bot(session: RecordingSession) -> Bot:
 @pytest.fixture
 def bot_settings(settings_factory: Callable[..., Settings]) -> Settings:
     return settings_factory(
-        allowed_telegram_user_ids=f"{OWNER_ID},{ALLOWED_ID}",
-        telegram_chat_id=GROUP_ID,
+        platform_admin_ids=f"{OWNER_ID}",
     )
 
 
@@ -367,22 +372,55 @@ UPDATE_KINDS = (
 )
 
 
+class NullPool:
+    """A :class:`ClientPool` stand-in. Tenancy resolves without a real key."""
+
+    def peek(self, tenant_id: Any) -> None:
+        return None
+
+    async def get(self, tenant: Any) -> Any:
+        raise MissingKeyError("no key in this test")
+
+
+def make_tenancy(
+    settings: Settings,
+    system_db: Database,
+    **overrides: Any,
+) -> TenantMiddleware:
+    options: dict[str, Any] = {
+        "system_db": system_db,
+        "clients": NullPool(),
+        "settings": settings,
+        "notifier": StrangerNotifier(enabled=False),
+        # Resolution is cached for 30s in production; a test that changes
+        # membership must see it immediately.
+        "cache_ttl_s": 0.0,
+    }
+    options.update(overrides)
+    return TenantMiddleware(**options)
+
+
 def make_dispatcher(
     settings: Settings,
     db: Database | None,
     *,
-    auth: AuthMiddleware | None = None,
+    system_db: Database | None = None,
+    auth: TenantMiddleware | None = None,
     storage: BaseStorage | None = None,
 ) -> tuple[Dispatcher, list[Any]]:
     """A Dispatcher with the production middleware stack and a catch-all."""
+    resolved_system = system_db if system_db is not None else db
+    assert resolved_system is not None
     dispatcher = Dispatcher(
-        storage=storage or SqliteStorage(db), settings=settings, db=db
+        storage=storage or PostgresStorage(db), settings=settings, db=db
     )
     install_middleware(
         dispatcher,
         settings=settings,
+        system_db=resolved_system,
+        clients=cast(ClientPool, NullPool()),
         db=db,
-        auth=auth or AuthMiddleware(settings, db=db, notify_owner=False),
+        tenancy=auth or make_tenancy(settings, resolved_system),
     )
 
     seen: list[Any] = []
@@ -399,15 +437,39 @@ def make_dispatcher(
 
 
 # =============================================================================
-# Allow-list — the security boundary
+# Tenancy — the security boundary
 # =============================================================================
 
 
+@pytest.fixture
+async def seated(system_db: Database) -> None:
+    """The bootstrap tenant, with the test group bound and two members seated.
+
+    This is the shape of a real workspace: one supergroup, one Conductor
+    organisation, several humans.
+    """
+    await tenancy_repo.bind_chat(
+        system_db, GROUP_ID, BOOTSTRAP_TENANT_ID, is_primary=True, bound_by=OWNER_ID
+    )
+    await tenancy_repo.add_member(
+        system_db, BOOTSTRAP_TENANT_ID, OWNER_ID, role="owner"
+    )
+    await tenancy_repo.add_member(
+        system_db, BOOTSTRAP_TENANT_ID, ALLOWED_ID, role="member"
+    )
+
+
 @pytest.mark.parametrize("kind", UPDATE_KINDS)
-async def test_stranger_gets_silence_on_every_update_type(
-    kind: str, bot: Bot, session: RecordingSession, bot_settings: Settings, db: Database
+async def test_a_stranger_gets_silence_on_every_update_type(
+    kind: str,
+    bot: Bot,
+    session: RecordingSession,
+    bot_settings: Settings,
+    db: Database,
+    system_db: Database,
+    seated: None,
 ) -> None:
-    dispatcher, seen = make_dispatcher(bot_settings, db)
+    dispatcher, seen = make_dispatcher(bot_settings, db, system_db=system_db)
     await dispatcher.feed_update(bot, build_update(kind, STRANGER_ID))
     assert seen == []
     # Silence means silence: not one Telegram API call was made.
@@ -415,21 +477,67 @@ async def test_stranger_gets_silence_on_every_update_type(
 
 
 @pytest.mark.parametrize("kind", UPDATE_KINDS)
-async def test_allowed_user_passes_on_every_update_type(
-    kind: str, bot: Bot, bot_settings: Settings, db: Database
+async def test_a_member_passes_on_every_update_type(
+    kind: str,
+    bot: Bot,
+    bot_settings: Settings,
+    db: Database,
+    system_db: Database,
+    seated: None,
 ) -> None:
-    dispatcher, seen = make_dispatcher(bot_settings, db)
+    dispatcher, seen = make_dispatcher(bot_settings, db, system_db=system_db)
     await dispatcher.feed_update(bot, build_update(kind, ALLOWED_ID))
     assert len(seen) == 1
 
 
-async def test_allowed_user_is_rejected_in_an_unconfigured_group(
-    bot: Bot, bot_settings: Settings, db: Database
+async def test_an_unbound_group_is_refused_even_for_a_member(
+    bot: Bot, bot_settings: Settings, db: Database, system_db: Database, seated: None
 ) -> None:
-    dispatcher, seen = make_dispatcher(bot_settings, db)
+    """Anyone can add a shared bot to a group. Being added is not consent."""
+    dispatcher, seen = make_dispatcher(bot_settings, db, system_db=system_db)
+    update = Update(update_id=1, message=_message(ALLOWED_ID, chat_id=GROUP_ID - 1))
+
+    await dispatcher.feed_update(bot, update)
+
+    assert seen == []
+
+
+async def test_a_stranger_in_a_bound_group_is_still_refused(
+    bot: Bot, bot_settings: Settings, db: Database, system_db: Database, seated: None
+) -> None:
+    """Membership is checked separately from the chat.
+
+    Being in the right supergroup is not authorisation; a customer's colleague
+    who was never invited to the workspace gets nothing.
+    """
+    dispatcher, seen = make_dispatcher(bot_settings, db, system_db=system_db)
+    await dispatcher.feed_update(bot, build_update("message", STRANGER_ID))
+    assert seen == []
+
+
+async def test_a_members_dm_resolves_to_their_only_workspace(
+    bot: Bot, bot_settings: Settings, db: Database, system_db: Database, seated: None
+) -> None:
+    dispatcher, seen = make_dispatcher(bot_settings, db, system_db=system_db)
     update = Update(
         update_id=1,
-        message=_message(ALLOWED_ID, chat_id=GROUP_ID - 1),
+        message=_message(ALLOWED_ID, chat_id=ALLOWED_ID, chat_type="private"),
+    )
+
+    await dispatcher.feed_update(bot, update)
+
+    assert len(seen) == 1
+
+
+async def test_a_dm_from_someone_in_two_workspaces_needs_an_explicit_binding(
+    bot: Bot, bot_settings: Settings, db: Database, system_db: Database, seated: None
+) -> None:
+    """A prompt must never silently land in the wrong organisation."""
+    await tenancy_repo.add_member(system_db, OTHER_TENANT_ID, ALLOWED_ID, role="member")
+    dispatcher, seen = make_dispatcher(bot_settings, db, system_db=system_db)
+    update = Update(
+        update_id=1,
+        message=_message(ALLOWED_ID, chat_id=ALLOWED_ID, chat_type="private"),
     )
 
     await dispatcher.feed_update(bot, update)
@@ -437,29 +545,11 @@ async def test_allowed_user_is_rejected_in_an_unconfigured_group(
     assert seen == []
 
 
-async def test_allowed_user_can_still_use_private_dm(
-    bot: Bot, bot_settings: Settings, db: Database
+async def test_a_channel_post_without_a_sender_is_dropped(
+    bot: Bot, bot_settings: Settings, db: Database, system_db: Database, seated: None
 ) -> None:
-    dispatcher, seen = make_dispatcher(bot_settings, db)
-    update = Update(
-        update_id=1,
-        message=_message(
-            ALLOWED_ID,
-            chat_id=ALLOWED_ID,
-            chat_type="private",
-        ),
-    )
-
-    await dispatcher.feed_update(bot, update)
-
-    assert len(seen) == 1
-
-
-async def test_channel_post_without_a_sender_is_dropped(
-    bot: Bot, bot_settings: Settings, db: Database
-) -> None:
-    """No ``from_user`` means nobody to allow — fail closed."""
-    dispatcher, seen = make_dispatcher(bot_settings, db)
+    """No ``from_user`` means nobody to authorise — fail closed."""
+    dispatcher, seen = make_dispatcher(bot_settings, db, system_db=system_db)
     update = Update(
         update_id=1,
         channel_post=Message(
@@ -470,34 +560,199 @@ async def test_channel_post_without_a_sender_is_dropped(
     assert seen == []
 
 
-async def test_runtime_allow_list_from_the_db_is_honoured(
-    bot: Bot, bot_settings: Settings, db: Database
+async def test_inviting_someone_lets_them_in(
+    bot: Bot, bot_settings: Settings, db: Database, system_db: Database, seated: None
 ) -> None:
-    """``/allow`` writes a row; the union of env and DB is what is checked."""
-    from ctb.db.repo import allowlist
-
-    dispatcher, seen = make_dispatcher(bot_settings, db)
+    """``/invite`` writes a row; this is the whole co-founder story."""
+    dispatcher, seen = make_dispatcher(bot_settings, db, system_db=system_db)
     await dispatcher.feed_update(bot, build_update("message", 4242))
     assert seen == []
 
-    await allowlist.upsert(db, 4242, note="added by /allow")
+    await tenancy_repo.add_member(system_db, BOOTSTRAP_TENANT_ID, 4242, role="member")
     await dispatcher.feed_update(bot, build_update("message", 4242, update_id=2))
     assert len(seen) == 1
 
 
-async def test_db_failure_fails_closed(
-    bot: Bot, bot_settings: Settings, db: Database
+async def test_removing_someone_locks_them_out(
+    bot: Bot, bot_settings: Settings, db: Database, system_db: Database, seated: None
 ) -> None:
-    await db.execute("DROP TABLE allowed_users")
-    dispatcher, seen = make_dispatcher(bot_settings, db)
-    await dispatcher.feed_update(bot, build_update("message", 9999))
-    assert seen == []
-    # ...but an env-allow-listed user still gets through: the env is authority.
-    await dispatcher.feed_update(bot, build_update("message", OWNER_ID, update_id=2))
+    dispatcher, seen = make_dispatcher(bot_settings, db, system_db=system_db)
+    await dispatcher.feed_update(bot, build_update("message", ALLOWED_ID))
+    assert len(seen) == 1
+
+    await tenancy_repo.remove_member(system_db, BOOTSTRAP_TENANT_ID, ALLOWED_ID)
+    await dispatcher.feed_update(bot, build_update("message", ALLOWED_ID, update_id=2))
     assert len(seen) == 1
 
 
-class SpyStorage(SqliteStorage):
+async def test_a_suspended_workspace_stops_answering(
+    bot: Bot, bot_settings: Settings, db: Database, system_db: Database, seated: None
+) -> None:
+    await tenancy_repo.set_status(system_db, BOOTSTRAP_TENANT_ID, "suspended")
+    dispatcher, seen = make_dispatcher(bot_settings, db, system_db=system_db)
+    await dispatcher.feed_update(bot, build_update("message", ALLOWED_ID))
+    assert seen == []
+
+
+async def test_a_database_failure_fails_closed(
+    bot: Bot, bot_settings: Settings, db: Database, system_db: Database, seated: None
+) -> None:
+    """A broken lookup must not open the door."""
+
+    class Broken(Database):
+        async def fetch_one(self, sql: str, params: Any = ()) -> Any:
+            raise DatabaseError("connection reset")
+
+    broken = Broken(system_db.dsn, system=True)
+    dispatcher, seen = make_dispatcher(bot_settings, db, system_db=broken)
+    await dispatcher.feed_update(bot, build_update("message", ALLOWED_ID))
+    assert seen == []
+
+
+async def test_registration_commands_reach_a_handler_without_a_tenant(
+    bot: Bot, bot_settings: Settings, db: Database, system_db: Database
+) -> None:
+    """``/start`` in a DM is how someone becomes a tenant in the first place."""
+    dispatcher, seen = make_dispatcher(bot_settings, db, system_db=system_db)
+    update = Update(
+        update_id=1,
+        message=_message(9999, chat_id=9999, chat_type="private", text="/start"),
+    )
+
+    await dispatcher.feed_update(bot, update)
+
+    assert len(seen) == 1
+
+
+async def test_registration_commands_do_not_open_a_group(
+    bot: Bot, bot_settings: Settings, db: Database, system_db: Database
+) -> None:
+    """The entry point is a private message, never someone else's supergroup."""
+    dispatcher, seen = make_dispatcher(bot_settings, db, system_db=system_db)
+    update = Update(update_id=1, message=_message(9999, text="/start"))
+
+    await dispatcher.feed_update(bot, update)
+
+    assert seen == []
+
+
+async def test_ordinary_text_from_a_stranger_is_still_silence(
+    bot: Bot, bot_settings: Settings, db: Database, system_db: Database
+) -> None:
+    dispatcher, seen = make_dispatcher(bot_settings, db, system_db=system_db)
+    update = Update(
+        update_id=1,
+        message=_message(9999, chat_id=9999, chat_type="private", text="hello"),
+    )
+
+    await dispatcher.feed_update(bot, update)
+
+    assert seen == []
+
+
+async def test_the_tenant_context_reaches_the_handler(
+    bot: Bot, bot_settings: Settings, db: Database, system_db: Database, seated: None
+) -> None:
+    dispatcher = Dispatcher(storage=PostgresStorage(db), settings=bot_settings, db=db)
+    dispatcher.update.outer_middleware(make_tenancy(bot_settings, system_db))
+    captured: list[dict[str, Any]] = []
+
+    async def handler(event: Any, **data: Any) -> None:
+        captured.append(data)
+
+    router = Router(name="capture")
+    router.message.register(handler)
+    dispatcher.include_router(router)
+
+    await dispatcher.feed_update(bot, build_update("message", OWNER_ID))
+    await dispatcher.feed_update(bot, build_update("message", ALLOWED_ID, update_id=2))
+
+    assert [data["tenant"].role for data in captured] == ["owner", "member"]
+    assert [data["is_owner"] for data in captured] == [True, False]
+    assert {data["tenant"].tenant_id for data in captured} == {BOOTSTRAP_TENANT_ID}
+
+
+async def test_owners_are_told_about_a_stranger_once_per_day(
+    bot: Bot,
+    session: RecordingSession,
+    bot_settings: Settings,
+    db: Database,
+    system_db: Database,
+    seated: None,
+) -> None:
+    clock = FakeClock()
+    notifier = StrangerNotifier(clock=clock)
+    auth = make_tenancy(bot_settings, system_db, notifier=notifier)
+    dispatcher, seen = make_dispatcher(bot_settings, db, system_db=system_db, auth=auth)
+
+    for index in range(5):
+        await dispatcher.feed_update(
+            bot, build_update("message", STRANGER_ID, index + 1)
+        )
+        clock.advance(60)
+    assert seen == []
+    assert notifier.sent == 1
+
+
+async def test_a_different_stranger_gets_their_own_notice(
+    bot: Bot,
+    session: RecordingSession,
+    bot_settings: Settings,
+    db: Database,
+    system_db: Database,
+    seated: None,
+) -> None:
+    notifier = StrangerNotifier(clock=FakeClock())
+    auth = make_tenancy(bot_settings, system_db, notifier=notifier)
+    dispatcher, _ = make_dispatcher(bot_settings, db, system_db=system_db, auth=auth)
+
+    await dispatcher.feed_update(bot, build_update("message", STRANGER_ID, 1))
+    await dispatcher.feed_update(bot, build_update("message", STRANGER_ID + 1, 2))
+
+    assert notifier.sent == 2
+
+
+async def test_a_flood_of_strangers_cannot_flood_the_owners(
+    bot: Bot,
+    session: RecordingSession,
+    bot_settings: Settings,
+    db: Database,
+    system_db: Database,
+    seated: None,
+) -> None:
+    """ "Once per stranger" without a cap is a spam amplifier, not a guard."""
+    notifier = StrangerNotifier(clock=FakeClock(), max_per_window=3)
+    auth = make_tenancy(bot_settings, system_db, notifier=notifier)
+    dispatcher, _ = make_dispatcher(bot_settings, db, system_db=system_db, auth=auth)
+
+    for index in range(20):
+        await dispatcher.feed_update(
+            bot, build_update("message", 90_000 + index, index + 1)
+        )
+
+    assert notifier.sent == 3
+
+
+async def test_a_failing_notice_does_not_break_the_rejection_path(
+    bot: Bot,
+    session: RecordingSession,
+    bot_settings: Settings,
+    db: Database,
+    system_db: Database,
+    seated: None,
+) -> None:
+    session.raises = RuntimeError("blocked by user")
+    notifier = StrangerNotifier(clock=FakeClock())
+    auth = make_tenancy(bot_settings, system_db, notifier=notifier)
+    dispatcher, seen = make_dispatcher(bot_settings, db, system_db=system_db, auth=auth)
+
+    await dispatcher.feed_update(bot, build_update("message", STRANGER_ID))
+
+    assert seen == []
+    assert notifier.sent == 0
+
+
+class SpyStorage(PostgresStorage):
     """Counts reads, to prove a stranger never reaches the storage."""
 
     def __init__(self, db: Database) -> None:
@@ -513,11 +768,17 @@ class SpyStorage(SqliteStorage):
 
 
 async def test_a_stranger_never_touches_the_fsm_storage(
-    bot: Bot, bot_settings: Settings, db: Database
+    bot: Bot,
+    bot_settings: Settings,
+    db: Database,
+    system_db: Database,
+    seated: None,
 ) -> None:
     """aiogram's FSM middleware reads storage per update; it must run after us."""
     spy = SpyStorage(db)
-    dispatcher, seen = make_dispatcher(bot_settings, db, storage=spy)
+    dispatcher, seen = make_dispatcher(
+        bot_settings, db, system_db=system_db, storage=spy
+    )
     await dispatcher.feed_update(bot, build_update("message", STRANGER_ID))
     assert seen == []
     assert spy.reads == 0
@@ -527,98 +788,48 @@ async def test_a_stranger_never_touches_the_fsm_storage(
     assert spy.reads == 1
 
 
-async def test_principal_marks_the_owner(
-    bot: Bot, bot_settings: Settings, db: Database
+async def test_the_principal_reflects_the_members_role(
+    bot: Bot, bot_settings: Settings, db: Database, system_db: Database, seated: None
 ) -> None:
-    dispatcher = Dispatcher(storage=SqliteStorage(db), settings=bot_settings, db=db)
-    dispatcher.update.outer_middleware(
-        AuthMiddleware(bot_settings, db=db, notify_owner=False)
-    )
+    """``is_owner`` is a role on ``tenant_members``, not a position in a list."""
+    dispatcher = Dispatcher(storage=PostgresStorage(db), settings=bot_settings, db=db)
+    dispatcher.update.outer_middleware(make_tenancy(bot_settings, system_db))
     captured: list[dict[str, Any]] = []
 
     async def handler(event: Any, **data: Any) -> None:
         captured.append(data)
 
-    router = Router(name="capture")
+    router = Router(name="principal")
     router.message.register(handler)
     dispatcher.include_router(router)
 
     await dispatcher.feed_update(bot, build_update("message", OWNER_ID))
     await dispatcher.feed_update(bot, build_update("message", ALLOWED_ID, update_id=2))
-    assert [d["is_owner"] for d in captured] == [True, False]
-    assert captured[0]["principal"].source == "env"
+
+    assert [data["principal"].is_owner for data in captured] == [True, False]
+    assert all(data["principal"].source == "member" for data in captured)
 
 
-# -- the owner notice ----------------------------------------------------------
-
-
-async def test_owner_is_dmed_once_per_unknown_user_per_day(
-    bot: Bot, session: RecordingSession, bot_settings: Settings, db: Database
+async def test_an_admin_also_passes_the_owner_gate(
+    bot: Bot, bot_settings: Settings, db: Database, system_db: Database, seated: None
 ) -> None:
-    clock = FakeClock()
-    auth = AuthMiddleware(bot_settings, db=db, notify_owner=True, clock=clock)
-    dispatcher, seen = make_dispatcher(bot_settings, db, auth=auth)
-
-    for i in range(5):
-        await dispatcher.feed_update(bot, build_update("message", STRANGER_ID, i + 1))
-        clock.advance(60)
-    assert seen == []
-    assert auth.notices_sent == 1
-    assert len(session.calls) == 1
-    assert str(STRANGER_ID) in session.sent_texts()[0]
-    # The DM goes to the owner and nobody else.
-    assert getattr(session.calls[0], "chat_id", None) == OWNER_ID  # noqa: B009
-
-    # Just under a day: still silent.
-    clock.advance(24 * 3600 - 400)
-    await dispatcher.feed_update(bot, build_update("message", STRANGER_ID, 50))
-    assert auth.notices_sent == 1
-
-    # Past the day boundary: one more.
-    clock.advance(1000)
-    await dispatcher.feed_update(bot, build_update("message", STRANGER_ID, 51))
-    assert auth.notices_sent == 2
-
-
-async def test_a_different_stranger_gets_their_own_notice(
-    bot: Bot, bot_settings: Settings, db: Database
-) -> None:
-    clock = FakeClock()
-    auth = AuthMiddleware(bot_settings, db=db, notify_owner=True, clock=clock)
-    dispatcher, _ = make_dispatcher(bot_settings, db, auth=auth)
-    await dispatcher.feed_update(bot, build_update("message", 7001, 1))
-    await dispatcher.feed_update(bot, build_update("message", 7002, 2))
-    await dispatcher.feed_update(bot, build_update("message", 7001, 3))
-    assert auth.notices_sent == 2
-
-
-async def test_a_flood_of_strangers_cannot_flood_the_owner(
-    bot: Bot, bot_settings: Settings, db: Database
-) -> None:
-    clock = FakeClock()
-    auth = AuthMiddleware(
-        bot_settings,
-        db=db,
-        notify_owner=True,
-        clock=clock,
-        max_notices_per_window=3,
+    await tenancy_repo.add_member(
+        system_db, BOOTSTRAP_TENANT_ID, ALLOWED_ID, role="admin"
     )
-    dispatcher, _ = make_dispatcher(bot_settings, db, auth=auth)
-    for i in range(20):
-        await dispatcher.feed_update(bot, build_update("message", 8000 + i, i + 1))
-    assert auth.notices_sent == 3
-    assert auth.rejected == 20
+    dispatcher = Dispatcher(storage=PostgresStorage(db), settings=bot_settings, db=db)
+    dispatcher.update.outer_middleware(make_tenancy(bot_settings, system_db))
+    captured: list[dict[str, Any]] = []
 
+    async def handler(event: Any, **data: Any) -> None:
+        captured.append(data)
 
-async def test_a_failing_dm_does_not_break_the_rejection_path(
-    bot: Bot, session: RecordingSession, bot_settings: Settings, db: Database
-) -> None:
-    session.raises = RuntimeError("owner blocked the bot")
-    auth = AuthMiddleware(bot_settings, db=db, notify_owner=True, clock=FakeClock())
-    dispatcher, seen = make_dispatcher(bot_settings, db, auth=auth)
-    await dispatcher.feed_update(bot, build_update("message", STRANGER_ID))
-    assert seen == []
-    assert auth.notices_sent == 0
+    router = Router(name="admin")
+    router.message.register(handler)
+    dispatcher.include_router(router)
+
+    await dispatcher.feed_update(bot, build_update("message", ALLOWED_ID))
+
+    assert captured[0]["is_owner"] is True
 
 
 # =============================================================================
@@ -660,6 +871,12 @@ async def route_for(
     data: dict[str, Any] = {
         EVENT_CONTEXT_KEY: UserContextMiddleware.resolve_event_context(update),
         "db": db,
+        # Routing runs behind tenancy in production; without a tenant there is
+        # no scope, and it deliberately resolves nothing.
+        "tenant": SimpleNamespace(
+            tenant_id=BOOTSTRAP_TENANT_ID,
+            settings=SimpleNamespace(voice_enabled=False),
+        ),
     }
     captured: dict[str, Route] = {}
 
@@ -781,7 +998,11 @@ async def test_reply_to_override_uses_the_injected_resolver(db: Database) -> Non
 
 
 async def test_routing_survives_a_broken_database(db: Database) -> None:
-    await db.execute("DROP TABLE chats")
+    class Broken(Database):
+        async def fetch_one(self, sql: str, params: Any = ()) -> Any:
+            raise DatabaseError("connection reset")
+
+    db = Broken(db.dsn)
     update = Update(update_id=1, message=_message(OWNER_ID, thread_id=TOPIC_ID))
     route = await route_for(RoutingMiddleware(db=db), update, db)
     assert route.session_id is None
@@ -1043,15 +1264,15 @@ def storage_key(
     return StorageKey(bot_id=1, chat_id=chat_id, user_id=user_id, thread_id=thread_id)
 
 
-async def test_fsm_state_survives_a_restart(db: Database, db_path: Any) -> None:
+async def test_fsm_state_survives_a_restart(db: Database) -> None:
     key = storage_key()
-    storage = SqliteStorage(db)
+    storage = PostgresStorage(db)
     await storage.set_state(key, "NewWorkspace:branch")
     await storage.set_data(key, {"project": "api", "prompt": "fix the test"})
 
-    # A brand-new storage object over the same file is what a redeploy looks
-    # like from the wizard's point of view.
-    restarted = SqliteStorage(db)
+    # A brand-new storage object over the same database is what a redeploy
+    # looks like from the wizard's point of view.
+    restarted = PostgresStorage(db)
     assert await restarted.get_state(key) == "NewWorkspace:branch"
     assert await restarted.get_data(key) == {
         "project": "api",
@@ -1060,7 +1281,7 @@ async def test_fsm_state_survives_a_restart(db: Database, db_path: Any) -> None:
 
 
 async def test_fsm_seats_are_isolated_by_chat_thread_and_user(db: Database) -> None:
-    storage = SqliteStorage(db)
+    storage = PostgresStorage(db)
     a = storage_key(thread_id=1)
     b = storage_key(thread_id=2)
     c = storage_key(thread_id=1, user_id=ALLOWED_ID)
@@ -1073,7 +1294,7 @@ async def test_fsm_seats_are_isolated_by_chat_thread_and_user(db: Database) -> N
 
 
 async def test_fsm_dm_key_has_no_thread(db: Database) -> None:
-    storage = SqliteStorage(db)
+    storage = PostgresStorage(db)
     key = StorageKey(bot_id=1, chat_id=DM_ID, user_id=OWNER_ID, thread_id=None)
     await storage.set_state(key, "wizard")
     assert await storage.get_state(key) == "wizard"
@@ -1084,7 +1305,7 @@ async def test_fsm_dm_key_has_no_thread(db: Database) -> None:
 
 
 async def test_fsm_clearing_removes_the_row(db: Database) -> None:
-    storage = SqliteStorage(db)
+    storage = PostgresStorage(db)
     key = storage_key()
     await storage.set_state(key, "step")
     await storage.set_data(key, {"x": 1})
@@ -1097,7 +1318,7 @@ async def test_fsm_clearing_removes_the_row(db: Database) -> None:
 
 
 async def test_fsm_update_data_merges(db: Database) -> None:
-    storage = SqliteStorage(db)
+    storage = PostgresStorage(db)
     key = storage_key()
     await storage.set_data(key, {"a": 1})
     merged = await storage.update_data(key, {"b": 2})
@@ -1106,7 +1327,7 @@ async def test_fsm_update_data_merges(db: Database) -> None:
 
 
 async def test_fsm_non_default_destiny_is_namespaced(db: Database) -> None:
-    storage = SqliteStorage(db)
+    storage = PostgresStorage(db)
     plain = storage_key()
     scene = StorageKey(
         bot_id=1,
@@ -1128,7 +1349,7 @@ async def test_fsm_non_default_destiny_is_namespaced(db: Database) -> None:
 
 
 async def test_fsm_expired_wizard_reads_as_absent(db: Database) -> None:
-    storage = SqliteStorage(db, ttl_ms=1)
+    storage = PostgresStorage(db, ttl_ms=1)
     key = storage_key()
     await storage.set_state(key, "yesterday")
     await asyncio.sleep(0.01)
@@ -1137,15 +1358,21 @@ async def test_fsm_expired_wizard_reads_as_absent(db: Database) -> None:
 
 
 async def test_fsm_is_reachable_through_the_dispatcher(
-    bot: Bot, bot_settings: Settings, db: Database
+    bot: Bot,
+    bot_settings: Settings,
+    db: Database,
+    system_db: Database,
+    seated: None,
 ) -> None:
-    """Moving the FSM middleware behind the allow-list must not break it."""
-    dispatcher = Dispatcher(storage=SqliteStorage(db), settings=bot_settings, db=db)
+    """Moving the FSM middleware behind tenancy must not break it."""
+    dispatcher = Dispatcher(storage=PostgresStorage(db), settings=bot_settings, db=db)
     install_middleware(
         dispatcher,
         settings=bot_settings,
+        system_db=system_db,
+        clients=cast(ClientPool, NullPool()),
         db=db,
-        auth=AuthMiddleware(bot_settings, db=db, notify_owner=False),
+        tenancy=make_tenancy(bot_settings, system_db),
     )
     seen: list[str | None] = []
     routes: list[Route] = []
@@ -1162,10 +1389,14 @@ async def test_fsm_is_reachable_through_the_dispatcher(
     await dispatcher.feed_update(bot, build_update("message", OWNER_ID))
     assert seen == ["asked"]
     assert routes[0].chat_id == GROUP_ID
-    stored = await db.fetch_val(
-        "SELECT state_key FROM wizard_state WHERE user_id = ?", (OWNER_ID,)
-    )
+    # The scope lives for the duration of the update, so read it back inside
+    # one — exactly as a handler would.
+    async with tenant_scope(BOOTSTRAP_TENANT_ID):
+        stored = await db.fetch_val(
+            "SELECT state_key FROM wizard_state WHERE user_id = ?", (OWNER_ID,)
+        )
     assert stored == "asked"
+    assert routes[0].tenant_id == BOOTSTRAP_TENANT_ID
 
 
 # =============================================================================
@@ -1192,24 +1423,56 @@ def test_discover_tolerates_a_missing_handler_package() -> None:
     assert bot_app.discover_routers("ctb.bot.definitely_not_here") == ()
 
 
+def test_the_phone_menu_never_advertises_a_command_that_does_not_exist() -> None:
+    """A menu entry with no handler is a dead button on every user's phone.
+
+    The menu is a hand-written tuple set once at boot, so nothing else would
+    catch a rename or a deleted handler.
+    """
+    clear_routers()
+    try:
+        routers = bot_app.discover_routers()
+    finally:
+        clear_routers()
+
+    handled: set[str] = set()
+    for router in routers:
+        for handler in router.message.handlers:
+            for flt in handler.filters or ():
+                callback = getattr(flt, "callback", None)
+                handled.update(getattr(callback, "commands", ()) or ())
+
+    advertised = {c.command for c in bot_app.BOT_COMMANDS}
+    assert advertised <= handled, advertised - handled
+
+
 def test_build_app_wires_everything(
-    bot: Bot, bot_settings: Settings, db: Database
+    bot: Bot, bot_settings: Settings, db: Database, system_db: Database
 ) -> None:
     router = Router(name="x")
-    app = build_app(settings=bot_settings, db=db, bot=bot, routers=[router])
+    app = build_app(
+        settings=bot_settings,
+        db=db,
+        system_db=system_db,
+        clients=cast(ClientPool, NullPool()),
+        bot=bot,
+        routers=[router],
+    )
     assert app.dispatcher["settings"] is bot_settings
     assert app.dispatcher["db"] is db
     assert app.dispatcher["nonces"] is app.nonces
-    assert isinstance(app.storage, SqliteStorage)
+    assert isinstance(app.storage, PostgresStorage)
     assert app.routers == (router,)
     assert app.health()["routers"] == ["x"]
 
 
-async def test_unexpected_handler_error_replies_to_the_allowed_user(
+async def test_an_unexpected_handler_error_replies_without_leaking(
     bot: Bot,
     session: RecordingSession,
     bot_settings: Settings,
     db: Database,
+    system_db: Database,
+    seated: None,
 ) -> None:
     router = Router(name="broken")
 
@@ -1217,7 +1480,14 @@ async def test_unexpected_handler_error_replies_to_the_allowed_user(
         raise RuntimeError("secret internal detail")
 
     router.message.register(boom)
-    app = build_app(settings=bot_settings, db=db, bot=bot, routers=[router])
+    app = build_app(
+        settings=bot_settings,
+        db=db,
+        system_db=system_db,
+        clients=cast(ClientPool, NullPool()),
+        bot=bot,
+        routers=[router],
+    )
 
     await app.dispatcher.feed_update(bot, build_update("message", OWNER_ID))
 
@@ -1247,10 +1517,17 @@ async def test_conflict_guard_counts_and_reraises(bot: Bot) -> None:
 
 
 async def test_polling_retries_a_conflict_instead_of_crashing(
-    bot: Bot, bot_settings: Settings, db: Database
+    bot: Bot, bot_settings: Settings, db: Database, system_db: Database
 ) -> None:
     """PLAN §Redeploy overlap defence #3: 409 is 'wait', never 'die'."""
-    app = build_app(settings=bot_settings, db=db, bot=bot, routers=[])
+    app = build_app(
+        settings=bot_settings,
+        db=db,
+        system_db=system_db,
+        clients=cast(ClientPool, NullPool()),
+        bot=bot,
+        routers=[],
+    )
     attempts = 0
 
     async def fake_start_polling(*_args: Any, **_kwargs: Any) -> None:
@@ -1272,9 +1549,16 @@ async def test_polling_retries_a_conflict_instead_of_crashing(
 
 
 async def test_polling_backs_off_on_an_unexpected_error(
-    bot: Bot, bot_settings: Settings, db: Database
+    bot: Bot, bot_settings: Settings, db: Database, system_db: Database
 ) -> None:
-    app = build_app(settings=bot_settings, db=db, bot=bot, routers=[])
+    app = build_app(
+        settings=bot_settings,
+        db=db,
+        system_db=system_db,
+        clients=cast(ClientPool, NullPool()),
+        bot=bot,
+        routers=[],
+    )
     calls = 0
 
     async def boom(*_args: Any, **_kwargs: Any) -> None:
@@ -1294,9 +1578,16 @@ async def test_polling_backs_off_on_an_unexpected_error(
 
 
 async def test_polling_propagates_cancellation(
-    bot: Bot, bot_settings: Settings, db: Database
+    bot: Bot, bot_settings: Settings, db: Database, system_db: Database
 ) -> None:
-    app = build_app(settings=bot_settings, db=db, bot=bot, routers=[])
+    app = build_app(
+        settings=bot_settings,
+        db=db,
+        system_db=system_db,
+        clients=cast(ClientPool, NullPool()),
+        bot=bot,
+        routers=[],
+    )
 
     async def cancelled(*_args: Any, **_kwargs: Any) -> None:
         raise asyncio.CancelledError
@@ -1307,10 +1598,67 @@ async def test_polling_propagates_cancellation(
 
 
 async def test_app_close_closes_the_session(
-    bot: Bot, bot_settings: Settings, db: Database
+    bot: Bot, bot_settings: Settings, db: Database, system_db: Database
 ) -> None:
-    app: BotApp = build_app(settings=bot_settings, db=db, bot=bot, routers=[])
+    app: BotApp = build_app(
+        settings=bot_settings,
+        db=db,
+        system_db=system_db,
+        clients=cast(ClientPool, NullPool()),
+        bot=bot,
+        routers=[],
+    )
     await app.close()
+
+
+async def test_an_uninvited_seat_cannot_jam_a_dm(
+    bot: Bot,
+    bot_settings: Settings,
+    db: Database,
+    system_db: Database,
+    seated: None,
+) -> None:
+    """Anyone can ``/invite`` anyone, so an unwanted seat must not lock you out.
+
+    Ambiguous DMs resolve to nothing. Without preferring the workspace you
+    *own*, a stranger could seat you in theirs and every private command you
+    sent — including the ``/key`` finishing your own sign-up — would be met
+    with silence, permanently.
+    """
+    await tenancy_repo.add_member(system_db, OTHER_TENANT_ID, OWNER_ID, role="member")
+    dispatcher, seen = make_dispatcher(bot_settings, db, system_db=system_db)
+
+    await dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=1,
+            message=_message(OWNER_ID, chat_id=OWNER_ID, chat_type="private"),
+        ),
+    )
+
+    assert len(seen) == 1
+
+
+async def test_two_owned_workspaces_stay_ambiguous(
+    bot: Bot,
+    bot_settings: Settings,
+    db: Database,
+    system_db: Database,
+    seated: None,
+) -> None:
+    """Preferring what you own must not become guessing between two of them."""
+    await tenancy_repo.add_member(system_db, OTHER_TENANT_ID, OWNER_ID, role="owner")
+    dispatcher, seen = make_dispatcher(bot_settings, db, system_db=system_db)
+
+    await dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=1,
+            message=_message(OWNER_ID, chat_id=OWNER_ID, chat_type="private"),
+        ),
+    )
+
+    assert seen == []
 
 
 BOT_SELF_ID: Final = 8925129863
@@ -1342,33 +1690,46 @@ def _bot_authored_update(update_id: int = 900) -> Update:
     )
 
 
-async def test_the_bots_own_service_message_never_dms_the_owner(
-    bot: Bot, session: RecordingSession, bot_settings: Settings, db: Database
+async def test_the_bots_own_service_message_never_notifies_the_owners(
+    bot: Bot,
+    session: RecordingSession,
+    bot_settings: Settings,
+    db: Database,
+    system_db: Database,
+    seated: None,
 ) -> None:
-    """The owner was DMed "unknown Telegram user … @Conductor_agent_bot".
+    """The owners were told "unknown Telegram user … @Conductor_agent_bot".
 
-    A bot is not a person who can be allow-listed, so reporting one as a
-    stranger is noise the owner can do nothing about — and it arrives while
-    they are mid-task, because their own /new caused it.
+    A bot is not a person anyone can invite, so reporting one as a stranger is
+    noise they can do nothing about — and it arrives while they are mid-task,
+    because their own /new caused it.
     """
-    auth = AuthMiddleware(bot_settings, db=db, notify_owner=True, clock=FakeClock())
-    dispatcher, seen = make_dispatcher(bot_settings, db, auth=auth)
+    notifier = StrangerNotifier(clock=FakeClock())
+    auth = make_tenancy(bot_settings, system_db, notifier=notifier)
+    dispatcher, seen = make_dispatcher(bot_settings, db, system_db=system_db, auth=auth)
 
     await dispatcher.feed_update(bot, _bot_authored_update())
 
     assert seen == [], "still dropped — the boundary does not move"
-    assert auth.notices_sent == 0, "but the owner is not told about it"
+    assert notifier.sent == 0, "but nobody is told about it"
     assert session.calls == []
 
 
 async def test_a_real_stranger_is_still_reported(
-    bot: Bot, session: RecordingSession, bot_settings: Settings, db: Database
+    bot: Bot,
+    session: RecordingSession,
+    bot_settings: Settings,
+    db: Database,
+    system_db: Database,
+    seated: None,
 ) -> None:
     """Silencing bots must not silence the alert that matters."""
-    auth = AuthMiddleware(bot_settings, db=db, notify_owner=True, clock=FakeClock())
-    dispatcher, _seen = make_dispatcher(bot_settings, db, auth=auth)
+    notifier = StrangerNotifier(clock=FakeClock())
+    auth = make_tenancy(bot_settings, system_db, notifier=notifier)
+    dispatcher, _seen = make_dispatcher(
+        bot_settings, db, system_db=system_db, auth=auth
+    )
 
     await dispatcher.feed_update(bot, build_update("message", STRANGER_ID))
 
-    assert auth.notices_sent == 1
-    assert str(STRANGER_ID) in session.sent_texts()[0]
+    assert notifier.sent == 1

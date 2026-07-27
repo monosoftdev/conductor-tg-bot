@@ -18,30 +18,29 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Any
 
 import pytest
-from aiosqlite import IntegrityError
 
 from ctb.conductor.models import SessionStatusValue, TranscriptMessage
 from ctb.db import MAX_CONTENT_BYTES, NO_THREAD_ID
-from ctb.db.backup import create_backup
-from ctb.db.connection import Database, now_ms
+from ctb.db.connection import Database, now_ms, tenant_scope
+from ctb.db.errors import IntegrityError
 from ctb.db.repo import (
-    allowlist,
     chats,
     deliveries,
     events,
     lease,
     prompts,
     sessions,
+    tenancy,
     transcript,
     wizard,
     workspaces,
 )
 from ctb.db.repo.transcript import AdvanceItem, DeliveryDraft
 from ctb.turn.state import TurnState
+from tests.pg import BOOTSTRAP_TENANT_ID, app_dsn, worker_dsn
 
 SESSION = "sess-1"
 WORKSPACE = "ws-1"
@@ -372,9 +371,15 @@ async def test_claim_returns_transcript_order(
     assert all(row.state == "sending" for row in claimed)
 
 
-async def test_two_claimers_on_one_connection_do_not_overlap(
+async def test_two_claimers_do_not_overlap(
     seeded: Database, message_factory: MessageFactory
 ) -> None:
+    """Disjoint sets, every row claimed, no row claimed twice.
+
+    Under SQLite the file lock made one claimer take everything; ``SKIP
+    LOCKED`` lets both make progress instead. What must not change is the
+    property that actually matters — no row reaches Telegram twice.
+    """
     await transcript.advance_cursor(seeded, SESSION, _items(message_factory, 0, 1, 2))
 
     first, second = await asyncio.gather(
@@ -384,21 +389,28 @@ async def test_two_claimers_on_one_connection_do_not_overlap(
 
     keys = [row.key for row in first] + [row.key for row in second]
     assert len(keys) == len(set(keys)) == 3
-    assert not (first and second)  # the conditional update gives one of them all
+    assert {row.claim_id for row in first} <= {"a"}
+    assert {row.claim_id for row in second} <= {"b"}
 
 
 async def test_two_connections_cannot_claim_the_same_row(
-    seeded: Database, db_path: Path, message_factory: MessageFactory
+    seeded: Database, message_factory: MessageFactory
 ) -> None:
-    """The redeploy-overlap case: two processes, one SQLite file, one winner."""
+    """The redeploy-overlap case: two pools, one database, one winner.
+
+    Two genuinely independent pools model a redeploy overlap far better than
+    two handles on one SQLite file ever did — there is no shared lock to make
+    the answer come out right by accident.
+    """
     await transcript.advance_cursor(seeded, SESSION, _items(message_factory, 0))
 
-    other = await Database(db_path).connect()
+    other = await Database(app_dsn(), min_size=1, max_size=2).connect()
     try:
-        first, second = await asyncio.gather(
-            deliveries.claim(seeded, claim_id="proc-1", limit=10),
-            deliveries.claim(other, claim_id="proc-2", limit=10),
-        )
+        async with tenant_scope(BOOTSTRAP_TENANT_ID):
+            first, second = await asyncio.gather(
+                deliveries.claim(seeded, claim_id="proc-1", limit=10),
+                deliveries.claim(other, claim_id="proc-2", limit=10),
+            )
     finally:
         await other.close()
 
@@ -509,7 +521,11 @@ async def test_boot_recovers_orphans_and_skips_proven_duplicates(
     echo_key = (SESSION, "synthetic-echo", 0, CHAT)
     await deliveries.mark_sent(seeded, echo_key, tg_message_id=1)
 
-    result = await deliveries.recover_orphaned(seeded, claim_id="new-worker")
+    # Recovery only takes rows whose claim has gone stale; a fresh one may
+    # still be in flight on a live peer. Jump past the orphan window.
+    result = await deliveries.recover_orphaned(
+        seeded, claim_id="new-worker", at=now_ms() + deliveries.ORPHAN_AFTER_MS + 1
+    )
 
     assert [row.key for row in result.skipped] == [duplicate.key]
     assert [row.key for row in result.claimed] == [claimed[1].key]
@@ -542,7 +558,9 @@ async def test_recover_ignores_duplicates_outside_the_window(
     stale = now_ms() - 60 * 60 * 1000
     await deliveries.mark_sent(seeded, (SESSION, "ancient", 0, CHAT), at=stale)
 
-    result = await deliveries.recover_orphaned(seeded, claim_id="new-worker")
+    result = await deliveries.recover_orphaned(
+        seeded, claim_id="new-worker", at=now_ms() + deliveries.ORPHAN_AFTER_MS + 1
+    )
 
     assert result.skipped == ()
     assert len(result.claimed) == 1
@@ -597,12 +615,12 @@ async def test_telegram_reply_lookup_finds_delivery_then_status_card(
 
 
 async def test_two_acquirers_produce_exactly_one_winner(
-    db: Database, db_path: Path
+    system_db: Database,
 ) -> None:
-    other = await Database(db_path).connect()
+    other = await Database(worker_dsn(), min_size=1, max_size=2, system=True).connect()
     try:
         first, second = await asyncio.gather(
-            lease.acquire(db, holder="proc-1"),
+            lease.acquire(system_db, holder="proc-1"),
             lease.acquire(other, holder="proc-2"),
         )
     finally:
@@ -610,56 +628,56 @@ async def test_two_acquirers_produce_exactly_one_winner(
 
     winners = [held for held in (first, second) if held is not None]
     assert len(winners) == 1
-    held = await lease.get(db)
+    held = await lease.get(system_db)
     assert held is not None
     assert held.holder == winners[0].holder
 
 
-async def test_the_loser_cannot_take_a_live_lease(db: Database) -> None:
+async def test_the_loser_cannot_take_a_live_lease(system_db: Database) -> None:
     stamp = now_ms()
-    assert await lease.acquire(db, holder="a", at=stamp) is not None
-    assert await lease.acquire(db, holder="b", at=stamp + 1_000) is None
-    held = await lease.get(db)
+    assert await lease.acquire(system_db, holder="a", at=stamp) is not None
+    assert await lease.acquire(system_db, holder="b", at=stamp + 1_000) is None
+    held = await lease.get(system_db)
     assert held is not None
     assert held.holder == "a"
 
 
-async def test_an_expired_lease_is_stealable(db: Database) -> None:
+async def test_an_expired_lease_is_stealable(system_db: Database) -> None:
     stamp = now_ms()
-    first = await lease.acquire(db, holder="a", at=stamp, ttl_ms=lease.TTL_MS)
+    first = await lease.acquire(system_db, holder="a", at=stamp, ttl_ms=lease.TTL_MS)
     assert first is not None
-    stolen = await lease.acquire(db, holder="b", at=stamp + lease.TTL_MS + 1)
+    stolen = await lease.acquire(system_db, holder="b", at=stamp + lease.TTL_MS + 1)
     assert stolen is not None
     assert stolen.holder == "b"
 
 
-async def test_reacquiring_keeps_the_original_acquired_at(db: Database) -> None:
+async def test_reacquiring_keeps_the_original_acquired_at(system_db: Database) -> None:
     stamp = now_ms()
-    first = await lease.acquire(db, holder="a", at=stamp)
+    first = await lease.acquire(system_db, holder="a", at=stamp)
     assert first is not None
-    renewed = await lease.acquire(db, holder="a", at=stamp + 4_000)
+    renewed = await lease.acquire(system_db, holder="a", at=stamp + 4_000)
     assert renewed is not None
     assert renewed.acquired_at == first.acquired_at
     assert renewed.expires_at > first.expires_at
 
 
-async def test_heartbeat_reports_a_lost_lease(db: Database) -> None:
+async def test_heartbeat_reports_a_lost_lease(system_db: Database) -> None:
     stamp = now_ms()
-    assert await lease.acquire(db, holder="a", at=stamp) is not None
-    beat = await lease.heartbeat(db, holder="a", at=stamp + lease.HEARTBEAT_MS)
+    assert await lease.acquire(system_db, holder="a", at=stamp) is not None
+    beat = await lease.heartbeat(system_db, holder="a", at=stamp + lease.HEARTBEAT_MS)
     assert beat is not None
     assert beat.expires_at == stamp + lease.HEARTBEAT_MS + lease.TTL_MS
 
     # Somebody else took over while we were away.
-    await lease.acquire(db, holder="b", at=stamp + 60_000)
-    assert await lease.heartbeat(db, holder="a", at=stamp + 61_000) is None
+    await lease.acquire(system_db, holder="b", at=stamp + 60_000)
+    assert await lease.heartbeat(system_db, holder="a", at=stamp + 61_000) is None
 
 
-async def test_release_only_works_for_the_holder(db: Database) -> None:
-    assert await lease.acquire(db, holder="a") is not None
-    assert await lease.release(db, holder="b") is False
-    assert await lease.release(db, holder="a") is True
-    assert await lease.get(db) is None
+async def test_release_only_works_for_the_holder(system_db: Database) -> None:
+    assert await lease.acquire(system_db, holder="a") is not None
+    assert await lease.release(system_db, holder="b") is False
+    assert await lease.release(system_db, holder="a") is True
+    assert await lease.get(system_db) is None
 
 
 def test_instance_id_is_unique() -> None:
@@ -855,27 +873,29 @@ async def test_record_status_keeps_error_text_and_clears_it(seeded: Database) ->
     assert recovered.error_text is None
 
 
-async def test_bound_sessions_drive_the_supervisor(seeded: Database) -> None:
+async def test_bound_sessions_drive_the_supervisor(
+    seeded: Database, system_db: Database
+) -> None:
     await sessions.upsert(seeded, "sess-2", workspace_id=WORKSPACE)
     await sessions.bind(seeded, "sess-2", chat_id=CHAT, thread_id=99)
     await sessions.update(seeded, "sess-2", turn_state="WORKING")
 
-    bound = await sessions.list_bound(seeded)
+    bound = await sessions.list_bound(system_db)
     assert [row.id for row in bound] == ["sess-2", SESSION]  # active first
 
     assert await sessions.get_bound_for(seeded, CHAT, 99) is not None
     await sessions.unbind(seeded, "sess-2")
     assert await sessions.get_bound_for(seeded, CHAT, 99) is None
-    assert [row.id for row in await sessions.list_bound(seeded)] == [SESSION]
+    assert [row.id for row in await sessions.list_bound(system_db)] == [SESSION]
 
 
-async def test_mark_dead_is_terminal(seeded: Database) -> None:
+async def test_mark_dead_is_terminal(seeded: Database, system_db: Database) -> None:
     row = await sessions.mark_dead(seeded, SESSION, reason="404 from /messages")
     assert row is not None
     assert row.state is TurnState.DEAD
     assert row.is_bound is False
     assert row.last_error == "404 from /messages"
-    assert await sessions.list_bound(seeded) == []
+    assert await sessions.list_bound(system_db) == []
 
 
 async def test_session_helpers(seeded: Database) -> None:
@@ -1052,7 +1072,13 @@ async def test_wizard_state_round_trip_and_expiry(db: Database) -> None:
     assert row.tg_message_id == 77
 
     advanced = await wizard.merge_data(
-        db, CHAT, TOPIC, user_id=1001, patch={"branch": "main"}, state_key="pick_branch"
+        db,
+        CHAT,
+        TOPIC,
+        user_id=1001,
+        patch={"branch": "main"},
+        state_key="pick_branch",
+        at=stamp,
     )
     assert advanced.data == {"project_id": "p-1", "branch": "main"}
     assert advanced.tg_message_id == 77  # the edited-in-place message is kept
@@ -1090,11 +1116,11 @@ async def test_wizards_in_the_same_topic_do_not_collide(db: Database) -> None:
 # ── api events and unknown content types ─────────────────────────────────────
 
 
-async def test_api_events_ring_buffer(db: Database) -> None:
+async def test_api_events_ring_buffer(system_db: Database) -> None:
     stamp = now_ms()
     for index in range(5):
         await events.record_api_event(
-            db,
+            system_db,
             method="GET",
             endpoint="/sessions/{id}/messages",
             status_code=200,
@@ -1102,7 +1128,7 @@ async def test_api_events_ring_buffer(db: Database) -> None:
             at=stamp + index,
         )
     await events.record_api_event(
-        db,
+        system_db,
         method="POST",
         endpoint="/sessions/{id}/messages",
         status_code=502,
@@ -1114,14 +1140,14 @@ async def test_api_events_ring_buffer(db: Database) -> None:
         at=stamp + 10,
     )
 
-    recent = await events.recent_api_events(db, limit=2)
+    recent = await events.recent_api_events(system_db, limit=2)
     assert [event.status_code for event in recent] == [502, 200]
-    failures = await events.recent_api_events(db, only_failed=True)
+    failures = await events.recent_api_events(system_db, only_failed=True)
     assert len(failures) == 1
     assert failures[0].attempt == 2
     assert failures[0].circuit_state == "half_open"
 
-    window = await events.stats(db, since_ms=stamp)
+    window = await events.stats(system_db, since_ms=stamp)
     assert window.total == 6
     assert window.ok == 5
     assert window.failed == 1
@@ -1129,9 +1155,9 @@ async def test_api_events_ring_buffer(db: Database) -> None:
     assert window.max_duration_ms == 900
     assert 0.16 < window.error_rate < 0.17
 
-    assert await events.prune_api_events(db, keep=2) == 4
-    assert len(await events.recent_api_events(db, limit=50)) == 2
-    assert (await events.stats(db, since_ms=stamp + 999_999)).total == 0
+    assert await events.prune_api_events(system_db, keep=2) == 4
+    assert len(await events.recent_api_events(system_db, limit=50)) == 2
+    assert (await events.stats(system_db, since_ms=stamp + 999_999)).total == 0
 
 
 async def test_shape_signature_ignores_values(seeded: Database) -> None:
@@ -1182,63 +1208,212 @@ async def test_deep_shapes_are_bounded(seeded: Database) -> None:
     assert len(events.shape_signature(nested)) == 16
 
 
-# ── allow list ───────────────────────────────────────────────────────────────
+# ── tenancy ──────────────────────────────────────────────────────────────────
 
 
-async def test_allowlist_sync_is_idempotent_and_never_deletes(db: Database) -> None:
-    await allowlist.sync(db, [1001, 1002], owner_id=1001)
-    await allowlist.upsert(db, 3003, username="guest", note="added via /allow")
-    await allowlist.sync(db, [1001, 1002], owner_id=1001)
-
-    everyone = await allowlist.list_all(db)
-    assert [user.user_id for user in everyone] == [1001, 1002, 3003]
-    assert await allowlist.count(db) == 3
-
-    guest = await allowlist.get(db, 3003)
-    assert guest is not None
-    assert guest.note == "added via /allow"  # sync did not clobber it
-
-    boss = await allowlist.owner(db)
-    assert boss is not None
-    assert boss.user_id == 1001
+async def test_a_tenant_is_created_with_its_first_owner(system_db: Database) -> None:
+    tenant = await tenancy.create(
+        system_db, slug="acme", name="Acme", owner_user_id=42, status="active"
+    )
+    assert tenant.slug == "acme"
+    assert tenant.status == "active"
+    seated = await tenancy.member(system_db, tenant.id, 42)
+    assert seated is not None and seated.role == "owner"
+    assert await tenancy.list_owner_ids(system_db, tenant.id) == (42,)
 
 
-async def test_allowlist_membership_and_owner_protection(db: Database) -> None:
-    await allowlist.sync(db, [1001, 1002])
+async def test_members_are_added_promoted_and_removed(system_db: Database) -> None:
+    tenant = await tenancy.create(system_db, slug="duo", name="Duo", owner_user_id=1)
+    # The co-founder path: one more row, same group, same Conductor key.
+    await tenancy.add_member(system_db, tenant.id, 2, role="member")
+    assert [m.user_id for m in await tenancy.list_members(system_db, tenant.id)] == [
+        1,
+        2,
+    ]
 
-    assert await allowlist.is_allowed(db, 1002) is True
-    assert await allowlist.is_allowed(db, 4004) is False
-    assert await allowlist.is_allowed(db, None) is False
+    promoted = await tenancy.add_member(system_db, tenant.id, 2, role="admin")
+    assert promoted.role == "admin"
+    assert promoted.is_owner is True  # admins pass the owner-only gate
 
-    assert await allowlist.remove(db, 1001) is False  # the owner is not removable
-    assert await allowlist.remove(db, 1002) is True
-    assert await allowlist.is_allowed(db, 1002) is False
-
-
-async def test_allowlist_sync_of_nothing(db: Database) -> None:
-    assert await allowlist.sync(db, []) == []
-    assert await allowlist.owner(db) is None
+    assert await tenancy.remove_member(system_db, tenant.id, 2) is True
+    assert await tenancy.member(system_db, tenant.id, 2) is None
 
 
-async def test_online_backup_is_consistent_and_retains_seven(
-    seeded: Database, tmp_path: Path
+async def test_the_last_owner_cannot_be_removed(system_db: Database) -> None:
+    """Otherwise a workspace can be orphaned with no way back in."""
+    tenant = await tenancy.create(system_db, slug="solo", name="Solo", owner_user_id=7)
+    await tenancy.add_member(system_db, tenant.id, 8, role="member")
+    assert await tenancy.remove_member(system_db, tenant.id, 7) is False
+    assert await tenancy.member(system_db, tenant.id, 7) is not None
+
+
+async def test_a_chat_belongs_to_exactly_one_tenant(system_db: Database) -> None:
+    first = await tenancy.create(system_db, slug="one", name="One", owner_user_id=1)
+    second = await tenancy.create(system_db, slug="two", name="Two", owner_user_id=2)
+    await tenancy.bind_chat(system_db, -500, first.id, is_primary=True)
+
+    with pytest.raises(ValueError, match="already bound"):
+        await tenancy.bind_chat(system_db, -500, second.id)
+
+    binding = await tenancy.chat_for(system_db, -500)
+    assert binding is not None and binding.tenant_id == first.id
+
+
+async def test_only_one_chat_is_primary_per_tenant(system_db: Database) -> None:
+    tenant = await tenancy.create(system_db, slug="p", name="P", owner_user_id=1)
+    await tenancy.bind_chat(system_db, -600, tenant.id, is_primary=True)
+    await tenancy.bind_chat(system_db, -601, tenant.id, is_primary=True)
+    primary = await tenancy.primary_chat(system_db, tenant.id)
+    assert primary is not None and primary.chat_id == -601
+
+
+async def test_storing_a_key_clears_a_previous_auth_failure(
+    system_db: Database,
 ) -> None:
-    backup_dir = tmp_path / "backups"
-    snapshot: Path | None = None
-    for index in range(9):
-        snapshot = await create_backup(
-            seeded,
-            directory=backup_dir,
-            at=1_800_000_000_000 + index,
-        )
+    """A new key must restart polling without waiting for a redeploy."""
+    tenant = await tenancy.create(system_db, slug="k", name="K", owner_user_id=1)
+    await tenancy.mark_auth_failed(system_db, tenant.id, reason="401")
+    failed = await tenancy.get(system_db, tenant.id)
+    assert failed is not None and failed.auth_failed_at is not None
 
-    snapshots = sorted(backup_dir.glob("ctb-*.db"))
-    assert len(snapshots) == 7
-    assert snapshot is not None
-    assert snapshot == snapshots[-1]
-    restored = await Database(snapshot).connect()
-    try:
-        row = await sessions.get(restored, SESSION)
-        assert row is not None and row.workspace_id == WORKSPACE
-    finally:
-        await restored.close()
+    updated = await tenancy.set_conductor_key(
+        system_db, tenant.id, ciphertext=b"sealed", kid="v1", fingerprint="abc"
+    )
+    assert updated is not None
+    assert updated.auth_failed_at is None
+    assert updated.has_conductor_key is True
+
+
+async def test_a_tenant_row_never_prints_its_sealed_keys(
+    system_db: Database,
+) -> None:
+    tenant = await tenancy.create(system_db, slug="r", name="R", owner_user_id=1)
+    stored = await tenancy.set_conductor_key(
+        system_db, tenant.id, ciphertext=b"SEALEDBYTES", kid="v1", fingerprint="fp"
+    )
+    assert stored is not None
+    assert "SEALED" not in repr(stored)
+    assert repr(stored) == "TenantRow(slug='r', status='pending')"
+
+
+async def test_an_enrollment_token_is_single_use(system_db: Database) -> None:
+    tenant = await tenancy.create(system_db, slug="e", name="E", owner_user_id=1)
+    await tenancy.create_enrollment_token(
+        system_db,
+        token_hash="hash-1",
+        tenant_id=tenant.id,
+        user_id=1,
+        purpose="bind_chat",
+        ttl_ms=60_000,
+    )
+    first = await tenancy.consume_enrollment_token(
+        system_db, token_hash="hash-1", purpose="bind_chat"
+    )
+    assert first == (tenant.id, 1)
+    assert (
+        await tenancy.consume_enrollment_token(
+            system_db, token_hash="hash-1", purpose="bind_chat"
+        )
+        is None
+    )
+
+
+async def test_an_expired_enrollment_token_is_refused(system_db: Database) -> None:
+    tenant = await tenancy.create(system_db, slug="x", name="X", owner_user_id=1)
+    await tenancy.create_enrollment_token(
+        system_db,
+        token_hash="hash-2",
+        tenant_id=tenant.id,
+        user_id=1,
+        purpose="set_key",
+        ttl_ms=1,
+        at=1_000,
+    )
+    assert (
+        await tenancy.consume_enrollment_token(
+            system_db, token_hash="hash-2", purpose="set_key", at=100_000
+        )
+        is None
+    )
+
+
+async def test_issuing_a_token_invalidates_the_previous_one(
+    system_db: Database,
+) -> None:
+    """A leaked older code must stop working the moment a new one is sent."""
+    tenant = await tenancy.create(system_db, slug="i", name="I", owner_user_id=1)
+    for digest in ("old", "new"):
+        await tenancy.create_enrollment_token(
+            system_db,
+            token_hash=digest,
+            tenant_id=tenant.id,
+            user_id=1,
+            purpose="bind_chat",
+            ttl_ms=60_000,
+        )
+    assert (
+        await tenancy.consume_enrollment_token(
+            system_db, token_hash="old", purpose="bind_chat"
+        )
+        is None
+    )
+    assert (
+        await tenancy.consume_enrollment_token(
+            system_db, token_hash="new", purpose="bind_chat"
+        )
+        is not None
+    )
+
+
+async def test_an_admin_cannot_demote_the_owner(system_db: Database) -> None:
+    """Admins pass the same command gate as owners, so this is a real path.
+
+    Demote-then-nothing-grants-it-back is a one-way door: no Telegram command
+    creates an ``owner``, so the workspace would have no administrator at all.
+    """
+    tenant = await tenancy.create(system_db, slug="d", name="D", owner_user_id=1)
+    await tenancy.add_member(system_db, tenant.id, 2, role="admin", added_by=1)
+
+    with pytest.raises(tenancy.RoleError, match="only an owner"):
+        await tenancy.add_member(system_db, tenant.id, 1, role="member", added_by=2)
+
+    still = await tenancy.member(system_db, tenant.id, 1)
+    assert still is not None and still.role == "owner"
+
+
+async def test_an_owner_can_demote_another_owner(system_db: Database) -> None:
+    tenant = await tenancy.create(system_db, slug="d2", name="D", owner_user_id=1)
+    await tenancy.add_member(system_db, tenant.id, 2, role="owner", added_by=1)
+
+    demoted = await tenancy.add_member(
+        system_db, tenant.id, 2, role="member", added_by=1
+    )
+    assert demoted.role == "member"
+
+
+async def test_an_admin_cannot_remove_the_owner(system_db: Database) -> None:
+    """The other route to the same one-way door."""
+    tenant = await tenancy.create(system_db, slug="d3", name="D", owner_user_id=1)
+    await tenancy.add_member(system_db, tenant.id, 2, role="admin", added_by=1)
+
+    assert await tenancy.remove_member(system_db, tenant.id, 1, removed_by=2) is False
+    assert await tenancy.member(system_db, tenant.id, 1) is not None
+
+
+async def test_admins_do_not_count_as_owners_for_the_last_owner_guard(
+    system_db: Database,
+) -> None:
+    """An admin is not a substitute; removing the owner would strand it."""
+    tenant = await tenancy.create(system_db, slug="d4", name="D", owner_user_id=1)
+    await tenancy.add_member(system_db, tenant.id, 2, role="admin", added_by=1)
+
+    assert await tenancy.remove_member(system_db, tenant.id, 1, removed_by=1) is False
+
+
+async def test_anyone_can_remove_themselves(system_db: Database) -> None:
+    """``/leave``. Anyone can seat anyone, so there must be a way out."""
+    tenant = await tenancy.create(system_db, slug="d5", name="D", owner_user_id=1)
+    await tenancy.add_member(system_db, tenant.id, 9, role="member", added_by=1)
+
+    assert await tenancy.remove_member(system_db, tenant.id, 9, removed_by=9) is True
+    assert await tenancy.member(system_db, tenant.id, 9) is None

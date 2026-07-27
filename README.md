@@ -1,225 +1,188 @@
 # conductor-tg-bot
 
-Drive Conductor cloud agents from Telegram. Each workspace gets a forum topic:
-send a prompt, watch one compact status card, and receive the answer on your
-phone.
+[![CI](https://github.com/reclaimly/conductor-tg-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/reclaimly/conductor-tg-bot/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python 3.13](https://img.shields.io/badge/python-3.13-blue.svg)](https://www.python.org/downloads/)
 
-## Status
+Drive [Conductor](https://conductor.build) cloud coding agents from Telegram.
+Each workspace gets a forum topic: send a prompt, watch one compact status card,
+and get the answer on your phone.
 
-Ready for a first Railway deployment and live Telegram testing.
+One bot serves many workspaces. Each brings its own Conductor API key; their
+transcripts, their spending and their data stay theirs.
 
-- Python 3.13, aiogram 3, httpx, SQLite/WAL
+- Python 3.13, aiogram 3, httpx, PostgreSQL
 - Telegram long polling; no public webhook
-- One Railway replica with a persistent `/data` volume
-- Durable prompt idempotency, transcript cursor, delivery outbox, and
-  singleton poller lease
-- New-workspace prompts are held durably until the workspace is ready
-- Transient Telegram failures retry without a terminal attempt cap
-- Defensive HTML rendering and UTF-16-safe Telegram chunking
-- Daily, power, and owner command surfaces
-- Durable Telegram voice-note and audio transcription with replay-safe actions
-- Mobile reply guidance automatically added to every Telegram prompt
+- Tenant isolation enforced by PostgreSQL row-level security, not by code review
+- API keys sealed with AES-256-GCM, bound to the tenant that owns them
+- Durable prompt idempotency, transcript cursor, delivery outbox, singleton lease
+- One stateless replica; every byte of state is in the database
 
 The transcript cursor is the source of truth. Session status only changes poll
 cadence and progress UX; it never gates delivery.
 
-## Telegram setup
+## Using it
 
-1. Create a bot with `@BotFather`.
-2. Create a private supergroup and enable Forum Topics.
-3. Add the bot as an administrator with permission to manage topics, pin
-   messages, delete messages, and send messages/documents.
-4. Add only trusted Telegram user IDs to
-   `ALLOWED_TELEGRAM_USER_IDS`. The first ID is the owner. This is the security
-   boundary.
-5. Start the bot and run `/setup` in the group. Wait for
-   `Ready · General is search-only; /new creates topics.` before the first
-   `/new` — `/new` creates the Conductor workspace before the topic, so a
-   missing Manage Topics permission strands a live cloud workspace per attempt.
-6. Leave `TELEGRAM_CHAT_ID` unset at first. It is a second fence on top of the
-   allowlist, `/setup` does not write it, nothing in the bot prints a chat id,
-   and a wrong value silently drops every group update. Add it later from the
-   Telegram web client URL if you want it.
-7. Keep `General` as the cockpit. Plain text there searches; it never becomes a
-   prompt without an explicit button tap.
+Four steps, once, from a phone — the full walkthrough with screenshots' worth of
+detail is in [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md):
 
-DMs work as a degraded, single-session fallback.
+1. `/register your-team-name` in a private chat with the bot.
+2. Create a private supergroup, enable **Topics**, add the bot as an
+   administrator (manage topics, pin, delete, send).
+3. `/setup <code>` in that group, using the code from step 1.
+4. `/key <your Conductor API key>` privately. The bot validates it, stores it
+   encrypted, and **deletes your message**.
 
-## Daily control loop
+Ran out of time on the 15-minute code? `/register` again gives you a fresh one.
 
-Use General as the cockpit and workspace topics as focused control rooms:
+Then the daily loop, from the group:
 
-1. `/new [project:] prompt` starts work and creates its topic.
-2. Send text, voice, or audio in that topic to continue.
-3. `/mode` shows the current session, branch, model, queue, and safe actions.
-4. `/board` gives a compact cross-workspace view; `/s` switches sessions.
-5. A Conductor cloud workspace created on the laptop shows up there as
-   `+ Open <name>`; `/attach name` finds it directly. Tapping opens a topic,
-   binds the newest session, and posts the last exchange as a read-only
-   snapshot; the cursor starts at the end, so nothing is replayed. A
-   Mac-local-only workspace is outside Railway's reach.
-6. Stop from the pinned card or `/stop`; finish with `/done` plus confirmation.
+| Goal | Action |
+|---|---|
+| Start work | `/new [project:] prompt` — creates the workspace and its topic |
+| Continue | Type, speak, or send audio in that topic |
+| See state | `/mode` — session, branch, model, queue, safe actions |
+| See everything | `/board` · switch with `/s` |
+| Resume laptop work | `/attach [name]`, then tap `+ Open` |
+| Stop | The pinned card's ⏹, or `/stop` |
+| Search | Plain text in General, or `/find text` |
+| Finish | `/done`, then the named confirmation |
 
-The pinned status card absorbs progress/tool noise. Final answers stay concise,
-outcome-first, and easy to scan on a phone. Prompts use 👀/👍 reactions instead
-of receipt bubbles, and agent decisions become one-tap numbered buttons with
-the recommended choice first.
+Your co-founder joins with `/invite <their telegram id>` — same group, same
+Conductor organisation, same topics. `/members` lists who is in.
 
-## Local development
+Sending an API key to a *group* is refused and the message deleted; rotate it
+and send it privately instead.
 
-Python 3.13 is required.
+## Commands
+
+Daily: `/new` `/attach` `/board` `/stop` `/find` `/mode` `/done`
+Power: `/s` `/fork` `/name` `/open` `/desk` `/here` `/log` `/notify` `/defaults` `/sql` `/tidy`
+Workspace: `/invite` `/remove` `/leave` `/members` `/health` `/export` `/key` `/voicekey` `/voice` `/revoke`
+Multiple workspaces: `/use` picks which one your DMs mean · `/forget` drops one
+Anyone: `/start` `/register` `/setup` `/privacy` `/help`
+Operator: `/platform list|suspend|resume`, gated on `PLATFORM_ADMIN_IDS`
+
+## Running it
+
+Python 3.13 and a PostgreSQL 16 server.
 
 ```bash
 python3.13 -m venv .venv
 .venv/bin/pip install -e '.[dev]'
-cp .env.example .env
+docker compose up -d --wait db          # PostgreSQL on :5433, disposable
+cp .env.example .env                    # then fill in the four required values
 ```
 
-Set the three required values in `.env`:
+Create the roles and schema once, with a superuser DSN:
 
-```dotenv
-TELEGRAM_BOT_TOKEN=...
-CONDUCTOR_API_KEY=...
-ALLOWED_TELEGRAM_USER_IDS=123456789
+```bash
+.venv/bin/python -m ctb.db.bootstrap \
+    --admin-dsn "postgresql://postgres:postgres@127.0.0.1:5433/ctb" \
+    --app-password "..." --worker-password "..."
 ```
 
-Then run:
+Generate a master key for `CTB_MASTER_KEYS`:
+
+```bash
+.venv/bin/python -m ctb.rewrap --new-key v1
+```
+
+Then:
 
 ```bash
 .venv/bin/python -m ctb
-```
-
-### Voice and audio
-
-The bot accepts Telegram mic-button voice notes and uploaded audio messages.
-Audio stays in memory only; the durable job stores the transcript and its
-snapshotted topic/session route.
-
-Enable ordinary spoken prompts with:
-
-```dotenv
-VOICE_ENABLED=true
-ELEVENLABS_API_KEY=...
-VOICE_MODE=prompts
-```
-
-Modes:
-
-- `shadow` — transcribe and preview; execute nothing.
-- `prompts` — submit ordinary topic/DM speech; General remains search-only.
-  Spoken commands are preview-only.
-- `commands` — also execute exact wake-phrase commands such as
-  “command stop” or “команда знайди SQLite”. `/done` still requires the named
-  confirmation button. There is no fuzzy command matching.
-
-The defaults cap audio at 180 seconds and Telegram's 20 MB bot-download limit.
-Keep `VOICE_LANGUAGE=auto` to preserve multilingual and code-switched speech.
-
-Health is served on `PORT` (default `8080`):
-
-```bash
 curl http://127.0.0.1:8080/health
 ```
 
-## Railway deployment
+### Two database roles
 
-### Before your first deploy
+| Role | Used by | Row-level security |
+|---|---|---|
+| `ctb_app` | every handler, routing, FSM storage | **enforced** |
+| `ctb_worker` | supervisor, delivery and voice claim loops, prune, tenancy lookups | bypassed (`BYPASSRLS`) |
 
-1. **Set `RAILWAY_RUN_UID=0`.** The image runs as UID 10001 and Railway mounts
-   a fresh *root-owned* volume over `/data`, so without this SQLite cannot open
-   the database and the service crash-loops. The container now fails with
-   `FATAL: cannot write /data …` instead of a bare `OperationalError`, but the
-   variable is the fix. A local `docker run` cannot reproduce this — Docker
-   seeds a named volume from image content, Railway does not.
-2. **Mount the volume at exactly `/data`.** Any other path silently writes to
-   ephemeral container disk and loses the cursors on every deploy.
-3. **Set all three required variables in one go** — the bot reports them
-   together, so a partial set just crashes again:
-   `TELEGRAM_BOT_TOKEN`, `CONDUCTOR_API_KEY`, `ALLOWED_TELEGRAM_USER_IDS`.
-4. **Verify the token first:** `curl "https://api.telegram.org/bot<TOKEN>/getMe"`.
-   A rejected token now fails the deploy loudly rather than retrying forever.
-5. **Set `HEALTH_TOKEN`** to a random string if you generate a public Railway
-   domain. Without it the detailed `/health` body is served to loopback only,
-   so a public domain sees the status summary and nothing identifying.
-6. Optional: `TELEGRAM_CHAT_ID` (leave unset at first), and for voice/audio
-   `VOICE_ENABLED=true` plus `ELEVENLABS_API_KEY`.
+`ctb_app` is deliberately not a member of `ctb_worker`, so there is no
+`SET ROLE` path from the request path to the bypass role. Repository SQL
+contains no `WHERE tenant_id = ?` anywhere: a forgotten filter returns zero rows
+rather than another customer's data.
 
-### Deploy
+### Key rotation
 
-1. Create a Railway service from this private repository.
-2. Deploy with the checked-in `Dockerfile` and `railway.toml`.
-3. Confirm `/health` returns `{"status":"ok","ok":true,...}`.
-4. In Telegram, run `/setup`, then `/new <prompt>`, then `/health` — expect
-   `circuit closed` and `0 overdue`.
+No downtime, no dual-write window:
 
-Keep exactly one replica. SQLite, the volume, Telegram `getUpdates`, and the
-singleton lease all assume a single active service. `overlapSeconds=0` stops
-the old deployment before the new poller starts.
+```bash
+.venv/bin/python -m ctb.rewrap --new-key v2   # prepend to CTB_MASTER_KEYS, deploy
+.venv/bin/python -m ctb.rewrap --rewrap       # re-seal rows still on v1
+                                              # drop v1 on the next deploy
+```
 
-## Commands
+Every sealed blob names the key that sealed it, so old and new coexist.
 
-Daily:
+## Deploying
 
-- `/new [project:] prompt`
-- `/attach [name]`
-- `/board`
-- `/stop`
-- `/find text`
-- `/mode`
-- `/done`
+One always-on service and one PostgreSQL database. No volume, no Redis, no
+public webhook. Full instructions in [`docs/DEPLOY.md`](docs/DEPLOY.md); the
+shape of it:
 
-Power:
+1. Add a PostgreSQL database. You need one — there is no SQLite fallback.
+2. `python -m ctb.db.bootstrap` once, with a superuser DSN, to create the two
+   roles and the schema. **Do not point the bot at the superuser** — a
+   superuser bypasses row-level security and every tenant would see every row.
+3. Set `TELEGRAM_BOT_TOKEN`, `DATABASE_URL` (as `ctb_app`), `SYSTEM_DATABASE_URL`
+   (as `ctb_worker`), `CTB_MASTER_KEYS`. All four are reported together, so set
+   them in one go.
+4. Confirm `/health` returns `{"status":"ok","ok":true,...}`.
 
-- `/s`, `/fork`, `/name`, `/open`, `/desk`, `/log`
-- `/notify`, `/defaults`, `/sql`, `/tidy`, `/setup`
-
-Owner:
-
-- `/allow`, `/deny`, `/health`, `/backup`
+Keep exactly one replica. Telegram's `getUpdates` and the supervisor lease both
+assume it; `overlapSeconds=0` stops the old deployment before the new one polls.
 
 ## Quality gates
 
 ```bash
-.venv/bin/ruff format --check src scripts tests
-.venv/bin/ruff check src scripts tests
-.venv/bin/pyright
-.venv/bin/pytest -q
-docker build -t conductor-tg-bot:local .
+docker compose up -d --wait db
+.venv/bin/python -m pytest -q          # 1927 tests
+.venv/bin/python -m pytest -q -m "not db"   # the ~1400 that need no server
+.venv/bin/python -m ruff format --check src scripts tests
+.venv/bin/python -m ruff check src scripts tests
+.venv/bin/python -m pyright
 ```
 
-The local production-image smoke test verifies migrations, lease acquisition,
-all six long-lived services, and `/health`. It cannot verify volume
-permissions: Docker seeds a named volume from the image (ownership included),
-while Railway mounts an empty root-owned one. That is what `RAILWAY_RUN_UID=0`
-is for.
+The suite migrates once per session and truncates between tests, so a full run
+is under a minute. `tests/test_isolation.py` is generated from the live schema:
+a table added later is covered without anyone remembering to add it.
 
-## Live acceptance checklist
+## What is still unproven
 
-Run these from a phone after the first deploy:
+Everything below is verified offline against a real PostgreSQL and a faked
+Conductor API. These need a live deployment:
 
-1. `/new <prompt>` creates a topic and delivers one answer.
-2. `/stop` mid-turn reports stopped state and dropped queued prompts.
-3. Redeploy mid-turn; the answer arrives without a lost transcript message.
-4. Replace the Conductor key with a bad value; pollers stop without a retry
-   storm and `/health` reports the auth failure.
-5. Run three workspaces concurrently; answers stay in their own topics.
-6. `/find` returns a known historical phrase.
-7. `/done` archives the workspace and closes its topic.
-8. Send a voice note in a topic; its prompt reaches that topic's session once.
-9. Send audio in General; it searches and never submits a prompt.
-10. With `VOICE_MODE=commands`, “command stop” stops the current session and
-    “command done” only shows the archive confirmation.
-11. Create a workspace on the laptop, then tap `+ Open <name>` in `/board`: one
-    topic appears, the snapshot card shows the last exchange, and the next line
-    typed there reaches that session.
+1. First Railway deploy with a real database and real secrets.
+2. The phone checklist: `/register` → `/setup` → `/key` → `/new` → answer.
+3. Two real workspaces at once, each with its own key, staying separate.
+4. Redeploy mid-turn; the answer arrives exactly once.
+5. Real Conductor and Telegram 429s, to tune the rate budgets.
+6. Voice: a workspace storing its own speech key and 30 owner recordings.
 
-The renderer corpus currently contains probe-verified simple turns plus clearly
-labelled synthetic tool/diff/error shapes. Expand it with curated real
-tool-heavy transcripts after the account has such sessions.
+## Before you open this to strangers
 
-Full architecture and verification details are in
-[`docs/PLAN.md`](docs/PLAN.md). Probe findings are in
-[`docs/HANDOFF.md`](docs/HANDOFF.md). The final operator and architecture map is
-in [`docs/SYSTEM_OVERVIEW.md`](docs/SYSTEM_OVERVIEW.md). The failure contract
-and fault matrix are in
-[`docs/RELIABILITY_AUDIT.md`](docs/RELIABILITY_AUDIT.md).
+You will be holding other people's Conductor API keys. Each one can read every
+transcript in their organisation and spend their money.
+
+- Confirm with Conductor that brokering third-party keys is within their terms.
+- Publish a privacy policy and terms; `/privacy` states what is stored today.
+- Write the breach runbook: rotate `CTB_MASTER_KEYS`, re-wrap, notify.
+- Back the master keys up **separately** from the database. Together they are
+  the same secret; apart, neither is enough.
+- Consider `REGISTRATION_OPEN=false` for the first weeks, so your first users
+  are people you can call.
+
+## Contributing
+
+Read [`CONTRIBUTING.md`](CONTRIBUTING.md) for the four gates and the
+conventions that are not negotiable. Security reports go through
+[`SECURITY.md`](SECURITY.md), never a public issue.
+
+Architecture and the failure contract are in [`docs/`](docs/).
+
+MIT licensed, © 2026 Reclaimly, Inc. Not affiliated with Conductor or Telegram.

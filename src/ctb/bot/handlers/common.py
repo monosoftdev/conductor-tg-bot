@@ -23,12 +23,12 @@ from ctb.bot.handlers.topics import (
     discard_topic,
     forum_support,
     require_topic,
-    resolve_client,
     resolve_db,
     send_html,
     topic_label,
 )
 from ctb.bot.middleware.routing import Route
+from ctb.bot.middleware.tenancy import TenantSettings
 from ctb.conductor.client import ConductorClient
 from ctb.conductor.models import Project, validate_pairing
 from ctb.db import NO_THREAD_ID
@@ -38,7 +38,6 @@ from ctb.db.repo import prompts as prompts_repo
 from ctb.db.repo import sessions as sessions_repo
 from ctb.db.repo import workspaces as workspaces_repo
 from ctb.delivery.render.html import escape
-from ctb.settings import Settings
 from ctb.turn import cursor
 from ctb.turn.state import Cancel, Evidence, TopicMarker, TurnState
 
@@ -217,11 +216,31 @@ def match_project(projects: list[Project], query: str) -> Project | None:
     return prefix[0] if len(prefix) == 1 else None
 
 
+async def quota_error(db: Database, defaults: TenantSettings) -> str | None:
+    """The workspace quota, as one named check. ``None`` means go ahead.
+
+    Extracted so the protection is a thing that can be called and tested. As an
+    inline branch it shipped unexercised, and an adversarial review deleted it
+    without turning the suite red — a quota nothing verifies is a number in a
+    column, not a limit.
+
+    Archived workspaces do not count: this bounds what a tenant runs *at once*,
+    not what it has ever run.
+    """
+    live = await workspaces_repo.count_live(db)
+    if live < defaults.max_workspaces:
+        return None
+    return (
+        f"This workspace is at its limit of {defaults.max_workspaces} "
+        "Conductor workspaces. Finish one with /done first."
+    )
+
+
 async def resolve_new_request(
     *,
     text: str,
     route: Route,
-    settings: Settings,
+    defaults: TenantSettings,
     db: Database,
     client: ConductorClient,
 ) -> CreateRequest:
@@ -253,11 +272,15 @@ async def resolve_new_request(
     if project is None:
         project = projects[0]
 
-    agent = (chat.default_agent if chat else None) or settings.default_agent
-    model = (chat.default_model if chat else None) or settings.default_model
-    effort = (chat.default_effort if chat else None) or settings.default_effort
+    refusal = await quota_error(db, defaults)
+    if refusal is not None:
+        raise ValueError(refusal)
+
+    agent = (chat.default_agent if chat else None) or defaults.default_agent
+    model = (chat.default_model if chat else None) or defaults.default_model
+    effort = (chat.default_effort if chat else None) or defaults.default_effort
     branch = (
-        (chat.default_branch if chat else None) or settings.default_branch
+        (chat.default_branch if chat else None) or defaults.default_branch
     ) or DEFAULT_BRANCH
     validate_pairing(agent, model, effort)
     return CreateRequest(
@@ -311,7 +334,7 @@ async def submit_prompt(
         db,
         session_id,
         turn_state=str(TurnState.QUEUED),
-        start_witnessed=0,
+        start_witnessed=False,
         consecutive_idle=0,
     )
     await chats_repo.touch_prompt(db, chat_id, thread_id, focus_for_ms=FOCUS_MS)
@@ -338,8 +361,8 @@ async def create_and_bind(
     message: Message,
     route: Route,
     request: CreateRequest,
+    client: ConductorClient,
     db: Database | None = None,
-    client: ConductorClient | None = None,
 ) -> CreatedBinding:
     bot = getattr(message, "bot", None)
     if bot is None and message.chat.type != "private":
@@ -365,12 +388,17 @@ async def create_and_bind_input(
     route: Route,
     request: CreateRequest,
     db: Database | None = None,
-    client: ConductorClient | None = None,
+    client: ConductorClient,
     action_id: str | None = None,
 ) -> CreatedBinding:
-    """Create/bind from typed or voice input without manufacturing an update."""
+    """Create/bind from typed or voice input without manufacturing an update.
+
+    ``client`` is the *tenant's* client, passed explicitly: there is no
+    process-wide fallback to reach for, which is what makes a cross-organisation
+    create impossible to write by accident.
+    """
     database = resolve_db(db)
-    conductor = resolve_client(client)
+    conductor = client
     validate_pairing(request.agent, request.model, request.effort)
     label = topic_label(request.project_name, request.branch)
 
@@ -546,7 +574,7 @@ async def create_and_bind_input(
         database,
         session_id,
         turn_state=str(TurnState.WAKING),
-        start_witnessed=0,
+        start_witnessed=False,
         consecutive_idle=0,
     )
     await chats_repo.touch_prompt(database, chat_id, thread_id, focus_for_ms=FOCUS_MS)

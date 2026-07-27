@@ -37,11 +37,14 @@ from ctb.bot.keyboards import (
     keyboard,
 )
 from ctb.bot.middleware.routing import Route
+from ctb.bot.middleware.tenancy import TenantSettings
 from ctb.conductor.client import ConductorClient
-from ctb.db.connection import Database, now_ms
+from ctb.conductor.pool import ClientPool
+from ctb.db.connection import Database, now_ms, tenant_scope
 from ctb.db.repo import chats as chats_repo
 from ctb.db.repo import prompts as prompts_repo
 from ctb.db.repo import sessions as sessions_repo
+from ctb.db.repo import tenancy
 from ctb.db.repo import voice_inputs as voice_repo
 from ctb.db.repo import wizard as wizard_repo
 from ctb.db.repo import workspaces as workspaces_repo
@@ -55,11 +58,18 @@ from ctb.voice.intent import (
     VoiceIntentKind,
     parse_intent,
 )
-from ctb.voice.provider import ElevenLabsProvider, SpeechProvider, TranscriptionError
+from ctb.voice.pool import ProviderPool
+from ctb.voice.provider import SpeechProvider, TranscriptionError
 
 __all__ = ["VoiceEnqueueStatus", "VoiceService"]
 
 log = get_logger(__name__)
+
+#: Said whenever a voice action needs the Conductor API and no key is stored.
+_NO_KEY = (
+    "This workspace has no Conductor API key yet. An owner can set one with "
+    "<code>/key</code> in a private message."
+)
 
 _OPERATION_NAMESPACE: Final = uuid.UUID("ab10e43e-134f-4559-84a4-ad0374ed6606")
 _TRANSCRIPT_LIMIT: Final = 16_000
@@ -104,35 +114,43 @@ class VoiceEnqueueStatus(StrEnum):
 
 @dataclass(slots=True)
 class VoiceService:
+    """Transcribes voice notes, per tenant, with per-tenant credentials.
+
+    Voice is the one feature whose data genuinely leaves the perimeter, so
+    there is no platform-wide speech key: a tenant that has not stored one has
+    no provider, and its notes are refused rather than billed to somebody else.
+    """
+
     settings: Settings
     db: Database
+    system_db: Database
     bot: Bot
-    client: ConductorClient
+    clients: ClientPool
     supervisor: CancelDispatcher
     nonces: NonceStore
-    provider: SpeechProvider | None = None
+    #: ``None`` means the platform has no speech vendor configured at all.
+    providers: ProviderPool | None = None
     _stop: asyncio.Event = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._stop = asyncio.Event()
-        if self.provider is None and self.settings.elevenlabs_api_key is not None:
-            self.provider = ElevenLabsProvider(
-                self.settings.elevenlabs_api_key.get_secret_value(),
-                model=self.settings.voice_stt_model,
-                language=self.settings.voice_language,
-            )
 
     @property
     def available(self) -> bool:
-        return self.settings.voice_enabled and self.provider is not None
+        """Whether the *platform* serves voice at all.
+
+        Whether a given tenant can use it is decided per job, by whether they
+        have stored a speech key.
+        """
+        return self.settings.voice_enabled and self.providers is not None
 
     async def enqueue(self, message: Message, route: Route) -> VoiceEnqueueStatus:
         media = message.voice or getattr(message, "audio", None)
         if media is None:
             raise ValueError("message has no voice or audio")
-        if not self.settings.voice_enabled:
+        if not self.settings.voice_enabled or not route.tenant_voice_enabled:
             return VoiceEnqueueStatus.DISABLED
-        if self.provider is None:
+        if self.providers is None:
             return VoiceEnqueueStatus.UNCONFIGURED
         if media.duration > self.settings.voice_max_duration_seconds:
             return VoiceEnqueueStatus.TOO_LONG
@@ -202,7 +220,7 @@ class VoiceService:
             log.info(
                 "voice.disabled",
                 enabled=self.settings.voice_enabled,
-                configured=self.provider is not None,
+                configured=self.providers is not None,
             )
             await self._stop.wait()
             return
@@ -215,13 +233,14 @@ class VoiceService:
 
     async def stop(self) -> None:
         self._stop.set()
-        if self.provider is not None:
-            await self.provider.aclose()
+        if self.providers is not None:
+            await self.providers.aclose()
 
     async def _recover(self) -> None:
         """Requeue what a dead process left behind; report what we gave up on."""
         try:
-            recovery = await voice_repo.recover_stale(self.db)
+            # Cross-tenant maintenance, so the worker pool.
+            recovery = await voice_repo.recover_stale(self.system_db)
             pruned = await self._prune()
         except asyncio.CancelledError:
             raise
@@ -240,7 +259,7 @@ class VoiceService:
 
     async def _prune(self) -> int:
         cutoff = now_ms() - self.settings.voice_completed_retention_days * 86_400_000
-        return await voice_repo.prune_terminal(self.db, before=cutoff)
+        return await voice_repo.prune_terminal(self.system_db, before=cutoff)
 
     async def _worker(self, index: int) -> None:
         while not self._stop.is_set():
@@ -256,37 +275,53 @@ class VoiceService:
                 await self._pause(_ERROR_BACKOFF_SECONDS)
 
     async def _tick(self, index: int) -> None:
-        row = await voice_repo.claim_next(self.db)
+        # Claiming is cross-tenant, so it runs on the worker pool. Everything
+        # after it acts on *one* tenant's rows and runs in that tenant's scope.
+        row = await voice_repo.claim_next(self.system_db)
         if row is None:
             await self._pause(_POLL_SECONDS)
             return
-        try:
-            async with asyncio.timeout(_JOB_DEADLINE_SECONDS):
-                await self._process(row)
-        except asyncio.CancelledError:
-            raise
-        except TimeoutError:
-            error = "Transcription timed out."
-            log.warning(
-                "voice.job_timed_out",
-                chat_id=row.chat_id,
-                tg_message_id=row.tg_message_id,
-                worker=index,
-                seconds=_JOB_DEADLINE_SECONDS,
-            )
-            await voice_repo.fail(self.db, row, error=error)
-            await self._send_failure(row, error)
-        except Exception as exc:
-            error = short_error(exc)
-            log.warning(
-                "voice.job_failed",
-                chat_id=row.chat_id,
-                tg_message_id=row.tg_message_id,
-                worker=index,
-                error=error,
-            )
-            await voice_repo.fail(self.db, row, error=error)
-            await self._send_failure(row, error)
+        if row.tenant_id is None:  # pragma: no cover - the column is NOT NULL
+            return
+        # The failure paths need the tenant scope as much as the happy path
+        # does. Written as one block rather than try/except *around* the scope,
+        # because `async with` exits before an outer `except` body runs — and
+        # `voice_repo.fail` on the tenant-scoped pool with no tenant set raises
+        # `TenantScopeError`, replacing the real error and leaving the job stuck
+        # in `transcribing` until the next redeploy. The user never hears why
+        # their voice note went nowhere.
+        async with tenant_scope(row.tenant_id):
+            try:
+                async with asyncio.timeout(_JOB_DEADLINE_SECONDS):
+                    await self._process(row)
+            except asyncio.CancelledError:
+                raise
+            except TimeoutError:
+                error = "Transcription timed out."
+                log.warning(
+                    "voice.job_timed_out",
+                    chat_id=row.chat_id,
+                    tg_message_id=row.tg_message_id,
+                    worker=index,
+                    seconds=_JOB_DEADLINE_SECONDS,
+                )
+                with suppress(Exception):
+                    await voice_repo.fail(self.db, row, error=error)
+                with suppress(Exception):
+                    await self._send_failure(row, error)
+            except Exception as exc:
+                error = short_error(exc)
+                log.warning(
+                    "voice.job_failed",
+                    chat_id=row.chat_id,
+                    tg_message_id=row.tg_message_id,
+                    worker=index,
+                    error=error,
+                )
+                with suppress(Exception):
+                    await voice_repo.fail(self.db, row, error=error)
+                with suppress(Exception):
+                    await self._send_failure(row, error)
 
     async def _sweep(self) -> None:
         """Re-queue rows abandoned mid-flight, without waiting for a restart.
@@ -330,17 +365,49 @@ class VoiceService:
             if pruned:
                 log.info("voice.jobs_pruned", count=pruned)
 
+    async def _defaults(self, row: VoiceInputRow) -> TenantSettings:
+        """This job's tenant's agent/model/effort defaults."""
+        tenant = (
+            None
+            if row.tenant_id is None
+            else await tenancy.get(self.system_db, row.tenant_id)
+        )
+        if tenant is None:
+            return TenantSettings()
+        return TenantSettings.of(tenant, self.settings)
+
+    async def _provider_for(self, row: VoiceInputRow) -> SpeechProvider | None:
+        """This job's tenant's speech provider, or ``None`` if unset."""
+        if self.providers is None or row.tenant_id is None:
+            return None
+        tenant = await tenancy.get(self.system_db, row.tenant_id)
+        if tenant is None:  # pragma: no cover - FK makes this unreachable
+            return None
+        return await self.providers.get(tenant)
+
+    async def _client_for(self, row: VoiceInputRow) -> ConductorClient | None:
+        if row.tenant_id is None:
+            return None
+        tenant = await tenancy.get(self.system_db, row.tenant_id)
+        if tenant is None or not tenant.has_conductor_key:
+            return None
+        return await self.clients.get(tenant)
+
     async def _pause(self, seconds: float) -> None:
         with suppress(TimeoutError):
             await asyncio.wait_for(self._stop.wait(), timeout=seconds)
 
     async def _process(self, row: VoiceInputRow) -> None:
         current = row
+        provider = await self._provider_for(current)
         if current.transcript is None:
-            if self.provider is None:
-                raise TranscriptionError("Voice transcription is not configured.")
+            if provider is None:
+                raise TranscriptionError(
+                    "This workspace has no speech key. An owner can set one "
+                    "with /voicekey in a private message."
+                )
             audio = await self._download(current)
-            result = await self.provider.transcribe(
+            result = await provider.transcribe(
                 audio,
                 filename=current.file_name or f"voice-{current.tg_message_id}.ogg",
                 mime_type=current.mime_type or "audio/ogg",
@@ -428,7 +495,8 @@ class VoiceService:
                 f"🎙 <b>Needs clarification</b>\n{escape(self._audit(intent.text))}",
             )
             return False
-        if self.settings.voice_mode == "shadow":
+        mode = (await self._defaults(row)).voice_mode
+        if mode == "shadow":
             await self._send(
                 row,
                 f"🎙 <b>Heard</b>\n{escape(self._audit(intent.text))}\n"
@@ -436,7 +504,7 @@ class VoiceService:
             )
             return True
         if intent.kind is VoiceIntentKind.COMMAND:
-            if self.settings.voice_mode != "commands":
+            if mode != "commands":
                 await voice_repo.wait_for_user(
                     self.db, row, reason="voice commands are in preview mode"
                 )
@@ -456,8 +524,12 @@ class VoiceService:
         # to the question the bot had just asked was run as a /find.
         if await self._finish_wizard(row, text):
             return True
+        conductor = await self._client_for(row)
+        if conductor is None:
+            await self._send(row, _NO_KEY)
+            return True
         if row.route_kind == "general":
-            rendered = await find_text(self.client, text)
+            rendered = await find_text(conductor, text)
             await self._send(
                 row,
                 f"🎙 <b>Search</b> · {escape(self._audit(text))}\n{rendered}",
@@ -468,7 +540,7 @@ class VoiceService:
             return True
         _message_id, state = await submit_prompt(
             db=self.db,
-            client=self.client,
+            client=conductor,
             session_id=row.route_session_id,
             text=text,
             chat_id=row.chat_id,
@@ -488,6 +560,7 @@ class VoiceService:
 
     async def _command(self, row: VoiceInputRow, intent: VoiceIntent) -> bool:
         command = intent.command
+        conductor = await self._client_for(row)
         if command is VoiceCommand.STOP:
             if not row.route_session_id:
                 await self._send(row, "No session here.")
@@ -503,10 +576,16 @@ class VoiceService:
             if not intent.argument:
                 await self._send(row, "Say what to find after the command.")
                 return True
-            await self._send(row, await find_text(self.client, intent.argument))
+            if conductor is None:
+                await self._send(row, _NO_KEY)
+                return True
+            await self._send(row, await find_text(conductor, intent.argument))
             return True
         if command is VoiceCommand.BOARD:
-            rows = await board_rows(self.db, self.client)
+            if conductor is None:
+                await self._send(row, _NO_KEY)
+                return True
+            rows = await board_rows(self.db, conductor)
             await self._send(
                 row, "\n".join(board_lines(rows)) if rows else "No live workspaces."
             )
@@ -578,12 +657,15 @@ class VoiceService:
                 chat=chat,
                 session=session,
             )
+            if conductor is None:
+                await self._send(row, _NO_KEY)
+                return True
             request = await resolve_new_request(
                 text=intent.argument,
                 route=route,
-                settings=self.settings,
+                defaults=await self._defaults(row),
                 db=self.db,
-                client=self.client,
+                client=conductor,
             )
             created = await create_and_bind_input(
                 bot=self.bot,
@@ -593,7 +675,7 @@ class VoiceService:
                 route=route,
                 request=request,
                 db=self.db,
-                client=self.client,
+                client=conductor,
                 action_id=row.action_id,
             )
             await self._send(
@@ -616,9 +698,18 @@ class VoiceService:
         )
         if wizard is None or wizard.state_key != PROMPT_STATE_KEY:
             return False
-        request = request_from_wizard(wizard.data, text, settings=self.settings)
+        # This tenant's defaults, not the platform's — `/defaults` is per
+        # workspace, and a spoken prompt must resolve them exactly as a typed
+        # one does. Sharing `request_from_wizard` is what guarantees that.
+        request = request_from_wizard(
+            wizard.data, text, settings=await self._defaults(row)
+        )
         if request is None:
             return False
+        conductor = await self._client_for(row)
+        if conductor is None:
+            await self._send(row, _NO_KEY)
+            return True
         chat = await chats_repo.get(self.db, row.chat_id, row.thread_id)
         route = Route(
             chat_id=row.chat_id,
@@ -634,7 +725,7 @@ class VoiceService:
             route=route,
             request=request,
             db=self.db,
-            client=self.client,
+            client=conductor,
             action_id=row.action_id,
         )
         await wizard_repo.clear(
