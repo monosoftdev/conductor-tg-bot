@@ -28,6 +28,8 @@ from pydantic.alias_generators import to_camel
 
 from ctb.conductor.errors import PairingError
 
+HELLO = "hello world"
+
 __all__ = [
     "AGENT_EFFORTS",
     "AGENT_MODELS",
