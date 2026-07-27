@@ -25,11 +25,6 @@ ELEVENLABS_STT_URL = "https://api.elevenlabs.io/v1/speech-to-text"
 # It is enterprise-gated, so a rejection aimed at this parameter degrades the
 # request instead of failing the job — the note still has to be transcribed.
 _ZERO_RETENTION_PARAMS: Final[dict[str, str]] = {"enable_logging": "false"}
-_ZERO_RETENTION_MARKERS: Final[tuple[str, ...]] = (
-    "enable_logging",
-    "zero retention",
-    "zero_retention",
-)
 
 
 class TranscriptionError(RuntimeError):
@@ -97,12 +92,20 @@ class ElevenLabsProvider:
         if cleaned:
             data["keyterms"] = cleaned
         response = await self._post(data, audio, filename=filename, mime_type=mime_type)
-        if self._zero_retention and _rejects_zero_retention(response):
-            # Not an entitlement this account has. Say so once, then keep the
-            # note moving; the retention posture is documented in CLAUDE.md.
+        if self._zero_retention and 400 <= response.status_code < 500:
+            # Zero retention is enterprise-gated, so a refusal is expected on
+            # most plans — and the refusal does not have to mention it. Matching
+            # on vendor prose meant a 403 aimed at `enable_logging` read as "the
+            # key lacks Speech-to-Text", which sent the owner to re-check a
+            # permission that was already correct.
+            #
+            # So drop the optional parameter and try again rather than guess
+            # what the body will say. One extra call, only on the failure path,
+            # and only until the first refusal latches it off for the process.
             log.warning(
                 "voice.zero_retention_unavailable",
                 status=response.status_code,
+                detail=_reason(response),
             )
             self._zero_retention = False
             response = await self._post(
@@ -115,11 +118,13 @@ class ElevenLabsProvider:
         # ElevenLabs scopes each key per product, so a real key with
         # Speech-to-Text unticked is the likelier of the two.
         if response.status_code == 401:
-            raise TranscriptionError("ElevenLabs rejected the key. Check the value.")
-        if response.status_code == 403:
             raise TranscriptionError(
-                "ElevenLabs key lacks Speech-to-Text. Enable it on the key."
+                f"ElevenLabs rejected the key · {_reason(response)}"
             )
+        if response.status_code == 403:
+            # Say what ElevenLabs said. Naming a cause we inferred sent the
+            # owner to re-check a Speech-to-Text permission that was already on.
+            raise TranscriptionError(f"ElevenLabs refused · {_reason(response)}")
         if response.status_code >= 400:
             raise TranscriptionError(
                 f"Speech service rejected the note ({response.status_code})."
@@ -171,15 +176,27 @@ class ElevenLabsProvider:
             await self._client.aclose()
 
 
-def _rejects_zero_retention(response: httpx.Response) -> bool:
-    """True only for a 4xx aimed at ``enable_logging`` itself."""
-    if not 400 <= response.status_code < 500:
-        return False
+def _reason(response: httpx.Response) -> str:
+    """ElevenLabs' own words for a refusal, in one short phone line.
+
+    The body is one of several shapes (``detail.message``, ``detail.status``, a
+    bare ``detail`` string, ``message``), so pull whichever is there and fall
+    back to the status code rather than inventing a cause.
+    """
     try:
-        body = response.text.casefold()
-    except (UnicodeDecodeError, httpx.HTTPError):  # pragma: no cover - defensive
-        return False
-    return any(marker in body for marker in _ZERO_RETENTION_MARKERS)
+        payload: Any = response.json()
+    except ValueError:
+        payload = None
+    candidates: list[Any] = []
+    if isinstance(payload, dict):
+        detail = payload.get("detail")
+        if isinstance(detail, dict):
+            candidates += [detail.get("message"), detail.get("status")]
+        candidates += [detail, payload.get("message")]
+    for value in candidates:
+        if isinstance(value, str) and value.strip():
+            return " ".join(value.split())[:120]
+    return f"HTTP {response.status_code}"
 
 
 def _valid_keyterms(values: list[str]) -> list[str]:

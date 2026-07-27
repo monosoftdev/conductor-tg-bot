@@ -80,8 +80,16 @@ async def test_a_non_enterprise_tier_degrades_instead_of_losing_the_note() -> No
     assert [("enable_logging" in url) for url in urls] == [True, False, False]
 
 
-async def test_an_unrelated_4xx_is_still_an_error_and_is_not_retried() -> None:
-    """Only a rejection naming the parameter degrades — nothing else."""
+async def test_any_4xx_retries_once_without_zero_retention() -> None:
+    """Deliberate change: the old rule was "only a refusal that names it".
+
+    Zero retention is enterprise-gated, so a refusal is expected on most
+    plans — and it does not have to mention `enable_logging`. Matching on
+    vendor prose meant a 403 aimed at the parameter was reported as "the key
+    lacks Speech-to-Text", sending the owner to re-check a permission that was
+    already correct. Dropping the optional parameter and retrying costs one
+    call on the failure path and cannot misdiagnose.
+    """
     calls = 0
 
     async def handler(_request: httpx.Request) -> httpx.Response:
@@ -99,7 +107,7 @@ async def test_an_unrelated_4xx_is_still_an_error_and_is_not_retried() -> None:
     finally:
         await client.aclose()
 
-    assert calls == 1
+    assert calls == 2, "once with the parameter, once without"
 
 
 @pytest.mark.parametrize(
@@ -108,7 +116,8 @@ async def test_an_unrelated_4xx_is_still_an_error_and_is_not_retried() -> None:
         # 401 and 403 are deliberately different sentences: re-paste the key
         # vs. tick Speech-to-Text on a key that was fine. See provider.py.
         (401, "rejected the key"),
-        (403, "lacks Speech-to-Text"),
+        # ElevenLabs' own words now, not a cause we inferred.
+        (403, "refused"),
         (429, "rate-limited"),
         (500, "rejected"),
     ),
@@ -126,6 +135,57 @@ async def test_provider_errors_are_short_and_safe(status: int, message: str) -> 
                 filename="voice.ogg",
                 mime_type="audio/ogg",
                 keyterms=[],
+            )
+    finally:
+        await client.aclose()
+
+
+async def test_a_403_that_never_names_the_parameter_still_transcribes() -> None:
+    """The live failure, exactly.
+
+    ElevenCreative is not an enterprise plan, so `enable_logging=false` was
+    refused with a 403 whose body says nothing about zero retention. The owner
+    was told their key lacked Speech-to-Text — with a screenshot proving it was
+    enabled — because the retry was gated on guessing the wording.
+    """
+    seen: list[str | None] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        param = request.url.params.get("enable_logging")
+        seen.append(param)
+        if param is not None:
+            return httpx.Response(
+                403, json={"detail": {"status": "missing_permissions"}}
+            )
+        return httpx.Response(200, json={"text": "ship the fix", "language_code": "en"})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = ElevenLabsProvider("secret", client=client)
+    try:
+        result = await provider.transcribe(
+            b"audio", filename="v.ogg", mime_type="audio/ogg", keyterms=[]
+        )
+    finally:
+        await client.aclose()
+
+    assert result.text == "ship the fix"
+    assert seen == ["false", None], "retried without the enterprise-only parameter"
+
+
+async def test_a_genuine_403_reports_elevenlabs_own_words() -> None:
+    """When it really is the key, do not paraphrase — quote."""
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            403, json={"detail": {"message": "API key is missing the stt permission"}}
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = ElevenLabsProvider("secret", client=client)
+    try:
+        with pytest.raises(TranscriptionError, match="missing the stt permission"):
+            await provider.transcribe(
+                b"audio", filename="v.ogg", mime_type="audio/ogg", keyterms=[]
             )
     finally:
         await client.aclose()
