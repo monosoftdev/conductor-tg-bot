@@ -79,6 +79,31 @@ async def deny(
     )
 
 
+def _count(value: object) -> int:
+    """A health section is untyped JSON; a missing or odd key reads as zero."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _voice_line(voice: dict[str, object]) -> str:
+    """Voice counters, but only once there is something to say.
+
+    ``transcribing`` is called out separately: a note parked mid-flight is what
+    a hang looks like, and folded into ``pending`` it reads the same as a note
+    that arrived a second ago.
+    """
+    pending = _count(voice.get("pending"))
+    failed = _count(voice.get("failed"))
+    transcribing = _count(voice.get("transcribing"))
+    if not (pending or failed):
+        return ""
+    parts = [f"{pending} pending"]
+    if transcribing:
+        parts.append(f"{transcribing} transcribing")
+    if failed:
+        parts.append(f"{failed} failed")
+    return "🎙 voice: " + " · ".join(parts)
+
+
 @router.message(Command("health"))
 async def health(
     message: Message,
@@ -93,6 +118,8 @@ async def health(
         await tell(message, "Owner only.")
         return
     database = resolve_db(db)
+    why = ""
+    voice_line = ""
     try:
         if health_monitor is not None:
             report = await health_monitor.report(force=True)
@@ -103,6 +130,14 @@ async def health(
             # only part of it the owner can act on. See health.lease_line.
             driver = lease_line(report.lease)
             unknown = len(report.unknown_content_types)
+            # "degraded" on its own, above five lines that all read fine, is a
+            # riddle. Every Degradation already carries human-facing prose;
+            # printing the word without it was the whole problem.
+            why = " · ".join(
+                escape(item.detail or item.code.replace("_", " "))
+                for item in report.degradations
+            )
+            voice_line = _voice_line(report.voice)
         else:
             status = "ok"
             uptime = "n/a"
@@ -123,9 +158,11 @@ async def health(
     await tell(
         message,
         f"<b>{escape(status)}</b> · uptime {escape(uptime)}\n"
-        f"circuit {escape(circuit)} · poll lag {lag}\n"
+        + (f"⚠️ {why}\n" if why else "")
+        + f"circuit {escape(circuit)} · poll lag {lag}\n"
         f"deliveries {pending} pending · unknown {unknown}\n"
-        f"lease {driver}\n"
+        + (f"{voice_line}\n" if voice_line else "")
+        + f"lease {driver}\n"
         f"last error: {escape((last or 'none')[:180])}",
     )
 

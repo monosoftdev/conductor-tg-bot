@@ -42,6 +42,7 @@ from ctb.health import (
     HEALTH_PATH,
     MONITOR_KEY,
     TELEGRAM_FAILURE_THRESHOLD,
+    Degradation,
     HealthMonitor,
     HealthReport,
     HealthServer,
@@ -922,3 +923,35 @@ def test_format_health_html_of_an_empty_report() -> None:
     text = format_health_html(HealthReport())
     assert text.startswith("✅ <b>ok</b>")
     assert "unheld" in text
+
+
+def test_a_degraded_health_line_always_says_why() -> None:
+    """The live report read "degraded" above five lines that were all fine.
+
+    ``Degradation`` has carried human-facing ``detail`` all along; the compact
+    ``/health`` printed the verdict and dropped the reason, which is the one
+    part the owner can act on.
+    """
+    from ctb.bot.handlers.admin import _voice_line
+
+    report = HealthReport(
+        status=HealthStatus.DEGRADED,
+        degradations=(
+            Degradation(code=DEGRADATION_POLL_LAG, detail="2 sessions overdue"),
+            Degradation(code=DEGRADATION_CIRCUIT_OPEN),
+        ),
+    )
+
+    why = " · ".join(
+        item.detail or item.code.replace("_", " ") for item in report.degradations
+    )
+
+    assert why == "2 sessions overdue · circuit open"
+    assert "_" not in why, "codes are prose here, not identifiers"
+    # And a healthy report contributes no reason line at all.
+    assert HealthReport(status=HealthStatus.OK).degradations == ()
+    # Voice stays silent until it has something to report.
+    assert _voice_line({}) == ""
+    assert _voice_line({"pending": 1, "transcribing": 1}) == (
+        "🎙 voice: 1 pending · 1 transcribing"
+    )
