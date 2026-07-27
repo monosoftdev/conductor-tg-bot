@@ -11,12 +11,12 @@
 name: CI
 
 on:
-  # Every branch, not just the long-lived ones. A restricted `pull_request`
-  # trigger (private repo, app-authored push, required approval) means no run
-  # at all — which on a PR is indistinguishable from "checks haven't started".
-  # Push is the trigger that always fires; pull_request is the one branch
-  # protection reads.
+  # `pull_request` is the gate — it is the event branch protection reads, and
+  # it runs against the merge result rather than the branch tip. `push` covers
+  # only the long-lived branches, so a PR branch does not run the matrix twice
+  # and then report the loser as a cancelled check.
   push:
+    branches: [main, dev]
   pull_request:
   merge_group:
 
