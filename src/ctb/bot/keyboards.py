@@ -79,6 +79,7 @@ __all__ = [
     "CONTROL_TTL_S",
     "MAX_BUTTON_TEXT",
     "NONCE_TTL_S",
+    "PLAIN_STYLE",
     "RESTARTABLE_ACTIONS",
     "Action",
     "CardAction",
@@ -124,6 +125,13 @@ MAX_BUTTON_TEXT: Final = 48
 
 #: The name is always in a confirm button. Change the shape here, not the rule.
 CONFIRM_TEMPLATE: Final = "{verb} {name}"
+
+#: Ask for the client's own default button chrome. Distinct from ``style=None``,
+#: which means "whatever this action normally looks like" and lets
+#: :func:`_style_for` colour it. Telegram offers exactly three colours, so the
+#: uncoloured button is the fourth one available to a caller that needs four
+#: buttons to look different from each other.
+PLAIN_STYLE: Final = "plain"
 
 _NONCE_BYTES: Final = 9  # -> 12 url-safe characters, no ':' to collide with sep
 _PURGE_THRESHOLD: Final = 128
@@ -626,10 +634,11 @@ def button(
             ttl=ttl,
         )
         data = ticket.callback_data
+    resolved = _style_for(action) if style is None else style
     return InlineKeyboardButton(
         text=label,
         callback_data=data,
-        style=style or _style_for(action),
+        style=None if resolved == PLAIN_STYLE else resolved,
     )
 
 
@@ -775,8 +784,12 @@ def status_card_keyboard(
 
 
 def quick_reply_label(index: int, choice: str) -> str:
-    """The exact label :func:`quick_reply_keyboard` will put on the button."""
+    """The spelled-out label — the whole option, readable on one button."""
     return f"{'✓ ' if index == 1 else ''}{index} · {' '.join(choice.split())[:160]}"
+
+
+def _spells_out(index: int, choice: str) -> bool:
+    return len(quick_reply_label(index, choice)) <= MAX_BUTTON_TEXT
 
 
 def quick_replies_fit(choices: Sequence[str]) -> bool:
@@ -788,9 +801,19 @@ def quick_replies_fit(choices: Sequence[str]) -> bool:
     if not choices:
         return False
     return all(
-        len(quick_reply_label(index, choice)) <= MAX_BUTTON_TEXT
-        for index, choice in enumerate(choices[:4], start=1)
+        _spells_out(index, choice) for index, choice in enumerate(choices[:4], start=1)
     )
+
+
+#: One style per option, so no two buttons in a block ever look alike.
+#: :data:`PLAIN_STYLE` is a real fourth slot — the client's own chrome — and it
+#: is what keeps a red button off the three-option blocks agents actually emit.
+_QUICK_REPLY_STYLES: Final[tuple[str, ...]] = (
+    "success",
+    "primary",
+    PLAIN_STYLE,
+    "danger",
+)
 
 
 def quick_reply_keyboard(
@@ -802,27 +825,51 @@ def quick_reply_keyboard(
     chat_id: int | None = None,
     thread_id: int = NO_THREAD_ID,
 ) -> InlineKeyboardMarkup | None:
-    """One-tap replies for a final ``Choices:`` block from the agent."""
-    rows: list[list[InlineKeyboardButton]] = []
-    for index, choice in enumerate(choices[:4], start=1):
-        cleaned = " ".join(choice.split())[:160]
-        if not cleaned:
-            continue
-        rows.append(
-            [
-                button(
-                    quick_reply_label(index, cleaned),
-                    Action.SEND,
-                    f"{session_id}\nChoose option {index}: {cleaned}",
-                    store=store,
-                    user_id=user_id,
-                    chat_id=chat_id,
-                    thread_id=thread_id,
-                    ttl=CONTROL_TTL_S,
-                    style="success" if index == 1 else "primary",
-                )
-            ]
+    """One-tap replies for a final ``Choices:`` block from the agent.
+
+    Two shapes, one rule: **a button never shows a half-read option.** When
+    every option fits, the buttons *are* the options — one per row, spelled
+    out, and the caller has already cut the prose. When they do not fit, the
+    prose stays and the buttons shrink to the bare numbers standing beside it,
+    on one row.
+
+    The old middle ground — a full-length label handed to a 48-character
+    budget — was the worst of both. :func:`truncate_label` keeps the *tail*, so
+    the number the option belongs to was the first thing cut: three buttons
+    reading "…cate placeholder ## Testing section at line 89." under a list
+    that had already said it better.
+    """
+    options = [
+        (index, cleaned)
+        for index, cleaned in (
+            (index, " ".join(choice.split())[:160])
+            for index, choice in enumerate(choices[:4], start=1)
         )
+        if cleaned
+    ]
+    if not options:
+        return None
+    spelled = all(_spells_out(index, choice) for index, choice in options)
+    rows: list[list[InlineKeyboardButton]] = []
+    numbered: list[InlineKeyboardButton] = []
+    for index, cleaned in options:
+        item = button(
+            quick_reply_label(index, cleaned) if spelled else str(index),
+            Action.SEND,
+            f"{session_id}\nChoose option {index}: {cleaned}",
+            store=store,
+            user_id=user_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            ttl=CONTROL_TTL_S,
+            style=_QUICK_REPLY_STYLES[index - 1],
+        )
+        if spelled:
+            rows.append([item])
+        else:
+            numbered.append(item)
+    if numbered:
+        rows.append(numbered)
     return keyboard(rows) if rows else None
 
 
