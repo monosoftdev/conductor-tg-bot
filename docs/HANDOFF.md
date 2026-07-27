@@ -8,7 +8,7 @@ and a live phone pass.
 
 Verified offline, on every commit:
 
-- **1,832 tests pass** against a real PostgreSQL 16.
+- **1,866 tests pass** against a real PostgreSQL 16.
 - `ruff format --check`, `ruff check`, `pyright` — all clean.
 - The real runtime boots against a real database: all six services start,
   `/health` returns `ok`, the lease is acquired, shutdown is clean.
@@ -52,6 +52,23 @@ not be re-cut.
   on PostgreSQL. It is now deterministic.
 - **A chat-id collision across tenants used to raise "row vanished".** It now
   raises `ChatOwnedElsewhereError` and says what actually happened.
+
+## The adversarial review, and what it found
+
+An independent review of the finished branch found four critical bugs and five
+high ones. All are fixed; `docs/TENANCY.md` documents the rules that came out
+of them. The lesson worth keeping:
+
+**One line in the test harness hid three of them.** Both database fixtures put
+a tenant in scope for the whole test, so every background task — the FSM
+storage read that runs before *every* handler, the voice workers, the
+status-card writer — looked correct and failed the moment it ran for real.
+Self-serve registration was completely dead, and 1,832 passing tests said
+otherwise.
+
+The fixture no longer scopes the worker pool, and `tests/test_unscoped_workers.py`
+runs the real code the way a background task does. Four other tests that passed
+with their feature deleted now fail with it.
 
 ## Probe facts still carried in code
 

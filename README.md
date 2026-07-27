@@ -51,7 +51,7 @@ and send it privately instead.
 
 Daily: `/new` `/attach` `/board` `/stop` `/find` `/mode` `/done`
 Power: `/s` `/fork` `/name` `/open` `/desk` `/log` `/notify` `/defaults` `/sql` `/tidy`
-Workspace: `/invite` `/remove` `/members` `/health` `/export` `/key` `/revoke`
+Workspace: `/invite` `/remove` `/leave` `/members` `/health` `/export` `/key` `/revoke`
 Anyone: `/start` `/register` `/setup` `/privacy` `/help`
 
 ## Running it
@@ -128,8 +128,8 @@ There is no volume — the image is stateless.
 
 ```bash
 docker compose up -d --wait db
-.venv/bin/python -m pytest -q          # 1832 tests
-.venv/bin/python -m pytest -q -m "not db"   # the ~600 that need no server
+.venv/bin/python -m pytest -q          # 1866 tests
+.venv/bin/python -m pytest -q -m "not db"   # the ~1400 that need no server
 .venv/bin/python -m ruff format --check src scripts tests
 .venv/bin/python -m ruff check src scripts tests
 .venv/bin/python -m pyright

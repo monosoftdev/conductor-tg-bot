@@ -44,9 +44,16 @@ It resolves in this order:
    resolves the way a private message does — by the sender's own membership,
    and only when it is unambiguous.
 
-Rejection is silence. The one exception is the registration entry point:
-`/start`, `/register`, `/help` and `/privacy`, in a private chat only, reach a
-handler with `tenant=None`, because they are how somebody becomes a member.
+Rejection is silence. Two exceptions, both of which exist because they are how
+somebody *becomes* a member, and both reach a handler with `tenant=None`:
+
+* `/start`, `/register`, `/help` and `/privacy`, in a **private chat**.
+* `/setup`, in a **group**. A fresh supergroup has no `tenant_chats` row by
+  definition, so without this the second step of sign-up is unreachable. It is
+  safe because it does nothing without a valid single-use code, which only its
+  own workspace's owner ever saw — and it proves the bot can really create a
+  topic *before* spending that code, so a permissions problem does not leave a
+  workspace permanently unbindable.
 
 ## Why row-level security
 
@@ -120,8 +127,11 @@ separates the Conductor key from the speech key on the same row.
 There is **no plaintext cache**. `ClientPool.get()` decrypts once, hands the key
 to the client's default headers, and drops the reference. The client is the
 cache; idle eviction after fifteen minutes destroys the last copy in memory.
-`conductor_key_fp` — a truncated SHA-256 — exists so that "is this the same
-key?" never needs a decrypt.
+`conductor_key_fp` — a truncated HMAC under a key derived from the master,
+scoped to the tenant — exists so "is this the same key?" never needs a decrypt.
+HMAC rather than a bare digest because the application role can read that
+column, and an unsalted hash of an API key is offline-guessable for any key
+with predictable structure.
 
 Rotation is prepend, deploy, `python -m ctb.rewrap --rewrap`, drop. Every blob
 names the key that sealed it, so old and new coexist and there is no window.
@@ -165,3 +175,63 @@ Setting `status='suspended'` stops that tenant's polling on the next five-second
 pass. A rejected API key stamps `auth_failed_at`, cancels *that tenant's*
 pollers, and tells its owners — everyone else keeps running. Storing a new key
 clears the stamp, which is the only thing that restarts it.
+
+
+## What runs with no tenant at all
+
+Three bugs hid here at once, so it is worth stating explicitly. These run as
+process-level tasks or before any handler, and therefore have **no scope**:
+
+* aiogram's FSM middleware, which reads storage on *every* update — including
+  the registration commands, which by definition have no tenant yet. The
+  storage treats "no tenant" as "no wizard": reads answer empty, writes drop.
+* The delivery, voice and status-card loops. Each **claims** cross-tenant on
+  the worker pool, then enters the claimed row's own tenant to do the work.
+* The supervisor's reconcile pass. Each poller runs inside
+  ``tenant_scope(session.tenant_id)`` for its whole lifetime.
+
+The rule: **claim wide, act narrow.** A worker may look across tenants to find
+work; it may not touch a tenant's rows without entering that tenant.
+
+`tests/pg.py::unscoped` runs a block the way these tasks run, and
+`tests/test_unscoped_workers.py` uses it. A fixture that supplies a scope makes
+every one of these look fine.
+
+## Callback payloads
+
+Buttons that must survive a redeploy cannot be handles in a dead process's
+memory, so they describe themselves: action, expiry, target. That makes every
+field attacker-supplied unless it is signed — and unsigned, "single use" and
+"expires in fifteen minutes" were decorative, and a ``stop`` payload could name
+any session id its sender had ever seen.
+
+They carry a truncated HMAC under a key derived from the master key
+(``SecretBox.derive``), so every replica of a deployment agrees and nothing
+outside it can mint one. Rotating the master key invalidates in-flight payloads,
+which is the safe direction for a button that already expires in minutes.
+
+The signature is a *fallback*, not a bypass: the nonce store is still asked
+first, so a ticket it knows — spent, expired, revoked, minted for someone else —
+is refused as before.
+
+`stop` additionally reads its session back through the tenant-scoped pool.
+``Supervisor.dispatch`` looks up a process-global task map with no tenant of its
+own, so that read is the only thing between a stray payload and somebody else's
+running agent.
+
+## Roles
+
+``owner`` and ``admin`` both pass the ``is_owner`` command gate, and that is
+deliberate — but it means an admin holds most of an owner's power. Two guards
+keep the door open:
+
+* Only an **owner** may change an owner's role. Nothing in Telegram grants the
+  ``owner`` role, so a demotion is a one-way door.
+* The last **owner** cannot be removed, counting the ``owner`` role only.
+  Counting admins would let an admin remove the owner and leave a workspace
+  nobody can administer.
+
+Anyone can seat anyone with ``/invite``, so ``/leave`` exists and DM resolution
+prefers the workspace you own. Without that preference, seating someone in your
+workspace would silence every private command they send — including the
+``/key`` that finishes their own sign-up.
