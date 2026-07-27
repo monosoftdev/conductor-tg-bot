@@ -2,8 +2,10 @@
 
 The address of a prompt is the forum topic your thumb is in. ``thread_id`` is
 NOT NULL and uses :data:`ctb.db.NO_THREAD_ID` (0) for "no topic" — a DM or the
-supergroup's General — because SQLite permits NULLs inside a PRIMARY KEY and a
-nullable thread would silently destroy the uniqueness of the routing key.
+supergroup's General — so the routing key never contains a NULL.
+
+Rows are tenant-scoped by row-level security: ``tenant_id`` is filled from the
+``ctb.tenant_id`` GUC and every statement here is filtered by it.
 """
 
 from __future__ import annotations
@@ -11,10 +13,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Self
 
-import aiosqlite
-
 from ctb.db import NO_THREAD_ID
-from ctb.db.connection import Database, now_ms
+from ctb.db.connection import Database, Row, now_ms
 from ctb.db.repo._util import (
     UNSET,
     Maybe,
@@ -75,7 +75,7 @@ class ChatRow:
     updated_at: int = 0
 
     @classmethod
-    def from_row(cls, row: aiosqlite.Row) -> Self:
+    def from_row(cls, row: Row) -> Self:
         return cls(
             chat_id=as_int(row["chat_id"]),
             thread_id=as_int(row["thread_id"]),

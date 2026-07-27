@@ -5,9 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Final, Self
 
-import aiosqlite
-
-from ctb.db.connection import Database, now_ms
+from ctb.db.connection import Database, Row, now_ms
 from ctb.db.repo._util import as_int, as_opt_int, as_opt_str, as_str
 
 __all__ = [
@@ -45,6 +43,9 @@ _COLUMNS = """
     updated_at, completed_at
 """
 
+#: The same list aliased for a ``RETURNING`` clause inside :func:`claim_next`.
+_QUALIFIED_COLUMNS = ", ".join(f"v.{name.strip()}" for name in _COLUMNS.split(","))
+
 
 @dataclass(frozen=True, slots=True)
 class VoiceInputRow:
@@ -76,7 +77,7 @@ class VoiceInputRow:
     completed_at: int | None
 
     @classmethod
-    def from_row(cls, row: aiosqlite.Row) -> Self:
+    def from_row(cls, row: Row) -> Self:
         return cls(
             chat_id=as_int(row["chat_id"]),
             tg_message_id=as_int(row["tg_message_id"]),
@@ -172,13 +173,14 @@ async def create(
     stamp = now_ms() if at is None else at
     changed = await db.execute(
         """
-        INSERT OR IGNORE INTO voice_inputs
+        INSERT INTO voice_inputs
             (chat_id, tg_message_id, thread_id, user_id, file_id,
              file_unique_id, file_name, mime_type, duration_seconds, file_size,
              route_kind,
              route_session_id, route_workspace_id, provider, model, state,
              action_id, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'received', ?, ?, ?)
+        ON CONFLICT DO NOTHING
         """,
         (
             chat_id,
@@ -208,47 +210,42 @@ async def create(
 
 
 async def claim_next(db: Database, *, at: int | None = None) -> VoiceInputRow | None:
-    """Conditionally claim one transcription or recovered dispatch job."""
+    """Claim the oldest transcription or recovered dispatch job.
+
+    One statement. ``FOR UPDATE SKIP LOCKED`` means concurrent workers pick
+    *different* rows instead of all converging on the head of the queue and all
+    but one losing a compare-and-swap.
+    """
     stamp = now_ms() if at is None else at
-    async with db.transaction():
-        candidate = await db.fetch_one(
-            """
+    row = await db.fetch_one(
+        f"""
+        WITH candidate AS (
             SELECT chat_id, tg_message_id, state
               FROM voice_inputs
              WHERE state IN ('received', 'transcribed')
              ORDER BY created_at
              LIMIT 1
-            """
-        )
-        if candidate is None:
-            return None
-        old_state = as_str(candidate["state"])
-        new_state = "transcribing" if old_state == "received" else "dispatching"
-        changed = await db.execute(
-            """
-            UPDATE voice_inputs
-               SET state = ?,
-                   attempts = attempts + CASE WHEN ? = 'transcribing' THEN 1 ELSE 0 END,
+               FOR UPDATE SKIP LOCKED
+        ),
+        claimed AS (
+            UPDATE voice_inputs v
+               SET state = CASE WHEN c.state = 'received'
+                                THEN 'transcribing' ELSE 'dispatching' END,
+                   attempts = v.attempts
+                              + CASE WHEN c.state = 'received' THEN 1 ELSE 0 END,
                    updated_at = ?,
                    last_error = NULL
-             WHERE chat_id = ? AND tg_message_id = ? AND state = ?
-            """,
-            (
-                new_state,
-                new_state,
-                stamp,
-                as_int(candidate["chat_id"]),
-                as_int(candidate["tg_message_id"]),
-                old_state,
-            ),
+              FROM candidate c
+             WHERE v.chat_id = c.chat_id
+               AND v.tg_message_id = c.tg_message_id
+               AND v.state = c.state
+            RETURNING {_QUALIFIED_COLUMNS}
         )
-        if changed != 1:
-            return None
-        return await get(
-            db,
-            as_int(candidate["chat_id"]),
-            as_int(candidate["tg_message_id"]),
-        )
+        SELECT {_COLUMNS} FROM claimed
+        """,
+        (stamp,),
+    )
+    return None if row is None else VoiceInputRow.from_row(row)
 
 
 async def mark_transcribed(

@@ -20,9 +20,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Final, Self
 
-import aiosqlite
-
-from ctb.db.connection import Database, now_ms
+from ctb.db.connection import Database, Row, now_ms
 from ctb.db.repo._util import as_int, as_str
 
 __all__ = [
@@ -61,7 +59,7 @@ class Lease:
     expires_at: int = 0
 
     @classmethod
-    def from_row(cls, row: aiosqlite.Row) -> Self:
+    def from_row(cls, row: Row) -> Self:
         return cls(
             name=as_str(row["name"]),
             holder=as_str(row["holder"]),

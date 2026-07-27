@@ -37,11 +37,9 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Self
 
-import aiosqlite
-
 from ctb.conductor.models import TranscriptMessage
 from ctb.db import MAX_CONTENT_BYTES, NO_THREAD_ID, TRANSCRIPT_RETENTION_DAYS
-from ctb.db.connection import Database, now_ms
+from ctb.db.connection import Database, Row, now_ms
 from ctb.db.repo._util import (
     as_bool,
     as_int,
@@ -106,7 +104,7 @@ _INSERT_DELIVERY = """
 #: seek-to-end must not be allowed to jump the cursor over undelivered messages.
 _ADVANCE_CURSOR = """
     UPDATE sessions
-       SET cursor_message_id = ?, cursor_session_index = ?, seeded = 1,
+       SET cursor_message_id = ?, cursor_session_index = ?, seeded = true,
            updated_at = ?
      WHERE id = ? AND cursor_session_index < ?
 """
@@ -182,7 +180,7 @@ class StoredMessage:
     inserted_at: int = 0
 
     @classmethod
-    def from_row(cls, row: aiosqlite.Row) -> Self:
+    def from_row(cls, row: Row) -> Self:
         return cls(
             session_id=str(row["session_id"]),
             message_id=str(row["message_id"]),
@@ -289,6 +287,14 @@ async def advance_cursor(
     content_ids: set[str] = set()
 
     async with db.transaction():
+        # Serialise per session. Recording messages, queueing their deliveries
+        # and moving the cursor must be one indivisible step; two pollers on the
+        # same session would otherwise interleave and leave a cursor that has
+        # advanced past deliveries the other transaction had not committed yet.
+        # Under SQLite this came free from BEGIN IMMEDIATE.
+        await db.execute(
+            "SELECT 1 FROM sessions WHERE id = ? FOR UPDATE", (session_id,)
+        )
         for item in ordered:
             message = item.message
             content_json, truncated, size = encode_content(message.content)
@@ -301,7 +307,7 @@ async def advance_cursor(
                     message.session_index,
                     message.type,
                     content_json,
-                    1 if truncated else 0,
+                    truncated,
                     size,
                     message.turn_id,
                     message.content_id,

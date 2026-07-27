@@ -15,10 +15,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Self
 
-import aiosqlite
-
 from ctb.db import NO_THREAD_ID
-from ctb.db.connection import Database, now_ms
+from ctb.db.connection import Database, Row, now_ms
 from ctb.db.repo._util import (
     UNSET,
     Maybe,
@@ -62,7 +60,7 @@ class WizardRow:
     expires_at: int | None = None
 
     @classmethod
-    def from_row(cls, row: aiosqlite.Row) -> Self:
+    def from_row(cls, row: Row) -> Self:
         return cls(
             chat_id=as_int(row["chat_id"]),
             thread_id=as_int(row["thread_id"]),
@@ -133,7 +131,8 @@ async def set_state(
             ON CONFLICT(chat_id, thread_id, user_id) DO UPDATE SET
                 state_key     = excluded.state_key,
                 data_json     = excluded.data_json,
-                tg_message_id = CASE WHEN ? THEN wizard_state.tg_message_id
+                tg_message_id = CASE WHEN ?::boolean
+                                     THEN wizard_state.tg_message_id
                                      ELSE excluded.tg_message_id END,
                 updated_at    = excluded.updated_at,
                 expires_at    = excluded.expires_at
@@ -147,7 +146,7 @@ async def set_state(
                 message_value,
                 stamp,
                 expires,
-                1 if keep_message else 0,
+                keep_message,
             ),
         )
         row = await db.fetch_one(

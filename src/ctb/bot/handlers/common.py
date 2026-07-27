@@ -38,7 +38,6 @@ from ctb.db.repo import prompts as prompts_repo
 from ctb.db.repo import sessions as sessions_repo
 from ctb.db.repo import workspaces as workspaces_repo
 from ctb.delivery.render.html import escape
-from ctb.settings import Settings
 from ctb.turn import cursor
 from ctb.turn.state import Cancel, Evidence, TopicMarker, TurnState
 
@@ -221,7 +220,7 @@ async def resolve_new_request(
     *,
     text: str,
     route: Route,
-    settings: Settings,
+    defaults: TenantSettings,
     db: Database,
     client: ConductorClient,
 ) -> CreateRequest:
@@ -253,11 +252,11 @@ async def resolve_new_request(
     if project is None:
         project = projects[0]
 
-    agent = (chat.default_agent if chat else None) or settings.default_agent
-    model = (chat.default_model if chat else None) or settings.default_model
-    effort = (chat.default_effort if chat else None) or settings.default_effort
+    agent = (chat.default_agent if chat else None) or defaults.default_agent
+    model = (chat.default_model if chat else None) or defaults.default_model
+    effort = (chat.default_effort if chat else None) or defaults.default_effort
     branch = (
-        (chat.default_branch if chat else None) or settings.default_branch
+        (chat.default_branch if chat else None) or defaults.default_branch
     ) or DEFAULT_BRANCH
     validate_pairing(agent, model, effort)
     return CreateRequest(

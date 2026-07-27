@@ -3,7 +3,15 @@
 One module per table group. Every function takes a
 :class:`ctb.db.connection.Database` as its first argument and returns frozen
 row dataclasses, never live cursors, so nothing above this layer has to know
-about SQLite. That is the seam if this ever has to become Postgres.
+about psycopg.
+
+Tenant isolation is enforced *below* this layer, by PostgreSQL row-level
+security keyed on the ``ctb.tenant_id`` GUC that
+:class:`ctb.db.connection.Database` publishes on every checkout. That is why no
+statement here carries a ``WHERE tenant_id = ?``: a forgotten filter returns
+zero rows rather than another tenant's data. The exceptions are deliberate and
+named — :mod:`ctb.db.repo.tenancy`, ``sessions.list_bound``, the claim loops and
+the prune helpers all run on the system pool, which bypasses RLS.
 
 Import the module, not the function, so the call site reads as the table it
 touches::
@@ -20,20 +28,21 @@ their own modules:
 * :func:`ctb.db.repo.transcript.advance_cursor` — record messages, queue
   deliveries and move the cursor in one transaction, so the cursor can never
   advance past an unrecorded message and a replay can never duplicate one.
-* :func:`ctb.db.repo.deliveries.claim` — the conditional ``pending -> sending``
-  update, so two overlapping pollers cannot both send the same chunk.
+* :func:`ctb.db.repo.deliveries.claim` — a ``FOR UPDATE SKIP LOCKED`` claim
+  that re-asserts ``state = 'pending'``, so two overlapping workers cannot both
+  send the same chunk.
 """
 
 from __future__ import annotations
 
 from ctb.db.repo import (
-    allowlist,
     chats,
     deliveries,
     events,
     lease,
     prompts,
     sessions,
+    tenancy,
     transcript,
     voice_inputs,
     wizard,
@@ -45,7 +54,6 @@ __all__ = [
     "UNSET",
     "Maybe",
     "Unset",
-    "allowlist",
     "chats",
     "content_hash",
     "deliveries",
@@ -53,6 +61,7 @@ __all__ = [
     "lease",
     "prompts",
     "sessions",
+    "tenancy",
     "transcript",
     "voice_inputs",
     "wizard",

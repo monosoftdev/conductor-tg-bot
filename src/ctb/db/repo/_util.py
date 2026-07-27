@@ -2,7 +2,7 @@
 
 Two things live here that every module needs: the ``UNSET`` sentinel that lets a
 partial update distinguish "leave this column alone" from "set it to NULL", and
-the small coercions that turn ``aiosqlite.Row`` values (typed ``Any``) into the
+the small coercions that turn fetched row values (typed ``Any``) into the
 concrete types the row dataclasses declare.
 """
 
@@ -85,9 +85,13 @@ def as_bool(value: Any) -> bool:
     return bool(value)
 
 
-def bit(value: bool) -> int:
-    """Booleans are stored as INTEGER 0/1."""
-    return 1 if value else 0
+def bit(value: bool) -> bool:
+    """Normalise to a real boolean before binding.
+
+    PostgreSQL columns are ``boolean``; this keeps a stray ``1``/``0`` from a
+    caller out of the bind parameters.
+    """
+    return bool(value)
 
 
 def as_int(value: Any, default: int = 0) -> int:

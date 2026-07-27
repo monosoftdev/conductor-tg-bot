@@ -1,32 +1,45 @@
 """``deliveries`` — one row per rendered chunk per destination chat.
 
-The worker claims work with a **conditional** update:
+The worker claims work with a single statement:
 
 .. code-block:: sql
 
-    UPDATE deliveries SET state='sending', claim_id=? WHERE state='pending'
+    WITH candidates AS (SELECT … WHERE state='pending' … FOR UPDATE SKIP LOCKED)
+    UPDATE deliveries … FROM candidates WHERE … AND state = 'pending'
 
-Conditional because two pollers may briefly overlap across a redeploy. Only one
-``pending -> sending`` transition can win, so only one of them sends. Rows come
-back in ``(session_index, part_index)`` order, which is transcript order.
+Two properties are load-bearing and neither is decoration:
+
+``FOR UPDATE SKIP LOCKED``
+    Concurrent claimers take *disjoint* sets and neither blocks. Under SQLite
+    this was a file lock; PostgreSQL would otherwise serialise the workers or
+    raise a serialisation failure.
+
+``AND state = 'pending'`` in the outer ``UPDATE``
+    Re-asserted rather than left to the sub-select. PostgreSQL already
+    re-evaluates the CTE's predicate after taking each row lock, so this is
+    belt and braces rather than the load-bearing guard — but it is one line,
+    and it keeps the statement correct if the locking clause is ever weakened
+    (dropping ``SKIP LOCKED``, or a future ``READ COMMITTED`` change).
+
+Rows come back in ``(session_index, part_index)`` order, which is transcript
+order.
 
 The residual window is a crash between the Telegram call and the DB write. That
 is resolved deliberately in favour of **at-least-once**: on boot, rows left in
-``sending`` are re-sent, because a rare duplicate beats a silently lost reply.
-:func:`recover_orphaned` softens the common case by skipping any orphan whose
-``content_hash`` already appears on a recently ``sent`` row in the same chat.
+``sending`` past :data:`ORPHAN_AFTER_MS` are re-sent, because a rare duplicate
+beats a silently lost reply. :func:`recover_orphaned` softens the common case by
+skipping any orphan whose ``content_hash`` already appears on a recently
+``sent`` row in the same chat.
 """
 
 from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, replace
-from typing import Any, Self
-
-import aiosqlite
+from typing import Any, Final, Self
 
 from ctb.db import NO_THREAD_ID
-from ctb.db.connection import Database, now_ms
+from ctb.db.connection import Database, Row, now_ms
 from ctb.db.repo._util import (
     as_int,
     as_opt_int,
@@ -38,6 +51,8 @@ from ctb.db.repo._util import (
 
 __all__ = [
     "DEDUPE_WINDOW_MS",
+    "ORPHAN_AFTER_MS",
+    "Destination",
     "DeliveryKey",
     "DeliveryRow",
     "RecoveryResult",
@@ -53,6 +68,7 @@ __all__ = [
     "mark_skipped",
     "new_claim_id",
     "pending_count",
+    "pending_destinations",
     "recover_orphaned",
     "release",
     "requeue",
@@ -62,13 +78,25 @@ __all__ = [
 #: How far back the boot-time duplicate guard looks for an identical payload.
 DEDUPE_WINDOW_MS = 10 * 60 * 1000
 
+#: A ``sending`` row younger than this may still be in flight on a live peer.
+#: Only older rows are treated as orphaned, so recovery cannot steal and
+#: double-send work another worker is holding.
+ORPHAN_AFTER_MS: Final = 60_000
+
 _COLUMNS = """
     session_id, message_id, part_index, chat_id, thread_id, session_index, kind,
-    state, claim_id, content_hash, payload_json, tg_message_id, attempts,
-    last_error, created_at, updated_at, sent_at
+    state, claim_id, claimed_at, content_hash, payload_json, tg_message_id,
+    attempts, last_error, created_at, updated_at, sent_at
 """
 
+#: Qualified for the claim statement, whose ``RETURNING`` names the alias.
+_RETURNING = ", ".join(f"d.{name.strip()}" for name in _COLUMNS.split(","))
+
 _KEY_WHERE = "session_id = ? AND message_id = ? AND part_index = ? AND chat_id = ?"
+
+#: The composite primary key, minus ``tenant_id``. ``chat_id`` already belongs
+#: to exactly one tenant (see ``tenant_chats``), so this identifies one row.
+_KEY_COLUMNS: Final = ("session_id", "message_id", "part_index", "chat_id")
 
 
 def new_claim_id() -> str:
@@ -91,6 +119,7 @@ class DeliveryRow:
     kind: str = "text"
     state: str = "pending"
     claim_id: str | None = None
+    claimed_at: int | None = None
     content_hash: str | None = None
     payload_json: str | None = None
     tg_message_id: int | None = None
@@ -101,7 +130,7 @@ class DeliveryRow:
     sent_at: int | None = None
 
     @classmethod
-    def from_row(cls, row: aiosqlite.Row) -> Self:
+    def from_row(cls, row: Row) -> Self:
         return cls(
             session_id=str(row["session_id"]),
             message_id=str(row["message_id"]),
@@ -112,6 +141,7 @@ class DeliveryRow:
             kind=as_str(row["kind"], "text"),
             state=as_str(row["state"], "pending"),
             claim_id=as_opt_str(row["claim_id"]),
+            claimed_at=as_opt_int(row["claimed_at"]),
             content_hash=as_opt_str(row["content_hash"]),
             payload_json=as_opt_str(row["payload_json"]),
             tg_message_id=as_opt_int(row["tg_message_id"]),
@@ -185,52 +215,110 @@ async def get(db: Database, key: DeliveryKey) -> DeliveryRow | None:
     return None if row is None else DeliveryRow.from_row(row)
 
 
+@dataclass(frozen=True, slots=True)
+class Destination:
+    """One ``(chat, topic)`` with pending work, and how much of it there is.
+
+    The outbox rotates over these so a tenant with ten thousand queued chunks
+    cannot starve a tenant with one.
+    """
+
+    chat_id: int
+    thread_id: int = NO_THREAD_ID
+    tenant_id: uuid.UUID | None = None
+    pending: int = 0
+    head_at: int = 0
+
+    @property
+    def key(self) -> tuple[int, int]:
+        return (self.chat_id, self.thread_id)
+
+
+async def pending_destinations(db: Database, *, limit: int = 64) -> list[Destination]:
+    """Destinations with pending rows, oldest head of queue first.
+
+    Served as an index scan by ``idx_deliveries_claim``, whose leading columns
+    are ``(chat_id, thread_id)`` for exactly this query.
+    """
+    rows = await db.fetch_all(
+        """
+        SELECT tenant_id, chat_id, thread_id,
+               MIN(created_at) AS head_at, COUNT(*) AS pending
+          FROM deliveries
+         WHERE state = 'pending'
+         GROUP BY tenant_id, chat_id, thread_id
+         ORDER BY MIN(created_at)
+         LIMIT ?
+        """,
+        (max(1, limit),),
+    )
+    return [
+        Destination(
+            chat_id=as_int(row["chat_id"]),
+            thread_id=as_int(row["thread_id"]),
+            tenant_id=row["tenant_id"],
+            pending=as_int(row["pending"]),
+            head_at=as_int(row["head_at"]),
+        )
+        for row in rows
+    ]
+
+
 async def claim(
     db: Database,
     *,
     claim_id: str,
     limit: int = 20,
     session_id: str | None = None,
+    chat_id: int | None = None,
+    thread_id: int | None = None,
     at: int | None = None,
 ) -> list[DeliveryRow]:
     """Atomically take up to ``limit`` pending rows for this worker.
 
-    ``BEGIN IMMEDIATE`` plus the ``state = 'pending'`` predicate means two
-    workers — two tasks, or two processes across a redeploy — can never claim
-    the same row. The loser simply gets fewer rows.
+    Concurrent claimers skip each other's locked rows rather than blocking, so
+    the loser simply gets fewer rows — never the same rows. Scope the claim to
+    one destination (``chat_id``/``thread_id``) to keep ordering per topic while
+    several destinations drain in parallel.
     """
     stamp = now_ms() if at is None else at
-    scope = "" if session_id is None else "AND session_id = ?"
-    params: tuple[Any, ...] = (
-        (claim_id, stamp, max(1, limit))
-        if session_id is None
-        else (claim_id, stamp, session_id, max(1, limit))
-    )
-    async with db.transaction():
-        await db.execute(
-            f"""
-            UPDATE deliveries
-               SET state = 'sending', claim_id = ?, updated_at = ?
-             WHERE rowid IN (
-                   -- The ORDER BY matches idx_deliveries_claim
-                   -- (state, session_index, part_index) exactly, so this is an
-                   -- index scan with no temp B-tree.
-                   SELECT rowid FROM deliveries
-                    WHERE state = 'pending' {scope}
-                    ORDER BY session_index, part_index
-                    LIMIT ?
-             )
-            """,
-            params,
-        )
-        rows = await db.fetch_all(
-            f"""
-            SELECT {_COLUMNS} FROM deliveries
-             WHERE claim_id = ? AND state = 'sending'
+    where: list[str] = ["state = 'pending'"]
+    scope_params: list[Any] = []
+    if session_id is not None:
+        where.append("session_id = ?")
+        scope_params.append(session_id)
+    if chat_id is not None:
+        where.append("chat_id = ?")
+        scope_params.append(chat_id)
+    if thread_id is not None:
+        where.append("thread_id = ?")
+        scope_params.append(thread_id)
+    predicate = " AND ".join(where)
+    match_on = " AND ".join(f"d.{name} = c.{name}" for name in _KEY_COLUMNS)
+    key_list = ", ".join(_KEY_COLUMNS)
+
+    rows = await db.fetch_all(
+        f"""
+        WITH candidates AS (
+            SELECT {key_list}
+              FROM deliveries
+             WHERE {predicate}
              ORDER BY session_index, part_index
-            """,
-            (claim_id,),
+             LIMIT ?
+               FOR UPDATE SKIP LOCKED
+        ),
+        claimed AS (
+            UPDATE deliveries d
+               SET state = 'sending', claim_id = ?, claimed_at = ?, updated_at = ?
+              FROM candidates c
+             WHERE {match_on}
+               AND d.state = 'pending'
+            RETURNING {_RETURNING}
         )
+        SELECT {_COLUMNS} FROM claimed ORDER BY session_index, part_index
+        """,
+        (*scope_params, max(1, limit), claim_id, stamp, stamp),
+    )
     return [DeliveryRow.from_row(row) for row in rows]
 
 
@@ -260,6 +348,7 @@ async def mark_sent(
             "state": "sent",
             "tg_message_id": tg_message_id,
             "claim_id": None,
+            "claimed_at": None,
             "last_error": None,
             "sent_at": stamp,
             "updated_at": stamp,
@@ -285,8 +374,8 @@ async def mark_failed(
         await db.execute(
             f"""
             UPDATE deliveries
-               SET state = ?, claim_id = NULL, attempts = attempts + 1,
-                   last_error = ?, updated_at = ?
+               SET state = ?, claim_id = NULL, claimed_at = NULL,
+                   attempts = attempts + 1, last_error = ?, updated_at = ?
              WHERE {_KEY_WHERE}
             """,
             ("pending" if retry else "failed", error, stamp, *key),
@@ -305,6 +394,7 @@ async def mark_skipped(
         {
             "state": "skipped",
             "claim_id": None,
+            "claimed_at": None,
             "last_error": reason,
             "updated_at": stamp,
         },
@@ -316,7 +406,14 @@ async def requeue(
 ) -> DeliveryRow | None:
     stamp = now_ms() if at is None else at
     return await _set(
-        db, key, {"state": "pending", "claim_id": None, "updated_at": stamp}
+        db,
+        key,
+        {
+            "state": "pending",
+            "claim_id": None,
+            "claimed_at": None,
+            "updated_at": stamp,
+        },
     )
 
 
@@ -326,7 +423,8 @@ async def release(db: Database, claim_id: str, *, at: int | None = None) -> int:
     return await db.execute(
         """
         UPDATE deliveries
-           SET state = 'pending', claim_id = NULL, updated_at = ?
+           SET state = 'pending', claim_id = NULL, claimed_at = NULL,
+               updated_at = ?
          WHERE claim_id = ? AND state = 'sending'
         """,
         (stamp, claim_id),
@@ -350,26 +448,37 @@ async def recover_orphaned(
     *,
     claim_id: str,
     dedupe_window_ms: int = DEDUPE_WINDOW_MS,
+    orphan_after_ms: int = ORPHAN_AFTER_MS,
     at: int | None = None,
 ) -> RecoveryResult:
     """Take over rows stranded in ``sending`` by a crash. At-least-once.
+
+    Only rows claimed longer than ``orphan_after_ms`` ago are considered: a
+    younger one may still be in flight on a live peer, and stealing it would
+    turn crash recovery into a duplicate-send machine.
 
     Each orphan is compared against recently ``sent`` rows in the same chat: an
     identical ``content_hash`` means the Telegram call almost certainly landed
     and only the bookkeeping write was lost, so the row is skipped. Everything
     else is re-claimed and re-sent — losing a reply is worse than repeating one.
+
+    Every update re-asserts ``state = 'sending'``; a row another worker took in
+    the meantime is left alone rather than double-claimed.
     """
     stamp = now_ms() if at is None else at
-    cutoff = stamp - max(0, dedupe_window_ms)
+    dedupe_cutoff = stamp - max(0, dedupe_window_ms)
+    orphan_cutoff = stamp - max(0, orphan_after_ms)
     claimed: list[DeliveryRow] = []
     skipped: list[DeliveryRow] = []
     async with db.transaction():
         rows = await db.fetch_all(
             f"""
             SELECT {_COLUMNS} FROM deliveries
-             WHERE state = 'sending'
+             WHERE state = 'sending' AND COALESCE(claimed_at, 0) <= ?
              ORDER BY session_index, part_index
-            """
+               FOR UPDATE SKIP LOCKED
+            """,
+            (orphan_cutoff,),
         )
         for raw in rows:
             row = DeliveryRow.from_row(raw)
@@ -383,33 +492,35 @@ async def recover_orphaned(
                            AND state = 'sent' AND COALESCE(sent_at, 0) >= ?
                          LIMIT 1
                         """,
-                        (row.chat_id, row.thread_id, row.content_hash, cutoff),
+                        (row.chat_id, row.thread_id, row.content_hash, dedupe_cutoff),
                         default=0,
                     )
                     == 1
                 )
             if duplicate:
-                await db.execute(
+                changed = await db.execute(
                     f"""
                     UPDATE deliveries
-                       SET state = 'skipped', claim_id = NULL,
+                       SET state = 'skipped', claim_id = NULL, claimed_at = NULL,
                            last_error = 'boot: identical payload already sent',
                            updated_at = ?
-                     WHERE {_KEY_WHERE}
+                     WHERE {_KEY_WHERE} AND state = 'sending'
                     """,
                     (stamp, *row.key),
                 )
-                skipped.append(row)
+                if changed:
+                    skipped.append(row)
             else:
-                await db.execute(
+                changed = await db.execute(
                     f"""
                     UPDATE deliveries
-                       SET claim_id = ?, updated_at = ?
-                     WHERE {_KEY_WHERE}
+                       SET claim_id = ?, claimed_at = ?, updated_at = ?
+                     WHERE {_KEY_WHERE} AND state = 'sending'
                     """,
-                    (claim_id, stamp, *row.key),
+                    (claim_id, stamp, stamp, *row.key),
                 )
-                claimed.append(replace(row, claim_id=claim_id))
+                if changed:
+                    claimed.append(replace(row, claim_id=claim_id, claimed_at=stamp))
     return RecoveryResult(claimed=tuple(claimed), skipped=tuple(skipped))
 
 

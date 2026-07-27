@@ -63,7 +63,6 @@ from ctb.db.repo import transcript as transcript_repo
 from ctb.db.repo import workspaces as workspaces_repo
 from ctb.db.repo.sessions import SessionRow
 from ctb.delivery.render.html import escape
-from ctb.settings import Settings
 from ctb.turn import cursor as turn_cursor
 from ctb.turn.state import TurnState
 
@@ -359,7 +358,7 @@ async def switch_callback(
 async def fork(
     message: Message,
     route: Route,
-    settings: Settings,
+    tenant: TenantContext,
     state: FSMContext,
     db: Database | None = None,
     client: ConductorClient | None = None,
@@ -374,17 +373,17 @@ async def fork(
     agent = (
         (chat.default_agent if chat else None)
         or (current.agent if current else None)
-        or settings.default_agent
+        or tenant.settings.default_agent
     )
     model = (
         (chat.default_model if chat else None)
         or (current.model if current else None)
-        or settings.default_model
+        or tenant.settings.default_model
     )
     effort = (
         (chat.default_effort if chat else None)
         or (current.effort if current else None)
-        or settings.default_effort
+        or tenant.settings.default_effort
     )
     title = command_text(message) or "Telegram fork"
     session_id = new_session_id()
@@ -655,7 +654,7 @@ async def notify_callback(
 async def defaults(
     message: Message,
     route: Route,
-    settings: Settings,
+    tenant: TenantContext,
     state: FSMContext,
     db: Database | None = None,
 ) -> None:
@@ -696,10 +695,10 @@ async def defaults(
         )
         await tell(message, f"Defaults: <b>{agent.value}</b> · {model}/{effort}.")
         return
-    agent = chat.default_agent or settings.default_agent
-    model = chat.default_model or settings.default_model
-    effort = chat.default_effort or settings.default_effort
-    branch = chat.default_branch or settings.default_branch
+    agent = chat.default_agent or tenant.settings.default_agent
+    model = chat.default_model or tenant.settings.default_model
+    effort = chat.default_effort or tenant.settings.default_effort
+    branch = chat.default_branch or tenant.settings.default_branch
     await tell(
         message,
         f"Defaults: <b>{escape(agent)}</b> · {escape(model)}/{escape(effort)} · "

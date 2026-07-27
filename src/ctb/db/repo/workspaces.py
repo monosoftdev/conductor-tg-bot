@@ -12,10 +12,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Self
 
-import aiosqlite
-
 from ctb.conductor.models import WorkspaceStatusValue
-from ctb.db.connection import Database, now_ms
+from ctb.db.connection import Database, Row, now_ms
 from ctb.db.repo._util import (
     UNSET,
     Maybe,
@@ -77,7 +75,7 @@ class WorkspaceRow:
     archived_at: int | None = None
 
     @classmethod
-    def from_row(cls, row: aiosqlite.Row) -> Self:
+    def from_row(cls, row: Row) -> Self:
         return cls(
             id=str(row["id"]),
             project_id=as_opt_str(row["project_id"]),

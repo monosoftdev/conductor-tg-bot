@@ -269,10 +269,10 @@ async def start_wizard(
             "wid": new_wizard_id(),
             "projects": {item.id: item.name or item.id[:8] for item in projects},
             "project_id": chat.default_project_id,
-            "branch": chat.default_branch or settings.default_branch,
-            "agent": chat.default_agent or settings.default_agent,
-            "model": chat.default_model or settings.default_model,
-            "effort": chat.default_effort or settings.default_effort,
+            "branch": chat.default_branch or defaults.default_branch,
+            "agent": chat.default_agent or defaults.default_agent,
+            "model": chat.default_model or defaults.default_model,
+            "effort": chat.default_effort or defaults.default_effort,
         }
     )
     markup = await _offer(
@@ -326,7 +326,7 @@ async def _ask_branch(
     when it is genuinely different.
     """
     data = await state.get_data()
-    configured = settings.default_branch or DEFAULT_BRANCH
+    configured = defaults.default_branch or DEFAULT_BRANCH
     current = str(data.get("branch") or configured)
     markup = await _offer(
         message,
@@ -519,10 +519,10 @@ async def typed_prompt(
     request = CreateRequest(
         project_id=project_id,
         project_name=str(projects.get(project_id) or project_id[:8]),
-        branch=str(data.get("branch") or settings.default_branch or DEFAULT_BRANCH),
-        agent=str(data.get("agent") or settings.default_agent),
-        model=str(data.get("model") or settings.default_model),
-        effort=str(data.get("effort") or settings.default_effort),
+        branch=str(data.get("branch") or defaults.default_branch or DEFAULT_BRANCH),
+        agent=str(data.get("agent") or defaults.default_agent),
+        model=str(data.get("model") or defaults.default_model),
+        effort=str(data.get("effort") or defaults.default_effort),
         prompt=(message.text or "").strip(),
     )
     try:
