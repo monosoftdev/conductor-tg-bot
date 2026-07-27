@@ -1,5 +1,10 @@
 """Sign-up, chat binding, and key intake.
 
+The shortest path to working is two private messages — ``/start`` then
+``/key`` — and :class:`TestFirstRun` is the test of exactly that. A group is
+optional, reached through ``/team``, and :class:`TestTeam` proves it still
+works end to end.
+
 Three properties carry the security of the whole self-serve story, and each
 has a test that fails loudly if it stops holding:
 
@@ -71,9 +76,9 @@ async def issue_code_for(
 ) -> str:
     """Register, store a key, and return the binding code.
 
-    The code is minted once a Conductor key exists, not at ``/register``, so
-    its 15-minute clock starts when the owner is ready to make a group rather
-    than while they are still hunting for an API key.
+    The code comes from ``/team``, the optional group flow — nothing earlier
+    mints one, so its 15-minute clock starts when the owner is ready to make a
+    group rather than while they are still hunting for an API key.
     """
     await registration.register(
         dm(f"/register {slug}", user_id=user_id), settings, NullState()
@@ -85,11 +90,10 @@ async def issue_code_for(
     )
     keyed = await tenancy.get(system_db, created.id)
     assert keyed is not None
-    await registration.register(
-        dm(f"/register {slug}", user_id=user_id),
-        settings,
+    await registration.team(
+        dm("/team", user_id=user_id),
+        context(keyed, user_id=user_id),
         NullState(),
-        tenant=context(keyed, user_id=user_id),
     )
     return said[-1].rsplit("/setup ", 1)[1].split("<", 1)[0].strip()
 
@@ -114,13 +118,27 @@ def said(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     return lines
 
 
-def dm(text: str, *, user_id: int = OWNER, bot: FakeBot | None = None) -> Any:
+def dm(
+    text: str,
+    *,
+    user_id: int = OWNER,
+    bot: FakeBot | None = None,
+    username: str | None = None,
+    first_name: str | None = None,
+) -> Any:
+    """A private message. The account fields are what an implicit team is named
+    after, so they are part of the fixture rather than an afterthought."""
     return SimpleNamespace(
         text=text,
         chat=SimpleNamespace(id=user_id, type="private", title=None),
         message_thread_id=None,
         message_id=11,
-        from_user=SimpleNamespace(id=user_id),
+        from_user=SimpleNamespace(
+            id=user_id,
+            username=username,
+            first_name=f"User{user_id}" if first_name is None else first_name,
+            last_name=None,
+        ),
         bot=bot or FakeBot(),
     )
 
@@ -131,7 +149,9 @@ def group(text: str, *, bot: FakeBot | None = None, user_id: int = OWNER) -> Any
         chat=SimpleNamespace(id=GROUP, type="supergroup", title="Acme"),
         message_thread_id=None,
         message_id=12,
-        from_user=SimpleNamespace(id=user_id),
+        from_user=SimpleNamespace(
+            id=user_id, username=None, first_name=f"User{user_id}", last_name=None
+        ),
         bot=bot or FakeBot(),
     )
 
@@ -219,27 +239,27 @@ class TestRegister:
         assert await tenancy.get_by_slug(system_db, "acme") is None
         assert "closed" in said[0]
 
-    async def test_an_owner_with_no_group_gets_another_code(
+    async def test_an_owner_who_runs_it_again_gets_one_team_and_the_next_step(
         self, db: Database, system_db: Database, settings: Settings, said: list[str]
     ) -> None:
-        """The 15-minute code expires long before a phone finishes step 2.
-
-        `/register` is the only command that mints one, so refusing outright
-        left anybody who was slow with an unbindable workspace and no way out.
-        """
+        """Naming a team is optional and re-runnable; it never forks one."""
         row = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
         assert row is not None
         await registration.register(
             dm("/register Again"), settings, NullState(), tenant=context(row)
         )
-        assert "/setup " in said[-1]
-        code = said[-1].rsplit("/setup ", 1)[1].split("<", 1)[0].strip()
-        redeemed = await tenancy.consume_enrollment_token(
-            system_db,
-            token_hash=registration.hash_code(code),
-            purpose="bind_chat",
+        assert await tenancy.get_by_slug(system_db, "again") is None
+        assert "ready" in said[-1].casefold()
+        assert "supergroup" not in said[-1], "a group is not a step any more"
+
+    async def test_a_bare_register_takes_the_default_name(
+        self, db: Database, system_db: Database, settings: Settings, said: list[str]
+    ) -> None:
+        """A usage line here would be one more round trip before the key."""
+        await registration.register(
+            dm("/register", username="Chef"), settings, NullState()
         )
-        assert redeemed is not None and redeemed[0] == BOOTSTRAP_TENANT_ID
+        assert await tenancy.get_by_slug(system_db, "chef") is not None
 
     async def test_a_mere_member_is_told_to_leave_first(
         self, db: Database, system_db: Database, settings: Settings, said: list[str]
@@ -256,15 +276,275 @@ class TestRegister:
         assert "/leave" in said[-1]
 
 
+class TestFirstRun:
+    """DM the bot, paste a key, go. No team name, no group, no `/register`."""
+
+    @pytest.fixture(autouse=True)
+    def _key_is_accepted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async def ok(_key: str, _url: str) -> None:
+            return None
+
+        monkeypatch.setattr(registration, "_check_conductor_key", ok)
+
+    async def _only_seat(self, system_db: Database) -> TenantRow:
+        seats = await tenancy.memberships_for_user(system_db, OWNER)
+        assert len(seats) == 1, "one /start, one team"
+        row = await tenancy.get(system_db, seats[0].tenant_id)
+        assert row is not None
+        return row
+
+    async def test_start_alone_creates_the_team_and_asks_only_for_a_key(
+        self, db: Database, system_db: Database, settings: Settings, said: list[str]
+    ) -> None:
+        await registration.start(dm("/start"), settings, NullState())
+
+        row = await self._only_seat(system_db)
+        assert row.status == "pending"  # no key yet
+        assert "/key" in said[-1]
+        assert "/register" not in said[-1], "no team name is asked for"
+        assert "supergroup" not in said[-1], "no group is asked for"
+
+    async def test_start_twice_makes_one_team(
+        self, db: Database, system_db: Database, settings: Settings, said: list[str]
+    ) -> None:
+        """Tapping the button twice is the most ordinary thing a user does.
+
+        Both calls run *unresolved*, exactly as the middleware delivers them
+        before any chat is bound, so the guard under test is the membership
+        lookup and not a cached tenant.
+        """
+        await registration.start(dm("/start"), settings, NullState())
+        await registration.start(dm("/start"), settings, NullState())
+
+        await self._only_seat(system_db)
+        assert "/key" in said[-1], "the second one still says what to do"
+
+    async def test_the_key_finishes_it_and_points_at_new(
+        self, db: Database, system_db: Database, settings: Settings, said: list[str]
+    ) -> None:
+        """`/start` + `/key` is the whole sign-up."""
+        await registration.start(dm("/start"), settings, NullState())
+        row = await self._only_seat(system_db)
+
+        await registration.set_key(
+            dm("/key cndk_live_first_run_0001"),
+            context(row),
+            voice_settings(),
+            NullState(),
+        )
+
+        after = await tenancy.get(system_db, row.id)
+        assert after is not None and after.status == "active"
+        assert "ready" in said[-1].casefold()
+        assert "/new" in said[-1]
+        assert "supergroup" not in said[-1], "the group must not read as step 2"
+        assert "optional" in said[-1], "and where it is mentioned, it is optional"
+
+    async def test_the_private_chat_is_bound_to_the_new_team(
+        self, db: Database, system_db: Database, settings: Settings, said: list[str]
+    ) -> None:
+        """Otherwise a second team makes the first one's DM ambiguous, and
+        `/use` — the fix — needs a resolved tenant itself."""
+        await registration.start(dm("/start"), settings, NullState())
+
+        row = await self._only_seat(system_db)
+        binding = await tenancy.chat_for(system_db, OWNER)
+        assert binding is not None
+        assert binding.tenant_id == row.id
+        assert binding.kind == "dm"
+
+    async def test_the_team_is_named_after_the_account(
+        self, db: Database, system_db: Database, settings: Settings, said: list[str]
+    ) -> None:
+        await registration.start(dm("/start", username="Chef"), settings, NullState())
+        assert await tenancy.get_by_slug(system_db, "chef") is not None
+
+    async def test_a_name_that_slugifies_to_nothing_still_gets_a_handle(
+        self, db: Database, system_db: Database, settings: Settings, said: list[str]
+    ) -> None:
+        """Slugs are logged and shown, so they cannot be empty or shared."""
+        await registration.start(
+            dm("/start", first_name="Борис"), settings, NullState()
+        )
+        assert await tenancy.get_by_slug(system_db, f"team-{OWNER}") is not None
+
+    async def test_two_accounts_with_the_same_name_stay_separate(
+        self, db: Database, system_db: Database, settings: Settings, said: list[str]
+    ) -> None:
+        await registration.start(dm("/start", username="Chef"), settings, NullState())
+        await registration.start(
+            dm("/start", user_id=OWNER + 1, username="Chef"), settings, NullState()
+        )
+        rows = await system_db.fetch_all(
+            "SELECT slug FROM tenants WHERE slug LIKE 'chef%'"
+        )
+        assert len(rows) == 2
+
+    async def test_a_closed_instance_creates_nothing(
+        self,
+        db: Database,
+        system_db: Database,
+        settings_factory: Any,
+        said: list[str],
+    ) -> None:
+        """`/start` is the sign-up path now, so it is also the gate."""
+        await registration.start(
+            dm("/start"), settings_factory(registration_open=False), NullState()
+        )
+
+        assert await tenancy.memberships_for_user(system_db, OWNER) == []
+        assert "closed" in said[-1]
+
+    async def test_the_rate_limit_applies_to_the_implicit_path(
+        self,
+        db: Database,
+        system_db: Database,
+        settings_factory: Any,
+        said: list[str],
+    ) -> None:
+        """An unauthenticated INSERT per /start, and nothing prunes it."""
+        await registration.start(
+            dm("/start"),
+            settings_factory(registration_rate_per_hour=1),
+            NullState(),
+        )
+
+        assert await tenancy.memberships_for_user(system_db, OWNER) == []
+        assert "busy" in said[-1]
+
+    async def test_a_group_is_never_the_entry_point(
+        self, db: Database, system_db: Database, settings: Settings, said: list[str]
+    ) -> None:
+        """Sign-up ends in a key, and a key in a group is a key to rotate."""
+        await registration.start(group("/start"), settings, NullState())
+
+        assert await tenancy.memberships_for_user(system_db, OWNER) == []
+        assert "private chat" in said[-1]
+
+    async def test_start_after_the_key_says_ready(
+        self, db: Database, system_db: Database, settings: Settings, said: list[str]
+    ) -> None:
+        row = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
+        assert row is not None
+
+        await registration.start(
+            dm("/start"), settings, NullState(), tenant=context(row)
+        )
+
+        assert "ready" in said[-1].casefold()
+        assert "/new" in said[-1]
+
+    async def test_a_member_of_a_keyless_team_is_told_who_can_fix_it(
+        self, db: Database, system_db: Database, settings: Settings, said: list[str]
+    ) -> None:
+        """A member cannot store the key, so `/key` is not their instruction."""
+        await tenancy.set_conductor_key(
+            system_db, BOOTSTRAP_TENANT_ID, ciphertext=None, kid=None, fingerprint=None
+        )
+        row = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
+        assert row is not None
+
+        await registration.start(
+            dm("/start"), settings, NullState(), tenant=context(row, role="member")
+        )
+
+        assert "owner" in said[-1]
+
+
+class TestTeam:
+    """The group flow, now optional and reached on purpose."""
+
+    @pytest.fixture(autouse=True)
+    def _forum_ok(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async def ok(*_args: Any, **_kwargs: Any) -> Any:
+            return SimpleNamespace(degraded=False, detail=None)
+
+        async def topic(*_args: Any, **_kwargs: Any) -> int:
+            return 99
+
+        async def discard(*_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        async def key_ok(_key: str, _url: str) -> None:
+            return None
+
+        monkeypatch.setattr(registration, "forum_support", ok)
+        monkeypatch.setattr(registration, "require_topic", topic)
+        monkeypatch.setattr(registration, "discard_topic", discard)
+        monkeypatch.setattr(registration, "_check_conductor_key", key_ok)
+
+    async def test_it_explains_what_a_group_adds_and_issues_a_code(
+        self, db: Database, system_db: Database, said: list[str]
+    ) -> None:
+        row = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
+        assert row is not None
+
+        await registration.team(dm("/team"), context(row), NullState())
+
+        assert "optional" in said[-1].casefold()
+        assert "/setup " in said[-1]
+        code = said[-1].rsplit("/setup ", 1)[1].split("<", 1)[0].strip()
+        redeemed = await tenancy.consume_enrollment_token(
+            system_db, token_hash=registration.hash_code(code), purpose="bind_chat"
+        )
+        assert redeemed is not None and redeemed[0] == BOOTSTRAP_TENANT_ID
+
+    async def test_the_whole_group_flow_still_works(
+        self, db: Database, system_db: Database, settings: Settings, said: list[str]
+    ) -> None:
+        """`/start` → `/key` → `/team` → `/setup` in the supergroup."""
+        await registration.start(dm("/start"), settings, NullState())
+        seats = await tenancy.memberships_for_user(system_db, OWNER)
+        assert len(seats) == 1
+        row = await tenancy.get(system_db, seats[0].tenant_id)
+        assert row is not None
+        await registration.set_key(
+            dm("/key cndk_live_group_flow"), context(row), voice_settings(), NullState()
+        )
+        keyed = await tenancy.get(system_db, row.id)
+        assert keyed is not None
+
+        await registration.team(dm("/team"), context(keyed), NullState())
+        code = said[-1].rsplit("/setup ", 1)[1].split("<", 1)[0].strip()
+        await registration.setup(group(f"/setup {code}"), NullState(), db=db)
+
+        binding = await tenancy.chat_for(system_db, GROUP)
+        assert binding is not None and binding.tenant_id == row.id
+        assert binding.is_primary is True, "the group takes over owner notices"
+        assert "Ready" in said[-1]
+
+    async def test_only_owners_mint_one(
+        self, db: Database, system_db: Database, said: list[str]
+    ) -> None:
+        row = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
+        assert row is not None
+
+        await registration.team(dm("/team"), context(row, role="member"), NullState())
+
+        assert said[-1] == "Owners only."
+        assert await system_db.fetch_val("SELECT COUNT(*) FROM enrollment_tokens") == 0
+
+    async def test_it_is_refused_in_a_group(
+        self, db: Database, system_db: Database, said: list[str]
+    ) -> None:
+        """The code would be a bearer token in front of everyone who can read."""
+        row = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
+        assert row is not None
+
+        await registration.team(group("/team"), context(row), NullState())
+
+        assert "private chat" in said[-1]
+        assert await system_db.fetch_val("SELECT COUNT(*) FROM enrollment_tokens") == 0
+
+
 class TestBinding:
     async def _register(
         self, settings: Settings, said: list[str], system_db: Database | None = None
     ) -> str:
         """Walk the private half and return the binding code.
 
-        The code is minted once a Conductor key is stored, not at `/register` —
-        so the 15-minute clock starts when the owner is ready to make a group
-        rather than while they are still looking for an API key.
+        `/team` is the only thing that mints one — the group is optional, so
+        nothing before it mentions a supergroup at all.
         """
         await registration.register(dm("/register Acme"), settings, NullState())
         system = system_db if system_db is not None else system_database()
@@ -277,17 +557,11 @@ class TestBinding:
             kid="v1",
             fingerprint="fp-acme",
         )
-        # Re-fetch: the context carries the row, and the row is what
-        # `_resume_registration` reads to decide which step you are on.
+        # Re-fetch: the context carries the row, and the row is what decides
+        # which step you are on.
         keyed = await tenancy.get(system, created.id)
         assert keyed is not None
-        # Re-running /register resumes: key present, no group yet -> code.
-        await registration.register(
-            dm("/register Acme"),
-            settings,
-            NullState(),
-            tenant=context(keyed),
-        )
+        await registration.team(dm("/team"), context(keyed), NullState())
         return said[-1].rsplit("/setup ", 1)[1].split("<", 1)[0].strip()
 
     @pytest.fixture(autouse=True)
@@ -345,7 +619,7 @@ class TestBinding:
     ) -> None:
         await registration.setup(group("/setup"), NullState(), db=db)
         assert await tenancy.chat_for(system_db, GROUP) is None
-        assert "/register" in said[-1]
+        assert "/team" in said[-1]
 
     async def test_a_group_already_owned_cannot_be_stolen(
         self, db: Database, system_db: Database, settings: Settings, said: list[str]
@@ -570,6 +844,23 @@ class TestKeyIntake:
         )
 
         assert "already the stored key" in said[-1]
+
+    async def test_a_key_sent_before_start_is_still_deleted(
+        self, db: Database, system_db: Database, said: list[str]
+    ) -> None:
+        """The message carries a live credential whether or not we know who
+        sent it. Deletion first; the instruction after."""
+        bot = FakeBot()
+
+        await registration.set_key(
+            dm("/key cndk_live_too_early", bot=bot),
+            None,
+            voice_settings(),
+            NullState(),
+        )
+
+        assert bot.deleted == [(OWNER, 11)]
+        assert "/start" in said[-1]
 
     async def test_only_owners_may_set_a_key(
         self, db: Database, system_db: Database, said: list[str]

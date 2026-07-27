@@ -1,8 +1,9 @@
 # Getting started
 
 Drive your [Conductor](https://conductor.build) coding agents from Telegram.
-This is the whole setup, once, from a phone. It takes about ten minutes and the
-slowest part is Telegram's own settings screens.
+This is the whole setup, once, from a phone: **two messages, both in your
+private chat with the bot.** A minute, not ten. A Telegram group is optional
+and comes later, or never.
 
 **What you need before you start**
 
@@ -16,31 +17,26 @@ run. This bot adds nothing.
 ---
 
 > **A note on words.** Conductor calls a checkout-plus-agent a *workspace*, and
-> `/new` creates those all day. The thing you create below is a **team**: it
-> owns one Conductor API key, the people allowed to use it, and one Telegram
-> group. One team, many workspaces.
+> `/new` creates those all day. The thing you get below is a **team**: it owns
+> one Conductor API key and the people allowed to use it. One team, many
+> workspaces. A team can also own a Telegram group, and most never will.
 
 ## Step 1 — Say hello to the bot
 
 Open Telegram, search for the bot's handle (whoever runs the instance will have
 given it to you), and press **Start**.
 
-Send:
+That is it. `/start` creates your team, named after your Telegram account, and
+asks for one thing.
 
-```
-/register acme
-```
-
-Replace `acme` with a short name for your workspace. Letters, numbers and
-hyphens; anything else is turned into a hyphen. It appears in `/members` and in
-logs, so keep it boring.
-
-The bot asks for your Conductor key next — everything private happens here,
-before you touch a group.
+> **Want to name it yourself?** Send `/register acme` instead of `/start`.
+> Letters, numbers and hyphens; anything else becomes a hyphen. It shows up in
+> `/members` and in logs, so keep it boring. Running `/start` twice does *not*
+> make a second team.
 
 ---
 
-## Step 2 — Give it your keys
+## Step 2 — Give it your key
 
 Still in the private chat:
 
@@ -64,18 +60,96 @@ pauses it later without throwing the key away.
 > to rotate it — but other members may have already seen it. It catches a key
 > typed on the wrong command too, so `/voice sk_...` is handled the same way.
 
-Now the bot hands you a **setup code**, good for **15 minutes**, once.
-
-> **Ran out of time?** Send `/register` again for a fresh one. You cannot lock
-> yourself out.
+You should see **ready**. Sign-up is over.
 
 ---
 
-## Step 3 — Make a group for your work
+## Step 3 — Run something
 
-Everything happens in one Telegram group, and each of your Conductor workspaces
-gets its own **topic** inside it. That is what lets you have five things running
-at once without losing track.
+In the same private chat:
+
+```
+/new fix the flaky test in checkout_test.py
+```
+
+The bot creates a Conductor workspace, opens a **topic** for it right there in
+the chat, and posts a pinned status card that updates as the agent works. The
+answer arrives in that topic.
+
+From then on, **just type in the topic** to continue that session. No command
+needed.
+
+> **No topics in your chat?** You may see *Topics unavailable here · one
+> workspace at a time.* Telegram, not the bot, decides whether a private chat
+> can hold topics — see [below](#when-your-private-chat-has-no-topics). The bot
+> keeps working; it just holds one workspace at a time, and `/s` switches.
+
+---
+
+## The daily loop
+
+| What you want | What you send |
+|---|---|
+| Start something new | `/new [project:] your prompt` |
+| Continue | Type, speak, or send audio **in that topic** |
+| Stop the current turn | Tap **⏹** on the pinned card, or `/stop` |
+| See what this session is doing | `/mode` |
+| See everything at once | `/board` |
+| Jump to another session | `/s` (or `/s name`) |
+| Another session, same workspace | `/fork` |
+| Open a laptop-made workspace here | `/attach`, then tap **+ Open** |
+| Search your transcripts | `/find some text` |
+| Finish and archive | `/done`, then confirm by name |
+
+`/help` prints a short version of this in the chat.
+
+Plain text is a **prompt** wherever a session is bound: a workspace topic, or
+your private chat itself. The one place it is not is a group's **General**,
+where it searches instead — that is the cockpit, and a prompt typed there would
+be a prompt sent to whichever session you last used.
+
+---
+
+## When your private chat has no topics
+
+Topics inside a private chat are a Telegram feature, and the bot can only ask
+for them. Two things decide whether you get them:
+
+- **Threaded Mode** must be on for this bot — the operator sets it in
+  @BotFather. You need no Premium, and the bot needs no rights in your chat.
+- Telegram's own Bot API has to accept the call. This is new ground, and there
+  is a known regression where a thread is created but cannot be written to.
+
+If either fails, the bot says **Topics unavailable here · one workspace at a
+time** — once, not every time — and carries on linearly: one bound workspace in
+this chat, `/s` to switch to another, everything else identical. Nothing is
+lost and nothing is stranded; the workspace is created either way.
+
+Operators: `scripts/probe_dm_topics.py` answers this against a live token in
+about five seconds. Run it before promising anybody a topic list.
+
+If you want a guaranteed topic list today, use the optional group below —
+group topics have worked for years.
+
+---
+
+## Optional — a group for several people
+
+One team, several people, one topic list everybody sees. Skip this entirely if
+you are working alone; nothing above needs it.
+
+### 1. Get a code
+
+Privately, to the bot:
+
+```
+/team
+```
+
+It prints the steps and a **single-use code**, good for **15 minutes**. Run
+`/team` again for a fresh one. You cannot lock yourself out.
+
+### 2. Make the group
 
 On your phone:
 
@@ -99,9 +173,7 @@ Give it these four permissions and no others:
 > **Keep the group private.** Anything an agent prints — file contents, diffs,
 > stack traces — is posted here.
 
----
-
-## Step 4 — Link the group
+### 3. Link it
 
 In the group you just made, send the code from step 1:
 
@@ -114,60 +186,25 @@ it, and only then binds the group. That is deliberate — Telegram sometimes
 reports "can manage topics" on a group that then refuses, and a setup that says
 *Ready* while `/new` fails is worse than an honest refusal.
 
-You should see **Ready**.
+You should see **Ready**. From then on `/new` in that group's **General** opens
+the workspace's topic there.
 
 **If it does not work:**
 
 | Message | What to do |
 |---|---|
-| *That code is not valid, or has expired* | Send `/register` privately for a new one |
-| *That code was issued to someone else* | The person who ran `/register` has to run `/setup`. Or get your own code. |
-| *No topic permission (forum topics are off)* | Turn on **Topics** in the group's Edit screen |
-| *…already bound to another tenant* | This group belongs to a different workspace. Use a new group. |
+| *That code is not valid, or has expired* | Send `/team` privately for a new one |
+| *That code was issued to someone else* | The person who ran `/team` has to run `/setup`. Or get your own code. |
+| *Setup blocked · forum topics are off* | Turn on **Topics** in the group's Edit screen |
+| *Use a private supergroup with Topics enabled* | It is still a basic group; add a member and enable Topics |
+| *…already bound to another tenant* | This group belongs to a different team. Use a new group. |
 | Nothing at all | The bot is not an admin, or was never added |
-
----
-
-## Step 5 — Run something
-
-Back in the group, in the **General** topic:
-
-```
-/new fix the flaky test in checkout_test.py
-```
-
-The bot creates a Conductor workspace, opens a topic for it, and posts a pinned
-status card that updates as the agent works. The answer arrives in that topic.
-
-From then on, **just type in the topic** to continue that session. No command
-needed.
-
----
-
-## The daily loop
-
-Everything below happens in the group.
-
-| What you want | What you send |
-|---|---|
-| Start something new | `/new [project:] your prompt` |
-| Continue | Type, speak, or send audio **in that topic** |
-| Stop the current turn | Tap **⏹** on the pinned card, or `/stop` |
-| See what this session is doing | `/mode` |
-| See everything at once | `/board` |
-| Jump to another session | `/s` (or `/s name`) |
-| Another session, same workspace | `/fork` |
-| Open a laptop-made workspace here | `/attach`, then tap **+ Open** |
-| Search your transcripts | `/find some text`, or just type in General |
-| Finish and archive | `/done`, then confirm by name |
-
-`/help` prints a short version of this in the chat.
 
 ---
 
 ## Working with other people
 
-Everyone in the group shares one Conductor organisation and one key.
+Everyone on the team shares one Conductor organisation and one key.
 
 ```
 /invite 123456789          # their numeric Telegram id
@@ -176,22 +213,26 @@ Everyone in the group shares one Conductor organisation and one key.
 /leave                     # remove yourself
 ```
 
+A group is not required for this. Someone you invite can drive the team from
+their own private chat with the bot; the group only adds a topic list you all
+watch together.
+
 To find someone's Telegram id, have them message the bot `/start` — or use any
 "what is my id" bot.
 
-**Roles.** `owner` can do everything. `admin` can invite and remove members but
-cannot remove an owner or delete the workspace. `member` can drive sessions and
-nothing else.
+**Roles.** `owner` can do everything, including `/team`. `admin` can invite and
+remove members but cannot remove an owner or delete the team. `member` can
+drive sessions and nothing else.
 
-A workspace always keeps at least one owner: the bot refuses the change that
-would leave it with none, including an owner demoting themselves.
+A team always keeps at least one owner: the bot refuses the change that would
+leave it with none, including an owner demoting themselves.
 
 ---
 
-## If you are in more than one workspace
+## If you are in more than one team
 
-Group topics are unambiguous — each group belongs to exactly one workspace. Your
-**private chat** with the bot is not, so tell it which one you mean:
+A group is unambiguous — each one belongs to exactly one team. Your **private
+chat** with the bot is not, so tell it which one you mean:
 
 ```
 /use acme          # this DM now means acme
@@ -224,9 +265,9 @@ Then send a voice note in a topic and it becomes a prompt. To use voice for
 
 ```
 /privacy      # exactly what is stored and what leaves
-/export       # download everything this workspace holds
+/export       # download everything this team holds
 /revoke       # delete your stored keys; polling stops
-/forget       # delete the workspace and everything in it (two taps)
+/forget       # delete the team and everything in it (two taps)
 ```
 
 What is kept: your API key, encrypted; workspace, session and delivery
@@ -242,14 +283,16 @@ leaked.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Bot ignores the group entirely | Group not linked, or you are not a member | `/setup` with a fresh code, or ask an owner to `/invite` you |
+| Bot says nothing to `/new` in a DM | You never finished sign-up | `/start`, then `/key` |
+| *Topics unavailable here · one workspace at a time* | Telegram will not open a topic in this chat | Nothing to fix — the bot runs linearly. See [above](#when-your-private-chat-has-no-topics) |
+| Bot ignores a group entirely | Group not linked, or you are not a member | `/setup` with a fresh code from `/team`, or ask an owner to `/invite` you |
 | *Conductor rejected this workspace's API key* | Key revoked or expired at Conductor | `/key` privately with a new one |
-| *This workspace is suspended* | The operator suspended it | Contact whoever runs the instance |
+| *This workspace is suspended* | The operator suspended your team | Contact whoever runs the instance |
 | A button says it expired | Buttons last 15 minutes | Run the command again for fresh ones |
-| Answers stop mid-turn | Usually a deleted topic | The rest is redirected to **General** |
+| Answers stop mid-turn | Usually a deleted topic | The rest is redirected to the chat root |
 | *at its limit of N workspaces* | Quota | `/done` something first |
 | *Sign-ups are busy right now* | Instance-wide rate limit | Try again in an hour |
-| Whole group went silent after an upgrade | Telegram changed the group's id | Send `/setup <new code>` in it again |
+| A whole group went silent after an upgrade | Telegram changed the group's id | Send `/setup <new code>` in it again |
 
 `/health` (owners only) shows what the bot thinks is wrong, including whether
 your key is working and how far behind delivery is.
@@ -262,11 +305,16 @@ Running the instance rather than using it? See [`DEPLOY.md`](DEPLOY.md) for the
 Railway setup, and [`../SECURITY.md`](../SECURITY.md) for the key-rotation and
 breach runbooks.
 
+Turn **Threaded Mode** on in @BotFather, then run
+`scripts/probe_dm_topics.py` once against the live token — that is the only
+way to know whether your users get a topic list in their private chats or the
+linear fallback.
+
 ```
-/platform list                 # every workspace and its state
+/platform list                 # every team and its state
 /platform suspend acme         # stop it now
 /platform resume acme
 ```
 
-Gated on `PLATFORM_ADMIN_IDS`. An operator can *stop* a workspace and cannot
-*read* one — nothing there returns customer data.
+Gated on `PLATFORM_ADMIN_IDS`. An operator can *stop* a team and cannot *read*
+one — nothing there returns customer data.

@@ -5,10 +5,11 @@
 [![Python 3.13](https://img.shields.io/badge/python-3.13-blue.svg)](https://www.python.org/downloads/)
 
 Drive [Conductor](https://conductor.build) cloud coding agents from Telegram.
-Each workspace gets a forum topic: send a prompt, watch one compact status card,
-and get the answer on your phone.
+Each workspace gets its own topic — in your private chat with the bot, or in a
+shared group. Send a prompt, watch one compact status card, and get the answer
+on your phone.
 
-One bot serves many workspaces. Each brings its own Conductor API key; their
+One bot serves many teams. Each brings its own Conductor API key; their
 transcripts, their spending and their data stay theirs.
 
 - Python 3.13, aiogram 3, httpx, PostgreSQL
@@ -23,19 +24,19 @@ cadence and progress UX; it never gates delivery.
 
 ## Using it
 
-Four steps, once, from a phone — the full walkthrough with screenshots' worth of
-detail is in [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md):
+Two messages, once, from a phone — the full walkthrough with screenshots' worth
+of detail is in [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md):
 
-1. `/register your-team-name` in a private chat with the bot.
-2. Create a private supergroup, enable **Topics**, add the bot as an
-   administrator (manage topics, pin, delete, send).
-3. `/setup <code>` in that group, using the code from step 1.
-4. `/key <your Conductor API key>` privately. The bot validates it, stores it
-   encrypted, and **deletes your message**.
+1. `/start` in a private chat with the bot. That creates your team, named after
+   your Telegram account. No group, no admin rights, no decision.
+2. `/key <your Conductor API key>` in that same chat. The bot validates it,
+   stores it encrypted, and **deletes your message**.
 
-Ran out of time on the 15-minute code? `/register` again gives you a fresh one.
+Then `/new fix the flaky checkout test`, in that same private chat. Each
+workspace gets its own topic there. `/register <name>` instead of `/start` if
+you would rather pick the team's name yourself.
 
-Then the daily loop, from the group:
+Then the daily loop:
 
 | Goal | Action |
 |---|---|
@@ -45,21 +46,54 @@ Then the daily loop, from the group:
 | See everything | `/board` · switch with `/s` |
 | Resume laptop work | `/attach [name]`, then tap `+ Open` |
 | Stop | The pinned card's ⏹, or `/stop` |
-| Search | Plain text in General, or `/find text` |
+| Search | `/find text` anywhere · plain text in a group's General |
 | Finish | `/done`, then the named confirmation |
-
-Your co-founder joins with `/invite <their telegram id>` — same group, same
-Conductor organisation, same topics. `/members` lists who is in.
 
 Sending an API key to a *group* is refused and the message deleted; rotate it
 and send it privately instead.
+
+### Optional: a group
+
+One team, several people, one topic list everybody sees. Nothing above needs it.
+
+1. `/team` privately. It mints a single-use code, good for 15 minutes; run it
+   again for a fresh one.
+2. Create a private supergroup, enable **Topics**, add the bot as an
+   administrator (manage topics, pin, delete, send).
+3. `/setup <code>` in that group.
+
+Your co-founder joins with `/invite <their telegram id>` — same group, same
+Conductor organisation, same topics. `/members` lists who is in. `/invite`
+works without a group too; they just drive the team from their own private
+chat.
+
+### Topics in a private chat, and what happens when Telegram says no
+
+Topics in a DM need Telegram's **Threaded Mode** (@BotFather → your bot). The
+bot needs no admin rights and no Premium there, and the sibling toggle
+*"Disallow users to create new threads"* governs the **user**, never the bot.
+
+That rests on a Bot API 10.x feature with an open regression, so check it
+against your own token before you trust it:
+
+```bash
+export TELEGRAM_BOT_TOKEN=...      # the token the bot runs on
+export TELEGRAM_DM_CHAT_ID=...     # your own Telegram user id
+.venv/bin/python scripts/probe_dm_topics.py
+```
+
+If Telegram refuses — threaded mode off, `createForumTopic` rejected, a thread
+that cannot be addressed — the private chat degrades to **one workspace at a
+time**, says so once, and `/s` switches between them. Every DM-topic path has
+that fallback; a topic the bot cannot create or deliver into never costs you a
+working bot, only the topic list.
 
 ## Commands
 
 Daily: `/new` `/attach` `/board` `/stop` `/find` `/mode` `/done`
 Power: `/s` `/fork` `/name` `/open` `/desk` `/here` `/log` `/notify` `/defaults` `/sql` `/tidy`
-Workspace: `/invite` `/remove` `/leave` `/members` `/health` `/export` `/key` `/voicekey` `/voice` `/revoke`
-Multiple workspaces: `/use` picks which one your DMs mean · `/forget` drops one
+Team: `/team` `/invite` `/remove` `/leave` `/members` `/health` `/export` `/key` `/voicekey` `/voice` `/revoke`
+Several teams: `/use` picks which one your DMs mean · `/forget` drops one
 Anyone: `/start` `/register` `/setup` `/privacy` `/help`
 Operator: `/platform list|suspend|resume`, gated on `PLATFORM_ADMIN_IDS`
 
@@ -142,8 +176,8 @@ assume it; `overlapSeconds=0` stops the old deployment before the new one polls.
 
 ```bash
 docker compose up -d --wait db
-.venv/bin/python -m pytest -q          # 1927 tests
-.venv/bin/python -m pytest -q -m "not db"   # the ~1400 that need no server
+.venv/bin/python -m pytest -q          # 2031 tests
+.venv/bin/python -m pytest -q -m "not db"   # the 1423 that need no server
 .venv/bin/python -m ruff format --check src scripts tests
 .venv/bin/python -m ruff check src scripts tests
 .venv/bin/python -m pyright
@@ -159,11 +193,15 @@ Everything below is verified offline against a real PostgreSQL and a faked
 Conductor API. These need a live deployment:
 
 1. First Railway deploy with a real database and real secrets.
-2. The phone checklist: `/register` → `/setup` → `/key` → `/new` → answer.
-3. Two real workspaces at once, each with its own key, staying separate.
-4. Redeploy mid-turn; the answer arrives exactly once.
-5. Real Conductor and Telegram 429s, to tune the rate budgets.
-6. Voice: a workspace storing its own speech key and 30 owner recordings.
+2. The phone checklist: `/start` → `/key` → `/new` → answer, all in a DM.
+3. **DM topics.** `scripts/probe_dm_topics.py` against a live token: create,
+   send into, rename, icon. Everything degrades if it fails, but nobody has
+   watched it succeed.
+4. The optional group: `/team` → `/setup` → `/new` in a supergroup.
+5. Two real teams at once, each with its own key, staying separate.
+6. Redeploy mid-turn; the answer arrives exactly once.
+7. Real Conductor and Telegram 429s, to tune the rate budgets.
+8. Voice: a workspace storing its own speech key and 30 owner recordings.
 
 ## Before you open this to strangers
 

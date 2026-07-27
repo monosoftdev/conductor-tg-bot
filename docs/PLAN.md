@@ -2,10 +2,12 @@
 
 > **Historical.** This is the original single-user design, kept because its
 > reasoning about the Conductor API, the turn state machine and the delivery
-> contract is still exactly right and still implemented. Two things in it are
-> now out of date: storage is PostgreSQL rather than SQLite, and the bot serves
-> many workspaces rather than one owner. For those, read
-> [`TENANCY.md`](TENANCY.md) — and where the two disagree, `TENANCY.md` wins.
+> contract is still exactly right and still implemented. Three things in it are
+> now out of date: storage is PostgreSQL rather than SQLite, the bot serves
+> many workspaces rather than one owner, and the private supergroup it assumes
+> throughout is optional as of 2026-07-27 (see §Chat model). For the first two,
+> read [`TENANCY.md`](TENANCY.md) — and where the two disagree, `TENANCY.md`
+> wins.
 
 ## Context
 
@@ -314,7 +316,7 @@ but those characters and one miss is a `400` and a lost reply. HTML needs only `
 
 ## Phase 3 — Telegram UX
 
-### Chat model: private supergroup, Forum Topics on, one topic per workspace
+### Chat model: Forum Topics on, one topic per workspace
 
 The address of a prompt is the topic your thumb is in — there is no "bound session" variable to lose
 track of. This is why it beats a pinned card in a flat chat (which labels the mess but doesn't stop
@@ -325,6 +327,35 @@ Free from Telegram: the topic list *is* the switcher, with native unread badges,
 per-topic mute, and per-topic push. Routing key is `(chat_id, message_thread_id)`, so DM mode falls
 out as `thread_id = NULL` — a degraded single-bound-session mode with `/s` to switch, which the bot
 announces once.
+
+> **What shipped, 2026-07-27: the supergroup became optional.** This section was written
+> "private supergroup, Forum Topics on", and for the whole of the single-user design and the
+> multi-tenant rewrite that was literally required: sign-up did not finish until you had created a
+> supergroup, enabled Topics and granted the bot four admin rights. That was three screens of
+> Telegram settings standing between a new user and their first prompt, and it was the single
+> largest drop-off in the flow.
+>
+> Telegram then shipped **topics inside a private chat with a bot** (@BotFather → *Threaded Mode*).
+> A bot may create, rename and delete them there with **no admin rights and no Premium**; the
+> sibling toggle *"Disallow users to create new threads"* governs the *user*, and
+> `BOT_FORUM_CREATE_FORBIDDEN` is never about the bot. Non-Premium accounts get the default icon
+> pack, which is the only pack this repo has ever used.
+>
+> So the chat model above is unchanged — one topic per workspace, addressed by
+> `(chat_id, message_thread_id)` — and only its *host* is now free. The default is a private chat:
+> `/start` → `/key` → `/new`, and the topic opens in the DM. A group is the optional `/team` flow,
+> for several people who want one shared topic list.
+>
+> **The DM topic is the one path that may not be trusted.** Bot API 10.0 (2026-05-08) carries an
+> open regression where `sendMessage` with `message_thread_id` in a private chat answers *"message
+> thread not found"*, and `createForumTopic` in DMs has been reported failing outright.
+> `scripts/probe_dm_topics.py` answers it against a live token. Until it does, every DM-topic path
+> is written to degrade: the topic is created *before* the paid workspace, a refusal returns the
+> linear `thread_id = 0` seat above rather than raising, and `send_html` retries once without the
+> thread. A DM topic we cannot open costs the topic list and nothing else — never the prompt, the
+> workspace or the answer.
+>
+> The group path is byte-identical to what it always was, including the `/setup` capability probe.
 
 | Conductor state | Topic name |
 |---|---|

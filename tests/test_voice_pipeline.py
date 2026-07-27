@@ -806,7 +806,12 @@ async def test_a_job_that_hangs_becomes_a_message_not_a_stuck_card(
     """
     settings = settings_factory(voice_enabled=True)
     service = make_service(settings, db, system_db, provider=HangingProvider())
-    monkeypatch.setattr(voice_service_module, "_JOB_DEADLINE_SECONDS", 0.01)
+    # Long enough that `_process` always reaches the provider — the deadline
+    # starts before the download and its database round-trips, so a 10ms
+    # budget fired before `transcribe` was ever called on a loaded machine
+    # and the test failed roughly one full-suite run in four. Still four
+    # orders of magnitude below the hang it is proving.
+    monkeypatch.setattr(voice_service_module, "_JOB_DEADLINE_SECONDS", 0.25)
     await service.enqueue(voice_message(), _route())
 
     await service._tick(0)
@@ -824,7 +829,12 @@ async def test_the_worker_takes_the_next_note_after_one_hangs(
     settings = settings_factory(voice_enabled=True)
     provider = HangingProvider(hang_first_only=True)
     service = make_service(settings, db, system_db, provider=provider)
-    monkeypatch.setattr(voice_service_module, "_JOB_DEADLINE_SECONDS", 0.01)
+    # Long enough that `_process` always reaches the provider — the deadline
+    # starts before the download and its database round-trips, so a 10ms
+    # budget fired before `transcribe` was ever called on a loaded machine
+    # and the test failed roughly one full-suite run in four. Still four
+    # orders of magnitude below the hang it is proving.
+    monkeypatch.setattr(voice_service_module, "_JOB_DEADLINE_SECONDS", 0.25)
 
     await service.enqueue(voice_message(), _route())
     await service._tick(0)

@@ -117,3 +117,16 @@ Recorded so they don't get re-litigated:
 - [x] Self-serve `/register` → `/setup <code>` → `/key`, and `/invite` for teammates
 - [x] `/backup` deleted; `/export` is per workspace
 - [ ] Live: two real workspaces, two real keys, on one deployment
+
+## Phase 5 — The group becomes optional (2026-07-27)
+
+- [x] `/start` alone is sign-up: it creates the team, names it after the account, binds the DM
+- [x] `/register <name>` and `/team` are additive; neither is on the path to a first prompt
+- [x] `dm_topic_support` — @BotFather Threaded Mode via `getMe.has_topics_enabled`, no rights, no
+      Premium; only an explicit `false` refuses
+- [x] One topic per workspace **in a private chat**, created before the paid workspace
+- [x] Every DM-topic refusal degrades to the linear one-seat DM and says so once
+- [x] `send_html` retries once without `message_thread_id` when Telegram loses the thread
+- [ ] Live: `scripts/probe_dm_topics.py` against a real token — create, send, rename, icon
+- [ ] `/board` adoption in a DM still opens no topic (`adopt.py`); the gap is recorded in
+      `tests/test_bot_adopt.py`

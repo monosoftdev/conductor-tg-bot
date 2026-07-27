@@ -9,17 +9,24 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from aiogram.dispatcher.middlewares.user_context import (
+    EVENT_CONTEXT_KEY,
+    UserContextMiddleware,
+)
 from aiogram.enums import ContentType
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.methods import CreateForumTopic, SendMessage
 from aiogram.types import Chat, Message, User
+from aiogram.types import Update as TgUpdate
 
 from ctb.bot.app import PostgresStorage
 from ctb.bot.handlers import core as core_handlers
 from ctb.bot.handlers import prompts as prompt_handlers
+from ctb.bot.handlers.common import _LINEAR_TOLD as LINEAR_TOLD
 from ctb.bot.handlers.common import (
+    LINEAR_DM_NOTICE,
     MOBILE_REPLY_INSTRUCTION,
     CreateRequest,
     augment_prompt,
@@ -56,7 +63,7 @@ from ctb.bot.keyboards import (
     NonceStore,
     read_stateless,
 )
-from ctb.bot.middleware.routing import Route
+from ctb.bot.middleware.routing import Route, RoutingMiddleware
 from ctb.bot.middleware.tenancy import TenantContext, TenantSettings
 from ctb.bot.wizards import new_workspace
 from ctb.conductor.models import (
@@ -84,6 +91,12 @@ from ctb.settings import Settings
 from ctb.turn.cursor import quick_replies_for
 from ctb.turn.state import Cancel, TurnState
 from tests.pg import BOOTSTRAP_TENANT_ID
+
+
+@pytest.fixture(autouse=True)
+def _forget_linear_notices() -> None:
+    """ "Told this chat once" is process state. Do not let it leak between tests."""
+    LINEAR_TOLD.clear()
 
 
 def fake_tenant(
@@ -152,25 +165,34 @@ class _ForumBot:
         *,
         is_forum: bool = True,
         can_manage_topics: bool = True,
+        topics_enabled: bool | None = None,
         create_error: Exception | None = None,
         delete_error: Exception | None = None,
         trace: list[str] | None = None,
     ) -> None:
         self._is_forum = is_forum
         self._can_manage_topics = can_manage_topics
+        # ``None`` is what a live ``getMe`` returns when the field is absent —
+        # unknown, which must not be read as a refusal.
+        self._topics_enabled = topics_enabled
         self._create_error = create_error
         self._delete_error = delete_error
         self.topics = 0
         self.deleted: list[int] = []
         self.closed: list[int] = []
         self.renamed: list[str] = []
+        self.sent: list[dict[str, Any]] = []
         self.trace = trace if trace is not None else []
 
     async def get_chat(self, _chat_id: int) -> Any:
         return SimpleNamespace(type="supergroup", is_forum=self._is_forum)
 
     async def get_me(self) -> Any:
-        return SimpleNamespace(id=42)
+        return SimpleNamespace(id=42, has_topics_enabled=self._topics_enabled)
+
+    async def send_message(self, **kwargs: Any) -> Any:
+        self.sent.append(kwargs)
+        return SimpleNamespace(message_id=len(self.sent))
 
     async def get_chat_member(self, _chat_id: int, _user_id: int) -> Any:
         return SimpleNamespace(can_manage_topics=self._can_manage_topics)
@@ -1179,25 +1201,266 @@ async def test_a_replay_renames_a_topic_whose_title_drifted(
     assert bot.renamed == ["⏳ api/main"]
 
 
-async def test_a_dm_creates_no_topic_and_still_binds(db: Database) -> None:
-    """Degraded DM mode never touches the forum API."""
-    bot = _ForumBot()
-    client = _CountingClient()
-
-    created = await create_and_bind_input(
+async def _new_in_dm(
+    db: Database,
+    bot: _ForumBot,
+    client: _CountingClient,
+    *,
+    chat_id: int,
+    tg_message_id: int = 5,
+    request: CreateRequest | None = None,
+) -> Any:
+    return await create_and_bind_input(
         bot=bot,  # type: ignore[arg-type]
-        chat_id=1001,
+        chat_id=chat_id,
         chat_type="private",
-        tg_message_id=5,
-        route=Route(chat_id=1001, kind="dm"),
-        request=_REQUEST,
+        tg_message_id=tg_message_id,
+        route=Route(chat_id=chat_id, kind="dm"),
+        request=request or _REQUEST,
         db=db,
         client=client,  # type: ignore[arg-type]
     )
 
+
+async def test_a_dm_gets_one_topic_per_workspace_just_like_a_group(
+    db: Database,
+) -> None:
+    """A bot needs no rights to open a topic in a private chat.
+
+    So a DM is not a lesser chat with one seat: it is the same column of rooms
+    a group gets, bound through the same ``require_topic``/``attach`` path.
+    """
+    bot = _ForumBot(topics_enabled=True)
+    client = _CountingClient()
+
+    created = await _new_in_dm(db, bot, client, chat_id=1001)
+
+    assert created.thread_id == 99
+    assert created.linear_reason is None
+    assert bot.topics == 1 and bot.deleted == [] and bot.closed == []
+    assert bot.sent == [], "nothing to apologise for when it worked"
+    seat = await chats_repo.get(db, 1001, 99)
+    assert seat is not None
+    assert seat.kind == "topic", "a seat with a thread is a topic seat"
+    assert seat.session_id == "session-new"
+    session = await sessions_repo.get(db, "session-new")
+    assert session is not None and session.thread_id == 99
+    workspace = await workspaces_repo.get(db, "workspace-1")
+    assert workspace is not None and workspace.topic_id == 99
+
+
+async def test_a_refused_dm_topic_still_creates_and_still_delivers(
+    db: Database,
+) -> None:
+    """**The most important one.** An optional feature may not take the bot down.
+
+    Telegram has been refusing ``createForumTopic`` in DMs since the Bot API
+    10.0 rollout. A group has nothing to fall back to and fails the command;
+    a DM has the linear seat it used until today, so it uses it — same
+    workspace, same queued prompt, one line to say what changed.
+    """
+    trace: list[str] = []
+    bot = _ForumBot(
+        topics_enabled=True,
+        create_error=_refused("Bad Request: message thread not found"),
+        trace=trace,
+    )
+    client = _CountingClient(trace=trace)
+
+    created = await _new_in_dm(db, bot, client, chat_id=1002)
+
     assert created.thread_id == 0
-    assert bot.topics == 0 and bot.deleted == [] and bot.closed == []
+    assert created.linear_reason == "message thread not found"
+    assert client.creates == 1, "the workspace is what the owner asked for"
+    # …and it was still attempted first, so a refusal can never strand one.
+    assert trace == ["create_topic", "create_workspace"]
+    assert bot.deleted == [] and bot.closed == []
+    seat = await chats_repo.get(db, 1002, 0)
+    assert seat is not None and seat.kind == "dm"
+    assert seat.session_id == "session-new"
+    # The prompt is durable and queued, exactly as in the topic case.
+    pending = await prompts_repo.list_recoverable(db, session_id="session-new")
+    assert len(pending) == 1
+    assert [item["text"] for item in bot.sent] == [LINEAR_DM_NOTICE]
+
+
+async def test_threaded_mode_off_skips_a_create_that_cannot_work(
+    db: Database,
+) -> None:
+    """``getMe`` says so outright; spending a refused call to learn it is waste."""
+    trace: list[str] = []
+    bot = _ForumBot(topics_enabled=False, trace=trace)
+    client = _CountingClient(trace=trace)
+
+    created = await _new_in_dm(db, bot, client, chat_id=1003)
+
+    assert trace == ["create_workspace"]
+    assert created.thread_id == 0
+    assert created.linear_reason == "threaded mode is off"
     assert client.creates == 1
+
+
+async def test_an_unknown_threaded_mode_still_tries_the_topic(
+    db: Database,
+) -> None:
+    """Only an explicit ``False`` is a refusal.
+
+    ``has_topics_enabled`` is absent on an older API, and the created topic is
+    the only real proof anyway — so unknown means try, not give up.
+    """
+    bot = _ForumBot(topics_enabled=None)
+    client = _CountingClient()
+
+    created = await _new_in_dm(db, bot, client, chat_id=1004)
+
+    assert bot.topics == 1 and created.thread_id == 99
+
+
+async def test_the_linear_line_is_said_once_per_chat(db: Database) -> None:
+    """A nudge, not a nag: two workspaces in a linear DM say it once."""
+    bot = _ForumBot(topics_enabled=False)
+    client = _CountingClient()
+
+    await _new_in_dm(db, bot, client, chat_id=1005, tg_message_id=5)
+    await _new_in_dm(db, bot, client, chat_id=1005, tg_message_id=6)
+
+    assert [item["text"] for item in bot.sent] == [LINEAR_DM_NOTICE]
+    assert LINEAR_DM_NOTICE.count("\n") == 0, "one short line on a phone"
+
+
+async def test_a_dm_topic_is_renamed_through_the_one_rename_path(
+    db: Database,
+) -> None:
+    """Markers and renames behave identically in a DM (docs/NAMING.md)."""
+    bot = _ForumBot(topics_enabled=True)
+    client = _CountingClient()
+    await _new_in_dm(db, bot, client, chat_id=1006)
+    await workspaces_repo.update(db, "workspace-1", topic_name="stale/name")
+
+    await _new_in_dm(db, bot, client, chat_id=1006)
+
+    assert bot.topics == 1, "the replay reuses the topic this nonce owns"
+    assert bot.renamed == ["⏳ api/main"]
+
+
+async def test_a_dm_topic_switch_stays_inside_its_workspace(db: Database) -> None:
+    """The DM root keeps cross-workspace switching; a DM topic does not.
+
+    Deliberate: the root is the DM's cockpit and the only way round a chat with
+    no topics, while a DM topic is addressed exactly as a group topic is — the
+    way to reach another workspace is to tap its room.
+    """
+    sessions = [
+        SessionRow(id="a", workspace_id="workspace-a"),
+        SessionRow(id="b", workspace_id="workspace-b"),
+    ]
+    root = Route(chat_id=1007, kind="dm")
+    topic = Route(
+        chat_id=1007,
+        thread_id=99,
+        kind="dm",
+        chat=ChatRow(chat_id=1007, thread_id=99, workspace_id="workspace-a"),
+    )
+
+    assert root.is_dm and not root.is_topic
+    assert topic.is_topic and not topic.is_dm
+    assert topic.is_private, "still a private chat, whatever the seat"
+    assert [row.id for row in switchable_sessions(sessions, root)] == ["a", "b"]
+    assert [row.id for row in switchable_sessions(sessions, topic)] == ["a"]
+
+
+async def test_a_dm_topic_addresses_its_own_seat_without_is_topic_message(
+    db: Database,
+) -> None:
+    """The routing hazard, and why it is not left to aiogram.
+
+    ``EventContext.thread_id`` is only populated when Telegram also sets
+    ``is_topic_message``, which is documented for forums and not promised for a
+    topic in a private chat. Losing it would address every prompt typed in a DM
+    topic to the DM root — the *wrong* session, which is worse than none.
+    """
+    await workspaces_repo.upsert(db, "ws-dm", chat_id=1010, topic_id=99)
+    await sessions_repo.upsert(
+        db, "sess-dm-topic", workspace_id="ws-dm", chat_id=1010, thread_id=99
+    )
+    await chats_repo.bind(
+        db, 1010, 99, workspace_id="ws-dm", session_id="sess-dm-topic", kind="topic"
+    )
+    message = Message(
+        message_id=10,
+        date=datetime.now(tz=UTC),
+        chat=Chat(id=1010, type="private"),
+        from_user=User(id=1001, is_bot=False, first_name="T"),
+        text="go",
+        message_thread_id=99,
+        is_topic_message=False,
+    )
+    update = TgUpdate(update_id=1, message=message)
+    captured: dict[str, Route] = {}
+
+    async def handler(_event: Any, payload: dict[str, Any]) -> None:
+        captured["route"] = payload["route"]
+
+    await RoutingMiddleware(db=db)(
+        handler,
+        update,
+        {
+            EVENT_CONTEXT_KEY: UserContextMiddleware.resolve_event_context(update),
+            "db": db,
+            "tenant": SimpleNamespace(
+                tenant_id=BOOTSTRAP_TENANT_ID,
+                settings=SimpleNamespace(voice_enabled=False),
+            ),
+        },
+    )
+
+    route = captured["route"]
+    assert route.key == (1010, 99)
+    assert route.session_id == "sess-dm-topic"
+    assert route.is_topic and not route.is_dm
+
+
+async def test_a_reply_telegram_will_not_thread_still_arrives() -> None:
+    """A DM thread can stop existing between two messages. Say it anyway."""
+    calls: list[dict[str, Any]] = []
+
+    class Bot:
+        async def send_message(self, **kwargs: Any) -> Any:
+            calls.append(kwargs)
+            if kwargs.get("message_thread_id") is not None:
+                raise TelegramBadRequest(
+                    method=SendMessage(chat_id=1008, text="x"),
+                    message="Bad Request: message thread not found",
+                )
+            return SimpleNamespace(message_id=11)
+
+    result = await send_html(
+        Bot(),  # type: ignore[arg-type]
+        1008,
+        "done",
+        thread_id=99,
+        reply_to_message_id=7,
+    )
+
+    assert result is not None and result.message_id == 11
+    assert [call.get("message_thread_id") for call in calls] == [99, None]
+    # The reply target lived in that thread too — asking for it again is a
+    # second way to fail at the one thing left to get right.
+    assert "reply_to_message_id" not in calls[1]
+
+
+async def test_a_thread_telegram_accepts_is_never_second_guessed() -> None:
+    """The fallback is a fallback: one send when the thread works."""
+    calls: list[dict[str, Any]] = []
+
+    class Bot:
+        async def send_message(self, **kwargs: Any) -> Any:
+            calls.append(kwargs)
+            return SimpleNamespace(message_id=3)
+
+    await send_html(Bot(), 1009, "done", thread_id=99)  # type: ignore[arg-type]
+
+    assert [call.get("message_thread_id") for call in calls] == [99]
 
 
 async def test_new_tells_the_owner_what_telegram_actually_said(

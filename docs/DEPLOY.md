@@ -99,9 +99,16 @@ curl -H "Authorization: Bearer $HEALTH_TOKEN" https://<your-domain>/health
 # pool stats, lease holder, per-workspace poller counts, recent API calls
 ```
 
-Then from a phone: `/register` → create a supergroup with Topics on → add the
-bot as an admin → `/setup <code>` → `/key` privately → `/new fix the typo in
-the readme`. An answer in the topic means every layer works.
+Then from a phone, all in a private chat: `/start` → `/key` → `/new fix the
+typo in the readme`. An answer means every layer works.
+
+The optional group is a second pass: `/team` → create a supergroup with Topics
+on → add the bot as an admin → `/setup <code>` → `/new` in General.
+
+Topics inside a private chat need **Threaded Mode** on in @BotFather, and rest
+on a Bot API feature with an open regression. `scripts/probe_dm_topics.py`
+answers that against the live token before your users do; without it the bot
+still works, one workspace at a time per chat.
 
 ## Exactly one replica
 

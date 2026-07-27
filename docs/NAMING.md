@@ -10,6 +10,32 @@ whether it helps answer that in one glance.
 
 ---
 
+## Where the topic list is
+
+Since 2026-07-27, in two places, and the rules below are identical in both.
+
+- **A private chat with the bot.** The default. Telegram's *Threaded Mode*
+  (@BotFather) — a bot may create, rename and delete topics there with **no
+  admin rights and no Telegram Premium**. The sibling toggle *"Disallow users
+  to create new threads"* governs the **user**, never the bot, so
+  `BOT_FORUM_CREATE_FORBIDDEN` is never our error to fix.
+- **A supergroup with Forum Topics on.** The optional `/team` flow, for several
+  people watching one list.
+
+One consequence for this document specifically: **non-Premium accounts can only
+use the default topic-icon pack**, which is already the only pack anything here
+uses — `getForumTopicIconStickers` is fetched once per process and nothing is
+hard-coded. So the icon channel below needs no per-chat-kind branch.
+
+The other consequence is the fallback. DM topics rest on a Bot API 10.x feature
+with an open regression (`scripts/probe_dm_topics.py` is how you find out
+whether your token has it). When Telegram refuses, a private chat holds **one
+workspace at a time** and there is no list to scan — the whole vocabulary below
+degrades to the pinned card and `/board`, both of which render from the same
+constants. Nothing about a refused topic changes what a state *means*.
+
+---
+
 ## The one vocabulary
 
 | State | Glyph | Meaning |

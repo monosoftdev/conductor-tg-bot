@@ -431,6 +431,15 @@ async def test_a_partial_binding_repairs_the_remembered_topic_in_place(
 async def test_a_dm_binds_the_single_seat_without_a_topic(
     db: Database, client: ConductorClient, fake: FakeConductor
 ) -> None:
+    """Adoption is still linear in a DM — the known gap, asserted on purpose.
+
+    ``/new`` now opens a topic per workspace in a private chat exactly as it
+    does in a group (``tests/test_bot_handlers.py``); ``_open`` here does not
+    yet, so a workspace adopted from ``/board`` takes the DM's single seat and
+    displaces whatever was in it. Nothing is lost and nothing dead-ends, but the
+    two entry points disagree, and this test is what will fail when that is
+    fixed rather than a silent behaviour change.
+    """
     session = _seeded(fake)
     bot = _Bot()
 

@@ -1,8 +1,18 @@
 """Forum-topic lifecycle, and the small chat plumbing every handler shares.
 
-One topic per workspace. The address of a prompt is the topic your thumb is in
-(PLAN §Chat model), so the topic is created *instantly* — before the workspace
-exists — and adopted by the workspace id once ``POST /v0/workspaces`` returns.
+One topic per workspace — **in a group and in a DM alike**. The address of a
+prompt is the topic your thumb is in (PLAN §Chat model), so the topic is created
+*instantly* — before the workspace exists — and adopted by the workspace id once
+``POST /v0/workspaces`` returns.
+
+A bot needs no admin rights and no Premium to open a topic in a private chat;
+the one precondition is @BotFather's *Threaded Mode*, which ``getMe`` reports as
+``has_topics_enabled`` (:func:`dm_topic_support`). But whether DM topics work is
+a **runtime fact, not a config flag** — the Bot API 10.0 rollout has been
+observed refusing ``createForumTopic`` and thread-addressed ``sendMessage`` in
+private chats — so every DM-topic path degrades to the linear single-seat DM
+instead of dead-ending. :func:`send_html` re-sends without the thread when
+Telegram says the thread is gone, exactly as the outbox reroutes a delivery.
 
 **Renamed only on state transitions, never on a timer** (PLAN §Chat model). A
 rename is a Telegram API call; a 5-second init card that renamed the topic every
@@ -50,7 +60,7 @@ from ctb.db.repo import sessions as sessions_repo
 from ctb.db.repo import workspaces as workspaces_repo
 from ctb.db.repo.sessions import SessionRow
 from ctb.db.repo.workspaces import WorkspaceRow
-from ctb.delivery.outbox import is_entity_error
+from ctb.delivery.outbox import THREAD_GONE_MARKERS, is_entity_error
 from ctb.delivery.render.html import strip_html
 from ctb.logging import get_logger
 from ctb.turn.state import TopicMarker, TurnState
@@ -65,6 +75,7 @@ __all__ = [
     "close_topic",
     "create_topic",
     "discard_topic",
+    "dm_topic_support",
     "edit_html",
     "ensure_topic",
     "forum_support",
@@ -253,7 +264,8 @@ def jump_url(chat_id: int, topic_id: int | None) -> str | None:
     """``https://t.me/c/<internal>/<topic>`` — /board's "tap to jump".
 
     Only supergroups (``-100…``) have the ``/c/`` form; a DM has nothing to
-    jump to, and neither has a chat we have no topic for.
+    jump to — not even a DM *topic*, which Telegram publishes no link syntax
+    for — and neither has a chat we have no topic for.
     """
     text = str(chat_id)
     if not text.startswith("-100"):
@@ -269,6 +281,18 @@ def jump_url(chat_id: int, topic_id: int | None) -> str | None:
 # ── sending, with the mandatory HTML fallback ────────────────────────────────
 
 
+def thread_is_gone(exc: BaseException) -> bool:
+    """Telegram refused the thread itself, not the message in it.
+
+    The same markers the outbox reroutes on. A DM thread can be refused by a
+    client that predates threaded mode, by the Bot API 10.0 regression, or
+    because the topic was deleted — all of which mean *send it linearly*, never
+    *drop it*.
+    """
+    text = str(exc).casefold()
+    return any(marker in text for marker in THREAD_GONE_MARKERS)
+
+
 async def send_html(
     bot: Bot,
     chat_id: int,
@@ -282,10 +306,51 @@ async def send_html(
     """Send one interactive reply. Never raises; returns ``None`` on failure.
 
     Command replies are small, immediate and few, so they do not go through the
-    ``deliveries`` outbox — but they honour the same rule as everything else:
-    an entity-parse ``TelegramBadRequest`` is retried exactly once with
-    ``parse_mode=None`` (CLAUDE.md). A reply may look ugly; it is never lost.
+    ``deliveries`` outbox — but they honour the same rules as everything else:
+
+    * an entity-parse ``TelegramBadRequest`` is retried exactly once with
+      ``parse_mode=None`` (CLAUDE.md) — a reply may look ugly, never be lost;
+    * a *thread* Telegram will not accept is retried once without it. A topic
+      that stops working must leave a working chat behind, so the reply lands
+      in the chat root rather than nowhere.
     """
+    sent, thread_gone = await _send_attempt(
+        bot,
+        chat_id,
+        html,
+        thread_id=thread_id,
+        reply_markup=reply_markup,
+        silent=silent,
+        reply_to_message_id=reply_to_message_id,
+    )
+    if sent is not None or not thread_gone or thread_id == NO_THREAD_ID:
+        return sent
+    log.warning("topics.thread_gone", chat_id=chat_id, thread_id=thread_id)
+    # The reply-to target lived in that thread too; asking for it again is a
+    # second way to fail at the one thing left to get right.
+    sent, _ = await _send_attempt(
+        bot,
+        chat_id,
+        html,
+        thread_id=NO_THREAD_ID,
+        reply_markup=reply_markup,
+        silent=silent,
+        reply_to_message_id=None,
+    )
+    return sent
+
+
+async def _send_attempt(
+    bot: Bot,
+    chat_id: int,
+    html: str,
+    *,
+    thread_id: int,
+    reply_markup: InlineKeyboardMarkup | None,
+    silent: bool,
+    reply_to_message_id: int | None,
+) -> tuple[Message | None, bool]:
+    """One addressed send. ``(message, thread_is_gone)`` — never raises."""
     kwargs: dict[str, Any] = {
         "chat_id": chat_id,
         "message_thread_id": thread_id or None,
@@ -315,21 +380,21 @@ async def send_html(
         raise RuntimeError("unreachable command-send retry state")
 
     try:
-        return await send(html)
+        return await send(html), False
     except TelegramBadRequest as exc:
         if not is_entity_error(exc):
             log.warning("topics.send_failed", chat_id=chat_id, error=str(exc))
-            return None
+            return None, thread_is_gone(exc)
         try:
-            return await send(strip_html(html), plain=True)
+            return await send(strip_html(html), plain=True), False
         except TelegramAPIError as retry_exc:
             log.warning(
                 "topics.send_retry_failed", chat_id=chat_id, error=str(retry_exc)
             )
-            return None
+            return None, thread_is_gone(retry_exc)
     except TelegramAPIError as exc:
         log.warning("topics.send_failed", chat_id=chat_id, error=str(exc))
-        return None
+        return None, thread_is_gone(exc)
 
 
 async def edit_html(
@@ -384,7 +449,7 @@ class ForumSupport:
 
     ok: bool
     #: Machine-readable: ``ok`` · ``dm`` · ``not_forum`` · ``no_permission`` ·
-    #: ``unknown``.
+    #: ``threads_off`` · ``unknown``.
     reason: str = "ok"
     detail: str = ""
 
@@ -394,7 +459,12 @@ class ForumSupport:
 
 
 async def forum_support(bot: Bot, chat_id: int) -> ForumSupport:
-    """Check the two things degraded DM mode hinges on: forum + permission."""
+    """Check the two things a *group* topic hinges on: forum + permission.
+
+    A private chat is not this question — a bot needs no rights there. DMs go
+    through :func:`dm_topic_support` instead, and are reported degraded here so
+    ``/setup``'s group probe keeps refusing to run in one.
+    """
     try:
         chat = await bot.get_chat(chat_id)
     except TelegramAPIError as exc:
@@ -410,6 +480,39 @@ async def forum_support(bot: Bot, chat_id: int) -> ForumSupport:
         return ForumSupport(False, "unknown", str(exc))
     if not bool(getattr(member, "can_manage_topics", False)):
         return ForumSupport(False, "no_permission", "bot cannot manage topics")
+    return ForumSupport(True)
+
+
+async def dm_topic_support(bot: Bot) -> ForumSupport:
+    """Can this bot open a topic *inside a private chat*?
+
+    One precondition, and it is about the bot rather than the chat: @BotFather's
+    *Threaded Mode*, reported by ``getMe`` as ``has_topics_enabled``. No admin
+    rights, no Premium, no per-chat state — which is why this takes no
+    ``chat_id``. (The sibling toggle, "disallow users to create new threads",
+    governs the *user*; ``BOT_FORUM_CREATE_FORBIDDEN`` is never about us.)
+
+    Three answers, two of which are "go ahead":
+
+    * ``True``  — threaded mode is on.
+    * ``None``  — absent. Telegram omits false optionals, so this is *usually*
+      "off" — and it is deliberately still tried. An unknown is not a refusal:
+      ``createForumTopic`` is the only real proof, the caller degrades on it
+      anyway, and the price of the ambiguity is one refused call per ``/new``
+      rather than a feature that can never turn itself on.
+    * ``False`` — explicitly off. Skip the doomed create.
+
+    Deliberately not cached. It is one cheap call on a path that already makes
+    several, and caching would make flipping the @BotFather toggle need a
+    redeploy. Every failure — including a bot object that has no ``getMe`` —
+    answers "no", because the fallback is a chat that still works.
+    """
+    try:
+        me = await bot.get_me()
+    except Exception as exc:  # noqa: BLE001 - any failure means "degrade"
+        return ForumSupport(False, "unknown", telegram_reason(exc))
+    if getattr(me, "has_topics_enabled", None) is False:
+        return ForumSupport(False, "threads_off", "threaded mode is off")
     return ForumSupport(True)
 
 
