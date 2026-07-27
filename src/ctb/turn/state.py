@@ -18,6 +18,7 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Final, Self
 
+from ctb import signals
 from ctb.conductor.models import SessionStatusValue, WorkspaceStatusValue
 
 __all__ = [
@@ -328,10 +329,21 @@ class NotifyLevel(StrEnum):
 
 
 class TopicMarker(StrEnum):
-    """Topic-name prefix per Conductor state. Renamed on transitions only."""
+    """Topic-name prefix per Conductor state. Renamed on transitions only.
+
+    ``DONE`` and ``IDLE`` are deliberately separate. They used to be one blank
+    prefix, which made "finished, you have not read it" and "quiet, nothing to
+    do" identical in the topic list — and telling those two apart is the most
+    common reason to look at the list at all.
+
+    There is no read receipt for bots, so ``DONE`` cannot clear when you *look*
+    at a topic. It clears when you *act* in it: the next prompt moves the
+    session to ``WORKING`` and the marker follows.
+    """
 
     INITIALIZING = "initializing"
     IDLE = "idle"
+    DONE = "done"
     WORKING = "working"
     ERROR = "error"
     SLEEPING = "sleeping"
@@ -341,14 +353,40 @@ class TopicMarker(StrEnum):
     def prefix(self) -> str:
         return _TOPIC_PREFIXES[self]
 
+    @property
+    def icon(self) -> str:
+        """The emoji this state wants as the topic's icon, if one is free.
 
+        ``icon_color`` is fixed at creation and can only ever mean *which
+        workspace*; ``icon_custom_emoji_id`` can change on every rename, so
+        state goes here. Empty means "leave the icon alone".
+        """
+        return _TOPIC_ICONS[self]
+
+
+#: Prefixes come from :mod:`ctb.signals` so the topic list, the pinned card and
+#: ``/board`` cannot drift apart — they disagreed on every single state.
 _TOPIC_PREFIXES: Final[dict[TopicMarker, str]] = {
-    TopicMarker.INITIALIZING: "~ ",
-    TopicMarker.IDLE: "",
-    TopicMarker.WORKING: "● ",
-    TopicMarker.ERROR: "! ",
-    TopicMarker.SLEEPING: "· ",
-    TopicMarker.ARCHIVED: "x ",
+    TopicMarker.INITIALIZING: f"{signals.WAITING} ",
+    TopicMarker.IDLE: signals.IDLE,
+    TopicMarker.DONE: f"{signals.DONE} ",
+    TopicMarker.WORKING: f"{signals.WORKING} ",
+    TopicMarker.ERROR: f"{signals.ERROR} ",
+    TopicMarker.SLEEPING: f"{signals.SLEEPING} ",
+    TopicMarker.ARCHIVED: f"{signals.ARCHIVED} ",
+}
+
+#: Wanted icon per state. Telegram only serves a fixed pack of ~112 emoji to
+#: bots, so these are *requests*: the resolver drops any the pack lacks and
+#: leaves the icon unchanged rather than failing the rename.
+_TOPIC_ICONS: Final[dict[TopicMarker, str]] = {
+    TopicMarker.INITIALIZING: "⌛",
+    TopicMarker.IDLE: "💤",
+    TopicMarker.DONE: "✅",
+    TopicMarker.WORKING: "⚡",
+    TopicMarker.ERROR: "❗",
+    TopicMarker.SLEEPING: "💤",
+    TopicMarker.ARCHIVED: "🏁",
 }
 
 

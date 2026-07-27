@@ -564,7 +564,10 @@ def test_rule_15_draining_finalizes_after_three_idles() -> None:
     assert summary.duration_ms == int((30 + DRAIN_CONFIRMS - 1) * 1000)
     assert actions_of(last, EditStatusCard)[0].kind is CardKind.DONE
     assert has_action(last, StopTyping)
-    assert actions_of(last, SetTopicMarker)[0].marker is TopicMarker.IDLE
+    # DONE, not IDLE: the turn produced something to read, and a blank prefix
+    # made that indistinguishable from a topic with nothing in it. The state is
+    # still IDLE — only the topic marker distinguishes "finished" from "quiet".
+    assert actions_of(last, SetTopicMarker)[0].marker is TopicMarker.DONE
     assert cadence_set(last) == CADENCE_IDLE_DECAY_MS[0]
     # A new turn gets a new card.
     assert last.context.status_card_msg_id is None

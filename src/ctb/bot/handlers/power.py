@@ -61,7 +61,7 @@ from ctb.db.repo import workspaces as workspaces_repo
 from ctb.db.repo.sessions import SessionRow
 from ctb.delivery.render.html import escape
 from ctb.turn import cursor as turn_cursor
-from ctb.turn.state import TurnState
+from ctb.turn.state import TopicMarker, TurnState
 
 router = Router(name=__name__)
 register_router(router, order=30)
@@ -381,6 +381,13 @@ async def fork(
     except Exception as exc:
         await tell(message, f"Fork failed: {escape(short_error(exc))}", silent=False)
         return
+    # The topic now points at a session that has never run, so whatever the
+    # previous one left behind — most visibly a ✅ from its last finished turn —
+    # is now a claim about work that does not exist. The title stays correct
+    # (a fork shares the workspace, so `project/branch` is unchanged); only the
+    # state marker is stale.
+    if message.bot is not None:
+        await apply_marker(message.bot, database, route.workspace_id, TopicMarker.IDLE)
     # The argument the user just typed is the whole message. React instead.
     if not await react_ok(message):
         await tell(message, f"Forked <b>{escape(title[:80])}</b>.")
@@ -731,6 +738,12 @@ async def tidy(
         try:
             if message.bot is None:
                 raise RuntimeError("Telegram bot is not bound to the message")
+            # Rename before closing. Closing alone left whatever prefix the
+            # topic last had — a swept topic could sit in the list reading
+            # "⚙️ working" forever, describing a session nobody is running.
+            await apply_marker(
+                message.bot, database, row.id, TopicMarker.ARCHIVED, silent=True
+            )
             await message.bot.close_forum_topic(
                 chat_id=row.chat_id, message_thread_id=row.topic_id
             )

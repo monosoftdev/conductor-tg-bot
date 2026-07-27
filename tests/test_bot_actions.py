@@ -1,12 +1,21 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.methods import GetForumTopicIconStickers
+
+from ctb import signals
 from ctb.bot.actions import BotActionSink
+from ctb.bot.handlers import topics
+from ctb.bot.handlers.core import status_icon
 from ctb.db.connection import Database
 from ctb.db.repo import prompts, sessions, workspaces
 from ctb.delivery.outbox import Priority
+from ctb.delivery.status_card import CARD_EMOJI
 from ctb.turn.state import (
+    CardKind,
     Finalize,
     Notify,
     NotifyLevel,
@@ -86,7 +95,8 @@ async def test_sink_fans_out_cards_notice_and_topic_marker(
         {
             "chat_id": -1001,
             "message_thread_id": 42,
-            "name": "! api/main",
+            "name": "⚠️ api/main",
+            "icon_custom_emoji_id": None,
         }
     ]
     workspace = await workspaces.get(db, "ws-1")
@@ -148,3 +158,99 @@ async def test_finalize_turns_prompt_receipt_into_completion_reaction(
 
     assert bot.reactions[0]["message_id"] == 77
     assert bot.reactions[0]["reaction"][0].emoji == "👍"
+
+
+class _IconBot(Bot):
+    """A bot whose topic-icon pack Telegram will actually serve."""
+
+    def __init__(self, *, pack: bool = True) -> None:
+        super().__init__()
+        self._pack = pack
+        self.pack_calls = 0
+
+    async def get_forum_topic_icon_stickers(self) -> list[Any]:
+        self.pack_calls += 1
+        if not self._pack:
+            raise TelegramBadRequest(
+                method=GetForumTopicIconStickers(), message="Bad Request: nope"
+            )
+        return [
+            SimpleNamespace(emoji="✅", custom_emoji_id="id-done"),
+            SimpleNamespace(emoji="⚡", custom_emoji_id="id-working"),
+        ]
+
+
+async def test_a_finished_topic_is_marked_done_not_left_blank(db: Database) -> None:
+    """The blank IDLE prefix made "finished" and "nothing here" identical.
+
+    That distinction is the reason to look at the topic list at all.
+    """
+    await _bound(db)
+    bot = _IconBot()
+    topics._ICON_IDS.clear()
+
+    renamed = await topics.apply_marker(bot, db, "ws-1", TopicMarker.DONE)  # type: ignore[arg-type]
+
+    assert renamed is True
+    assert bot.renames[0]["name"].startswith(signals.DONE)
+    # The icon rides along on the rename that was happening anyway.
+    assert bot.renames[0]["icon_custom_emoji_id"] == "id-done"
+
+
+async def test_an_unfetchable_icon_pack_still_renames(db: Database) -> None:
+    """A missing icon is cosmetic. A skipped rename is a topic that lies."""
+    await _bound(db)
+    bot = _IconBot(pack=False)
+    topics._ICON_IDS.clear()
+
+    renamed = await topics.apply_marker(bot, db, "ws-1", TopicMarker.WORKING)  # type: ignore[arg-type]
+
+    assert renamed is True
+    assert bot.renames[0]["name"].startswith(signals.WORKING)
+    assert bot.renames[0]["icon_custom_emoji_id"] is None
+
+
+async def test_renaming_to_the_same_title_costs_no_api_call(db: Database) -> None:
+    """The guard compared markers, so `/name -w` with an unchanged name paid."""
+    await _bound(db)
+    bot = _IconBot()
+    topics._ICON_IDS.clear()
+
+    double: Any = bot
+    first = await topics.apply_marker(
+        double, db, "ws-1", TopicMarker.IDLE, label="api/main"
+    )
+    second = await topics.apply_marker(
+        double, db, "ws-1", TopicMarker.IDLE, label="api/main"
+    )
+
+    assert (first, second) == (False, False), "same marker, same name, no call"
+    assert bot.renames == []
+    # A genuinely different name still renames.
+    assert await topics.apply_marker(
+        double, db, "ws-1", TopicMarker.IDLE, label="api/dev"
+    )
+
+
+def test_every_surface_uses_one_glyph_per_state() -> None:
+    """Topic prefix, card and /board disagreed on every single state."""
+    assert (
+        TopicMarker.WORKING.prefix.strip() == signals.WORKING == status_icon("working")
+    )
+    assert TopicMarker.ERROR.prefix.strip() == signals.ERROR == status_icon("error")
+    assert TopicMarker.DONE.prefix.strip() == signals.DONE == status_icon("idle")
+    assert (
+        TopicMarker.SLEEPING.prefix.strip()
+        == signals.SLEEPING
+        == status_icon("sleeping")
+    )
+    assert CARD_EMOJI[CardKind.WORKING] == signals.WORKING
+    assert CARD_EMOJI[CardKind.DONE] == signals.DONE
+    assert CARD_EMOJI[CardKind.ERROR] == signals.ERROR
+
+
+def test_the_reaction_vocabulary_is_one_telegram_accepts() -> None:
+    """✅ and ⏳ are not valid reactions; reusing the card glyphs would 400."""
+    assert signals.DONE not in signals.REACTION_SAFE
+    assert signals.WAITING not in signals.REACTION_SAFE
+    assert {"👀", "👍", "😢"} <= signals.REACTION_SAFE, "what the bot uses today"

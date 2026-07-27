@@ -448,7 +448,11 @@ def _finalize(
         canceled_queued_messages=canceled_queued_messages,
     )
     tick.card(kind, text, buttons)
-    tick.do(Finalize(summary), StopTyping(), SetTopicMarker(TopicMarker.IDLE))
+    # DONE, not IDLE: a finished turn has something waiting to be read, and a
+    # blank prefix made that indistinguishable from a topic with nothing in it.
+    # It falls back to IDLE on the next prompt, when the marker follows the
+    # session to WORKING.
+    tick.do(Finalize(summary), StopTyping(), SetTopicMarker(TopicMarker.DONE))
     tick.enter(
         TurnState.IDLE,
         now,
@@ -1087,7 +1091,8 @@ def _die(tick: _Tick, now: float, what: str) -> TransitionResult:
     tick.do(
         StopTyping(),
         SetTopicMarker(TopicMarker.ARCHIVED),
-        # The topic is already renamed "🚫 proj/branch" and closed, and the card
+        # The topic is already renamed with the archived prefix and closed,
+        # and the card
         # says the same thing. One line is enough to push.
         Notify(f"Gone · {what}", NotifyLevel.LOUD, once_key="dead"),
         UnbindTopic(what),

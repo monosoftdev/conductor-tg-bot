@@ -11,6 +11,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 
+from ctb import signals
 from ctb.bot.app import register_router
 from ctb.bot.handlers.adopt import adopt_button
 from ctb.bot.handlers.common import (
@@ -92,18 +93,24 @@ SELECT session_id, workspace_id, session_title, workspace_name, workspace_state,
 
 
 def status_icon(value: str | TurnState | None) -> str:
+    """The glyph for a session state, from the one shared vocabulary.
+
+    ``/board``, the pinned card and the topic prefix all answer "what is this
+    session doing" and used to answer it with different glyphs. They now read
+    from :mod:`ctb.signals`.
+    """
     state = str(value or "").casefold()
     if any(word in state for word in ("error", "dead", "failed")):
-        return "⚠️"
+        return signals.ERROR
     if any(word in state for word in ("working", "running", "draining")):
-        return "⚙️"
+        return signals.WORKING
     if any(word in state for word in ("queued", "waking", "initializ")):
-        return "⏳"
+        return signals.WAITING
     if "cancell" in state or "stopp" in state:
-        return "🛑"
+        return signals.CANCELLED
     if "sleep" in state:
-        return "💤"
-    return "✅"
+        return signals.SLEEPING
+    return signals.DONE
 
 
 def session_overview_lines(

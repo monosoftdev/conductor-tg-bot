@@ -172,9 +172,51 @@ def topic_title(marker: TopicMarker, label: str) -> str:
 
 
 def topic_icon_color(label: str) -> int:
-    """Stable visual identity: the same project/branch keeps the same color."""
+    """Stable visual *identity*: the same project/branch keeps the same color.
+
+    Deliberately not a state signal — ``icon_color`` cannot be changed after
+    the topic is created, at any API level. State lives on the prefix and on
+    :func:`topic_icon_id`.
+    """
     digest = hashlib.sha256(label.casefold().encode("utf-8")).digest()
     return TOPIC_ICON_COLORS[int.from_bytes(digest[:2], "big") % len(TOPIC_ICON_COLORS)]
+
+
+#: Emoji → custom-emoji id for the topic-icon pack, fetched once per process.
+#: Telegram serves bots a fixed set (``getForumTopicIconStickers``) and refuses
+#: anything outside it, so the ids cannot be hard-coded from documentation —
+#: they have to be asked for.
+_ICON_IDS: dict[str, str] = {}
+_ICON_LOCK = asyncio.Lock()
+
+
+async def topic_icon_id(bot: Bot, marker: TopicMarker) -> str | None:
+    """The custom-emoji id for this state's icon, or ``None`` to leave it alone.
+
+    Never raises and never blocks a rename: if the pack cannot be fetched, or
+    does not contain the wanted emoji, the caller renames without touching the
+    icon. A missing icon is cosmetic; a failed rename is a topic that lies.
+    """
+    wanted = marker.icon
+    if not wanted:
+        return None
+    if not _ICON_IDS:
+        async with _ICON_LOCK:
+            if not _ICON_IDS:  # another caller may have filled it while we waited
+                try:
+                    for sticker in await bot.get_forum_topic_icon_stickers():
+                        emoji = getattr(sticker, "emoji", None)
+                        sticker_id = getattr(sticker, "custom_emoji_id", None)
+                        if emoji and sticker_id and emoji not in _ICON_IDS:
+                            _ICON_IDS[emoji] = sticker_id
+                except Exception as exc:
+                    # Deliberately every exception, not just TelegramAPIError.
+                    # This decorates a rename that has to happen either way, so
+                    # there is no failure here worth propagating — a stale
+                    # topic title is a lie, a missing icon is a missing icon.
+                    log.warning("topics.icon_pack_unavailable", error=repr(exc))
+                    return None
+    return _ICON_IDS.get(wanted)
 
 
 def marker_for(
@@ -410,11 +452,17 @@ async def require_topic(
     is not: it has been observed ``true`` on a chat that then refused
     ``createForumTopic``. Anything that costs money runs after this returns.
     """
+    icon = await topic_icon_id(bot, marker)
     try:
         topic = await bot.create_forum_topic(
             chat_id=chat_id,
             name=topic_title(marker, label),
+            # Colour is identity and is fixed from here on; the emoji is state
+            # and changes with every later rename. Telegram ignores the colour
+            # entirely once a custom emoji is set, which is the right trade —
+            # state is what you scan the list for.
             icon_color=topic_icon_color(label),
+            icon_custom_emoji_id=icon,
         )
     except TelegramAPIError as exc:
         reason = telegram_reason(exc)
@@ -530,24 +578,47 @@ async def apply_marker(
     marker: TopicMarker,
     *,
     label: str | None = None,
+    silent: bool = False,
 ) -> bool:
-    """Rename the topic **only if the marker actually changed**.
+    """Rename the topic **only if the title would actually change**.
 
-    Returns ``True`` when a rename was issued. Everything else — same marker,
+    Returns ``True`` when a rename was issued. Everything else — same title,
     no topic, a Telegram failure — returns ``False`` and costs no API call
     beyond the one that failed.
+
+    The state icon rides along: ``icon_custom_emoji_id`` is the one visual
+    channel Telegram lets a bot change after creation (``icon_color`` is fixed
+    for the topic's life), and the rename call is already being made.
     """
     row = await workspaces_repo.get(db, workspace_id)
     if row is None or row.chat_id is None or row.topic_id is None:
         return False
     name = label or row.topic_name or row.name or workspace_id
-    if row.topic_marker == marker.value and label is None:
+    title = topic_title(marker, name)
+    # Compare the *rendered title*, not just the marker. Comparing markers
+    # meant `/name -w` with an unchanged name always spent an API call, while a
+    # renamed-but-same-state topic silently kept its old title.
+    #
+    # ``topic_marker`` is NULL until the first rename, and an older row can
+    # carry a marker this version no longer has — neither is a reason to skip,
+    # so an unreadable marker falls through to renaming.
+    try:
+        current = topic_title(TopicMarker(row.topic_marker), row.topic_name or name)
+    except ValueError:
+        current = None
+    if row.topic_marker == marker.value and title == current:
         return False
+    # ``None`` here means "keep whatever icon the topic has". aiogram omits an
+    # unset optional from the payload, and Telegram keeps the existing value
+    # for an omitted field — so a pack we could not fetch costs the icon
+    # update, never the rename.
+    icon = await topic_icon_id(bot, marker)
     try:
         await bot.edit_forum_topic(
             chat_id=row.chat_id,
             message_thread_id=row.topic_id,
-            name=topic_title(marker, name),
+            name=title,
+            icon_custom_emoji_id=icon,
         )
     except TelegramAPIError as exc:
         log.warning(

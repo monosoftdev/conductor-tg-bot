@@ -1176,7 +1176,7 @@ async def test_a_replay_renames_a_topic_whose_title_drifted(
     )
 
     assert bot.topics == 1
-    assert bot.renamed == ["~ api/main"]
+    assert bot.renamed == ["⏳ api/main"]
 
 
 async def test_a_dm_creates_no_topic_and_still_binds(db: Database) -> None:

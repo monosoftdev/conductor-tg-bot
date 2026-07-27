@@ -567,7 +567,7 @@ async def test_a_sleeping_workspace_is_adopted_and_the_card_is_honest(
     card = bot.cards_in(FIRST_TOPIC)[0]
     assert "💤 Sleeping. A prompt may wake it — unverified." in card
     # The sleeping marker is on the topic, not just in the bubble.
-    assert bot.renamed == ["· checkout/main"]
+    assert bot.renamed == ["💤 checkout/main"]
 
 
 async def test_an_empty_transcript_says_nothing_yet_rather_than_faking_one(
