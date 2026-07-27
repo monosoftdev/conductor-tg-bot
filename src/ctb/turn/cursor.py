@@ -19,7 +19,8 @@ Four jobs, in order of how badly getting them wrong hurts:
    server-side regression and re-posting a whole transcript. A 404 on ``after``
    is repaired by offset paging, not by concluding the session is dead.
 3. **The advance is atomic.** ``transcript_messages`` + ``deliveries`` + the
-   cursor move happen in one ``BEGIN IMMEDIATE`` inside
+   cursor move happen in one transaction, behind a ``SELECT … FOR UPDATE`` on
+   the session, inside
    :func:`ctb.db.repo.transcript.advance_cursor`. The cursor never passes an
    unrecorded message (no drops) and a replayed page inserts nothing (no
    duplicates, even with two pollers overlapping across a redeploy).
@@ -72,7 +73,9 @@ from ctb.db.connection import Database, now_ms
 from ctb.db.repo import chats, events, prompts, sessions, transcript, workspaces
 from ctb.db.repo.prompts import PromptRow
 from ctb.db.repo.transcript import AdvanceItem, DeliveryDraft
-from ctb.delivery.render.adapters import best_effort_text
+from ctb.delivery.render.adapters import activity_text, best_effort_text
+from ctb.delivery.render.adapters.result import turn_cost
+from ctb.delivery.render.adapters.shapes import BlockRole, classify_block, first_str
 from ctb.delivery.render.chunk import PartKind, chunk_blocks, chunk_html
 from ctb.delivery.render.html import escape
 from ctb.delivery.render.registry import RenderResult, render_message
@@ -406,20 +409,35 @@ def preview_text(message: TranscriptMessage, *, limit: int = PREVIEW_CHARS) -> s
     """A one-line plain-text gist of a message, for the first-bind preview.
 
     Plain text, not HTML — the bot layer escapes it.
+
+    Known shapes are described by the adapters that know them: what the agent
+    *said* if it said anything, otherwise what it *did*, phrased the way the
+    status card phrases it (``Bash · git add app/models/org.py``).
+    :func:`best_effort_text` is the last resort only — it is the shape-blind
+    walker, and letting it describe a ``tool_use`` block is how a preview ends
+    up reading ``msg_011Cd… message assistant tool_use toolu_01Jz… Bash``.
     """
-    text = ""
-    for block in message.blocks:
-        if block.get("type") == "text":
-            value = block.get("text")
-            if isinstance(value, str) and value.strip():
-                text = value
-                break
+    text = _preview_source(message)
     if not text:
         text = message.prompt_text or best_effort_text(message.content, limit=limit * 4)
     collapsed = " ".join(text.split())
     if len(collapsed) <= limit:
         return collapsed
     return collapsed[: max(1, limit - 1)].rstrip() + "…"
+
+
+def _preview_source(message: TranscriptMessage) -> str:
+    """Said beats did: the first text block, else the first tool call."""
+    action = ""
+    for block in message.blocks:
+        role = classify_block(block)
+        if role is BlockRole.TEXT:
+            said = first_str(block, "text", "content")
+            if said:
+                return said
+        elif role is BlockRole.TOOL_USE and not action:
+            action = activity_text(block)
+    return action
 
 
 # ── evidence ─────────────────────────────────────────────────────────────────
@@ -687,6 +705,9 @@ class DrainResult:
     truncated: bool = False
     #: Latest renderer activity line this tick, for the edit-in-place card.
     latest_activity: str | None = None
+    #: ``total_cost_usd`` off the newest ``result`` payload this tick. The card
+    #: shows it only once the turn is finished, so it never races the clock.
+    latest_cost_usd: float | None = None
 
     @property
     def n(self) -> int:
@@ -747,6 +768,7 @@ async def drain(
     exhausted = True
     truncated = False
     latest_activity: str | None = None
+    latest_cost: float | None = None
 
     while pages < max_pages:
         try:
@@ -785,6 +807,9 @@ async def drain(
             unknown_records: list[Any] = []
             for message in fresh:
                 drafts: tuple[DeliveryDraft, ...] = ()
+                cost = turn_cost(message.content)
+                if cost is not None:
+                    latest_cost = cost
                 if planner is plan_deliveries:
                     rendered = render_message(
                         message,
@@ -891,6 +916,7 @@ async def drain(
         exhausted=exhausted,
         truncated=truncated,
         latest_activity=latest_activity,
+        latest_cost_usd=latest_cost,
     )
 
 

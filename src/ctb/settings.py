@@ -65,6 +65,19 @@ _REQUIRED_HINT = {
 _UNSET = "unset"
 
 
+def _stripped(value: SecretStr) -> SecretStr:
+    """Drop whitespace a paste into a hosting dashboard leaves behind.
+
+    A trailing newline or space rides into the auth header verbatim and comes
+    back as a 401 that looks exactly like a wrong key — observed on a real
+    deploy. Cheaper to strip than to diagnose. Tenant API keys get the same
+    treatment in ``/key``, which is where *those* are pasted.
+    """
+    raw = value.get_secret_value()
+    trimmed = raw.strip()
+    return value if trimmed == raw else SecretStr(trimmed)
+
+
 class Settings(BaseSettings):
     """Everything the *platform* reads from the environment.
 
@@ -188,7 +201,7 @@ class Settings(BaseSettings):
         # failure would otherwise arrive later, from Telegram, as a 401.
         if not value.get_secret_value().strip():
             raise ValueError(_UNSET)
-        return value
+        return _stripped(value)
 
     @field_validator("master_keys", mode="after")
     @classmethod
@@ -200,7 +213,7 @@ class Settings(BaseSettings):
             parse_master_keys(raw)
         except SecretError as exc:
             raise ValueError(str(exc)) from exc
-        return value
+        return _stripped(value)
 
     @field_validator("voice_wake_phrases", mode="before")
     @classmethod

@@ -6,8 +6,8 @@ supervisor refuses to spawn a poller without the lease and cancels every task
 the moment it loses it.
 
 The race is decided inside the database, not in Python. :func:`acquire` is a
-single ``INSERT … ON CONFLICT DO UPDATE … WHERE`` inside ``BEGIN IMMEDIATE``:
-the update only fires when the incumbent lease has expired or is already ours,
+single ``INSERT … ON CONFLICT DO UPDATE … WHERE``: the update only fires when
+the incumbent lease has expired or is already ours,
 so of two processes starting together exactly one gets a lease and the loser
 gets ``None``.
 """

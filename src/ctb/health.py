@@ -1041,6 +1041,21 @@ _STATUS_ICON: Final[dict[HealthStatus, str]] = {
 }
 
 
+def lease_line(lease: Mapping[str, Any]) -> str:
+    """Who is driving, in words rather than in a token.
+
+    The holder is a random instance id. Pasting it into a chat answers nothing
+    the owner can act on — there is no second token to compare it against. The
+    only actionable fact is whether *this* process is the one polling, which is
+    exactly what ``is_me`` says.
+    """
+    if not lease.get("holder"):
+        return "<i>unheld</i>"
+    if not lease.get("held", True):
+        return "expired · a new instance can take it"
+    return "this instance" if lease.get("is_me") else "another instance"
+
+
 def format_health_html(report: HealthReport, *, events: int = 5) -> str:
     """The ``/health`` command body. Telegram HTML, never MarkdownV2."""
     icon = _STATUS_ICON.get(report.status, "")
@@ -1091,20 +1106,19 @@ def format_health_html(report: HealthReport, *, events: int = 5) -> str:
             report.deliveries.get("failed", 0),
         )
     )
+    # ``transcribing`` earns its own number: a note stuck mid-flight is what a
+    # hang looks like, and it is invisible folded into ``pending``.
+    transcribing = int(report.voice.get("transcribing", 0) or 0)
     lines.append(
-        "🎙 voice: {} pending · {} failed · {} clarify".format(
+        "🎙 voice: {} pending · {} failed · {} clarify{}".format(
             report.voice.get("pending", 0),
             report.voice.get("failed", 0),
             report.voice.get("waiting_for_user", 0),
+            f" · {transcribing} transcribing" if transcribing else "",
         )
     )
 
-    holder = report.lease.get("holder")
-    lines.append(
-        "🔑 lease: {}".format(
-            escape(str(holder)) if holder else "<i>unheld</i>",
-        )
-    )
+    lines.append(f"🔑 lease: {lease_line(report.lease)}")
 
     unknown = report.unknown_content_types
     if unknown:
@@ -1166,6 +1180,7 @@ __all__ = [
     "default_detail_policy",
     "detail_allowed",
     "format_health_html",
+    "lease_line",
     "health_port",
     "health_token",
     "is_local_remote",

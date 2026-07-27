@@ -63,6 +63,7 @@ __all__ = [
     "STATUS_FAILURE_THRESHOLD",
     "SetCadence",
     "SetTopicMarker",
+    "SetTurnCost",
     "StartTyping",
     "Status",
     "StatusUnavailable",
@@ -392,6 +393,18 @@ class UpdateActivity:
 
 
 @dataclass(frozen=True, slots=True)
+class SetTurnCost:
+    """What this turn has cost so far, in USD.
+
+    The one number the machine cannot derive: it lives in the agent's own
+    ``result`` payload. The card shows it only on a finished turn, so it can
+    never contradict the live state.
+    """
+
+    cost_usd: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
 class StartTyping:
     """``sendChatAction("typing")`` every 4s until stopped."""
 
@@ -494,6 +507,7 @@ type Action = (
     PostStatusCard
     | EditStatusCard
     | UpdateActivity
+    | SetTurnCost
     | StartTyping
     | StopTyping
     | SetCadence

@@ -24,12 +24,22 @@ from ctb.bot.middleware.tenancy import TenantContext, TenantSettings
 from ctb.db.connection import Database
 from ctb.db.repo import tenancy
 from ctb.db.repo.tenancy import TenantRow
+from ctb.settings import Settings, load_settings
 from tests.pg import BOOTSTRAP_TENANT_ID
 
 pytestmark = pytest.mark.db
 
 MEMBER = 5150
 CHAT = -1_002_000_000_777
+
+
+def _settings() -> Settings:
+    return load_settings(
+        telegram_bot_token="123456:AA",
+        database_url="postgresql://x/y",
+        system_database_url="postgresql://x/y",
+        master_keys="v1:" + "A" * 43,
+    )
 
 
 class NullState:
@@ -96,7 +106,9 @@ GATED: dict[str, Any] = {
     "invite": lambda t, db: admin.invite(message("/invite 99"), t, NullState()),
     "remove": lambda t, db: admin.remove(message("/remove 99"), t, NullState()),
     "members": lambda t, db: admin.members(message("/members"), t, NullState()),
-    "health": lambda t, db: admin.health(message("/health"), t, NullState()),
+    "health": lambda t, db: admin.health(
+        message("/health"), t, NullState(), _settings()
+    ),
     "export": lambda t, db: admin.export(message("/export"), t, NullState()),
     "revoke": lambda t, db: registration.revoke(
         message("/revoke", private=True), t, NullState()

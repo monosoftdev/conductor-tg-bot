@@ -4,7 +4,8 @@ This module owns the single most important operation in the project:
 
 .. code-block:: sql
 
-    BEGIN IMMEDIATE;
+    BEGIN;
+      SELECT 1 FROM sessions WHERE id = ? FOR UPDATE;
       INSERT INTO transcript_messages(...) ON CONFLICT DO NOTHING;
       INSERT INTO deliveries(... state='pending') ON CONFLICT DO NOTHING;
       UPDATE sessions SET cursor_message_id=?, cursor_session_index=?;

@@ -374,8 +374,11 @@ class Supervisor:
         try:
             # System-scoped: retention is a platform job, not a tenant's.
             removed_transcript = await transcript.prune(self.system_db)
-            # `deliveries.payload_json` is the same customer content in another
-            # table; pruning transcripts alone left it there forever.
+            # Terminal deliveries had no retention at all, so one permanent
+            # Telegram refusal left /health reading "degraded" for the life of
+            # the database — a past event reported forever as a live problem.
+            # `payload_json` is also the same customer content transcripts are
+            # pruned for, so this closes two holes with one sweep.
             removed_deliveries = await deliveries.prune_terminal(self.system_db)
             removed_wizards = await wizard.prune_expired(self.system_db)
             removed_tokens = await tenancy.prune_enrollment_tokens(self.system_db)

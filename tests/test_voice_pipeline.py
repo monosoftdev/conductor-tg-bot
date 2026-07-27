@@ -12,12 +12,14 @@ import pytest
 from ctb.bot.handlers.common import MOBILE_REPLY_INSTRUCTION
 from ctb.bot.keyboards import NonceStore
 from ctb.bot.middleware.routing import Route
+from ctb.bot.wizards import new_workspace
 from ctb.conductor.models import PostMessageResult, PostState, SqlResult
 from ctb.db.connection import Database, now_ms
 from ctb.db.repo import prompts as prompts_repo
 from ctb.db.repo import sessions as sessions_repo
 from ctb.db.repo import tenancy
 from ctb.db.repo import voice_inputs as voice_repo
+from ctb.db.repo import wizard as wizard_repo
 from ctb.db.repo import workspaces as workspaces_repo
 from ctb.settings import Settings
 from ctb.voice import service as voice_service_module
@@ -69,6 +71,20 @@ class FakeProvider:
 
     async def aclose(self) -> None:
         return None
+
+
+class HangingProvider(FakeProvider):
+    """A provider that never returns — the shape of the live "Transcribing…"."""
+
+    def __init__(self, *, hang_first_only: bool = False) -> None:
+        super().__init__()
+        self._hang_first_only = hang_first_only
+
+    async def transcribe(self, *args: Any, **kwargs: Any) -> Transcription:
+        self.calls += 1
+        if not self._hang_first_only or self.calls == 1:
+            await asyncio.sleep(3600)
+        return Transcription(self.text, language="en")
 
 
 class FakeClient:
@@ -777,3 +793,99 @@ async def test_retention_covers_failed_and_waiting_rows(db: Database) -> None:
     remaining = await db.fetch_all("SELECT tg_message_id FROM voice_inputs")
     assert pruned == 3
     assert sorted(int(row["tg_message_id"]) for row in remaining) == [83, 84]
+
+
+async def test_a_job_that_hangs_becomes_a_message_not_a_stuck_card(
+    db: Database, system_db: Database, settings_factory: Any, monkeypatch: Any
+) -> None:
+    """The live failure: a note parked on "Transcribing…" indefinitely.
+
+    Every step inside ``_process`` is individually bounded, which is a claim
+    about code that was read rather than code that ran. The deadline is the
+    claim that still holds when one of those bounds is wrong.
+    """
+    settings = settings_factory(voice_enabled=True)
+    service = make_service(settings, db, system_db, provider=HangingProvider())
+    monkeypatch.setattr(voice_service_module, "_JOB_DEADLINE_SECONDS", 0.01)
+    await service.enqueue(voice_message(), _route())
+
+    await service._tick(0)
+
+    row = await voice_repo.get(db, -1001, 55)
+    assert row is not None
+    assert row.state == "failed", "the worker must not sit on it forever"
+    assert "timed out" in (row.last_error or "").casefold()
+
+
+async def test_the_worker_takes_the_next_note_after_one_hangs(
+    db: Database, system_db: Database, settings_factory: Any, monkeypatch: Any
+) -> None:
+    """A hung job used to take the worker with it, not just its own note."""
+    settings = settings_factory(voice_enabled=True)
+    provider = HangingProvider(hang_first_only=True)
+    service = make_service(settings, db, system_db, provider=provider)
+    monkeypatch.setattr(voice_service_module, "_JOB_DEADLINE_SECONDS", 0.01)
+
+    await service.enqueue(voice_message(), _route())
+    await service._tick(0)
+    second = voice_message()
+    second.message_id = 56
+    await service.enqueue(second, _route())
+    await service._tick(0)
+
+    assert provider.calls == 2, "the second note is still picked up"
+
+
+def _route(kind: str = "topic", thread_id: int = 7) -> Route:
+    # `tenant_voice_enabled` is the per-workspace half of the switch; without
+    # it `enqueue` refuses and nothing is stored.
+    return Route(
+        chat_id=-1001,
+        thread_id=thread_id,
+        kind=kind,
+        tenant_voice_enabled=True,
+    )
+
+
+async def test_a_voice_note_answers_an_open_wizard_instead_of_searching(
+    db: Database, system_db: Database, settings_factory: Any, monkeypatch: Any
+) -> None:
+    """The live failure: the wizard asked, voice answered, /find replied.
+
+    Typed text reaches the wizard because aiogram routes on FSM state before
+    any handler runs. Voice never passes through aiogram, so in General the
+    transcript hit the search-only rule — the answer to the question the bot
+    had *just asked* was run as a query, and reported "No matches."
+    """
+    settings = settings_factory(voice_enabled=True)
+    client = FakeClient()
+    service = make_service(settings, db, system_db, client=client)
+
+    created: list[Any] = []
+
+    async def fake_create(**kwargs: Any) -> Any:
+        created.append(kwargs["request"])
+        return SimpleNamespace(
+            label="api/dev", thread_id=42, deep_link=None, workspace_id="w1"
+        )
+
+    monkeypatch.setattr(voice_service_module, "create_and_bind_input", fake_create)
+    await wizard_repo.set_state(
+        db,
+        -1001,
+        0,
+        user_id=1001,
+        state_key=new_workspace.PROMPT_STATE_KEY,
+        data={"projects": {"p1": "api"}, "project_id": "p1", "branch": "dev"},
+    )
+
+    message = voice_message(thread_id=0)
+    await service.enqueue(message, _route(kind="general", thread_id=0))
+    await service._tick(0)
+
+    assert client.queries == [], "a wizard answer is never a search"
+    assert len(created) == 1, "the wizard was completed instead"
+    assert created[0].branch == "dev", "answers given before the prompt survive"
+    assert created[0].prompt == "Fix the flaky test", "the transcript is the prompt"
+    # And the wizard is finished, so the next note routes normally.
+    assert await wizard_repo.get(db, -1001, 0, user_id=1001) is None

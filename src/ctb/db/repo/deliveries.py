@@ -52,6 +52,7 @@ from ctb.logging import get_logger
 
 __all__ = [
     "DEDUPE_WINDOW_MS",
+    "TERMINAL_RETENTION_DAYS",
     "ORPHAN_AFTER_MS",
     "RECOVERY_BATCH",
     "Destination",
@@ -64,6 +65,7 @@ __all__ = [
     "counts_by_state",
     "delete_for_session",
     "enqueue",
+    "failure_digest",
     "get",
     "list_for_session",
     "mark_failed",
@@ -101,10 +103,16 @@ ORPHAN_AFTER_MS: Final = 150_000
 #: long-running transaction.
 RECOVERY_BATCH: Final = 200
 
-#: How long a settled delivery row is kept. Matched to the transcript window on
-#: purpose: `payload_json` is the same customer content in a different table,
-#: so a longer retention here would silently undo the shorter one there.
-DELIVERY_RETENTION_DAYS: Final = 30
+#: How long a settled delivery row is kept. Two independent reasons converge on
+#: a short window, so take the shorter:
+#:
+#: * ``payload_json`` is the rendered agent output — the same customer content
+#:   ``transcript_messages`` is pruned for, in a second table. A longer window
+#:   here would quietly undo the 30-day promise there.
+#: * ``failed`` rows with no retention left ``/health`` reading *degraded* for
+#:   the life of the database: one permanent Telegram refusal, reported forever
+#:   as a present fault.
+TERMINAL_RETENTION_DAYS: Final = 7
 
 _DAY_MS: Final = 24 * 60 * 60 * 1000
 
@@ -468,7 +476,7 @@ async def requeue(
 async def prune_terminal(
     db: Database,
     *,
-    older_than_days: int = DELIVERY_RETENTION_DAYS,
+    older_than_days: int = TERMINAL_RETENTION_DAYS,
     at: int | None = None,
 ) -> int:
     """Delete settled rows past the retention window.
@@ -480,7 +488,9 @@ async def prune_terminal(
 
     Only ``sent``/``failed``/``skipped`` are touched. A ``pending`` row is work
     still owed however old it looks, and a ``sending`` row belongs to
-    :func:`recover_orphaned`.
+    :func:`recover_orphaned`. Dropping ``sent`` rows is safe: the boot re-send
+    guard only ever compares against the row it is about to resend, never one
+    from last week.
     """
     stamp = now_ms() if at is None else at
     cutoff = stamp - max(0, older_than_days) * _DAY_MS
@@ -491,6 +501,36 @@ async def prune_terminal(
         """,
         (cutoff,),
     )
+
+
+async def failure_digest(db: Database) -> dict[str, object]:
+    """What actually failed, so ``/health`` can say more than a number.
+
+    "2 deliveries exhausted their retries" raises four questions and answers
+    none: which, where, when, and will it clear. The newest timestamp and the
+    last error answer three of them in one line.
+    """
+    row = await db.fetch_one(
+        """
+        SELECT COUNT(*) AS n, MAX(updated_at) AS newest
+          FROM deliveries WHERE state = 'failed'
+        """
+    )
+    count = as_int(row["n"]) if row is not None else 0
+    if not count:
+        return {"count": 0, "newest_ms": 0, "reason": ""}
+    detail = await db.fetch_one(
+        """
+        SELECT last_error FROM deliveries
+         WHERE state = 'failed' AND last_error IS NOT NULL
+         ORDER BY updated_at DESC LIMIT 1
+        """
+    )
+    return {
+        "count": count,
+        "newest_ms": as_int(row["newest"]) if row is not None else 0,
+        "reason": as_str(detail["last_error"]) if detail is not None else "",
+    }
 
 
 async def max_pending_index(

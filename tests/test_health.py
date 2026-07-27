@@ -42,6 +42,7 @@ from ctb.health import (
     HEALTH_PATH,
     MONITOR_KEY,
     TELEGRAM_FAILURE_THRESHOLD,
+    Degradation,
     HealthMonitor,
     HealthReport,
     HealthServer,
@@ -992,3 +993,71 @@ def test_format_health_html_of_an_empty_report() -> None:
     text = format_health_html(HealthReport())
     assert text.startswith("✅ <b>ok</b>")
     assert "unheld" in text
+
+
+def test_a_degraded_health_line_always_says_why() -> None:
+    """The live report read "degraded" above five lines that were all fine.
+
+    ``Degradation`` has carried human-facing ``detail`` all along; the compact
+    ``/health`` printed the verdict and dropped the reason, which is the one
+    part the owner can act on.
+    """
+    from ctb.bot.handlers.admin import _voice_line
+
+    report = HealthReport(
+        status=HealthStatus.DEGRADED,
+        degradations=(
+            Degradation(code=DEGRADATION_POLL_LAG, detail="2 sessions overdue"),
+            Degradation(code=DEGRADATION_CIRCUIT_OPEN),
+        ),
+    )
+
+    why = " · ".join(
+        item.detail or item.code.replace("_", " ") for item in report.degradations
+    )
+
+    assert why == "2 sessions overdue · circuit open"
+    assert "_" not in why, "codes are prose here, not identifiers"
+    # And a healthy report contributes no reason line at all.
+    assert HealthReport(status=HealthStatus.OK).degradations == ()
+    # Voice stays silent until it has something to report.
+    assert _voice_line({}, retention_days=7) == ""
+    assert _voice_line({"pending": 1, "transcribing": 1}, retention_days=7) == (
+        "🎙 voice · 1 waiting · 1 transcribing"
+    )
+
+
+def test_health_answers_what_where_when_and_what_next() -> None:
+    """The old report named a fault and answered none of the questions.
+
+    "2 deliveries exhausted their retries" did not say which, when, why, or
+    whether it would ever clear — and because failed rows had no retention, it
+    would have said it forever.
+    """
+    from ctb.bot.handlers.admin import _ago, _delivery_line, _verdict
+
+    now = 1_000_000_000
+    line = _delivery_line(
+        {
+            "count": 2,
+            "newest_ms": now - 11 * 60 * 1000,
+            "reason": "Forbidden: bot was blocked by the user",
+        },
+        now_ms_=now,
+    )
+
+    assert "2 replies never sent" in line  # what
+    assert "11m ago" in line  # when
+    assert "blocked by the user" in line  # why
+    assert "clears itself" in line  # what next
+    assert "exhausted" not in line, "jargon for a thing that already happened"
+
+    # The verdict answers "can I still use it", not "what is the process state".
+    assert _verdict("ok", False, False).startswith("✅")
+    assert "nothing needs you" in _verdict("ok", False, False)
+    assert "clearing on their own" in _verdict("degraded", True, False)
+    assert "needs you" in _verdict("degraded", True, True)
+    assert _verdict("down", True, False).startswith("🚫")
+    # Silence when there is nothing to report.
+    assert _delivery_line({"count": 0}, now_ms_=now) == ""
+    assert _ago(0, now_ms_=now) == "unknown"

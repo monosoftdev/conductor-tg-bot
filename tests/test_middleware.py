@@ -18,7 +18,7 @@ import asyncio
 import datetime as dt
 from collections.abc import AsyncGenerator, Callable
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Final, cast
 
 import pytest
 from aiogram import Bot, Dispatcher, Router
@@ -44,6 +44,7 @@ from aiogram.types import (
     ChatMemberMember,
     ChatMemberUpdated,
     ChosenInlineResult,
+    ForumTopicCreated,
     InlineQuery,
     Message,
     MessageReactionUpdated,
@@ -1658,3 +1659,77 @@ async def test_two_owned_workspaces_stay_ambiguous(
     )
 
     assert seen == []
+
+
+BOT_SELF_ID: Final = 8925129863
+
+
+def _bot_authored_update(update_id: int = 900) -> Update:
+    """What Telegram delivers when the bot's own action posts a message.
+
+    Creating, renaming or closing a forum topic emits a service message into
+    that topic, authored by the bot. ``/setup``, ``/new`` and every topic
+    rename produce one.
+    """
+    return Update(
+        update_id=update_id,
+        message=Message(
+            message_id=77,
+            date=NOW,
+            chat=_chat(),
+            from_user=User(
+                id=BOT_SELF_ID,
+                is_bot=True,
+                first_name="Conductor",
+                username="Conductor_agent_bot",
+            ),
+            message_thread_id=5,
+            is_topic_message=True,
+            forum_topic_created=ForumTopicCreated(name="api/dev", icon_color=0x6FB9F0),
+        ),
+    )
+
+
+async def test_the_bots_own_service_message_never_notifies_the_owners(
+    bot: Bot,
+    session: RecordingSession,
+    bot_settings: Settings,
+    db: Database,
+    system_db: Database,
+    seated: None,
+) -> None:
+    """The owners were told "unknown Telegram user … @Conductor_agent_bot".
+
+    A bot is not a person anyone can invite, so reporting one as a stranger is
+    noise they can do nothing about — and it arrives while they are mid-task,
+    because their own /new caused it.
+    """
+    notifier = StrangerNotifier(clock=FakeClock())
+    auth = make_tenancy(bot_settings, system_db, notifier=notifier)
+    dispatcher, seen = make_dispatcher(bot_settings, db, system_db=system_db, auth=auth)
+
+    await dispatcher.feed_update(bot, _bot_authored_update())
+
+    assert seen == [], "still dropped — the boundary does not move"
+    assert notifier.sent == 0, "but nobody is told about it"
+    assert session.calls == []
+
+
+async def test_a_real_stranger_is_still_reported(
+    bot: Bot,
+    session: RecordingSession,
+    bot_settings: Settings,
+    db: Database,
+    system_db: Database,
+    seated: None,
+) -> None:
+    """Silencing bots must not silence the alert that matters."""
+    notifier = StrangerNotifier(clock=FakeClock())
+    auth = make_tenancy(bot_settings, system_db, notifier=notifier)
+    dispatcher, _seen = make_dispatcher(
+        bot_settings, db, system_db=system_db, auth=auth
+    )
+
+    await dispatcher.feed_update(bot, build_update("message", STRANGER_ID))
+
+    assert notifier.sent == 1

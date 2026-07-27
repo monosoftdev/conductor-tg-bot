@@ -26,14 +26,24 @@ from ctb.bot.app import register_router
 from ctb.bot.handlers.common import abandon_wizard, command_text, short_error, tell
 from ctb.bot.handlers.topics import resolve_db
 from ctb.bot.middleware.tenancy import TenantContext, forget_cached
-from ctb.db.connection import Database
+from ctb.db.connection import Database, now_ms
 from ctb.db.repo import chats as chats_repo
 from ctb.db.repo import deliveries, events, lease, tenancy
 from ctb.db.repo import sessions as sessions_repo
 from ctb.db.repo import workspaces as workspaces_repo
+from ctb.db.repo.deliveries import (
+    TERMINAL_RETENTION_DAYS as DELIVERY_RETENTION_DAYS,
+)
 from ctb.delivery.render.html import escape
-from ctb.health import HealthMonitor
+from ctb.health import (
+    DEGRADATION_AUTH_FATAL,
+    DEGRADATION_DELIVERY_FAILED,
+    DEGRADATION_LEASE_LOST,
+    HealthMonitor,
+    lease_line,
+)
 from ctb.runtime import system_database
+from ctb.settings import Settings
 
 router = Router(name=__name__)
 register_router(router, order=10)
@@ -173,11 +183,89 @@ async def members(
     await tell(message, "\n".join(lines))
 
 
+def _count(value: object) -> int:
+    """A health section is untyped JSON; a missing or odd key reads as zero."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _ago(stamp_ms: int, *, now_ms_: int) -> str:
+    """``4m ago`` — when it happened, which is half of "does this matter"."""
+    if stamp_ms <= 0:
+        return "unknown"
+    seconds = max(0, (now_ms_ - stamp_ms) // 1000)
+    if seconds < 60:
+        return f"{seconds}s ago"
+    if seconds < 3600:
+        return f"{seconds // 60}m ago"
+    if seconds < 86_400:
+        return f"{seconds // 3600}h ago"
+    return f"{seconds // 86_400}d ago"
+
+
+def _voice_line(voice: dict[str, object], *, retention_days: int) -> str:
+    """Voice counters, but only once there is something to say.
+
+    ``transcribing`` is called out separately: a note parked mid-flight is what
+    a hang looks like, and folded into ``pending`` it reads the same as a note
+    that arrived a second ago.
+    """
+    pending = _count(voice.get("pending"))
+    failed = _count(voice.get("failed"))
+    transcribing = _count(voice.get("transcribing"))
+    if not (pending or failed):
+        return ""
+    parts = [f"{pending} waiting"]
+    if transcribing:
+        parts.append(f"{transcribing} transcribing")
+    if failed:
+        parts.append(f"{failed} failed · Retry on the note")
+    line = "🎙 voice · " + " · ".join(parts)
+    if failed:
+        line += f"\n   clears itself after {retention_days}d"
+    return line
+
+
+def _delivery_line(digest: dict[str, object], *, now_ms_: int) -> str:
+    """What failed to reach Telegram, when, why, and when it goes away.
+
+    "2 deliveries exhausted their retries" answered none of those, so it read
+    as a live fault needing attention when it is a record of a past one.
+    """
+    count = _count(digest.get("count"))
+    if not count:
+        return ""
+    reason = str(digest.get("reason") or "").strip() or "Telegram refused it"
+    when = _ago(_count(digest.get("newest_ms")), now_ms_=now_ms_)
+    noun = "reply" if count == 1 else "replies"
+    return (
+        f"📬 {count} {noun} never sent · newest {escape(when)}\n"
+        f"   {escape(reason[:80])}\n"
+        f"   already retried to the limit · clears itself after "
+        f"{DELIVERY_RETENTION_DAYS}d"
+    )
+
+
+def _verdict(status: str, degraded: bool, needs_owner: bool) -> str:
+    """One line saying what this means for the person reading it.
+
+    "degraded" is a word about the process. The owner is asking whether the bot
+    still works and whether they have to do something.
+    """
+    if status == "down":
+        return "🚫 <b>Down</b> · prompts are saved, nothing is running"
+    if not degraded:
+        return "✅ <b>Working</b> · nothing needs you"
+    if needs_owner:
+        return "⚠️ <b>Working</b> · one thing needs you"
+    return "⚠️ <b>Working</b> · past failures, clearing on their own"
+
+
 @router.message(Command("health"))
 async def health(
     message: Message,
     tenant: TenantContext,
     state: FSMContext,
+    settings: Settings,
     db: Database | None = None,
     health_monitor: HealthMonitor | None = None,
 ) -> None:
@@ -188,42 +276,96 @@ async def health(
         return
     database = resolve_db(db)
     system = system_database()
+    stamp = now_ms()
+    problems: list[str] = []
+    facts: list[str] = []
+    needs_owner = False
     try:
-        if health_monitor is not None:
-            report = await health_monitor.report(force=True)
-            status = str(report.status)
-            uptime = f"{int(report.uptime_s)}s"
-            lag = int(report.polling.get("overdue", 0) or 0)
-            lease_holder = str(report.lease.get("holder") or "none")
-        else:
-            status = "ok"
-            uptime = "n/a"
-            lag = 0
-            held = await lease.get(system)
-            lease_holder = held.holder if held else "none"
-        unknown = len(await events.list_unknown_content_types(database, limit=20))
+        report = (
+            await health_monitor.report(force=True)
+            if health_monitor is not None
+            else None
+        )
+        digest = await deliveries.failure_digest(database)
         counts = await deliveries.counts_by_state(database)
-        circuit = "no key"
-        if tenant.has_client:
-            api = tenant.client.health()
-            circuit = str((api.get("circuit") or {}).get("state", "?"))
+        # This workspace's client and this workspace's calls. `api_events` has
+        # no row-level security — a request can fail before a tenant resolves —
+        # so the filter here is explicit and the pool is the worker's.
+        api = tenant.client.health() if tenant.has_client else {}
         recent = await events.recent_api_events(
             system, limit=20, tenant_id=tenant.tenant_id
         )
+        if report is not None:
+            status = str(report.status)
+            # Anything the owner cannot fix themselves is noise on a phone; say
+            # which ones actually want a human.
+            needs_owner = report.has(DEGRADATION_AUTH_FATAL) or report.has(
+                DEGRADATION_LEASE_LOST
+            )
+            for item in report.degradations:
+                if item.code in {DEGRADATION_DELIVERY_FAILED}:
+                    continue  # said better, with when and why, below
+                problems.append(
+                    f"⚠️ {escape(item.detail or item.code.replace('_', ' '))}"
+                )
+            facts.append(
+                "📡 {} {} polling · {} behind".format(
+                    _count(report.polling.get("bound_sessions")),
+                    "session"
+                    if _count(report.polling.get("bound_sessions")) == 1
+                    else "sessions",
+                    _count(report.polling.get("overdue")),
+                )
+            )
+            voice = _voice_line(
+                report.voice,
+                retention_days=settings.voice_completed_retention_days,
+            )
+            if voice:
+                problems.append(voice)
+            uptime = f"{int(report.uptime_s)}s"
+            holder = lease_line(report.lease)
+            unknown = len(report.unknown_content_types)
+        else:
+            status = "ok"
+            uptime = "n/a"
+            # The lease is a platform row, not a tenant's: the worker pool.
+            held = await lease.get(system)
+            holder = "held" if held else "<i>unheld</i>"
+            unknown = len(await events.list_unknown_content_types(database, limit=20))
+        delivery = _delivery_line(digest, now_ms_=stamp)
+        if delivery:
+            problems.append(delivery)
     except Exception as exc:
         await tell(message, f"Health failed: {escape(short_error(exc))}", silent=False)
         return
+    circuit = str((api.get("circuit") or {}).get("state", "?")) if api else "no key"
     failures = [event for event in recent if not event.ok]
-    last = failures[0].error if failures else "none"
-    pending = counts.get("pending", 0) + counts.get("sending", 0)
-    await tell(
-        message,
-        f"<b>{escape(status)}</b> · uptime {escape(uptime)}\n"
-        f"circuit {escape(circuit)} · poll lag {lag}\n"
-        f"deliveries {pending} pending · unknown {unknown}\n"
-        f"lease <code>{escape(lease_holder[:36])}</code>\n"
-        f"last error: {escape((last or 'none')[:180])}",
+    queued = counts.get("pending", 0) + counts.get("sending", 0)
+
+    lines = [_verdict(status, bool(problems), needs_owner), ""]
+    lines += problems
+    if problems:
+        lines.append("")
+    # Plain English: "circuit closed" reads like a fault and is the healthy one.
+    lines.append(
+        "🔌 Conductor {} · {} {} in the last 20 calls".format(
+            "reachable" if circuit == "closed" else f"<b>{escape(circuit)}</b>",
+            len(failures) or "no",
+            "failure" if len(failures) == 1 else "failures",
+        )
     )
+    lines += facts
+    if queued:
+        lines.append(f"📬 {queued} replies on the way out")
+    if unknown:
+        lines.append(f"❓ {unknown} unrecognised message shapes (nothing lost)")
+    lines.append(f"⏱ up {escape(uptime)} · {holder}")
+    if failures:
+        lines.append(
+            f"<i>last API error · {escape((failures[0].error or '')[:120])}</i>"
+        )
+    await tell(message, "\n".join(lines))
 
 
 @router.message(Command("export"))

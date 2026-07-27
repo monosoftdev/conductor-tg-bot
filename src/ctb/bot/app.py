@@ -455,7 +455,7 @@ class PostgresStorage(BaseStorage):
     async def update_data(
         self, key: StorageKey, data: Mapping[str, Any]
     ) -> dict[str, Any]:
-        """Read-modify-write inside one ``BEGIN IMMEDIATE``.
+        """Read-modify-write inside one transaction.
 
         The base class does get-then-set with a gap; two wizard steps racing in
         that gap would lose one of them.

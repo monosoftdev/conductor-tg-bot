@@ -104,6 +104,9 @@ GONE_MESSAGE: Final = "Wizard closed · /new to start again."
 STALE_MESSAGE: Final = "That step is done · use the buttons on the card."
 #: The payload decodes but names nothing this wizard offered.
 INVALID_MESSAGE: Final = "Not a choice on this card."
+#: An older build minted the button, so it carries nothing to re-derive. The
+#: wizard is still live, so the card is redrawn and the tap simply repeats.
+REFRESHED_MESSAGE: Final = "Card refreshed · tap again."
 
 
 class NewWorkspace(StatesGroup):
@@ -113,6 +116,34 @@ class NewWorkspace(StatesGroup):
     model = State()
     effort = State()
     prompt = State()
+
+
+#: What ``wizard_state.state_key`` holds while the card reads "Send the first
+#: prompt." The voice path has no aiogram FSM filter, so it matches on this.
+PROMPT_STATE_KEY: Final = NewWorkspace.prompt.state
+
+
+def request_from_wizard(
+    data: Mapping[str, Any], text: str, *, settings: TenantSettings
+) -> CreateRequest | None:
+    """The wizard's answers plus this prompt, or ``None`` if it lost its project.
+
+    Shared so a spoken prompt and a typed one cannot resolve defaults
+    differently — that divergence is what sent a transcript to ``/find``.
+    """
+    projects = data.get("projects")
+    project_id = str(data.get("project_id") or "")
+    if not project_id or not isinstance(projects, Mapping):
+        return None
+    return CreateRequest(
+        project_id=project_id,
+        project_name=str(projects.get(project_id) or project_id[:8]),
+        branch=str(data.get("branch") or settings.default_branch or DEFAULT_BRANCH),
+        agent=str(data.get("agent") or settings.default_agent),
+        model=str(data.get("model") or settings.default_model),
+        effort=str(data.get("effort") or settings.default_effort),
+        prompt=text.strip(),
+    )
 
 
 def new_wizard_id() -> str:
@@ -396,6 +427,50 @@ async def _ask_prompt(message: Message, state: FSMContext, nonces: NonceStore) -
     await _edit(message, "Send the first prompt.", markup)
 
 
+def _card(query: CallbackQuery) -> Message:
+    """The wizard card, re-attributed to the person who tapped it.
+
+    ``_button`` mints each ticket for ``message.from_user``. On a tap that
+    message is the card *the bot sent*, so ``from_user`` is the bot — every
+    step drawn in response to a tap was bound to the bot's id and then refused
+    the owner, as ``wrong_user``, which reads as "This button has expired".
+    Only the first card, drawn from the owner's own ``/new``, ever worked.
+    """
+    card = query.message
+    assert isinstance(card, Message)  # guarded by the caller
+    return card.model_copy(update={"from_user": query.from_user})
+
+
+async def _reask(
+    step: str,
+    message: Message,
+    state: FSMContext,
+    nonces: NonceStore,
+    settings: TenantSettings,
+) -> bool:
+    """Redraw the step the wizard is on, with buttons this process minted.
+
+    A payload minted by an older build carries nothing to re-derive — the
+    restart-proof format did not exist when it was made — so the only honest
+    recovery is to hand back a card that works. Costs one tap instead of a
+    whole ``/new``.
+    """
+    match step:
+        case "branch":
+            await _ask_branch(message, state, nonces, settings)
+        case "agent":
+            await _ask_agent(message, state, nonces)
+        case "model":
+            await _ask_model(message, state, nonces)
+        case "effort":
+            await _ask_effort(message, state, nonces)
+        case "prompt":
+            await _ask_prompt(message, state, nonces)
+        case _:
+            return False
+    return True
+
+
 def _pick(code: str, data: Mapping[str, Any]) -> tuple[str, str] | str:
     """``(step, value)`` for a tapped option, or the line to answer with.
 
@@ -426,6 +501,19 @@ async def wizard_callback(
     try:
         ticket = resolve(query, expect=Action.WIZARD, store=nonces)
     except NonceError as exc:
+        # A payload this build cannot read is usually one an older build minted
+        # — the restart-proof format did not exist yet, so there is nothing in
+        # it to re-derive. The wizard itself is fine (its state is in SQLite),
+        # so redraw the step rather than dead-end on the word "expired".
+        step = str((await state.get_data()).get("step") or "")
+        if (
+            exc.reason == "unknown"
+            and step
+            and isinstance(query.message, Message)
+            and await _reask(step, _card(query), state, nonces, tenant.settings)
+        ):
+            await query.answer(REFRESHED_MESSAGE, show_alert=True)
+            return
         await query.answer(exc.user_message, show_alert=True)
         return
     if not isinstance(query.message, Message):
@@ -450,7 +538,7 @@ async def wizard_callback(
             await query.answer("Pick a project first.", show_alert=True)
             return
         await query.answer()
-        await _ask_prompt(query.message, state, nonces)
+        await _ask_prompt(_card(query), state, nonces)
         return
     picked = _pick(code, data)
     if isinstance(picked, str):
@@ -460,18 +548,18 @@ async def wizard_callback(
     await state.update_data({"project_id" if step == "project" else step: selected})
     await query.answer()
     if step == "project":
-        await _ask_branch(query.message, state, nonces, tenant.settings)
+        await _ask_branch(_card(query), state, nonces, tenant.settings)
     elif step == "branch":
-        await _ask_agent(query.message, state, nonces)
+        await _ask_agent(_card(query), state, nonces)
     elif step == "agent":
         await state.update_data({"model": default_model_for(selected)})
-        await _ask_model(query.message, state, nonces)
+        await _ask_model(_card(query), state, nonces)
     elif step == "model":
-        await _ask_effort(query.message, state, nonces)
+        await _ask_effort(_card(query), state, nonces)
     else:
         if selected == "default":
             await state.update_data({"effort": None})
-        await _ask_prompt(query.message, state, nonces)
+        await _ask_prompt(_card(query), state, nonces)
 
 
 @router.message(NewWorkspace.branch, F.text & ~F.text.startswith("/"))
@@ -509,24 +597,13 @@ async def typed_prompt(
         message.message_thread_id or NO_THREAD_ID,
         user_id=message.from_user.id if message.from_user else 0,
     )
-    projects = data.get("projects")
-    project_id = str(data.get("project_id") or "")
-    if not project_id or not isinstance(projects, dict):
+    request = request_from_wizard(data, message.text or "", settings=tenant.settings)
+    if request is None:
         await state.clear()
         await tell(
             message, "Wizard expired. Run <code>/new</code> again.", silent=False
         )
         return
-    defaults = tenant.settings
-    request = CreateRequest(
-        project_id=project_id,
-        project_name=str(projects.get(project_id) or project_id[:8]),
-        branch=str(data.get("branch") or defaults.default_branch or DEFAULT_BRANCH),
-        agent=str(data.get("agent") or defaults.default_agent),
-        model=str(data.get("model") or defaults.default_model),
-        effort=str(data.get("effort") or defaults.default_effort),
-        prompt=(message.text or "").strip(),
-    )
     try:
         created = await create_and_bind(
             message=message,

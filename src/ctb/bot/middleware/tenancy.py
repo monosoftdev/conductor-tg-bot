@@ -533,6 +533,19 @@ class TenantMiddleware(BaseMiddleware):
         """Tell the *chat's* owners, if the chat belongs to someone."""
         if chat is None or chat.type == "private":
             return
+        # A bot is not a person anyone can invite, so reporting one as an
+        # unknown *user* is noise the owner can act on in no way. Most of these
+        # are this bot's own doing: creating, renaming or closing a forum topic
+        # posts a service message into that topic authored by the bot, which
+        # Telegram delivers straight back — so an owner's own /new or /setup
+        # made the bot report itself as a stranger. `GroupAnonymousBot` is the
+        # same shape: an admin posting anonymously is attributed to a bot,
+        # correctly refused, and not worth waking anyone for.
+        #
+        # Still dropped either way. Only the alert is suppressed, and the
+        # rejection above is still logged.
+        if user.is_bot:
+            return
         try:
             binding = await tenancy.chat_for(self._db, chat.id)
             if binding is None:

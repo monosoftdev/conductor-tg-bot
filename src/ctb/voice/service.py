@@ -46,6 +46,7 @@ from ctb.db.repo import prompts as prompts_repo
 from ctb.db.repo import sessions as sessions_repo
 from ctb.db.repo import tenancy
 from ctb.db.repo import voice_inputs as voice_repo
+from ctb.db.repo import wizard as wizard_repo
 from ctb.db.repo import workspaces as workspaces_repo
 from ctb.db.repo.voice_inputs import VoiceInputRow
 from ctb.delivery.render.html import escape
@@ -78,6 +79,16 @@ _AUDIT_LIMIT: Final = 140
 _POLL_SECONDS: Final = 0.5
 _ERROR_BACKOFF_SECONDS: Final = 5.0
 _MAINTENANCE_SECONDS: Final = 3_600.0
+#: Ceiling on one job, end to end. Every step inside is already bounded, but
+#: "already bounded" is a claim about code that was read, not about code that
+#: ran — and the failure it misses is the worst one: the note sits on
+#: "Transcribing…" forever and the worker never takes another. A deadline turns
+#: that into a message with a Retry button.
+_JOB_DEADLINE_SECONDS: Final = 180.0
+#: A row left mid-flight (deadline, restart, hard kill) used to wait for the
+#: next boot to be noticed. Sweep on this cadence instead, so a stuck note
+#: recovers on its own rather than needing a redeploy.
+_RECOVERY_SECONDS: Final = 120.0
 _STATIC_KEYTERMS: Final[tuple[str, ...]] = (
     "Conductor",
     "Telegram",
@@ -217,6 +228,7 @@ class VoiceService:
         async with asyncio.TaskGroup() as tasks:
             for index in range(self.settings.voice_max_concurrent):
                 tasks.create_task(self._worker(index), name=f"ctb-voice-{index}")
+            tasks.create_task(self._sweep(), name="ctb-voice-sweep")
             tasks.create_task(self._maintenance(), name="ctb-voice-maintenance")
 
     async def stop(self) -> None:
@@ -271,8 +283,8 @@ class VoiceService:
             return
         if row.tenant_id is None:  # pragma: no cover - the column is NOT NULL
             return
-        # The failure path needs the scope as much as the happy path does.
-        # Written as one block rather than try/except *around* the scope,
+        # The failure paths need the tenant scope as much as the happy path
+        # does. Written as one block rather than try/except *around* the scope,
         # because `async with` exits before an outer `except` body runs — and
         # `voice_repo.fail` on the tenant-scoped pool with no tenant set raises
         # `TenantScopeError`, replacing the real error and leaving the job stuck
@@ -280,9 +292,23 @@ class VoiceService:
         # their voice note went nowhere.
         async with tenant_scope(row.tenant_id):
             try:
-                await self._process(row)
+                async with asyncio.timeout(_JOB_DEADLINE_SECONDS):
+                    await self._process(row)
             except asyncio.CancelledError:
                 raise
+            except TimeoutError:
+                error = "Transcription timed out."
+                log.warning(
+                    "voice.job_timed_out",
+                    chat_id=row.chat_id,
+                    tg_message_id=row.tg_message_id,
+                    worker=index,
+                    seconds=_JOB_DEADLINE_SECONDS,
+                )
+                with suppress(Exception):
+                    await voice_repo.fail(self.db, row, error=error)
+                with suppress(Exception):
+                    await self._send_failure(row, error)
             except Exception as exc:
                 error = short_error(exc)
                 log.warning(
@@ -296,6 +322,33 @@ class VoiceService:
                     await voice_repo.fail(self.db, row, error=error)
                 with suppress(Exception):
                     await self._send_failure(row, error)
+
+    async def _sweep(self) -> None:
+        """Re-queue rows abandoned mid-flight, without waiting for a restart.
+
+        ``recover_stale`` ran only at boot, so a note that died between claim
+        and completion held "Transcribing…" until the next redeploy. On its own
+        that is a hang the owner cannot tell from a slow provider.
+        """
+        while not self._stop.is_set():
+            await self._pause(_RECOVERY_SECONDS)
+            if self._stop.is_set():
+                return
+            try:
+                recovery = await voice_repo.recover_stale(self.db)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("voice.recover_failed", error=short_error(exc))
+                continue
+            if recovery.requeued or recovery.abandoned:
+                log.info(
+                    "voice.stale_recovered",
+                    requeued=recovery.requeued,
+                    abandoned=len(recovery.abandoned),
+                )
+            for row in recovery.abandoned:
+                await self._send_failure(row, "Transcription kept failing.")
 
     async def _maintenance(self) -> None:
         while not self._stop.is_set():
@@ -464,6 +517,13 @@ class VoiceService:
         return await self._prompt(row, intent.text)
 
     async def _prompt(self, row: VoiceInputRow, text: str) -> bool:
+        # A wizard waiting on "Send the first prompt." outranks everything
+        # below. Typed text reaches it because aiogram routes on FSM state
+        # first; voice never passes through aiogram, so without this check the
+        # transcript fell through to General's search-only rule and the answer
+        # to the question the bot had just asked was run as a /find.
+        if await self._finish_wizard(row, text):
+            return True
         conductor = await self._client_for(row)
         if conductor is None:
             await self._send(row, _NO_KEY)
@@ -623,6 +683,55 @@ class VoiceService:
             )
             return True
         await self._send(row, "Unknown voice command.")
+        return True
+
+    async def _finish_wizard(self, row: VoiceInputRow, text: str) -> bool:
+        """Answer an open ``/new`` wizard with this transcript.
+
+        ``False`` means no wizard is waiting for a prompt in this seat, and the
+        caller should route the note normally.
+        """
+        from ctb.bot.wizards.new_workspace import PROMPT_STATE_KEY, request_from_wizard
+
+        wizard = await wizard_repo.get(
+            self.db, row.chat_id, row.thread_id, user_id=row.user_id
+        )
+        if wizard is None or wizard.state_key != PROMPT_STATE_KEY:
+            return False
+        # This tenant's defaults, not the platform's — `/defaults` is per
+        # workspace, and a spoken prompt must resolve them exactly as a typed
+        # one does. Sharing `request_from_wizard` is what guarantees that.
+        request = request_from_wizard(
+            wizard.data, text, settings=await self._defaults(row)
+        )
+        if request is None:
+            return False
+        conductor = await self._client_for(row)
+        if conductor is None:
+            await self._send(row, _NO_KEY)
+            return True
+        chat = await chats_repo.get(self.db, row.chat_id, row.thread_id)
+        route = Route(
+            chat_id=row.chat_id,
+            thread_id=row.thread_id,
+            kind=row.route_kind,
+            chat=chat,
+        )
+        created = await create_and_bind_input(
+            bot=self.bot,
+            chat_id=row.chat_id,
+            chat_type="private" if row.route_kind == "dm" else "supergroup",
+            tg_message_id=row.tg_message_id,
+            route=route,
+            request=request,
+            db=self.db,
+            client=conductor,
+            action_id=row.action_id,
+        )
+        await wizard_repo.clear(
+            self.db, row.chat_id, row.thread_id, user_id=row.user_id
+        )
+        await self._send(row, f"→ <b>{escape(created.label)}</b>")
         return True
 
     async def _send_failure(self, row: VoiceInputRow, error: str) -> None:

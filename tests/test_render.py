@@ -21,7 +21,7 @@ import json
 import re
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 import pytest
 
@@ -43,6 +43,7 @@ from ctb.delivery.render.adapters.base import (
     split_fenced,
     truncate_text,
 )
+from ctb.delivery.render.adapters.extract import is_machine_token
 from ctb.delivery.render.adapters.result import format_duration
 from ctb.delivery.render.adapters.shapes import preamble_span
 from ctb.delivery.render.registry import (
@@ -64,6 +65,7 @@ from ctb.delivery.render.types import (
     Verbosity,
     utf16_len,
 )
+from ctb.turn.cursor import preview_text
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 VERBOSITIES = (Verbosity.QUIET, Verbosity.NORMAL, Verbosity.VERBOSE)
@@ -191,12 +193,26 @@ def test_probe_answer_is_delivered_exactly_once_per_turn() -> None:
     assert seen == 1
 
 
-def test_probe_result_is_card_material_only() -> None:
+def test_probe_result_never_puts_done_on_a_running_card() -> None:
+    """A ``result`` is accounting, not activity.
+
+    Emitting ``✅ done · 45.8s`` as an activity line put it beside a card that
+    still read ``working 20s`` and still carried Stop — one card, two states,
+    two clocks. The turn is over when the state machine says it is over.
+    """
     result = render(PROBE["probe_verified-5"])
     assert result.adapter == "result"
     assert result.chat == ()
-    assert result.activity and result.activity[0].startswith("✅ done")
-    assert "3.7s" in result.activity[0]
+    assert result.activity == ()
+
+
+def test_probe_result_summary_is_verbose_chat_only() -> None:
+    result = render(PROBE["probe_verified-5"], Verbosity.VERBOSE)
+    assert result.activity == ()
+    text = chat_text(result)
+    assert "done · 3.7s" in text
+    # Phone-sized money: two decimals, never four.
+    assert "$0.05" in text
 
 
 def test_probe_system_and_rate_limit_are_suppressed_below_verbose() -> None:
@@ -543,6 +559,142 @@ def test_server_tool_use_is_still_a_tool_call() -> None:
     assert result.activity == ("web_search · telegram sendMessage entity parse error",)
 
 
+# ── no machine identifiers, ever ─────────────────────────────────────────────
+
+#: Exhibit A, verbatim in shape: the assistant envelope whose ``tool_use`` block
+#: produced ``🤖 claude-opus-5 msg_011Cd… message assistant tool_use toolu_01Jz…
+#: Bash git add app/models/org.py && git commit -q -m "$(cat <<'EOF' chore:…``
+#: in a live adopt snapshot.
+EXHIBIT_A: Final[dict[str, Any]] = {
+    "type": "agentMessage",
+    "turnId": "msg_011CdRjDXXYG6KcJeuk1oXiu",
+    "rawPayload": {
+        "type": "assistant",
+        "message": {
+            "id": "msg_011CdRjDXXYG6KcJeuk1oXiu",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-opus-5",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_01Jzh4cfPmYAZJLZK4CKTXN1",
+                    "name": "Bash",
+                    "input": {
+                        "command": (
+                            "git add app/models/org.py && git commit -q -m "
+                            "\"$(cat <<'EOF'\n"
+                            "chore: add hello world comment to Org model "
+                            "(Conductor)\n"
+                            "EOF\n"
+                            ')"'
+                        ),
+                        "description": "Commit the Org model comment",
+                    },
+                }
+            ],
+            "usage": {"input_tokens": 4, "output_tokens": 91},
+        },
+        "session_id": "5b1f0c62-4f7a-4d1e-9b3a-4c9d2e6f8a11",
+    },
+}
+
+#: Substrings that must never survive to a chat surface.
+_MACHINE_SUBSTRINGS: Final = (
+    "msg_011",
+    "toolu_",
+    "5b1f0c62",
+    "claude-opus-5",
+)
+#: Protocol vocabulary that must never be read as prose.
+_DISCRIMINATOR_SUBSTRINGS: Final = ("tool_use", "assistant", "message", "user")
+
+
+def _exhibit_a() -> TranscriptMessage:
+    return TranscriptMessage(
+        id="env-exhibit-a",
+        session_id="s-exhibit",
+        session_index=7,
+        type="agentMessage",
+        content=json.loads(json.dumps(EXHIBIT_A)),
+    )
+
+
+def test_exhibit_a_never_reaches_a_preview_as_identifiers() -> None:
+    """The adopt snapshot line for a tool call names the tool, not the tokens."""
+    line = preview_text(_exhibit_a())
+
+    assert line == "Bash · git add app/models/org.py"
+    assert "\n" not in line
+    for token in _MACHINE_SUBSTRINGS:
+        assert token not in line
+    for word in _DISCRIMINATOR_SUBSTRINGS:
+        assert word not in line
+    # And never the heredoc.
+    assert "EOF" not in line and "<<" not in line
+
+
+def test_exhibit_a_best_effort_text_emits_no_identifiers() -> None:
+    """Even the shape-blind walker refuses ids and discriminator words.
+
+    ``best_effort_text`` is the last resort for shapes nobody has seen. Its
+    ``interesting`` flag used to be sticky, so entering ``rawPayload.message``
+    made every leaf beneath it prose — the model id, ``msg_…``, ``tool_use``,
+    ``assistant`` and the raw heredoc, in that order.
+    """
+    text = best_effort_text(EXHIBIT_A)
+
+    for token in _MACHINE_SUBSTRINGS:
+        assert token not in text
+    for word in _DISCRIMINATOR_SUBSTRINGS:
+        assert word not in text
+
+
+def test_exhibit_a_renders_as_one_activity_line() -> None:
+    result = render(_exhibit_a())
+    assert result.chat == ()
+    assert result.activity == ("Bash · git add app/models/org.py",)
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "msg_011CdRjDXXYG6KcJeuk1oXiu",
+        "toolu_01Jzh4cfPmYAZJLZK4CKTXN1",
+        "sevt_01ABCdefGHIjklMNO234",
+        "5b1f0c62-4f7a-4d1e-9b3a-4c9d2e6f8a11",
+        "a3f91c02be77d4e15b8c",
+        "deadbeefdeadbeefdead",
+    ],
+)
+def test_identifier_shapes_are_recognised(token: str) -> None:
+    assert is_machine_token(token)
+    assert best_effort_text({"text": token}) == ""
+
+
+@pytest.mark.parametrize(
+    "prose",
+    [
+        "chore_addhelloworld",
+        "Deployed to production at last",
+        "src/ctb/delivery/render.py",
+        "1200",
+        "ValueError: expected 3 arguments",
+    ],
+)
+def test_prose_is_not_mistaken_for_an_identifier(prose: str) -> None:
+    assert not is_machine_token(prose)
+    assert best_effort_text({"text": prose}) == prose
+
+
+def test_meta_keys_never_carry_prose_but_still_yield_nested_text() -> None:
+    assert best_effort_text({"type": "widget", "role": "user"}) == ""
+    # Interest is switched off for the subtree, not the subtree skipped.
+    assert best_effort_text({"metadata": {"text": "still readable"}}) == (
+        "still readable"
+    )
+
+
 # ── unknown content: counted, never crashed ──────────────────────────────────
 
 
@@ -565,6 +717,39 @@ def test_unknown_type_without_text_is_silent_but_counted() -> None:
     assert result.blocks == ()
     assert len(result.unknown) == 1
     assert result.unknown[0].type == "telemetry"
+
+
+def test_a_wholly_unknown_shape_degrades_without_raising_or_leaking_ids() -> None:
+    """The last resort stays a last resort: no soup, no tokens, still counted.
+
+    Nothing here may raise. Losing an unrecognised payload's wording is fine;
+    printing its ids at the owner is not.
+    """
+    message = TranscriptMessage(
+        id="env-mystery",
+        session_id="s-mystery",
+        session_index=11,
+        type="quantumEvent",
+        content={
+            "type": "quantumEvent",
+            "eventId": "sevt_01ABCdefGHIjklMNO234",
+            "requestId": "5b1f0c62-4f7a-4d1e-9b3a-4c9d2e6f8a11",
+            "payload": {"role": "assistant", "kind": "tool_use"},
+            "summary": "The workspace finished updating.",
+        },
+    )
+
+    for verbosity in Verbosity:
+        result = render(message, verbosity)
+        assert result.adapter == "unknown"
+        assert len(result.unknown) == 1
+        assert result.unknown[0].type == "quantumEvent"
+        text = chat_text(result)
+        assert "sevt_" not in text
+        assert "5b1f0c62" not in text
+        assert "tool_use" not in text
+        assert "assistant" not in text
+    assert "The workspace finished updating." in chat_text(render(message))
 
 
 def test_unknown_record_carries_no_content() -> None:
@@ -812,14 +997,42 @@ def test_best_effort_text_is_bounded() -> None:
 
 
 def test_activity_text_is_one_plain_line() -> None:
+    """One line by construction: the first line, not the whole thing flattened.
+
+    A multi-line command collapsed into a paragraph is still a paragraph. The
+    activity line says what the tool is doing, so it stops where the command
+    stops being that and starts being plumbing.
+    """
     line = activity_text(
         {"name": "Bash", "input": {"command": "pytest -q\n--maxfail=1"}}
     )
-    assert line == "Bash · pytest -q --maxfail=1"
+    assert line == "Bash · pytest -q"
     assert activity_text({"name": "Task"}) == "Task"
     assert activity_text({}) == "tool"
     long = activity_text({"name": "Bash", "input": {"command": "x" * 500}})
     assert utf16_len(long) <= 120
+
+
+def test_activity_text_drops_shell_plumbing() -> None:
+    heredoc = activity_text(
+        {
+            "name": "Bash",
+            "input": {
+                "command": (
+                    "git add app/models/org.py && git commit -q -m \"$(cat <<'EOF'\n"
+                    "chore: add hello world comment to Org model\n"
+                    "EOF\n"
+                    ')"'
+                )
+            },
+        }
+    )
+    assert heredoc == "Bash · git add app/models/org.py"
+    # A leading `cd` says where, not what.
+    assert (
+        activity_text({"name": "Bash", "input": {"command": "cd /srv && make test"}})
+        == "Bash · make test"
+    )
 
 
 @pytest.mark.parametrize(

@@ -452,6 +452,10 @@ async def health_stats(db: Database) -> dict[str, object]:
     )
     return {
         "pending": pending,
+        # Broken out of ``pending`` on purpose: a note parked here is the shape
+        # a hang takes, and "1 pending" cannot be told apart from a note that
+        # arrived a second ago.
+        "transcribing": by_state.get("transcribing", 0),
         "failed": by_state.get("failed", 0),
         "waiting_for_user": by_state.get("waiting_for_user", 0),
         "completed": by_state.get("completed", 0),

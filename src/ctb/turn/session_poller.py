@@ -53,6 +53,7 @@ from ctb.turn.state import (
     RequestWorkspaceStatus,
     SetCadence,
     SetTopicMarker,
+    SetTurnCost,
     Status,
     StatusUnavailable,
     StopPolling,
@@ -255,10 +256,7 @@ class SessionPoller:
                         await self._apply_evidence(
                             Timer(self._clock()), reposted=reposted
                         )
-                    if drained.latest_activity:
-                        await self._emit_external(
-                            (UpdateActivity(drained.latest_activity),)
-                        )
+                    await self._emit_card_updates(drained)
             if not self._stop_requested:
                 await self._poll_regular_status(reposted)
 
@@ -356,11 +354,24 @@ class SessionPoller:
                 return
             if result.delta is not None:
                 await self._apply_evidence(result.delta, reposted=reposted)
-            if result.latest_activity:
-                await self._emit_external((UpdateActivity(result.latest_activity),))
+            await self._emit_card_updates(result)
             if result.exhausted:
                 return
         _log.warning("poller.force_drain_budget_exhausted", session_id=self.session_id)
+
+    async def _emit_card_updates(self, drained: cursor.DrainResult) -> None:
+        """Chrome the drain produced: what it is doing, and what it has cost.
+
+        One batch, so a tool call and its turn's price cost one card edit.
+        Neither can gate anything — the content is already durable and queued.
+        """
+        updates: list[Action] = []
+        if drained.latest_activity:
+            updates.append(UpdateActivity(drained.latest_activity))
+        if drained.latest_cost_usd is not None:
+            updates.append(SetTurnCost(drained.latest_cost_usd))
+        if updates:
+            await self._emit_external(tuple(updates))
 
     async def _poll_regular_status(self, reposted: set[str]) -> None:
         context = self._require_context()
