@@ -51,6 +51,16 @@ jobs:
         if: always()
         run: pyright
 
+      # A workflow with a syntax error is not a failing build — GitHub rejects
+      # the file and runs *nothing*, which looks identical to "no checks yet".
+      # A double-quoted string in a `${{ }}` expression did exactly that here
+      # once. Lint the pipeline with the pipeline.
+      - name: Workflows
+        if: always()
+        uses: docker://rhysd/actionlint:latest
+        with:
+          args: -color
+
   offline:
     name: tests (no database)
     runs-on: ubuntu-latest
@@ -173,7 +183,10 @@ jobs:
       # a branch protection rule.
       - name: Verify
         run: |
-          results='${{ join(needs.*.result, " ") }}'
+          # Single quotes: GitHub expressions have no double-quoted strings,
+          # and the whole workflow is rejected — no jobs run at all — rather
+          # than failing the one step that uses it.
+          results='${{ join(needs.*.result, ' ') }}'
           echo "results: $results"
           for result in $results; do
             if [ "$result" != "success" ]; then
