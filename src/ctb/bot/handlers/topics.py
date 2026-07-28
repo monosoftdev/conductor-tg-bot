@@ -245,9 +245,9 @@ _INTERNAL_NAME: Final = re.compile(r"^tg-\d+-[A-Za-z0-9_-]{4,}$")
 def human_name(name: str | None) -> str:
     """``name``, unless it is the reconciliation key we invented for Conductor.
 
-    Every workspace this bot creates is called ``tg-1132334-iszvwjeb`` on the
+    Every workspace this bot creates is called ``tg-100200300-iszvwjeb`` on the
     Conductor side, and that string was being rendered straight into buttons
-    (``+ Open tg-1132334-iszvwjeb``) and, through adoption, into topic titles.
+    (``+ Open tg-100200300-iszvwjeb``) and, through adoption, into topic titles.
     Empty here means "you have nothing worth showing — use a fallback".
     """
     text = (name or "").strip()
@@ -263,7 +263,7 @@ def topic_label(
     phone shows perhaps thirty characters of it, so whatever identifies the
     workspace has to be in front. It used to be ``proj/branch`` alone — and
     since a branch is almost always ``main``, three workspaces on one repo were
-    three rows reading ``reclaimly-be/main``, in the same colour, with the same
+    three rows reading ``acme-api/main``, in the same colour, with the same
     icon. The list could not answer the one question you ask it.
 
     With no task — an adopted workspace, a hand rename — it falls back to

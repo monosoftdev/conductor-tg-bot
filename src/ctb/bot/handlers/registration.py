@@ -22,10 +22,12 @@ Everything else is additive, and nothing else is required:
   code somebody could bind the bot to a team that is not theirs.
 * ``/voicekey`` stores a speech key.
 
-``/start``, ``/register``, ``/help``, ``/privacy`` are the only commands a
-non-member can reach, and only in a private chat —
-:class:`~ctb.bot.middleware.tenancy.TenantMiddleware` lets exactly that set
-through unresolved. Everything else about someone with no team is silence.
+``/start``, ``/register``, ``/help``, ``/privacy`` and ``/platform`` are the
+only commands a non-member can reach in a private chat, and ``/setup`` the only
+one in a group — :class:`~ctb.bot.middleware.tenancy.TenantMiddleware` lets
+exactly those through unresolved (``UNRESOLVED_COMMANDS`` and
+``UNRESOLVED_GROUP_COMMANDS``). ``/platform`` is operator-only and answers
+nobody else. Everything else about someone with no team is silence.
 
 **The key never stays in Telegram.** Sent in a group it is refused *and*
 deleted, with a rotate-it warning. Sent in a private chat it is validated,

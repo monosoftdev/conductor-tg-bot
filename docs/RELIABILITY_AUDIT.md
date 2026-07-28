@@ -38,7 +38,7 @@ now fails the deployment instead of presenting a false-green service.
 | Telegram callback | Expired, reused, malformed, or unknown button | Alert closes spinner; destructive callbacks stay single-use |
 | Handler | Unexpected exception | Allowed user sees generic retry/health line; no secret or stack trace |
 | Authorization | Unknown user or wrong configured group | Silently rejected before download, DB mutation, or API call |
-| Owner command | Allowed non-owner invokes `/health`, `/backup`, `/sql`, `/allow`, `/deny` | `Owner only.`; never silent and never executed |
+| Owner command | Allowed non-owner invokes `/health`, `/sql`, `/invite`, `/remove` | `Owner only.`; never silent and never executed |
 | Command reply | Telegram timeout, 5xx, or `retry_after` | Bounded retry; HTML entity failure falls back to plain text |
 | Prompt accept | Telegram redelivers the same message | Existing durable prompt row and identical Conductor `messageId` reused |
 | Prompt POST | Timeout after Conductor may have accepted it | Remains pending; retry uses the identical ID |

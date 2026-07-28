@@ -73,6 +73,7 @@ from ctb.turn.state import (
     CADENCE_WORKING_MS,
     CADENCE_WORKING_STALLED_MS,
     CANCEL_CONFIRMS,
+    CANCEL_TIMEOUT_S,
     CURSOR_ONLY_QUIET_FINALIZE_S,
     DRAIN_CONFIRMS,
     E404,
@@ -1075,7 +1076,10 @@ def _on_cancel(tick: _Tick, evidence: Cancel, now: float) -> TransitionResult:
         cancel_requested_at=now,
     )
     tick.do(PostCancel(evidence.requested_by))
-    tick.card(CardKind.CANCELLING, "stopping…", ())
+    # Not `()`. A cancel that never settles used to leave a spinner with
+    # nothing to press; Check asks Conductor directly what the session is
+    # actually doing, which is the question the reader now has.
+    tick.card(CardKind.CANCELLING, "stopping…", (CardButton.CHECK,))
     tick.retune(now, "cancelling")
     return tick.result(18, "cancel requested")
 
@@ -1262,6 +1266,37 @@ def _timer_in_cancelling(tick: _Tick, now: float) -> TransitionResult:
             reason="canceled",
         )
         return tick.result(19, "cursor-only: cancel settled")
+    requested_at = tick.ctx.cancel_requested_at
+    if requested_at is not None and (now - requested_at) >= CANCEL_TIMEOUT_S:
+        # RULE 23 — Conductor never acknowledged the cancel.
+        #
+        # `PostCancel` is issued once and its transport errors are swallowed, so
+        # this state used to be absorbing: "🛑 stopping…" with no buttons, a
+        # typing indicator that never stopped, and a 2s poll, forever. Do not
+        # finalize — the turn may well still be running, and claiming "stopped"
+        # would be the one lie the card must never tell. Go back to reporting
+        # what is observable and hand back the controls.
+        tick.enter(
+            TurnState.WORKING,
+            now,
+            consecutive_idle=0,
+            cancel_requested_at=None,
+        )
+        tick.card(
+            CardKind.WORKING,
+            f"{_working_text(tick.ctx, now)} · stop not confirmed",
+            _STALLED_BUTTONS,
+        )
+        tick.do(
+            Notify(
+                "Conductor did not confirm the stop. The turn may still be "
+                "running — tap Check to ask, or Stop to try again.",
+                NotifyLevel.QUIET,
+                once_key=f"cancel-unconfirmed:{int(requested_at)}",
+            )
+        )
+        tick.retune(now, "cancel not confirmed")
+        return tick.result(23, "cancel was never confirmed")
     return tick.result(None, "cancelling")
 
 

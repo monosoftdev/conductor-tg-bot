@@ -220,9 +220,11 @@ watch together.
 To find someone's Telegram id, have them message the bot `/start` — or use any
 "what is my id" bot.
 
-**Roles.** `owner` can do everything, including `/team`. `admin` can invite and
-remove members but cannot remove an owner or delete the team. `member` can
-drive sessions and nothing else.
+**Roles.** `owner` and `admin` are treated the same almost everywhere: both can
+`/team`, `/key`, `/invite`, `/remove`, `/members` and `/health`. The one thing
+only an owner can do is `/forget`, which deletes the team and everything in it.
+An `admin` also cannot remove an owner. `member` can drive sessions and nothing
+else.
 
 A team always keeps at least one owner: the bot refuses the change that would
 leave it with none, including an owner demoting themselves.
@@ -244,12 +246,13 @@ chat** with the bot is not, so tell it which one you mean:
 ## Voice notes
 
 Off unless the operator has enabled it *and* you have stored your own speech
-key:
+key. Storing the key **is** the request to use it — there is no second switch:
 
 ```
 /voicekey sk_xxxxxxxxxxxx     # privately, like /key
-/voice on
 ```
+
+`/voice off` turns it back off, and `/voice on` afterwards turns it on again.
 
 Then send a voice note in a topic and it becomes a prompt. To use voice for
 *commands* rather than prompts, start with the word "command" ("command stop").
@@ -286,15 +289,15 @@ leaked.
 | Bot says nothing to `/new` in a DM | You never finished sign-up | `/start`, then `/key` |
 | *Topics unavailable here · one workspace at a time* | Telegram will not open a topic in this chat | Nothing to fix — the bot runs linearly. See [above](#when-your-private-chat-has-no-topics) |
 | Bot ignores a group entirely | Group not linked, or you are not a member | `/setup` with a fresh code from `/team`, or ask an owner to `/invite` you |
-| *Conductor rejected this workspace's API key* | Key revoked or expired at Conductor | `/key` privately with a new one |
-| *This workspace is suspended* | The operator suspended your team | Contact whoever runs the instance |
+| *Conductor rejected this team's API key* | Key revoked or expired at Conductor | `/key` privately with a new one |
+| *This team is suspended* | The operator suspended your team | Contact whoever runs the instance |
 | A button says it expired | Buttons last 15 minutes | Run the command again for fresh ones |
 | Answers stop mid-turn | Usually a deleted topic | The rest is redirected to the chat root |
 | *at its limit of N workspaces* | Quota | `/done` something first |
 | *Sign-ups are busy right now* | Instance-wide rate limit | Try again in an hour |
 | A whole group went silent after an upgrade | Telegram changed the group's id | Send `/setup <new code>` in it again |
 
-`/health` (owners only) shows what the bot thinks is wrong, including whether
+`/health` (owners and admins) shows what the bot thinks is wrong, including whether
 your key is working and how far behind delivery is.
 
 ---

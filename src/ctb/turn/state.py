@@ -57,6 +57,7 @@ __all__ = [
     "PostOk",
     "PostStatusCard",
     "QUEUED_SLOW_AFTER_S",
+    "CANCEL_TIMEOUT_S",
     "QUEUED_TIMEOUT_S",
     "RePost",
     "RequestStatus",
@@ -106,6 +107,11 @@ CANCEL_CONFIRMS: Final = 2
 #: QUEUED with no delta this long: the card says "queued behind another turn".
 QUEUED_SLOW_AFTER_S: Final = 90.0
 #: QUEUED this long without ever starting: give up and offer Retry.
+#: How long a requested cancel may go unconfirmed before the card stops
+#: claiming to be stopping. `POST /cancel` is asynchronous and settles in
+#: seconds when it works; two minutes is generous, and past it the truthful
+#: answer is "Conductor never confirmed", not a spinner with no buttons.
+CANCEL_TIMEOUT_S: Final = 120.0
 QUEUED_TIMEOUT_S: Final = 600.0
 #: WAKING this long: wake timeout.
 WAKE_TIMEOUT_S: Final = 600.0

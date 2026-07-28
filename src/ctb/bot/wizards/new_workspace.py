@@ -329,6 +329,40 @@ async def start_wizard(
         )
 
 
+#: The order the wizard asks in, which is the order the breadcrumb reads in.
+_CHOSEN_ORDER: Final = ("project", "branch", "agent", "model", "effort")
+
+
+def chosen_line(data: dict[str, Any], upto: str) -> str:
+    """What has been picked so far — ``api/main · claude``.
+
+    Five taps used to leave no trace: each step replaced the last and the final
+    card said only "Send the first prompt", so a mis-tapped agent was invisible
+    until a workspace had been paid for. This costs nothing — the card is one
+    message being edited either way.
+    """
+    projects = data.get("projects") or {}
+    parts: list[str] = []
+    for step in _CHOSEN_ORDER:
+        if step == upto:
+            break
+        value = data.get("project_id") if step == "project" else data.get(step)
+        if not value:
+            continue
+        text = str(projects.get(value) or value) if step == "project" else str(value)
+        if step == "branch" and parts:
+            parts[-1] = f"{parts[-1]}/{text}"
+            continue
+        parts.append(text)
+    return " · ".join(parts)
+
+
+def _ask(data: dict[str, Any], step: str, question: str) -> str:
+    """The question, under the breadcrumb of everything answered before it."""
+    chosen = chosen_line(data, step)
+    return f"<i>{escape(chosen)}</i>\n{question}" if chosen else question
+
+
 async def _edit(
     message: Message,
     text: str,
@@ -368,10 +402,11 @@ async def _ask_branch(
         fsm_state=NewWorkspace.branch,
         options=[(configured, configured), (current, current)],
     )
-    await _edit(message, "Branch? Type it or tap.", markup)
+    await _edit(message, _ask(data, "branch", "Branch? Type it or tap."), markup)
 
 
 async def _ask_agent(message: Message, state: FSMContext, nonces: NonceStore) -> None:
+    data = await state.get_data()
     markup = await _offer(
         message,
         state,
@@ -381,7 +416,7 @@ async def _ask_agent(message: Message, state: FSMContext, nonces: NonceStore) ->
         options=[(name, name) for name in ("claude", "codex", "cursor")],
         columns=3,
     )
-    await _edit(message, "Agent?", markup)
+    await _edit(message, _ask(data, "agent", "Agent?"), markup)
 
 
 async def _ask_model(message: Message, state: FSMContext, nonces: NonceStore) -> None:
@@ -396,7 +431,7 @@ async def _ask_model(message: Message, state: FSMContext, nonces: NonceStore) ->
         options=[(name, name) for name in models_for(agent)[:8]],
         columns=1,
     )
-    await _edit(message, "Model?", markup)
+    await _edit(message, _ask(data, "model", "Model?"), markup)
 
 
 async def _ask_effort(message: Message, state: FSMContext, nonces: NonceStore) -> None:
@@ -411,10 +446,11 @@ async def _ask_effort(message: Message, state: FSMContext, nonces: NonceStore) -
         options=[(name, name) for name in efforts_for(agent) or ("default",)],
         columns=3,
     )
-    await _edit(message, "Effort?", markup)
+    await _edit(message, _ask(data, "effort", "Effort?"), markup)
 
 
 async def _ask_prompt(message: Message, state: FSMContext, nonces: NonceStore) -> None:
+    data = await state.get_data()
     markup = await _offer(
         message,
         state,
@@ -424,7 +460,16 @@ async def _ask_prompt(message: Message, state: FSMContext, nonces: NonceStore) -
         options=(),
         defaults=False,
     )
-    await _edit(message, "Send the first prompt.", markup)
+    # The last card before money is spent shows *everything* chosen, not a
+    # prefix of it — this is the only chance to notice a mis-tap for free.
+    chosen = chosen_line(data, upto="")
+    await _edit(
+        message,
+        f"<b>{escape(chosen)}</b>\nSend the first prompt."
+        if chosen
+        else "Send the first prompt.",
+        markup,
+    )
 
 
 def _card(query: CallbackQuery) -> Message:

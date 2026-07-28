@@ -490,6 +490,59 @@ async def test_quiet_delivery_sets_telegram_silent_flag(
     assert all(json.loads(row.payload_json or "{}")["silent"] for row in rows)
 
 
+async def test_off_actually_means_off(db: Database, fake: FakeConductor) -> None:
+    """`off` used to be a synonym for `quiet`, focus window and all.
+
+    Both read `notify != "loud" and not is_focused()`, so a topic explicitly
+    set to off still pushed for the 30 minutes after every prompt. A setting
+    that does nothing is worse than no setting.
+    """
+    session = fake.add_session()
+    await bind(db, session)
+    await chats.set_notify(db, CHAT_ID, THREAD_ID, notify="off")
+    await chats.touch_prompt(db, CHAT_ID, THREAD_ID, focus_for_ms=60_000)
+
+    destination = await cursor.destination_for(db, session.session_id)
+
+    assert destination is not None
+    assert destination.silent is True, "focus must not override an explicit off"
+
+
+async def test_loud_pushes_even_when_the_topic_is_not_focused(
+    db: Database, fake: FakeConductor
+) -> None:
+    session = fake.add_session()
+    await bind(db, session)
+    await chats.set_notify(db, CHAT_ID, THREAD_ID, notify="loud")
+
+    destination = await cursor.destination_for(db, session.session_id)
+
+    assert destination is not None
+    assert destination.silent is False
+
+
+async def test_a_split_reply_buzzes_once_not_once_per_chunk(
+    db: Database, fake: FakeConductor, client: ConductorClient
+) -> None:
+    """A long answer is several messages. It is still one answer."""
+    session = fake.add_session(seed=[assistant("x" * 9_000)])
+    await bind(db, session)
+    await chats.set_notify(db, CHAT_ID, THREAD_ID, notify="quiet")
+    await chats.touch_prompt(db, CHAT_ID, THREAD_ID, focus_for_ms=60_000)
+
+    await cursor.drain(client, db, session.session_id)
+
+    rows = sorted(
+        await deliveries.list_for_session(db, session.session_id),
+        key=lambda row: row.part_index,
+    )
+    assert len(rows) > 1, "this reply must actually split"
+    # `silent` is only serialised when it is true.
+    silent = [json.loads(row.payload_json or "{}").get("silent", False) for row in rows]
+    assert silent[0] is False, "the first part announces the answer"
+    assert all(silent[1:]), "the rest are the same answer"
+
+
 # ── the replay attack ────────────────────────────────────────────────────────
 
 

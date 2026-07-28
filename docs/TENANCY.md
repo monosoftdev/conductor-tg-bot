@@ -114,7 +114,7 @@ remembering to add it.
 |---|---|---|
 | Row-level security | enforced | `BYPASSRLS` |
 | Used by | handlers, routing, FSM storage, pollers (inside a scope) | supervisor reconcile, delivery and voice claim loops, prune, tenancy lookups |
-| Grants | the nine tenant tables, plus read on the tenancy ones | everything |
+| Grants | the nine tenant tables, and `SELECT` on `schema_version`. **No grant at all** on `tenants`, `tenant_members`, `tenant_chats` — the tables that decide scope | everything |
 | Member of the other | **no** | no |
 
 The GUC answers "who is this acting for"; the *role* answers "may this

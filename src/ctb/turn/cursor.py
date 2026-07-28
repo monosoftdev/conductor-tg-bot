@@ -192,9 +192,18 @@ async def destination_for(db: Database, session_id: str) -> Destination | None:
             verbosity = Verbosity(chat.verbosity)
         except ValueError:  # pragma: no cover - CHECK constraint prevents this
             verbosity = Verbosity.NORMAL
-        # quiet/off suppress pushes, not delivery. The 30-minute focus window
-        # temporarily promotes the topic the user just prompted.
-        silent = chat.notify != "loud" and not chat.is_focused(now_ms())
+        # None of these suppress *delivery* — only the buzz.
+        #
+        # `off` used to be a synonym for `quiet`: both read
+        # `notify != "loud" and not is_focused()`, so a topic set to off still
+        # pushed for the whole focus window. A setting that does nothing is
+        # worse than no setting.
+        if chat.notify == "loud":
+            silent = False
+        elif chat.notify == "off":
+            silent = True
+        else:
+            silent = not chat.is_focused(now_ms())
     return Destination(
         chat_id=row.chat_id,
         thread_id=row.thread_id,
@@ -265,8 +274,17 @@ def _deliveries_from_render(
                     break
         # Errors always push loudly. Normal answers follow /notify and focus.
         has_error = any(block.kind is BlockKind.ERROR for block in result.chat)
-        if destination.silent and not has_error:
-            parts = [replace(part, silent=True) for part in parts]
+        if not has_error:
+            # One buzz per reply, not one per chunk. A long answer is split into
+            # up to three messages plus a document, and the focus window that
+            # promotes them lasts 30 minutes — so a single prompt could vibrate
+            # a phone four times, and a busy morning made `notify=quiet` feel
+            # like it was doing nothing at all. The first part is the one that
+            # says an answer has arrived; the rest are the same answer.
+            parts = [
+                replace(part, silent=destination.silent or index > 0)
+                for index, part in enumerate(parts)
+            ]
         return tuple(
             _draft(
                 destination,

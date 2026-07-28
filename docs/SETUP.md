@@ -1,7 +1,15 @@
-# Setup, once, from zero
+# Setup, once, from zero — the Railway path
 
 Everything that has to exist before this bot serves its first prompt, in the
 order it has to happen. Roughly 40 minutes, most of it waiting for Railway.
+
+**This is one way to deploy it, not the only one.** The bot is a single
+stateless process that needs PostgreSQL and outbound HTTPS, so anything that
+runs a container will do; Railway is written out here because it is what this
+project was deployed on and the specifics are where people get stuck. To run it
+on your laptop instead, see [`../CONTRIBUTING.md`](../CONTRIBUTING.md) — the
+database roles (step 4) and the master key (step 5) are the only parts you
+still need.
 
 Each step says **who** does it, because some of it only you can do — anything
 involving a browser login, a payment method, or a secret that must never reach
@@ -129,7 +137,7 @@ Open the Postgres service → **Variables**. You need two of them:
 
 ### 3b. The service
 
-**New → GitHub Repo → `Reclaimly/conductor-tg-bot`.**
+**New → GitHub Repo → your fork of `conductor-tg-bot`.**
 
 - Branch: `main`
 - `railway.toml` already selects the Dockerfile, the health check and the
@@ -328,23 +336,13 @@ Then, before opening registration:
 
 ---
 
-## What to give me, if you want me to do more
+## If a secret leaks
 
-I can already reach the repository, so branches, code, CI and docs need nothing
-from you. For anything that touches the live deployment I need one of:
-
-| To do this | I need |
-|---|---|
-| Read deploy logs, restart, set variables | a Railway API token (Account → Tokens), or paste the logs |
-| Diagnose a live database | the `SYSTEM_DATABASE_URL`, or the output of a query you run |
-| Reproduce a Telegram bug | the exact message you sent and what came back |
-| Set branch protection | nothing — GitHub refuses it to an integration; it is the UI |
-
-**Do not paste `CTB_MASTER_KEYS`, the bot token, or a customer's Conductor key
-into a chat with me or anyone else.** If one has already been pasted somewhere,
-treat it as leaked: [`SECURITY.md`](../SECURITY.md) has the rotation runbook,
-and the short version is that rotating the master key protects future data but
-does not un-leak what an attacker already read.
+**Never paste `CTB_MASTER_KEYS`, the bot token, or a customer's Conductor key
+into a chat, an issue, or a log.** If one already has been, treat it as leaked:
+[`SECURITY.md`](../SECURITY.md) has the rotation runbook. The short version is
+that rotating the master key protects future data and does not un-leak what an
+attacker has already read.
 
 ---
 

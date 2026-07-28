@@ -41,6 +41,7 @@ from ctb.turn.state import (
     CADENCE_WORKING_MS,
     CADENCE_WORKING_STALLED_MS,
     CANCEL_CONFIRMS,
+    CANCEL_TIMEOUT_S,
     CURSOR_ONLY_QUIET_FINALIZE_S,
     DRAIN_CONFIRMS,
     E404,
@@ -1340,3 +1341,44 @@ def test_cadence_cursor_only_overrides_active_states() -> None:
 )
 def test_format_duration(ms: int, text: str) -> None:
     assert format_duration(ms) == text
+
+
+def test_rule_23_an_unconfirmed_cancel_hands_the_controls_back() -> None:
+    """CANCELLING used to be absorbing: a spinner with no buttons, forever.
+
+    ``PostCancel`` is issued once and its transport errors are swallowed, and
+    the only exit was ``Status(idle)``. A session genuinely wedged in a tool
+    call never sent one, so the user who pressed Stop got "🛑 stopping…", a
+    perpetual typing indicator and a 2s poll until the process died.
+    """
+    cancelling = ctx(TurnState.CANCELLING, cancel_requested_at=T0)
+    at = T0 + CANCEL_TIMEOUT_S + 1
+
+    result = step(cancelling, Timer(at), at)
+
+    assert result.transition == 23
+    # Not finalized: the turn may still be running, and "stopped" would be the
+    # one thing the card must never say falsely.
+    assert result.state is TurnState.WORKING
+    card = actions_of(result, EditStatusCard)[0]
+    assert "stop not confirmed" in card.text
+    assert CardButton.CHECK in card.buttons and CardButton.STOP in card.buttons
+    assert result.context.cancel_requested_at is None
+
+
+def test_a_cancel_still_settles_normally_well_inside_the_timeout() -> None:
+    cancelling = ctx(TurnState.CANCELLING, cancel_requested_at=T0)
+    at = T0 + CANCEL_TIMEOUT_S - 1
+
+    result = step(cancelling, Timer(at), at)
+
+    assert result.state is TurnState.CANCELLING
+    assert result.transition is None
+
+
+def test_the_stopping_card_always_offers_a_way_to_ask() -> None:
+    result = step(ctx(TurnState.WORKING), Cancel(requested_by=1), T0 + 1)
+
+    card = actions_of(result, EditStatusCard)[0]
+    assert card.kind is CardKind.CANCELLING
+    assert CardButton.CHECK in card.buttons, "a spinner with no controls is a dead end"

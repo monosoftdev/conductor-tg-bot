@@ -70,7 +70,7 @@ Clipped to Telegram's 128-character limit, prefix included.
 **The task leads.** Telegram clips a topic row from the right, and a phone shows
 perhaps thirty characters of it, so whatever identifies the workspace has to be
 in front. It was `<project>/<branch>` alone — and since a branch is nearly always
-`main`, three workspaces on one repo were three rows reading `reclaimly-be/main`,
+`main`, three workspaces on one repo were three rows reading `acme-api/main`,
 in the same colour (it is a hash of the label) with the same state icon. The list
 could not answer the one question you open it to ask.
 

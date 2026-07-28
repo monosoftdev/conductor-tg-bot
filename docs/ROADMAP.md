@@ -66,7 +66,7 @@ No Telegram code. The whole phase is testable offline against `fakes/fake_conduc
 - [x] Routing on `(chat_id, message_thread_id)`; `General` is search-only, never a prompt target
 - [x] The six menu commands: `/new` `/board` `/stop` `/find` `/mode` `/done`
 - [x] `bot/wizards/new_workspace.py` — edit-in-place, `Go with defaults →` on every step
-- [x] Power commands, then admin (`/allow` `/deny` `/health`)
+- [x] Power commands, then admin — shipped as `/invite`, `/remove`, `/members`, `/health`
 - [x] Safety rails: nonce'd callbacks, named confirm buttons, echo-with-undo, reply-to override
 
 **Exit criterion:** the seven live phone tests in `PLAN.md` §Verification, especially #3 — redeploy
@@ -114,7 +114,8 @@ Recorded so they don't get re-litigated:
 - [x] AES-256-GCM envelope encryption for stored keys, with rotation
 - [x] `TenantMiddleware`, `TenantContext`, per-tenant `ClientPool` and `ProviderPool`
 - [x] Per-tenant auth-fatal and poller fair share; global + per-chat rate budgets
-- [x] Self-serve `/register` → `/setup <code>` → `/key`, and `/invite` for teammates
+- [x] Self-serve sign-up and `/invite` for teammates (this was `/register` → `/setup <code>`
+      → `/key`; Phase 5 replaced it with `/start` → `/key`)
 - [x] `/backup` deleted; `/export` is per workspace
 - [ ] Live: two real workspaces, two real keys, on one deployment
 
