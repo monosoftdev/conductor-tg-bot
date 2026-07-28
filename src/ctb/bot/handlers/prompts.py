@@ -11,6 +11,7 @@ import contextlib
 from aiogram import F, Router
 from aiogram.enums import ContentType
 from aiogram.exceptions import TelegramAPIError
+from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
 from ctb.bot.app import register_router
@@ -113,14 +114,42 @@ async def plain_text(
     route: Route,
     tenant: TenantContext,
     nonces: NonceStore,
+    state: FSMContext,
     db: Database | None = None,
     client: ConductorClient | None = None,
 ) -> None:
+    from ctb.bot.wizards.new_workspace import start_task
+
     text = (message.text or "").strip()
     if not text:
         await tell(message, "Empty message · send the instruction again.")
         return
     database = resolve_db(db)
+    # An empty thread in a private chat is a task nobody has started yet. In a
+    # threaded DM that is not an edge case, it is the *front door*: Telegram's
+    # "New Chat" seat is a composer, so every line typed there arrives in a
+    # thread of its own. Answering "No session here" made the one gesture the
+    # client invites — type what you want — the one gesture that did nothing.
+    #
+    # `get_state()` is part of the question: the wizard registers text handlers
+    # for only three of its seven steps, so a line typed at "Project?" or
+    # "Model?" reaches here. Starting a *second* task on it would post a rival
+    # card and leave the live one's buttons answering "Wizard closed".
+    if (
+        route.claimable_thread
+        and not route.via_reply
+        and await state.get_state() is None
+    ):
+        await start_task(
+            message,
+            text,
+            route=route,
+            tenant=tenant,
+            state=state,
+            db=database,
+            nonces=nonces,
+        )
+        return
     general = is_general_cockpit(message, route)
     # The DM root, once `/new` has moved this chat's work into its own topic,
     # is the same kind of seat General is: it addresses nothing, so it offers
@@ -155,7 +184,7 @@ async def plain_text(
         )
         return
     try:
-        _, state = await submit_prompt(
+        _, posted = await submit_prompt(
             db=database,
             client=resolve_client(client, tenant),
             session_id=route.session_id,
@@ -175,7 +204,7 @@ async def plain_text(
         if route.session is not None and route.session.title
         else route.session_id[:8]
     )
-    wording = f"queued ({pending} pending)" if pending > 1 else state
+    wording = f"queued ({pending} pending)" if pending > 1 else posted
     # **No Stop here.** This bubble is a receipt, and it carried one on the
     # theory that a refused 👀 left the user without a control — but the
     # reaction has nothing to do with the pinned card, which appears either way

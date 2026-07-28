@@ -46,6 +46,7 @@ from ctb.bot.keyboards import (
     NonceError,
     NonceStore,
     button,
+    home_keyboard,
     keyboard,
     resolve,
     url_button,
@@ -73,15 +74,15 @@ register_router(router, order=30)
 #: ``/new`` opens either way. It used to open with "General ·", which named a
 #: room a DM-only user does not have.
 _HELP = """<b>Phone loop</b>
-Here · <code>/new</code>, <code>/attach</code>, <code>/board</code>
+New thread · type a task; it becomes a workspace
 In a workspace · send text, voice, or audio
 Result · tap a numbered choice; ✓ is recommended
+<code>/attach</code> a laptop one · <code>/board</code> · <code>/home</code> for buttons
 
 <code>/stop</code> cancels this turn · also on the pinned card
 <code>/find text</code> searches every transcript you can reach
-<code>/mode</code> agent, model, effort
 <code>/name text</code> renames this session · <code>-w</code> renames the topic
-<code>/s</code> switches session · <code>/fork</code> starts another here
+<code>/s</code> switch · <code>/fork</code> another here · <code>/mode</code> settings
 <code>/notify</code> loud·quiet·off · <code>/done</code> archives, always confirms
 
 <b>Your team</b>
@@ -151,9 +152,39 @@ def homed_elsewhere(
 
 
 @router.message(Command("help", "start"))
-async def help_command(message: Message, state: FSMContext) -> None:
+async def help_command(
+    message: Message,
+    state: FSMContext,
+    tenant: TenantContext | None = None,
+) -> None:
     await abandon_wizard(state)
-    await tell(message, _HELP)
+    await tell(
+        message,
+        _HELP,
+        reply_markup=home_keyboard() if _launchable(message, tenant) else None,
+    )
+
+
+def _launchable(message: Message, tenant: TenantContext | None) -> bool:
+    """Whether handing this chat the launcher would give it working buttons.
+
+    Two ways it would not, and both were reachable:
+
+    * **A group.** Telegram shows a reply keyboard to everyone in it, and the
+      launcher is a personal control. A group's General is a real, readable
+      room, so there is nothing there for it to solve.
+    * **Nobody yet.** ``/start`` and ``/help`` are in ``UNRESOLVED_COMMANDS``, so
+      a stranger reaches them with no tenant at all — and their presses, being
+      plain text rather than an entry command, are dropped in silence *and*
+      page the owners with a stranger notice. A team that has not stored a key
+      is the same shape one step later: both buttons need the Conductor client.
+      ``active`` is exactly "the key is in", set by ``/key``.
+    """
+    return (
+        message.chat.type == "private"
+        and tenant is not None
+        and tenant.status == "active"
+    )
 
 
 @router.message(Command("s"))

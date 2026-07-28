@@ -15,6 +15,7 @@ from aiogram.types import InlineKeyboardMarkup, Message
 
 from ctb.bot.handlers.common import (
     CancelDispatcher,
+    all_projects,
     create_and_bind_input,
     request_cancel,
     resolve_new_request,
@@ -539,6 +540,20 @@ class VoiceService:
             )
             return True
         if not row.route_session_id:
+            # An empty thread in a DM is a task nobody has started yet — the
+            # shape Telegram hands us for anything sent into "New Chat", and
+            # dictating into it is the whole point of carrying this on a phone.
+            # The typed path offers to start it, so this one must too, off the
+            # same builder and the same card.
+            #
+            # Through `Route.claimable_thread`, never a lookalike condition. A
+            # stored row knows its session but not its *workspace*, so the
+            # obvious `thread_id != 0 and no session` would call somebody's
+            # workspace room empty in the window before its session row lands —
+            # and offer to open a second workspace inside it.
+            route = await self._route_for(row)
+            if route.claimable_thread and await self._offer_task(row, text, conductor):
+                return True
             # The DM root once `/new` moved this chat's work into topics. The
             # typed path answers with one "Send to …" button rather than a dead
             # end, and the spoken path must answer identically — the two
@@ -707,6 +722,100 @@ class VoiceService:
         await self._send(row, "Unknown voice command.")
         return True
 
+    async def _route_for(self, row: VoiceInputRow) -> Route:
+        """The seat this note arrived in, as the router would have described it.
+
+        A voice note is answered minutes after its update was dispatched, so
+        the ``Route`` is long gone and the durable row is all there is. Rebuilt
+        here rather than re-deriving each predicate from ``row`` by hand, so
+        everything that asks "what kind of seat is this?" asks it once.
+        """
+        chat = await chats_repo.get(self.db, row.chat_id, row.thread_id)
+        session = (
+            await sessions_repo.get(self.db, row.route_session_id)
+            if row.route_session_id
+            else None
+        )
+        return Route(
+            chat_id=row.chat_id,
+            thread_id=row.thread_id,
+            kind=row.route_kind,
+            chat=chat,
+            session=session,
+        )
+
+    async def _offer_task(
+        self, row: VoiceInputRow, text: str, conductor: ConductorClient
+    ) -> bool:
+        """Post the confirm card for a task dictated into an empty thread.
+
+        ``False`` means it could not be offered — no projects, or Conductor was
+        unreachable — and the caller falls through to its old answer rather than
+        inventing a new failure mode.
+
+        The state is written straight to ``wizard_state`` because voice never
+        passes through aiogram and so has no ``FSMContext``. That is the same
+        table :class:`~ctb.bot.app.PostgresStorage` writes, keyed the same way,
+        so the card's buttons are resolved by the ordinary typed handler.
+        """
+        from ctb.bot.wizards.new_workspace import (
+            CONFIRM_STATE_KEY,
+            confirm_card,
+            task_data,
+        )
+
+        try:
+            projects = await all_projects(conductor)
+        except Exception as exc:  # noqa: BLE001 - fall back to the old answer
+            log.warning("voice.task_offer_failed", error=repr(exc))
+            return False
+        if not projects:
+            return False
+        chat = await chats_repo.get(self.db, row.chat_id, row.thread_id)
+        data = await task_data(
+            self.db,
+            chat=chat,
+            defaults=await self._defaults(row),
+            projects=projects,
+            text=text,
+        )
+        # A second note in this seat is a *correction*, and the typed path
+        # answers one by editing the card in place. Keep the run's `wid` and its
+        # message so the buttons already on screen stay live: minting a new one
+        # would leave the visible card answering "Wizard closed · /new to start
+        # again", which is the opposite of the cheap repair this is for.
+        open_card = await wizard_repo.get(
+            self.db, row.chat_id, row.thread_id, user_id=row.user_id
+        )
+        card_id: int | None = None
+        if open_card is not None and open_card.state_key == CONFIRM_STATE_KEY:
+            card_id = open_card.tg_message_id
+            wid = open_card.data.get("wid")
+            if wid:
+                data["wid"] = wid
+        body, markup = confirm_card(
+            data,
+            nonces=self.nonces,
+            user_id=row.user_id,
+            chat_id=row.chat_id,
+            thread_id=row.thread_id,
+        )
+        heard = f"🎙 {escape(self._audit(text))}\n{body}"
+        if card_id is None or not await edit_html(
+            self.bot, row.chat_id, card_id, heard, reply_markup=markup
+        ):
+            card_id = await self._send(row, heard, reply_markup=markup)
+        await wizard_repo.set_state(
+            self.db,
+            row.chat_id,
+            row.thread_id,
+            user_id=row.user_id,
+            state_key=CONFIRM_STATE_KEY,
+            data=data,
+            tg_message_id=card_id,
+        )
+        return True
+
     async def _finish_wizard(self, row: VoiceInputRow, text: str) -> bool:
         """Answer an open ``/new`` wizard with this transcript.
 
@@ -785,7 +894,14 @@ class VoiceService:
         text: str,
         *,
         reply_markup: InlineKeyboardMarkup | None = None,
-    ) -> None:
+    ) -> int | None:
+        """Answer this note, and say which message carries the answer.
+
+        The id matters to exactly one caller — the confirm card, which has to be
+        *edited* when the task is re-dictated rather than posted again — and it
+        is not always a new message: the spoken path prefers to edit the "🎙
+        transcribing…" acknowledgement it already put on screen.
+        """
         latest = await voice_repo.get(self.db, row.chat_id, row.tg_message_id)
         ack_message_id = latest.ack_message_id if latest is not None else None
         if ack_message_id is not None:
@@ -797,8 +913,8 @@ class VoiceService:
                 reply_markup=reply_markup,
             )
             if edited:
-                return
-        await send_html(
+                return ack_message_id
+        sent = await send_html(
             self.bot,
             row.chat_id,
             text,
@@ -806,6 +922,7 @@ class VoiceService:
             reply_markup=reply_markup,
             reply_to_message_id=row.tg_message_id,
         )
+        return sent.message_id if sent is not None else None
 
     @staticmethod
     def _audit(text: str) -> str:

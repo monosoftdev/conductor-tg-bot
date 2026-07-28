@@ -75,7 +75,7 @@ from aiogram.exceptions import (
     TelegramRetryAfter,
     TelegramServerError,
 )
-from aiogram.types import InlineKeyboardMarkup, Message
+from aiogram.types import InlineKeyboardMarkup, Message, ReplyKeyboardMarkup
 
 from ctb.bot.middleware.tenancy import TenantContext
 from ctb.conductor.client import ConductorClient
@@ -95,10 +95,12 @@ from ctb.turn.state import TopicMarker, TurnState
 __all__ = [
     "TOPIC_NAME_LIMIT",
     "TOPIC_ICON_COLORS",
+    "Claim",
     "ForumSupport",
     "TopicCreateError",
     "apply_marker",
     "attach_topic",
+    "claim_topic",
     "close_topic",
     "create_topic",
     "discard_topic",
@@ -123,6 +125,11 @@ __all__ = [
 ]
 
 log = get_logger(__name__)
+
+#: What a command reply may carry. Almost always inline buttons; the launcher
+#: keyboard (:func:`ctb.bot.keyboards.home_keyboard`) is the one reply keyboard
+#: in the bot and rides on the same send path as everything else.
+type Markup = InlineKeyboardMarkup | ReplyKeyboardMarkup | None
 
 #: Telegram's own cap on a forum topic name.
 TOPIC_NAME_LIMIT: Final = 128
@@ -467,7 +474,7 @@ async def send_html(
     html: str,
     *,
     thread_id: int = NO_THREAD_ID,
-    reply_markup: InlineKeyboardMarkup | None = None,
+    reply_markup: Markup = None,
     silent: bool = False,
     reply_to_message_id: int | None = None,
 ) -> Message | None:
@@ -514,7 +521,7 @@ async def _send_attempt(
     html: str,
     *,
     thread_id: int,
-    reply_markup: InlineKeyboardMarkup | None,
+    reply_markup: Markup,
     silent: bool,
     reply_to_message_id: int | None,
 ) -> tuple[Message | None, bool]:
@@ -744,6 +751,82 @@ async def require_topic(
     return topic.message_thread_id
 
 
+@dataclass(frozen=True, slots=True)
+class Claim:
+    """What a :func:`claim_topic` probe learned about an existing thread."""
+
+    #: Telegram still knows this thread. ``False`` means open a new one.
+    alive: bool
+    #: The rename landed, so the stored title is what the list is showing.
+    named: bool = False
+
+
+async def claim_topic(
+    bot: Bot,
+    chat_id: int,
+    thread_id: int,
+    label: str,
+    *,
+    marker: TopicMarker = TopicMarker.INITIALIZING,
+) -> Claim:
+    """Take over a thread Telegram opened, by renaming it — and prove it exists.
+
+    This is :func:`require_topic`'s counterpart for the seat a request arrived
+    in, and it carries the same contract, for the same reason: *the only proof
+    that a room is usable is an API call that used it*. A claimed thread is not
+    free of that question merely because an update once came from it — the
+    confirm card puts a human-length pause between "Telegram opened a thread"
+    and "we spend money on it", and a thread can be deleted from the phone in
+    that window. Binding a paid workspace to a room that is gone is exactly the
+    failure ``require_topic`` exists to prevent.
+
+    The rename is the probe because it is a call we owe anyway: Telegram named
+    this room after whatever opened it — ``/new``, or the first sentence of a
+    dictated task — and the thread list is the only navigation a DM has.
+
+    Three outcomes, and only one of them is a refusal:
+
+    * ``Claim(True, True)`` — renamed, or already carrying that title.
+    * ``Claim(True, False)`` — Telegram would not rename it, but the thread is
+      there. Whether a bot may rename a thread a *user* created in a DM is
+      undocumented; being unable to retitle a room is not being unable to use
+      it, so the workspace still moves in and the caller leaves the stored
+      marker NULL, which makes the next state transition retry the rename.
+    * ``Claim(False)`` — the thread is gone. The caller opens one instead.
+    """
+    icon = await topic_icon_id(bot, marker)
+    try:
+        await bot.edit_forum_topic(
+            chat_id=chat_id,
+            message_thread_id=thread_id,
+            name=topic_title(marker, label),
+            icon_custom_emoji_id=icon,
+        )
+    except TelegramBadRequest as exc:
+        detail = str(exc).casefold()
+        if "not modified" in detail:
+            return Claim(True, True)
+        if thread_is_gone(exc):
+            log.info("topics.claim_gone", chat_id=chat_id, thread_id=thread_id)
+            return Claim(False)
+        log.info(
+            "topics.claim_unnamed",
+            chat_id=chat_id,
+            thread_id=thread_id,
+            reason=telegram_reason(exc),
+        )
+        return Claim(True)
+    except TelegramAPIError as exc:
+        # Ambiguous — a network blip, a 429. Treating that as "gone" would open
+        # a duplicate room for a thread that is fine, which is unrecoverable;
+        # treating it as "unnamed" costs a title until the next transition.
+        log.warning(
+            "topics.claim_unavailable", chat_id=chat_id, error=telegram_reason(exc)
+        )
+        return Claim(True)
+    return Claim(True, True)
+
+
 async def create_topic(
     bot: Bot,
     chat_id: int,
@@ -855,6 +938,11 @@ async def apply_marker(
     Returns ``True`` when a rename was issued. Everything else — same title,
     no topic, a Telegram failure — returns ``False`` and costs no API call
     beyond the one that failed.
+
+    A topic the bot did not create is renamed by :func:`claim_topic` instead,
+    *before* it is bound to anything — so there is no case here where the stored
+    marker is a claim about a title nobody ever applied, and no reason for a
+    caller to want this comparison skipped.
 
     The state icon rides along: ``icon_custom_emoji_id`` is the one visual
     channel Telegram lets a bot change after creation (``icon_color`` is fixed

@@ -14,7 +14,12 @@ from ctb.bot.handlers.core import DM_COCKPIT_HINT
 from ctb.bot.keyboards import NonceStore
 from ctb.bot.middleware.routing import Route
 from ctb.bot.wizards import new_workspace
-from ctb.conductor.models import PostMessageResult, PostState, SqlResult
+from ctb.conductor.models import (
+    PostMessageResult,
+    PostState,
+    Project,
+    SqlResult,
+)
 from ctb.db.connection import Database, now_ms
 from ctb.db.repo import chats as chats_repo
 from ctb.db.repo import prompts as prompts_repo
@@ -90,9 +95,16 @@ class HangingProvider(FakeProvider):
 
 
 class FakeClient:
-    def __init__(self) -> None:
+    def __init__(self, *, projects: tuple[str, ...] = ("api",)) -> None:
         self.posts: list[tuple[str, str, str]] = []
         self.queries: list[str] = []
+        self._projects = projects
+
+    async def list_projects(self, **_: Any) -> Any:
+        return SimpleNamespace(
+            data=[Project(id=f"project-{name}", name=name) for name in self._projects],
+            has_more=False,
+        )
 
     async def post_message(
         self, session_id: str, text: str, message_id: str
@@ -956,3 +968,108 @@ async def test_a_voice_note_answers_an_open_wizard_instead_of_searching(
     assert created[0].prompt == "Fix the flaky test", "the transcript is the prompt"
     # And the wizard is finished, so the next note routes normally.
     assert await wizard_repo.get(db, -1001, 0, user_id=1001) is None
+
+
+async def test_a_task_dictated_into_an_empty_thread_offers_to_start_it(
+    db: Database, settings_factory: Any, system_db: Database
+) -> None:
+    """Voice into "New Chat" is the whole reason this is on a phone.
+
+    Telegram opens a thread for the note; the thread is empty, so the note is a
+    task nobody has started. The typed path answers with a confirm card, so this
+    one must answer with **the same** card — built by the same ``task_data`` and
+    ``confirm_card``, and left in the same ``wizard_state`` row, so the tap that
+    follows is served by the ordinary typed handler.
+    """
+    settings = settings_factory(voice_enabled=True)
+    bot = FakeBot()
+    client = FakeClient()
+    service = make_service(settings, db, system_db, bot=bot, client=client)
+    await voice_repo.create(
+        db,
+        chat_id=1001,
+        tg_message_id=71,
+        thread_id=4242,
+        user_id=1001,
+        file_id="file-1",
+        file_unique_id="unique-1",
+        file_name=None,
+        mime_type="audio/ogg",
+        duration_seconds=8,
+        file_size=100,
+        route_kind="dm",
+        route_session_id=None,
+        route_workspace_id=None,
+        provider="elevenlabs",
+        model="scribe_v2",
+        action_id="voice-operation-empty-thread",
+    )
+    claimed = await voice_repo.claim_next(db)
+    assert claimed is not None
+
+    await service._process(claimed)
+
+    assert client.posts == [], "nothing is prompted — there is no session yet"
+    sent = bot.messages[-1]
+    assert "No session here" not in str(sent["text"])
+    markup = sent.get("reply_markup")
+    assert markup is not None
+    assert markup.inline_keyboard[0][0].text == "▶️ Start workspace"
+    # The state the tap will be checked against, written where aiogram reads it.
+    row = await wizard_repo.get(db, 1001, 4242, user_id=1001)
+    assert row is not None
+    assert row.state_key == new_workspace.CONFIRM_STATE_KEY
+    assert row.data["prompt"] == "Fix the flaky test"
+    assert row.data["project_id"] == "project-api"
+
+
+async def test_a_re_dictated_task_edits_the_card_instead_of_stacking_one(
+    db: Database, settings_factory: Any, system_db: Database
+) -> None:
+    """Saying it again is the repair the confirm card exists for.
+
+    The typed path edits the card in place and keeps the run's ``wid``, so the
+    buttons already on screen stay live. A second card with a fresh ``wid``
+    would leave the visible one answering "Wizard closed · /new to start
+    again" — the opposite of a cheap repair.
+    """
+    settings = settings_factory(voice_enabled=True)
+    bot = FakeBot()
+    provider = FakeProvider("fix the lonely page")
+    service = make_service(settings, db, system_db, bot=bot, provider=provider)
+
+    async def dictate(tg_message_id: int) -> None:
+        await voice_repo.create(
+            db,
+            chat_id=1001,
+            tg_message_id=tg_message_id,
+            thread_id=4242,
+            user_id=1001,
+            file_id="file-1",
+            file_unique_id=f"unique-{tg_message_id}",
+            file_name=None,
+            mime_type="audio/ogg",
+            duration_seconds=8,
+            file_size=100,
+            route_kind="dm",
+            route_session_id=None,
+            route_workspace_id=None,
+            provider="elevenlabs",
+            model="scribe_v2",
+            action_id=f"voice-op-{tg_message_id}",
+        )
+        claimed = await voice_repo.claim_next(db)
+        assert claimed is not None
+        await service._process(claimed)
+
+    await dictate(81)
+    first = await wizard_repo.get(db, 1001, 4242, user_id=1001)
+    assert first is not None
+    provider.text = "fix the login page"
+    await dictate(82)
+
+    row = await wizard_repo.get(db, 1001, 4242, user_id=1001)
+    assert row is not None
+    assert row.data["prompt"] == "fix the login page"
+    assert row.data["wid"] == first.data["wid"], "the live buttons stay live"
+    assert row.tg_message_id == first.tg_message_id, "one card, edited"

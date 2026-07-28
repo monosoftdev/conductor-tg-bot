@@ -50,9 +50,8 @@ path, not the hoped-for one:
   thread is gone, sharing `THREAD_GONE_MARKERS` with the delivery path.
 - The group path is byte-identical to what it was, `/setup` probe included.
 
-Known gap: `/board` adoption in a DM (`adopt.py`) is still linear — it does not
-open a topic. `tests/test_bot_adopt.py` records it with an unchanged assertion,
-so fixing it will fail that test rather than change behaviour silently.
+*(The gap this section used to record — `/board` adoption in a DM staying
+linear — is fixed; see "New Chat is a composer" below.)*
 
 ## A DM with topics had three dead ends (2026-07-28)
 
@@ -88,6 +87,107 @@ private chat.** Telegram publishes no link syntax for a DM topic, so `/new` ther
 had produced a bare `→ label` and no button — which is why it read as having
 done nothing. `common.created_card` now names the room instead, and is the one
 face `/new`, the wizard and adopt all use.
+
+## "New Chat" is a composer, not a room (2026-07-28)
+
+The first live pass on a threaded DM produced a topic list reading *New Chat ·
+/new · We would love…/dev · /attach · /attach · /attach · We have som…/main* —
+three workspaces' worth of rooms and four pieces of litter. One misunderstanding
+caused all of it, and it was ours:
+
+**Telegram's *New Chat* seat cannot be typed into.** It is a thread composer. A
+message sent there makes the client open a *new thread*, named after that first
+line, and the bot's update arrives already inside it. So `/new` was never
+handled at the DM root — it was handled inside a thread called "/new", and then
+opened a *second* topic beside it for the workspace. Two rooms per `/new`, one
+of them permanently empty; `/attach` the same.
+
+Everything below follows from taking that seriously.
+
+- **The room a request is standing in is the room it gets.**
+  `common.claimable_thread` answers "is this a private chat's thread with
+  nothing bound to it?" from the `Route` and nothing else, and `_seat_for`
+  claims that thread instead of creating a sibling. Claimed, not created — so
+  it is never discarded on a failed create, and it *is* renamed afterwards,
+  because Telegram named it "/new" and the topic list is the navigation.
+  `apply_marker(force=True)` exists for exactly that: the stored title is a
+  claim about a room nobody has ever renamed.
+- **An empty thread is a task composer.** Plain text there used to answer "No
+  session here", which was true and useless — the person had just said what they
+  wanted. It now starts `NewWorkspace.confirm`: the task read back, the project
+  and model that would be used, and one **▶️ Start workspace** button. Typing
+  again *replaces* the task. Nothing bills until the button is tapped.
+- **`/attach` in a DM was delivering into a room nobody can read.** `adopt.py`
+  skipped both the topic-create and the remembered-topic paths for
+  `chat_type == "private"`, binding to thread 0 — fine in a linear DM, a black
+  hole in a threaded one. That is the "I failed to attach" report. Both paths
+  now run in a DM, and the second `/attach` of a workspace jumps instead of
+  opening a sibling.
+- **A reply keyboard is the only control surface a threaded DM has.** There is
+  no message the bot can pin in *New Chat* and no room it can answer in, but a
+  reply keyboard belongs to the chat. `keyboards.home_keyboard` is deliberately
+  two entries — **➕ New workspace** and **📎 Attach existing** — because both
+  *consume* the thread their press creates. A `/board` button was drafted and
+  cut: it answers and abandons the room, and in a threaded DM the thread list
+  already is the board, with live state icons no message could draw.
+  `handlers/home.py` sits at router order 4, ahead of the wizard, so a press
+  mid-`/new` means start over rather than "the branch is called ➕ New
+  workspace".
+- **`/attach` had one sentence for three situations.** "No unattached cloud
+  workspace matches" meant *nothing exists*, *everything is already open*, and
+  *the view has no row for it yet* — and the common one is the least alarming.
+  `core.nothing_to_attach` counts the union of the transcript view and the local
+  cache, because a workspace opened a minute ago is in neither the view nor the
+  list it was filtered out of.
+
+**The one new unverified assumption:** whether Telegram lets a bot
+`editForumTopic` a thread the *user* created in a DM. The docs say a bot may
+manage "bot forum topics", which may or may not include this one. No probe can
+answer it — the bot cannot make a user type — so `topics.claim_topic` reads all
+three answers off that single call and only one of them is a refusal: renamed,
+*or* "cannot rename but the thread is there" (use it, leave `topic_marker` NULL
+so the next transition retries, and let the room keep the first line of the
+task, which is a reasonable name for it), *or* thread-not-found (open a real one
+instead). Nothing else depends on the rename landing.
+
+That call is also the claim path's **proof of life**, and it has to be: a
+claimed room gets the same contract as a created one — *the only proof that a
+room is usable is an API call that used it*. `require_topic` exists because a
+paid container bound to a room that does not exist is unrecoverable, and the
+confirm card puts a human-length pause between "Telegram opened a thread" and
+"we spend money", which is plenty of time to delete it from the phone.
+
+### What the review caught, and what it says about the shape
+
+An eight-angle adversarial pass over the finished branch found nine real
+defects. Every one of them was in a *second-order* path — the first-order flows
+were right — and two of them share a root worth naming:
+
+- **A second rule for the same question.** `claimable_thread` began as a helper
+  in `handlers/common.py`, so the voice worker — which has no `Route`, only a
+  durable row — asked "is this seat empty?" its own way and got a different
+  answer: a workspace whose session row had not landed yet was *taken* to text
+  and *empty* to voice. It is now `Route.claimable_thread`, beside `is_dm` and
+  `is_topic`, and the voice worker rebuilds the `Route` rather than the
+  predicate. The rule is one property, in the place that already owns the seat.
+- **A reply keyboard is a promise the bot has to keep.** It is persistent and
+  chat-wide, so `/start` handed one to strangers, whose presses are plain text,
+  are therefore dropped in silence, *and* page the owners with a stranger
+  notice. It now appears only where both buttons work — a private chat of a
+  team with a key (`power._launchable`) — and `📎 Attach existing` passes
+  `query=""` explicitly, because `command_text` was reading the button's own
+  label as a search term and answering "nothing matches" every time.
+
+The rest, each with a test that fails when the fix is removed: the wizard never
+checked the workspace quota (harmless while it was the long way round, not now
+it is the front door); a line typed at a wizard step with no text handler
+started a rival task and killed the live card's buttons; `⚙️ Change` could not
+reach the project step, so the one field the card *guesses* was the one it could
+not correct; a re-dictated task posted a second card instead of editing the
+first; `adopt_callback` suppressed its reply on the assumption a card had landed
+rather than on the card having landed (CLAUDE.md: never gate a `sendMessage` on
+a conclusion); `/attach` counted workspaces that exist rather than rooms this
+chat holds, and re-ran `board_rows` to do it.
 
 ## The topic icon was the same on every topic (2026-07-28)
 

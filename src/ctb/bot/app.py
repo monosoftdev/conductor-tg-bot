@@ -103,6 +103,7 @@ BOT_COMMANDS: Final[tuple[BotCommand, ...]] = (
     BotCommand(command="new", description="New workspace"),
     BotCommand(command="board", description="Live sessions"),
     BotCommand(command="attach", description="Open laptop workspace"),
+    BotCommand(command="home", description="Show the launcher buttons"),
     BotCommand(command="stop", description="Stop this turn"),
     BotCommand(command="find", description="Search transcripts"),
     BotCommand(command="mode", description="Current session & controls"),

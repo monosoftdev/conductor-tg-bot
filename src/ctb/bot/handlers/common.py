@@ -21,6 +21,7 @@ from aiogram.types import InlineKeyboardMarkup, Message, ReactionTypeEmoji
 from ctb.bot.handlers.topics import (
     TopicCreateError,
     apply_marker,
+    claim_topic,
     discard_topic,
     dm_topic_support,
     forum_support,
@@ -132,10 +133,25 @@ class _Seat:
     thread_id: int
     #: Set only when *this* call created the topic — the only one we may delete.
     fresh_topic: int | None = None
+    #: Set when the request arrived in an empty thread Telegram had already
+    #: opened, and that thread became this workspace's room. We did not create
+    #: it, so it is never discarded — but it still wears whatever Telegram
+    #: named it, so it must be renamed once the workspace exists.
+    claimed_topic: int | None = None
+    #: The claimed room actually took the workspace's name. ``False`` means
+    #: Telegram refused the rename and the topic list still shows whatever it
+    #: opened the thread as — so the marker is left unrecorded and the next
+    #: state transition tries again.
+    claimed_named: bool = False
     #: The name a replayed nonce's topic already carries, if it drifted.
     prior_label: str | None = None
     #: Why there is no topic, when there should have been one.
     refusal: str | None = None
+
+    @property
+    def owns_topic(self) -> bool:
+        """This call put the workspace in that room, however it got there."""
+        return self.fresh_topic is not None or self.claimed_topic is not None
 
 
 class CancelDispatcher(Protocol):
@@ -401,6 +417,7 @@ async def _seat_for(
     chat_type: str,
     label: str,
     nonce: str,
+    claimable_thread: int = NO_THREAD_ID,
 ) -> _Seat:
     """Reserve the room this workspace will live in — **before** it is paid for.
 
@@ -419,6 +436,22 @@ async def _seat_for(
       the bot did here until today and still works. Whether Telegram allows DM
       topics is a runtime fact, not a config flag; a feature that is optional
       must never take the bot down with it.
+
+    ``claimable_thread`` is the one thing that keeps a threaded DM from growing
+    two rooms per workspace. Telegram's *New Chat* seat is a composer, not a
+    chat: anything typed there — ``/new`` included — makes the client open a
+    thread named after that first line, and the bot's update arrives already
+    inside it. Opening a second topic next to that one is how ``/new`` came to
+    leave a stray ``/new`` thread behind every time. So an empty thread the
+    request already sits in *is* the room; only a bound thread (or none at all)
+    makes a new one. The caller decides emptiness, because only it can see the
+    route.
+
+    A claimed thread is held to the same standard as a created one: the rename
+    that gives it the workspace's name is also the call that proves it still
+    exists. "An update once arrived from it" is not proof — the confirm card
+    puts a human-length pause in front of the create, and a thread can be
+    deleted in that window.
     """
     prior = await workspaces_repo.get_by_nonce(database, nonce)
     if prior is not None and prior.chat_id == chat_id and prior.topic_id:
@@ -428,6 +461,18 @@ async def _seat_for(
     if chat_type == "private":
         if bot is None:
             return _Seat(NO_THREAD_ID, refusal="no bot bound")
+        if claimable_thread:
+            # No `dm_topic_support` probe: this update *arrived* in a thread, so
+            # the question it answers ("can this bot have topics here?") is
+            # already answered, and answered by the only thing that counts.
+            claim = await claim_topic(bot, chat_id, claimable_thread, label)
+            if claim.alive:
+                return _Seat(
+                    claimable_thread,
+                    claimed_topic=claimable_thread,
+                    claimed_named=claim.named,
+                )
+            # Deleted between the card and the tap. Fall through and open one.
         support = await dm_topic_support(bot)
         if support.degraded:
             return _Seat(NO_THREAD_ID, refusal=support.detail or support.reason)
@@ -526,6 +571,7 @@ async def create_and_bind_input(
         chat_type=chat_type,
         label=label,
         nonce=nonce,
+        claimable_thread=route.claimable_thread,
     )
     thread_id = seat.thread_id
     fresh_topic = seat.fresh_topic
@@ -557,7 +603,7 @@ async def create_and_bind_input(
     workspace_name = creation.name
     deep_link = creation.deep_link
     # Persist the mapping immediately: from here on a replay reuses this topic.
-    if fresh_topic is not None:
+    if seat.owns_topic:
         await workspaces_repo.upsert(
             database,
             workspace_id,
@@ -601,12 +647,16 @@ async def create_and_bind_input(
         topic_id=thread_id if thread_id else None,
         topic_name=label,
     )
-    if thread_id:
-        # `require_topic` created the topic already wearing ⏳, so record that.
-        # Left NULL, `apply_marker`'s "has anything changed?" test could not
-        # parse the stored marker, so every early rename spent a Telegram call
-        # to set a title that was already correct — and since a failed call
-        # returns before persisting, it stayed NULL and kept doing so.
+    if thread_id and (seat.fresh_topic is not None or seat.claimed_named):
+        # The room is wearing ⏳ right now — `require_topic` created it that way,
+        # or `claim_topic` renamed it before any of this was paid for. Record
+        # that, or `apply_marker`'s "has anything changed?" test cannot parse
+        # the stored marker and every early rename spends a Telegram call to
+        # set a title that is already correct.
+        #
+        # Deliberately *not* recorded when a claimed thread refused the rename:
+        # the row would then assert a title the list has never shown, and the
+        # next transition would skip the rename that would have fixed it.
         await workspaces_repo.set_topic_marker(
             database, workspace_id, TopicMarker.INITIALIZING.value
         )
@@ -708,7 +758,10 @@ async def create_and_bind_input(
 
 
 def created_card(
-    chat_id: int, created: CreatedBinding
+    chat_id: int,
+    created: CreatedBinding,
+    *,
+    from_thread: int = NO_THREAD_ID,
 ) -> tuple[str, InlineKeyboardMarkup | None]:
     """One face for "the workspace exists now", wherever it was asked for.
 
@@ -717,8 +770,14 @@ def created_card(
     the root, ``/new`` read as though it had done nothing — while the work had
     in fact moved one room over, and the root had stopped being a seat. Say
     which room, since we cannot link to it.
+
+    ``from_thread`` is where this card is about to be *shown*. When that is the
+    workspace's own room there is nowhere to point: no button, and no line
+    telling somebody to go and find a topic they are already reading.
     """
     text = f"→ <b>{escape(created.label)}</b>"
+    if created.thread_id and created.thread_id == from_thread:
+        return f"{text}\n<i>This thread is the workspace · type to send.</i>", None
     target = (
         jump_url(chat_id, created.thread_id) if created.thread_id else created.deep_link
     )

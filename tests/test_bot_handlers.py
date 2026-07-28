@@ -6,7 +6,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from aiogram.dispatcher.middlewares.user_context import (
@@ -22,8 +22,10 @@ from aiogram.methods import CreateForumTopic, SendMessage
 from aiogram.types import Chat, Message, User
 from aiogram.types import Update as TgUpdate
 
+from ctb.bot import keyboards
 from ctb.bot.app import PostgresStorage
 from ctb.bot.handlers import core as core_handlers
+from ctb.bot.handlers import home as home_handlers
 from ctb.bot.handlers import power as power_handlers
 from ctb.bot.handlers import prompts as prompt_handlers
 from ctb.bot.handlers import topics
@@ -572,6 +574,7 @@ async def test_general_plain_text_searches_and_never_posts(
         Route(chat_id=-1001, kind="general"),
         fake_tenant(_CountingClient()),
         NonceStore(),
+        _seat(db),
         db=db,
     )
 
@@ -1315,6 +1318,119 @@ async def test_a_dm_gets_one_topic_per_workspace_just_like_a_group(
     assert workspace is not None and workspace.topic_id == 99
 
 
+async def test_a_new_typed_into_an_empty_thread_lives_in_that_thread(
+    db: Database,
+) -> None:
+    """**The three-topics bug.**
+
+    Telegram's *New Chat* seat is a composer: it opens a thread out of whatever
+    is typed into it and names the thread after that first line. So ``/new``
+    arrived already inside a thread called "/new" — and then opened a second
+    one beside it for the workspace. Two rooms, one of them permanently empty,
+    every single time.
+
+    The room the request is already standing in is the room.
+    """
+    bot = _ForumBot(topics_enabled=True)
+    client = _CountingClient()
+
+    created = await create_and_bind_input(
+        bot=bot,  # type: ignore[arg-type]
+        chat_id=1007,
+        chat_type="private",
+        tg_message_id=5,
+        route=Route(chat_id=1007, thread_id=4242, kind="dm"),
+        request=_REQUEST,
+        db=db,
+        client=client,  # type: ignore[arg-type]
+    )
+
+    assert bot.topics == 0, "no sibling topic beside the one we are standing in"
+    assert created.thread_id == 4242
+    # It was called "/new" a second ago. The topic list is the navigation.
+    assert bot.renamed == ["⏳ Fix it · api/main"]
+    seat = await chats_repo.get(db, 1007, 4242)
+    assert seat is not None and seat.kind == "topic"
+    assert seat.session_id == "session-new"
+    workspace = await workspaces_repo.get(db, "workspace-1")
+    assert workspace is not None and workspace.topic_id == 4242
+
+
+async def test_a_new_from_a_thread_that_already_has_work_opens_a_new_room(
+    db: Database,
+) -> None:
+    """Claiming is only ever *empty* threads. A busy room is never taken over."""
+    bot = _ForumBot(topics_enabled=True)
+    client = _CountingClient()
+    busy = Route(
+        chat_id=1008,
+        thread_id=4242,
+        kind="dm",
+        session=SessionRow(id="sess-busy", chat_id=1008, thread_id=4242),
+    )
+
+    created = await create_and_bind_input(
+        bot=bot,  # type: ignore[arg-type]
+        chat_id=1008,
+        chat_type="private",
+        tg_message_id=5,
+        route=busy,
+        request=_REQUEST,
+        db=db,
+        client=client,  # type: ignore[arg-type]
+    )
+
+    assert bot.topics == 1 and created.thread_id == 99
+
+
+async def test_a_group_topic_is_never_claimed(db: Database) -> None:
+    """A group's rooms belong to people, not to the bot's scratch space.
+
+    Its General is thread 0 and would not qualify anyway; a topic in a group is
+    somebody's room. Only a *private* chat's empty thread is claimable.
+    """
+    bot = _ForumBot()
+    client = _CountingClient()
+
+    created = await create_and_bind_input(
+        bot=bot,  # type: ignore[arg-type]
+        chat_id=-1001,
+        chat_type="supergroup",
+        tg_message_id=5,
+        route=Route(chat_id=-1001, thread_id=4242, kind="topic"),
+        request=_REQUEST,
+        db=db,
+        client=client,  # type: ignore[arg-type]
+    )
+
+    assert bot.topics == 1 and created.thread_id == 99
+
+
+def test_claimable_thread_reads_the_route_and_only_the_route() -> None:
+    """One rule, in one place — the router already decided which seat this is."""
+    assert Route(chat_id=7, thread_id=12, kind="dm").claimable_thread == 12
+    assert Route(chat_id=7, thread_id=0, kind="dm").claimable_thread == 0
+    assert Route(chat_id=-1, thread_id=12, kind="topic").claimable_thread == 0
+    assert Route(chat_id=-1, thread_id=0, kind="general").claimable_thread == 0
+    bound = Route(
+        chat_id=7,
+        thread_id=12,
+        kind="dm",
+        session=SessionRow(id="s", chat_id=7, thread_id=12),
+    )
+    assert bound.claimable_thread == 0
+    # A room whose workspace exists but whose session row has not landed yet is
+    # still taken. The voice worker used to miss this and offer to open a second
+    # workspace inside somebody's.
+    homed = Route(
+        chat_id=7,
+        thread_id=12,
+        kind="dm",
+        chat=ChatRow(chat_id=7, thread_id=12, kind="topic", workspace_id="ws-1"),
+    )
+    assert homed.claimable_thread == 0
+
+
 async def test_a_refused_dm_topic_still_creates_and_still_delivers(
     db: Database,
 ) -> None:
@@ -1568,6 +1684,7 @@ async def _dm_root_text(
         Route(chat_id=chat_id, kind="dm"),
         fake_tenant(_CountingClient()),
         NonceStore(),
+        _seat(db),
         db=db,
     )
     return bubbles, searches
@@ -1650,6 +1767,7 @@ async def test_a_bound_dm_root_still_prompts_and_pays_for_no_cockpit_lookup(
         ),
         fake_tenant(_CountingClient()),
         NonceStore(),
+        _seat(db),
         db=db,
     )
 
@@ -1705,6 +1823,7 @@ async def test_the_prompt_receipt_carries_no_stop_of_its_own(
         ),
         fake_tenant(_CountingClient()),
         NonceStore(),
+        _seat(db),
         db=db,
     )
 
@@ -2151,6 +2270,7 @@ async def test_a_wizard_button_minted_before_a_redeploy_still_works(
     await new_workspace.wizard_callback(
         tap,  # type: ignore[arg-type]
         _seat(db),
+        Route(chat_id=-1001, kind="dm"),
         NonceStore(),
         fake_tenant(),
     )
@@ -2177,6 +2297,7 @@ async def test_a_wizard_button_is_still_single_use_while_the_process_lives(
         await new_workspace.wizard_callback(
             tap,  # type: ignore[arg-type]
             _seat(db),
+            Route(chat_id=-1001, kind="dm"),
             store,
             fake_tenant(),
         )
@@ -2207,6 +2328,7 @@ async def test_a_wizard_button_for_a_step_already_passed_is_refused(
     await new_workspace.wizard_callback(
         tap,  # type: ignore[arg-type]
         _seat(db),
+        Route(chat_id=-1001, kind="dm"),
         NonceStore(),
         fake_tenant(),
     )
@@ -2226,6 +2348,7 @@ async def test_a_wizard_button_says_closed_when_the_wizard_is_gone(
     await new_workspace.wizard_callback(
         tap,  # type: ignore[arg-type]
         _seat(db),
+        Route(chat_id=-1001, kind="dm"),
         NonceStore(),
         fake_tenant(),
     )
@@ -2245,6 +2368,7 @@ async def test_a_wizard_button_is_useless_to_another_seat(
     await new_workspace.wizard_callback(
         intruder,  # type: ignore[arg-type]
         _seat(db, user_id=2002),
+        Route(chat_id=-1001, kind="dm"),
         store,
         fake_tenant(),
     )
@@ -2257,6 +2381,7 @@ async def test_a_wizard_button_is_useless_to_another_seat(
         await new_workspace.wizard_callback(
             tap,  # type: ignore[arg-type]
             seat,
+            Route(chat_id=-1001, kind="dm"),
             NonceStore(),
             fake_tenant(),
         )
@@ -2295,7 +2420,8 @@ async def test_the_whole_wizard_survives_a_redeploy_at_every_step(
         tap = _Tap(str(first.callback_data))
         await new_workspace.wizard_callback(
             tap,  # type: ignore[arg-type]
-            _seat(db),  # the database is all that carried over
+            _seat(db),
+            Route(chat_id=-1001, kind="dm"),  # the database is all that carried over
             NonceStore(),  # the registry did not
             fake_tenant(),
         )
@@ -2457,6 +2583,7 @@ async def test_a_button_from_an_older_build_redraws_the_card_instead_of_dead_end
     await new_workspace.wizard_callback(
         stale,  # type: ignore[arg-type]
         _seat(db),
+        Route(chat_id=-1001, kind="dm"),
         NonceStore(),
         fake_tenant(),
     )
@@ -2483,6 +2610,7 @@ async def test_a_stale_button_with_no_wizard_open_still_says_so(
     await new_workspace.wizard_callback(
         stale,  # type: ignore[arg-type]
         _seat(db),
+        Route(chat_id=-1001, kind="dm"),
         NonceStore(),
         fake_tenant(),
     )
@@ -2513,6 +2641,7 @@ async def test_the_step_after_a_tap_is_tappable_by_the_owner(
     await new_workspace.wizard_callback(
         _Tap(data),  # type: ignore[arg-type]
         _seat(db),
+        Route(chat_id=-1001, kind="dm"),
         store,
         fake_tenant(),
     )
@@ -2528,6 +2657,7 @@ async def test_the_step_after_a_tap_is_tappable_by_the_owner(
     await new_workspace.wizard_callback(
         second,  # type: ignore[arg-type]
         _seat(db),
+        Route(chat_id=-1001, kind="dm"),
         store,
         fake_tenant(),
     )
@@ -2555,6 +2685,7 @@ async def test_the_branch_card_after_the_project_tap_is_tappable(
     await new_workspace.wizard_callback(
         project,  # type: ignore[arg-type]
         _seat(db),
+        Route(chat_id=-1001, kind="dm"),
         store,
         fake_tenant(),
     )
@@ -2564,6 +2695,7 @@ async def test_the_branch_card_after_the_project_tap_is_tappable(
     await new_workspace.wizard_callback(
         branch,  # type: ignore[arg-type]
         _seat(db),
+        Route(chat_id=-1001, kind="dm"),
         store,
         fake_tenant(),
     )
@@ -2632,6 +2764,7 @@ async def test_go_with_defaults_mid_wizard_keeps_the_answers_already_given(
     await new_workspace.wizard_callback(
         project,  # type: ignore[arg-type]
         _seat(db),
+        Route(chat_id=-1001, kind="dm"),
         NonceStore(),
         fake_tenant(),
     )
@@ -2640,6 +2773,7 @@ async def test_go_with_defaults_mid_wizard_keeps_the_answers_already_given(
     await new_workspace.wizard_callback(
         branch,  # type: ignore[arg-type]
         _seat(db),
+        Route(chat_id=-1001, kind="dm"),
         NonceStore(),
         fake_tenant(),
     )
@@ -2647,6 +2781,7 @@ async def test_go_with_defaults_mid_wizard_keeps_the_answers_already_given(
     await new_workspace.wizard_callback(
         defaults,  # type: ignore[arg-type]
         _seat(db),
+        Route(chat_id=-1001, kind="dm"),
         NonceStore(),
         fake_tenant(),
     )
@@ -2850,3 +2985,329 @@ def test_the_breadcrumb_names_the_project_not_its_id() -> None:
 def test_the_breadcrumb_skips_what_has_not_been_answered() -> None:
     data = {"projects": {}, "project_id": "p-1", "agent": "codex"}
     assert new_workspace.chosen_line(data, upto="") == "p-1 · codex"
+
+
+# ── the empty thread is a task composer ──────────────────────────────────────
+
+
+def _dm_thread_message(
+    text: str, *, chat_id: int = -1001, thread_id: int = 4242
+) -> Any:
+    """A real ``Message``: the wizard re-addresses its card with ``model_copy``."""
+    return Message(
+        message_id=31,
+        date=datetime.now(UTC),
+        chat=Chat(id=chat_id, type="private"),
+        from_user=User(id=1001, is_bot=False, first_name="Owner"),
+        message_thread_id=thread_id,
+        text=text,
+    )
+
+
+async def test_a_task_typed_into_an_empty_dm_thread_offers_to_start_it(
+    db: Database, monkeypatch: Any
+) -> None:
+    """The front door of a threaded DM.
+
+    Typing into *New Chat* is the one gesture the client actually invites, and
+    it used to be answered with "No session here" — true, and useless: the
+    person had just said exactly what they wanted. It now reads back the task
+    and offers one button, because a workspace bills from the moment it exists
+    and a typo must not be able to buy one.
+    """
+    posted: list[tuple[str, Any]] = []
+
+    async def fake_tell(_message: Any, text: str, **kwargs: Any) -> Any:
+        posted.append((text, kwargs.get("reply_markup")))
+        return SimpleNamespace(message_id=77)
+
+    monkeypatch.setattr(new_workspace, "tell", fake_tell)
+    monkeypatch.setattr(prompt_handlers, "tell", fake_tell)
+    state = _seat(db, thread_id=4242)
+
+    await prompt_handlers.plain_text(
+        _dm_thread_message("make the login page stop flashing"),
+        Route(chat_id=-1001, thread_id=4242, kind="dm"),
+        fake_tenant(_CountingClient()),
+        NonceStore(),
+        state,
+        db=db,
+    )
+
+    assert len(posted) == 1
+    text, markup = posted[0]
+    assert "make the login page stop flashing" in text
+    assert "No session here" not in text
+    labels = [item.text for row in markup.inline_keyboard for item in row]
+    assert labels[0] == "▶️ Start workspace"
+    assert set(labels) == {"▶️ Start workspace", "⚙️ Change", "Cancel"}
+    assert await state.get_state() == new_workspace.NewWorkspace.confirm.state
+    assert (await state.get_data())["prompt"] == "make the login page stop flashing"
+
+
+async def test_starting_from_the_confirm_card_uses_the_thread_it_is_in(
+    db: Database, monkeypatch: Any
+) -> None:
+    """One tap, one workspace, and it lives in the thread that asked for it."""
+    posted: list[Any] = []
+    edits: list[str] = []
+
+    async def fake_tell(_message: Any, _text: str, **kwargs: Any) -> Any:
+        posted.append(kwargs.get("reply_markup"))
+        return SimpleNamespace(message_id=77)
+
+    async def fake_edit(_message: Any, text: str, _markup: Any) -> bool:
+        edits.append(text)
+        return True
+
+    monkeypatch.setattr(new_workspace, "tell", fake_tell)
+    monkeypatch.setattr(prompt_handlers, "tell", fake_tell)
+    bot = _ForumBot(topics_enabled=True)
+    client = _CountingClient()
+    route = Route(chat_id=-1001, thread_id=4242, kind="dm")
+    state = _seat(db, thread_id=4242)
+
+    await prompt_handlers.plain_text(
+        _dm_thread_message("make the login page stop flashing"),
+        route,
+        fake_tenant(client),
+        NonceStore(),
+        state,
+        db=db,
+    )
+    monkeypatch.setattr(new_workspace, "_edit", fake_edit)
+    start = posted[0].inline_keyboard[0][0]
+    tap = _Tap(str(start.callback_data))
+    # The card the tap lands on: in the claimed thread, bound to a bot, exactly
+    # as Telegram delivers it — `create_and_bind` reads all three off it.
+    tap.message = Message(
+        message_id=77,
+        date=datetime.now(UTC),
+        chat=Chat(id=-1001, type="private"),
+        from_user=User(id=42, is_bot=True, first_name="Conductor"),
+        message_thread_id=4242,
+    ).as_(cast(Any, bot))
+
+    await new_workspace.wizard_callback(
+        tap,  # type: ignore[arg-type]
+        state,
+        route,
+        NonceStore(),
+        fake_tenant(client),
+        db=db,
+    )
+
+    assert client.creates == 1
+    assert bot.topics == 0, "the thread it was asked in is the thread it lives in"
+    seat = await chats_repo.get(db, -1001, 4242)
+    assert seat is not None and seat.session_id == "session-new"
+    # The card becomes the answer, and says nothing about going anywhere else.
+    assert "This thread is the workspace" in edits[-1]
+    assert await state.get_state() is None
+
+
+async def test_a_second_line_on_the_confirm_card_replaces_the_task(
+    db: Database, monkeypatch: Any
+) -> None:
+    """Dictation gets a word wrong; saying it again must be the cheap repair.
+
+    Never a second workspace — there is not even a first one yet — and never a
+    prompt, because nothing exists to prompt.
+    """
+    posted: list[Any] = []
+    edits: list[str] = []
+
+    async def fake_tell(_message: Any, _text: str, **kwargs: Any) -> Any:
+        posted.append(kwargs.get("reply_markup"))
+        return SimpleNamespace(message_id=77)
+
+    async def fake_edit(_message: Any, text: str, _markup: Any) -> bool:
+        edits.append(text)
+        return True
+
+    monkeypatch.setattr(new_workspace, "tell", fake_tell)
+    monkeypatch.setattr(prompt_handlers, "tell", fake_tell)
+    monkeypatch.setattr(new_workspace, "_edit", fake_edit)
+    client = _CountingClient()
+    route = Route(chat_id=-1001, thread_id=4242, kind="dm")
+    state = _seat(db, thread_id=4242)
+
+    await prompt_handlers.plain_text(
+        _dm_thread_message("fix the lonely page"),
+        route,
+        fake_tenant(client),
+        NonceStore(),
+        state,
+        db=db,
+    )
+    await new_workspace.typed_confirm(
+        _dm_thread_message("fix the login page"),
+        route,
+        state,
+        NonceStore(),
+        db=db,
+    )
+
+    assert client.creates == 0
+    assert len(posted) == 1, "one card, edited — not a second one below it"
+    assert "fix the login page" in edits[-1]
+    assert (await state.get_data())["prompt"] == "fix the login page"
+
+
+# ── /attach says which of the three nothings it means ────────────────────────
+
+
+def _workspace(workspace_id: str, *, topic_id: int | None = None) -> WorkspaceRow:
+    return WorkspaceRow(
+        id=workspace_id,
+        name=f"tg-1-{workspace_id}",
+        chat_id=-1001 if topic_id else None,
+        topic_id=topic_id,
+    )
+
+
+def test_attach_with_nothing_anywhere_points_at_the_thing_that_works() -> None:
+    assert (
+        core_handlers.nothing_to_attach([], "")
+        == "No workspaces in Conductor yet · describe a task here to start one."
+    )
+
+
+def test_attach_with_everything_already_open_says_so() -> None:
+    """The common case, and the one that read as "the bot cannot see them".
+
+    ``/attach`` lists only workspaces with no thread here, so a tidy chat has
+    an empty list — which is success, not a failure to find anything.
+    """
+    local = [_workspace("a", topic_id=100), _workspace("b", topic_id=101)]
+
+    assert core_handlers.nothing_to_attach(local, "").startswith(
+        "All 2 workspaces already open here"
+    )
+
+
+def test_the_count_is_rooms_this_chat_holds_not_workspaces_that_exist() -> None:
+    """A workspace with no room is one `/attach` would have offered.
+
+    Reaching this line means it did not — so counting it would point somebody
+    at a thread that does not exist.
+    """
+    local = [_workspace("a", topic_id=100), _workspace("b")]
+
+    assert core_handlers.nothing_to_attach(local, "").startswith(
+        "All 1 workspace already open here"
+    )
+
+
+def test_attach_with_a_query_blames_the_query_and_nothing_else() -> None:
+    assert (
+        core_handlers.nothing_to_attach([_workspace("a", topic_id=1)], "checkout")
+        == "Nothing unattached matches <b>checkout</b>."
+    )
+
+
+def test_a_workspace_the_transcript_view_has_not_heard_of_is_still_attachable() -> None:
+    """The view has a row only once a session has spoken.
+
+    So the workspace somebody opened on the laptop a minute ago — the one they
+    reach for `/attach` to find — is exactly the one it could not see.
+    """
+    rows = core_handlers.adoptable(
+        [], [_workspace("fresh"), _workspace("b", topic_id=9)]
+    )
+
+    assert [str(row["workspace_id"]) for row in rows] == ["fresh"]
+
+
+# ── the launcher, and the guards around it ───────────────────────────────────
+
+
+class _EmptyView(_CountingClient):
+    """The transcript view knows nothing — a workspace nobody has prompted."""
+
+    async def sql(self, *_: Any, **__: Any) -> Any:
+        return SimpleNamespace(rows=[], row_count=0, truncated=False)
+
+
+async def test_the_attach_button_does_not_spend_its_own_label_as_a_search(
+    db: Database, monkeypatch: Any
+) -> None:
+    """A reply keyboard sends its *label*, and `/attach` parses text as a query.
+
+    So `command_text` read "📎 Attach existing" as the search term
+    `Attach existing`, filtered every workspace out, and answered "Nothing
+    unattached matches" — the one button whose job is finding them found none.
+    """
+    seen: list[str] = []
+
+    async def fake_tell(_message: Any, text: str, **_kwargs: Any) -> Any:
+        seen.append(text)
+        return None
+
+    monkeypatch.setattr(core_handlers, "tell", fake_tell)
+    await workspaces_repo.upsert(db, "laptop-1", name="tg-1-abc")
+    message = _dm_thread_message(keyboards.HOME_ATTACH, chat_id=1001, thread_id=4242)
+
+    await home_handlers.launcher(
+        message,
+        Route(chat_id=1001, thread_id=4242, kind="dm"),
+        fake_tenant(_EmptyView()),
+        _seat(db, thread_id=4242),
+        NonceStore(),
+        db=db,
+    )
+
+    assert seen and "Nothing unattached matches" not in seen[0]
+    assert "Open laptop workspace" in seen[0]
+
+
+def test_the_launcher_is_offered_only_where_both_buttons_would_work() -> None:
+    """A stranger's press is dropped in silence and pages the owners.
+
+    `/start` and `/help` are reachable with no tenant at all, and a team with no
+    key stored is the same shape one step later: both buttons need the
+    Conductor client. `active` is exactly "the key is in".
+    """
+    dm = SimpleNamespace(chat=SimpleNamespace(type="private"))
+    group = SimpleNamespace(chat=SimpleNamespace(type="supergroup"))
+    active = fake_tenant()
+    pending = replace(active, status="pending")
+
+    assert power_handlers._launchable(dm, active)  # type: ignore[arg-type]
+    assert not power_handlers._launchable(dm, None)  # type: ignore[arg-type]
+    assert not power_handlers._launchable(dm, pending)  # type: ignore[arg-type]
+    assert not power_handlers._launchable(group, active)  # type: ignore[arg-type]
+
+
+async def test_a_line_typed_mid_wizard_never_starts_a_rival_task(
+    db: Database, monkeypatch: Any
+) -> None:
+    """The wizard has text handlers for three of its seven steps.
+
+    A line typed at "Project?" or "Model?" therefore reaches the plain-text
+    catch-all — and in an empty thread that used to post a *second* card,
+    leaving the live one's buttons answering "Wizard closed".
+    """
+    started: list[str] = []
+
+    async def fake_start_task(*_args: Any, **_kwargs: Any) -> None:
+        started.append("task")
+
+    async def fake_tell(_message: Any, _text: str, **_kwargs: Any) -> Any:
+        return None
+
+    monkeypatch.setattr(new_workspace, "start_task", fake_start_task)
+    monkeypatch.setattr(prompt_handlers, "tell", fake_tell)
+    state = _seat(db, thread_id=4242)
+    await state.set_state(new_workspace.NewWorkspace.model)
+
+    await prompt_handlers.plain_text(
+        _dm_thread_message("opus"),
+        Route(chat_id=-1001, thread_id=4242, kind="dm"),
+        fake_tenant(_CountingClient()),
+        NonceStore(),
+        state,
+        db=db,
+    )
+
+    assert started == []
