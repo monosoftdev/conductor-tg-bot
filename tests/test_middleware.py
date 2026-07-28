@@ -1181,10 +1181,16 @@ def test_confirm_button_contains_the_name() -> None:
     assert markup.inline_keyboard[1][0].text == "Cancel"
 
 
-def test_a_very_long_name_still_shows_its_distinguishing_tail() -> None:
-    label = confirm_label("Archive", "monorepo/" + "x" * 80 + "/feature-branch")
-    assert label.startswith("Archive ")
-    assert label.endswith("feature-branch")
+def test_a_very_long_name_keeps_the_verb_and_the_start_of_the_name() -> None:
+    """Destructive confirms must never lose the verb to a long name.
+
+    Labels lead with what distinguishes them now, so truncation keeps the head:
+    the tail of a topic label is a branch that is nearly always ``main``.
+    """
+    label = confirm_label("Archive", "drop the stale migrations · " + "x" * 80)
+
+    assert label.startswith("Archive drop the stale migrations")
+    assert label.endswith("…")
     assert len(label) <= 48 + len("Archive ")
 
 

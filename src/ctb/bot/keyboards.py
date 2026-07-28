@@ -566,10 +566,18 @@ def read_stateless(nonce: str, action: str, *, now: float | None = None) -> Tick
 
 
 def truncate_label(text: str, limit: int = MAX_BUTTON_TEXT) -> str:
-    """Keep the tail — the distinguishing part of ``proj/branch`` is the end."""
+    """Keep the head — what distinguishes a label is now at the front.
+
+    It used to keep the *tail*, because a label was ``proj/branch`` and the
+    branch was the only part that varied. Labels lead with the task now
+    (:func:`ctb.bot.handlers.topics.topic_label`), so the tail is a model id or
+    a branch that is almost always ``main`` — and cutting from the front took
+    the affordance with it, leaving ``…yer flaky test`` where ``+ Open`` had
+    been. Telegram clips its own topic rows the same way.
+    """
     if len(text) <= limit:
         return text
-    return "…" + text[-(limit - 1) :]
+    return text[: limit - 1].rstrip() + "…"
 
 
 def confirm_label(verb: str, name: str, limit: int = MAX_BUTTON_TEXT) -> str:
@@ -834,10 +842,9 @@ def quick_reply_keyboard(
     on one row.
 
     The old middle ground — a full-length label handed to a 48-character
-    budget — was the worst of both. :func:`truncate_label` keeps the *tail*, so
-    the number the option belongs to was the first thing cut: three buttons
-    reading "…cate placeholder ## Testing section at line 89." under a list
-    that had already said it better.
+    budget — was the worst of both: three buttons reading like the middles of
+    sentences, under a list that had already said it better. Numbering them is
+    what makes them readable, not where the truncation falls.
     """
     options = [
         (index, cleaned)

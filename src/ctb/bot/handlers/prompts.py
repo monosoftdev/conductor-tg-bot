@@ -10,6 +10,7 @@ import contextlib
 
 from aiogram import F, Router
 from aiogram.enums import ContentType
+from aiogram.exceptions import TelegramAPIError
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
 from ctb.bot.app import register_router
@@ -22,7 +23,7 @@ from ctb.bot.handlers.common import (
     tell,
 )
 from ctb.bot.handlers.core import run_find
-from ctb.bot.handlers.topics import resolve_client, resolve_db
+from ctb.bot.handlers.topics import resolve_client, resolve_db, topic_title
 from ctb.bot.keyboards import (
     CONTROL_TTL_S,
     Action,
@@ -36,13 +37,16 @@ from ctb.bot.keyboards import (
 from ctb.bot.middleware.routing import Route
 from ctb.bot.middleware.tenancy import TenantContext
 from ctb.conductor.client import ConductorClient
+from ctb.db import NO_THREAD_ID
 from ctb.db.connection import Database
 from ctb.db.repo import chats as chats_repo
 from ctb.db.repo import prompts as prompts_repo
 from ctb.db.repo import sessions as sessions_repo
 from ctb.db.repo import transcript as transcript_repo
+from ctb.db.repo import workspaces as workspaces_repo
 from ctb.delivery.render.html import escape
 from ctb.logging import get_logger
+from ctb.turn.state import TopicMarker
 from ctb.turn.supervisor import Supervisor
 
 log = get_logger(__name__)
@@ -423,6 +427,40 @@ async def edited_text(message: Message) -> None:
         "Edit not resent · send the correction as a new message.",
         silent=False,
     )
+
+
+@router.message(F.forum_topic_edited)
+async def tidy_rename_notice(message: Message, db: Database | None = None) -> None:
+    """Delete the "changed the topic name to …" line our own rename just made.
+
+    Every state change renames the topic, and Telegram answers each rename with
+    a permanent service message. Three of them per turn turned a working topic
+    into a wall of bookkeeping about itself — the state belongs in the topic
+    *list*, where you read it at a glance, not in the transcript you scroll.
+
+    Only our own. The title Telegram reports is compared against the one this
+    workspace's row says we last applied, so a person renaming their own topic
+    by hand keeps their receipt. Best effort throughout: the delete needs a
+    permission the group grants and a DM does not, and a topic with one extra
+    line in it is still a working topic.
+    """
+    edited = message.forum_topic_edited
+    if edited is None or edited.name is None:
+        return
+    database = resolve_db(db)
+    row = await workspaces_repo.get_by_topic(
+        database, message.chat.id, message.message_thread_id or NO_THREAD_ID
+    )
+    if row is None or row.topic_name is None:
+        return
+    try:
+        ours = topic_title(TopicMarker(row.topic_marker), row.topic_name)
+    except ValueError:
+        return
+    if edited.name != ours:
+        return
+    with contextlib.suppress(TelegramAPIError):
+        await message.delete()
 
 
 @router.edited_message()

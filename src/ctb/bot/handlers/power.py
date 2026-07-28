@@ -33,6 +33,7 @@ from ctb.bot.handlers.core import adoptable_rows, status_icon
 from ctb.bot.handlers.topics import (
     apply_marker,
     edit_html,
+    human_name,
     jump_url,
     marker_for,
     resolve_client,
@@ -208,11 +209,8 @@ async def switch_session(
             entries.append(
                 adopt_button(
                     workspace_id=workspace_id,
-                    name=str(
-                        row.get("workspace_name")
-                        or row.get("session_title")
-                        or workspace_id[:8]
-                    ),
+                    name=human_name(str(row.get("workspace_name") or ""))
+                    or str(row.get("session_title") or workspace_id[:8]),
                     session_id=str(row.get("session_id") or "") or None,
                     store=nonces,
                     user_id=message.from_user.id if message.from_user else None,
@@ -746,9 +744,7 @@ async def tidy(
             # Rename before closing. Closing alone left whatever prefix the
             # topic last had — a swept topic could sit in the list reading
             # "⚙️ working" forever, describing a session nobody is running.
-            await apply_marker(
-                message.bot, database, row.id, TopicMarker.ARCHIVED, silent=True
-            )
+            await apply_marker(message.bot, database, row.id, TopicMarker.ARCHIVED)
             await message.bot.close_forum_topic(
                 chat_id=row.chat_id, message_thread_id=row.topic_id
             )

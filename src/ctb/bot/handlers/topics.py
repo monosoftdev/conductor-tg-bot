@@ -20,20 +20,26 @@ tick would spend the whole flood budget on cosmetics. The last applied prefix
 lives in ``workspaces.topic_marker``, and :func:`apply_marker` is a no-op when
 the marker has not actually changed — that check is the rule, in code.
 
-The name is always ``<marker> <project>/<branch>`` — :func:`topic_label` builds
-the stable half and it is **never** the text of a prompt. Prefixes come from
-:mod:`ctb.signals`, so the topic list, the status card and the transcript all
-say the same thing:
+The name is ``<marker> <task> · <project>/<branch>`` — a **state prefix** that
+changes, and a **label** that never does. :func:`topic_label` builds the label
+once, at creation, from the opening prompt; :func:`apply_marker` only ever
+touches the prefix. Prefixes come from :mod:`ctb.signals`, so the topic list,
+the status card and ``/board`` all say the same thing:
 
-| Conductor state          | Topic name          |
-|--------------------------|---------------------|
-| workspace initializing   | ``⏳ proj/branch``  |
-| ready + session idle     | ``proj/branch``     |
-| session working          | ``⚙️ proj/branch``  |
-| turn finished, unread    | ``✅ proj/branch``  |
-| session error            | ``⚠️ proj/branch``  |
-| workspace sleeping       | ``💤 proj/branch``  |
-| archived / deleted       | ``🗄 proj/branch``, topic closed |
+| Conductor state          | Topic name                       |
+|--------------------------|----------------------------------|
+| workspace initializing   | ``⏳ fix login · api/main``      |
+| ready + session idle     | ``fix login · api/main``         |
+| session working          | ``⚙️ fix login · api/main``      |
+| turn finished, unread    | ``✅ fix login · api/main``      |
+| session error            | ``⚠️ fix login · api/main``      |
+| workspace sleeping       | ``💤 fix login · api/main``      |
+| archived / deleted       | ``🗄 fix login · api/main``, topic closed |
+
+The task leads because Telegram clips a topic row from the right and a phone
+shows perhaps thirty characters of it. A branch is nearly always ``main``, so
+``proj/branch`` alone made every workspace on one repo look identical — same
+name, same colour (it is a hash of the label), same state icon.
 
 **There is no bot-managed "General" topic.** Every topic here belongs to one
 workspace. The always-present seat is the chat root — Telegram's own General in
@@ -90,13 +96,13 @@ __all__ = [
     "edit_html",
     "ensure_topic",
     "forum_support",
+    "human_name",
     "jump_url",
     "marker_for",
     "require_topic",
     "resolve_client",
     "resolve_db",
     "send_html",
-    "sync_marker",
     "telegram_reason",
     "topic_label",
     "topic_icon_color",
@@ -178,11 +184,97 @@ def resolve_client(
 # ── naming ───────────────────────────────────────────────────────────────────
 
 
-def topic_label(project: str | None, branch: str | None) -> str:
-    """``proj/branch`` — the stable half of a topic name, marker excluded."""
-    left = (project or "workspace").strip() or "workspace"
-    right = (branch or "").strip()
-    label = f"{left}/{right}" if right else left
+#: How much of the opening prompt becomes the topic's name. Wide enough for a
+#: recognisable phrase, short enough that ``proj/branch`` after it still lands
+#: inside the ~30 characters a phone shows of a topic row.
+TASK_HINT_CHARS: Final = 28
+
+_WHITESPACE: Final = re.compile(r"\s+")
+#: Openers that are true of every prompt and identify none of them.
+_HINT_NOISE: Final = re.compile(
+    r"^(?:please\s+|can\s+you\s+|could\s+you\s+|i\s+want\s+(?:you\s+)?to\s+"
+    r"|i\s+need\s+(?:you\s+)?to\s+|let'?s\s+|help\s+me\s+|hey\s+|hi\s+|ok(?:ay)?[,\s]+)+",
+    re.IGNORECASE,
+)
+#: Words that carry nothing on their own, so a clip ending on one reads as a
+#: sentence cut off rather than a name.
+_DANGLING: Final[frozenset[str]] = frozenset(
+    {
+        "a", "an", "and", "as", "at", "but", "by", "for", "from", "in", "into",
+        "of", "on", "or", "so", "that", "the", "then", "to", "when", "where",
+        "which", "while", "with", "without",
+    }
+)  # fmt: skip
+
+
+def task_hint(prompt: str | None) -> str:
+    """A few words of the opening prompt — what makes one topic recognisable.
+
+    Not the running prompt: this is taken **once**, from the first one, and
+    never changes afterwards. A name that moved with the conversation would
+    make the topic list unlearnable and cost a rename per turn.
+    """
+    lines = (prompt or "").strip().splitlines()
+    if not lines:
+        return ""
+    text = _WHITESPACE.sub(" ", lines[0].strip())
+    text = _HINT_NOISE.sub("", text).strip(" .,:;-—")
+    if len(text) <= TASK_HINT_CHARS:
+        return text
+    clipped = text[:TASK_HINT_CHARS]
+    if not text[TASK_HINT_CHARS].isspace():
+        # The cut landed inside a word. Retreat to the boundary — but never
+        # give back a stub: "implement" beats "i".
+        head, sep, _ = clipped.rpartition(" ")
+        if sep and len(head) >= TASK_HINT_CHARS // 2:
+            clipped = head
+    # A clip that lands on "the" or "where" reads like a transmission cutting
+    # out. Dropping the dangling word costs a few characters and buys a phrase.
+    words = clipped.split()
+    while len(words) > 1 and words[-1].casefold() in _DANGLING:
+        words.pop()
+    return " ".join(words).rstrip(" .,")
+
+
+#: ``tg-<chatid>-<nonce>``, the name we give Conductor so an ambiguous create
+#: can be reconciled by listing (see :func:`ctb.turn.cursor.workspace_name`).
+#: It is bookkeeping, and it must never reach a person.
+_INTERNAL_NAME: Final = re.compile(r"^tg-\d+-[A-Za-z0-9_-]{4,}$")
+
+
+def human_name(name: str | None) -> str:
+    """``name``, unless it is the reconciliation key we invented for Conductor.
+
+    Every workspace this bot creates is called ``tg-1132334-iszvwjeb`` on the
+    Conductor side, and that string was being rendered straight into buttons
+    (``+ Open tg-1132334-iszvwjeb``) and, through adoption, into topic titles.
+    Empty here means "you have nothing worth showing — use a fallback".
+    """
+    text = (name or "").strip()
+    return "" if not text or _INTERNAL_NAME.match(text) else text
+
+
+def topic_label(
+    project: str | None, branch: str | None, *, task: str | None = None
+) -> str:
+    """What tells one topic from another, marker excluded.
+
+    **The task comes first.** Telegram clips a topic row from the right and a
+    phone shows perhaps thirty characters of it, so whatever identifies the
+    workspace has to be in front. It used to be ``proj/branch`` alone — and
+    since a branch is almost always ``main``, three workspaces on one repo were
+    three rows reading ``reclaimly-be/main``, in the same colour, with the same
+    icon. The list could not answer the one question you ask it.
+
+    With no task — an adopted workspace, a hand rename — it falls back to
+    ``proj/branch``, which is what it always was.
+    """
+    where = (project or "workspace").strip() or "workspace"
+    branch_part = (branch or "").strip()
+    if branch_part:
+        where = f"{where}/{branch_part}"
+    hint = task_hint(task)
+    label = f"{hint} · {where}" if hint else where
     return label[:TOPIC_NAME_LIMIT]
 
 
@@ -692,7 +784,6 @@ async def apply_marker(
     marker: TopicMarker,
     *,
     label: str | None = None,
-    silent: bool = False,
 ) -> bool:
     """Rename the topic **only if the title would actually change**.
 
@@ -707,10 +798,11 @@ async def apply_marker(
     row = await workspaces_repo.get(db, workspace_id)
     if row is None or row.chat_id is None or row.topic_id is None:
         return False
-    # Never `row.name`: that is the *Conductor* workspace name, `tg-<chat>-<nonce>`.
-    # Renaming somebody's topic to an internal id because one column came back
-    # NULL is worse than the generic label a fresh topic would have been given.
-    name = label or row.topic_name or topic_label(row.project_id, row.branch)
+    # Never `row.name` (the *Conductor* name, `tg-<chat>-<nonce>`) and never
+    # `row.project_id` (an id, not a project). Retitling somebody's topic to an
+    # internal identifier because one column came back NULL is worse than
+    # leaving the generic word a nameless workspace would have been given.
+    name = label or row.topic_name or topic_label(None, row.branch)
     title = topic_title(marker, name)
     # Compare the *rendered title*, not just the marker. Comparing markers
     # meant `/name -w` with an unchanged name always spent an API call, while a
@@ -749,20 +841,6 @@ async def apply_marker(
     if label is not None and label != row.topic_name:
         await workspaces_repo.update(db, workspace_id, topic_name=label)
     return True
-
-
-async def sync_marker(bot: Bot, db: Database, workspace_id: str) -> bool:
-    """Recompute the marker from the cached rows and apply it if it moved."""
-    row = await workspaces_repo.get(db, workspace_id)
-    if row is None:
-        return False
-    session = await _newest_session(db, row)
-    marker = marker_for(
-        workspace_status=row.status_value,
-        turn_state=session.state if session is not None else None,
-        session_status=session.status_value if session is not None else None,
-    )
-    return await apply_marker(bot, db, workspace_id, marker)
 
 
 async def close_topic(bot: Bot, db: Database, workspace_id: str) -> bool:

@@ -24,6 +24,7 @@ from ctb.bot.handlers.topics import (
     discard_topic,
     dm_topic_support,
     forum_support,
+    human_name,
     require_topic,
     resolve_db,
     send_html,
@@ -509,7 +510,10 @@ async def create_and_bind_input(
     database = resolve_db(db)
     conductor = client
     validate_pairing(request.agent, request.model, request.effort)
-    label = topic_label(request.project_name, request.branch)
+    # The opening prompt names the topic. Taken once, here, and never revisited:
+    # `apply_marker` only ever changes the prefix, so the name a workspace is
+    # born with is the name it keeps.
+    label = topic_label(request.project_name, request.branch, task=request.prompt)
 
     operation_id = action_id or f"{chat_id}:{tg_message_id}"
     nonce = cursor.stable_nonce(operation_id)
@@ -567,6 +571,18 @@ async def create_and_bind_input(
             raise RuntimeError("Workspace created, but no session was returned.")
         session_id = page.data[0].id
 
+    # The topic was named before the workspace existed. If what it actually
+    # carries is not what the workspace ended up called, correct it through the
+    # one rename path there is — never a second mechanism.
+    #
+    # **Before** the upsert below, not after. `apply_marker` decides whether a
+    # rename is needed by comparing against the title the row says was last
+    # applied; writing `topic_name=label` first destroys exactly that evidence
+    # and makes the correction skip itself.
+    if bot is not None and prior_label is not None and prior_label != label:
+        await apply_marker(
+            bot, database, workspace_id, TopicMarker.INITIALIZING, label=label
+        )
     await workspaces_repo.upsert(
         database,
         workspace_id,
@@ -583,12 +599,14 @@ async def create_and_bind_input(
         topic_id=thread_id if thread_id else None,
         topic_name=label,
     )
-    # The topic was named before the workspace existed. If what it actually
-    # carries is not what the workspace ended up called, correct it through the
-    # one rename path there is — never a second mechanism.
-    if bot is not None and prior_label is not None and prior_label != label:
-        await apply_marker(
-            bot, database, workspace_id, TopicMarker.INITIALIZING, label=label
+    if thread_id:
+        # `require_topic` created the topic already wearing ⏳, so record that.
+        # Left NULL, `apply_marker`'s "has anything changed?" test could not
+        # parse the stored marker, so every early rename spent a Telegram call
+        # to set a title that was already correct — and since a failed call
+        # returns before persisting, it stayed NULL and kept doing so.
+        await workspaces_repo.set_topic_marker(
+            database, workspace_id, TopicMarker.INITIALIZING.value
         )
     await sessions_repo.upsert(
         database,
@@ -695,7 +713,12 @@ async def require_session(message: Message, route: Route) -> str | None:
 
 
 def workspace_name(row: Any) -> str:
-    return row.topic_name or row.name or row.id[:8]
+    """What to call this workspace to a person.
+
+    ``row.name`` is Conductor's, which for anything the bot created is the
+    ``tg-<chat>-<nonce>`` reconciliation key — bookkeeping, never a name.
+    """
+    return row.topic_name or human_name(row.name) or row.id[:8]
 
 
 def safe_title(text: str | None, fallback: str) -> str:

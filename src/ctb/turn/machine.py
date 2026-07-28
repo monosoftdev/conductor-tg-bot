@@ -397,6 +397,11 @@ def _start_turn(tick: _Tick, now: float, index_at_post: int | None) -> None:
         status_card_msg_id=None,
     )
     tick.card(CardKind.QUEUED, _queued_text(tick.ctx), _queue_buttons(tick.ctx))
+    # The topic list is the only surface you can see without opening anything,
+    # and it used to keep saying ✅ from the *previous* turn until the agent
+    # produced its first output. Sending a prompt and watching the list say
+    # "finished" is the one wrong answer; ⏳ from the moment it is accepted.
+    tick.do(SetTopicMarker(TopicMarker.INITIALIZING))
     tick.retune(now, "queued")
 
 
@@ -1014,12 +1019,19 @@ def _on_ws(tick: _Tick, evidence: Ws, now: float) -> TransitionResult:
             # face has been shown, so rule 10 can reset it.
             tick.enter(TurnState.WAKING, now, consecutive_idle=0, waking_notified=True)
             tick.card(CardKind.WAKING, _waking_text(tick.ctx), _ACTIVE_BUTTONS)
-            marker = (
-                TopicMarker.SLEEPING
-                if evidence.status is WorkspaceStatusValue.SLEEPING
-                else TopicMarker.INITIALIZING
+            # 💤 means "nothing is happening here". With a prompt outstanding
+            # something *is* happening — the machine is waiting on infrastructure
+            # — so the topic says ⏳ whether the workspace was asleep or is
+            # cloning. Which of the two it was is our problem, not the reader's,
+            # and pretending otherwise costs a rename to correct it a second later.
+            tick.do(
+                SetTopicMarker(
+                    TopicMarker.SLEEPING
+                    if evidence.status is WorkspaceStatusValue.SLEEPING
+                    and tick.ctx.outstanding == 0
+                    else TopicMarker.INITIALIZING
+                )
             )
-            tick.do(SetTopicMarker(marker))
             tick.retune(now, "waking")
             return tick.result(9, "workspace is waking")
         if state is TurnState.WAKING:
@@ -1035,7 +1047,11 @@ def _on_ws(tick: _Tick, evidence: Ws, now: float) -> TransitionResult:
             tick.card(CardKind.QUEUED, _queued_text(tick.ctx), _queue_buttons(tick.ctx))
             for prompt in tick.ctx.pending_prompts:
                 tick.do(RePost(prompt.message_id))
-            tick.do(SetTopicMarker(TopicMarker.IDLE))
+            # Still ⏳, not blank. The workspace is up but the turn has not
+            # started, and a blank prefix here meant the topic flickered
+            # ⏳ → nothing → ⚙️ inside two polls: two renames, two permanent
+            # "changed the topic name" lines, to say nothing that lasted.
+            tick.do(SetTopicMarker(TopicMarker.INITIALIZING))
             tick.retune(now, "queued")
             return tick.result(10, "workspace ready")
         tick.enter(TurnState.IDLE, now, consecutive_idle=0, idle_decay_step=0)

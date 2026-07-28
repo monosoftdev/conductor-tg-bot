@@ -678,9 +678,7 @@ class VoiceService:
                 client=conductor,
                 action_id=row.action_id,
             )
-            await self._send(
-                row, f"Created <b>{escape(created.label)}</b> · prompt queued."
-            )
+            await self._send(row, f"→ <b>{escape(created.label)}</b> · queued")
             return True
         await self._send(row, "Unknown voice command.")
         return True

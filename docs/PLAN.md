@@ -357,14 +357,19 @@ announces once.
 >
 > The group path is byte-identical to what it always was, including the `/setup` capability probe.
 
+> Superseded by `docs/NAMING.md`, which is the current rule. The glyphs below
+> were replaced by the one vocabulary in `ctb/signals.py`, and the label now
+> leads with the task: `⚙️ fix the login bug · proj/branch`.
+
 | Conductor state | Topic name |
 |---|---|
-| workspace initializing | `~ proj/branch` |
-| ready + session idle | `proj/branch` |
-| session working | `● proj/branch` |
-| session error | `! proj/branch` |
-| workspace sleeping | `· proj/branch` |
-| archived/deleted | `x proj/branch`, topic closed |
+| workspace initializing | `⏳ <task> · proj/branch` |
+| ready + session idle | `<task> · proj/branch` |
+| turn finished, unread | `✅ <task> · proj/branch` |
+| session working | `⚙️ <task> · proj/branch` |
+| session error | `⚠️ <task> · proj/branch` |
+| workspace sleeping | `💤 <task> · proj/branch` |
+| archived/deleted | `🗄 <task> · proj/branch`, topic closed |
 
 Renamed only on state *transitions*, never on a timer (rename is an API call).
 

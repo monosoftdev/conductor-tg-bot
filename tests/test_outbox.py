@@ -371,9 +371,9 @@ async def test_decision_result_carries_one_tap_replies(
 def test_options_too_long_to_spell_out_become_bare_numbers() -> None:
     """The old label was a tail-truncated copy of a list already on screen.
 
-    ``truncate_label`` keeps the end, so ``1 · `` was the first thing cut and
-    three buttons all read like the ends of sentences. The prose stays (the
-    cursor only strips it when the options fit), so the numbers are enough.
+    A 48-character budget cannot spell out an option and stay readable, wherever
+    the cut falls. The prose stays (the cursor only strips it when the options
+    fit), so the numbers are enough.
     """
     long_options = (
         "Delete the duplicate placeholder ## Testing section at line 89.",

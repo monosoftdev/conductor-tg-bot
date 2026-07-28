@@ -29,6 +29,7 @@ from ctb.bot.handlers.common import (
 from ctb.bot.handlers.topics import (
     close_topic,
     edit_html,
+    human_name,
     jump_url,
     resolve_client,
     resolve_db,
@@ -240,7 +241,9 @@ async def board(
     for row in rows[:BOARD_VISIBLE]:
         wid = str(row.get("workspace_id") or "")
         local = await workspaces_repo.get(database, wid) if wid else None
-        name = str(row.get("workspace_name") or row.get("session_title") or wid[:8])
+        name = human_name(str(row.get("workspace_name") or "")) or str(
+            row.get("session_title") or wid[:8]
+        )
         icon = status_icon(
             str(row.get("display_state") or row.get("workspace_state") or "")
         )
@@ -357,7 +360,9 @@ async def adoptable_rows(
         local = await workspaces_repo.get(database, wid)
         if local is not None and local.chat_id is not None and local.topic_id:
             continue
-        name = str(row.get("workspace_name") or row.get("session_title") or wid[:8])
+        name = human_name(str(row.get("workspace_name") or "")) or str(
+            row.get("session_title") or wid[:8]
+        )
         if needle and needle not in name.casefold() and needle not in wid.casefold():
             continue
         seen.add(wid)
@@ -390,8 +395,8 @@ async def attach_workspace(
     buttons = []
     for row in rows:
         workspace_id = str(row.get("workspace_id") or "")
-        name = str(
-            row.get("workspace_name") or row.get("session_title") or workspace_id[:8]
+        name = human_name(str(row.get("workspace_name") or "")) or str(
+            row.get("session_title") or workspace_id[:8]
         )
         buttons.append(
             [
@@ -418,7 +423,9 @@ def board_lines(rows: list[dict[str, object]]) -> list[str]:
     lines = [f"<b>Board · {len(rows)} workspace{'' if len(rows) == 1 else 's'}</b>"]
     for row in rows[:BOARD_VISIBLE]:
         wid = str(row.get("workspace_id") or "")
-        name = str(row.get("workspace_name") or row.get("session_title") or wid[:8])
+        name = human_name(str(row.get("workspace_name") or "")) or str(
+            row.get("session_title") or wid[:8]
+        )
         status = str(row.get("display_state") or row.get("workspace_state") or "?")
         model = str(row.get("model") or "")
         lines.append(
@@ -487,7 +494,9 @@ async def find_text(client: ConductorClient, text: str) -> str:
             f"<b>{total} matches</b>" + (" · truncated" if result.truncated else "")
         )
     for row in shown:
-        title = str(row.get("workspace_name") or row.get("session_title") or "session")
+        title = human_name(str(row.get("workspace_name") or "")) or str(
+            row.get("session_title") or "session"
+        )
         preview = " ".join(str(row.get("preview") or "").split())
         lines.append(f"<b>{escape(title)}</b> · {escape(preview[:90])}")
     return "\n".join(lines)
