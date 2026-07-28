@@ -164,7 +164,7 @@ jobs:
       # `readme = "README.md"` in pyproject.toml did exactly that, passed every
       # other gate, and broke the deploy instead of the build.
       - name: Build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: false
