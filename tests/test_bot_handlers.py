@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 from aiogram.dispatcher.middlewares.user_context import (
     EVENT_CONTEXT_KEY,
+    EventContext,
     UserContextMiddleware,
 )
 from aiogram.enums import ContentType
@@ -23,16 +24,19 @@ from aiogram.types import Update as TgUpdate
 
 from ctb.bot.app import PostgresStorage
 from ctb.bot.handlers import core as core_handlers
+from ctb.bot.handlers import power as power_handlers
 from ctb.bot.handlers import prompts as prompt_handlers
 from ctb.bot.handlers import topics
 from ctb.bot.handlers.common import _LINEAR_TOLD as LINEAR_TOLD
 from ctb.bot.handlers.common import (
     LINEAR_DM_NOTICE,
     MOBILE_REPLY_INSTRUCTION,
+    CreatedBinding,
     CreateRequest,
     augment_prompt,
     create_and_bind,
     create_and_bind_input,
+    created_card,
     react_received,
     request_cancel,
     submit_prompt,
@@ -49,7 +53,7 @@ from ctb.bot.handlers.core import (
     session_overview_lines,
     status_icon,
 )
-from ctb.bot.handlers.power import switchable_sessions
+from ctb.bot.handlers.power import homed_elsewhere, switchable_sessions
 from ctb.bot.handlers.topics import (
     TOPIC_ICON_COLORS,
     TopicCreateError,
@@ -62,6 +66,7 @@ from ctb.bot.keyboards import (
     Action,
     NonceError,
     NonceStore,
+    button,
     read_stateless,
 )
 from ctb.bot.middleware.routing import Route, RoutingMiddleware
@@ -88,9 +93,10 @@ from ctb.db.repo.chats import ChatRow
 from ctb.db.repo.sessions import SessionRow
 from ctb.db.repo.tenancy import TenantRow
 from ctb.db.repo.workspaces import WorkspaceRow
+from ctb.delivery.status_card import CardState, card_buttons
 from ctb.settings import Settings
 from ctb.turn.cursor import quick_replies_for
-from ctb.turn.state import Cancel, TopicMarker, TurnState
+from ctb.turn.state import Cancel, CardButton, CardKind, TopicMarker, TurnState
 from tests.pg import BOOTSTRAP_TENANT_ID
 
 
@@ -98,6 +104,16 @@ from tests.pg import BOOTSTRAP_TENANT_ID
 def _forget_linear_notices() -> None:
     """ "Told this chat once" is process state. Do not let it leak between tests."""
     LINEAR_TOLD.clear()
+
+
+class _NullFsm:
+    """``abandon_wizard`` only asks whether a wizard is open."""
+
+    async def get_state(self) -> str | None:
+        return None
+
+    async def clear(self) -> None:
+        return None
 
 
 def fake_tenant(
@@ -1446,10 +1462,11 @@ async def test_a_dm_topic_addresses_its_own_seat_without_is_topic_message(
         is_topic_message=False,
     )
     update = TgUpdate(update_id=1, message=message)
-    captured: dict[str, Route] = {}
+    captured: dict[str, Any] = {}
 
     async def handler(_event: Any, payload: dict[str, Any]) -> None:
         captured["route"] = payload["route"]
+        captured["data"] = payload
 
     await RoutingMiddleware(db=db)(
         handler,
@@ -1468,6 +1485,386 @@ async def test_a_dm_topic_addresses_its_own_seat_without_is_topic_message(
     assert route.key == (1010, 99)
     assert route.session_id == "sess-dm-topic"
     assert route.is_topic and not route.is_dm
+    # …and the seat is republished, because aiogram's FSM keys wizard state off
+    # `EventContext.thread_id` and Telegram leaves it empty here. Without this
+    # every seat in the DM shares one wizard, so a `/new` left open in the root
+    # eats the next line typed in any topic.
+    assert captured["data"][EVENT_CONTEXT_KEY].thread_id == 99
+
+
+async def test_the_dm_root_publishes_no_seat_so_wizards_key_on_the_root(
+    db: Database,
+) -> None:
+    """The other half of the same rule: the root is thread ``None``, not 99."""
+    message = Message(
+        message_id=11,
+        date=datetime.now(tz=UTC),
+        chat=Chat(id=1011, type="private"),
+        from_user=User(id=1001, is_bot=False, first_name="T"),
+        text="hi",
+    )
+    update = TgUpdate(update_id=2, message=message)
+    captured: dict[str, Any] = {}
+
+    async def handler(_event: Any, payload: dict[str, Any]) -> None:
+        captured["data"] = payload
+
+    await RoutingMiddleware(db=db)(
+        handler,
+        update,
+        {
+            EVENT_CONTEXT_KEY: UserContextMiddleware.resolve_event_context(update),
+            "db": db,
+            "tenant": SimpleNamespace(
+                tenant_id=BOOTSTRAP_TENANT_ID,
+                settings=SimpleNamespace(voice_enabled=False),
+            ),
+        },
+    )
+
+    assert captured["data"][EVENT_CONTEXT_KEY].thread_id is None
+
+
+def test_a_forums_general_is_published_as_the_root_seat_too() -> None:
+    """Thread 1 and thread 0 are one seat, and the FSM must agree with `/setup`."""
+    context = EventContext(chat=Chat(id=-1001, type="supergroup"), thread_id=1)
+    data: dict[str, Any] = {EVENT_CONTEXT_KEY: context, "event_thread_id": 1}
+
+    updated = RoutingMiddleware._publish_seat(context, 0, data)
+
+    assert updated.thread_id is None
+    assert data[EVENT_CONTEXT_KEY] is updated
+    assert "event_thread_id" not in data, "aiogram's mirror must not disagree"
+
+
+# ── the DM root is a cockpit, never a dead end ───────────────────────────────
+
+
+async def _dm_root_text(
+    db: Database, monkeypatch: Any, *, chat_id: int
+) -> tuple[list[tuple[str, Any]], list[str]]:
+    """Type a task into the DM root and report what came back."""
+    bubbles: list[tuple[str, Any]] = []
+    searches: list[str] = []
+
+    async def fake_tell(_message: Any, text: str, **kwargs: Any) -> Any:
+        bubbles.append((text, kwargs.get("reply_markup")))
+
+    async def fake_find(_message: Any, text: str, **_: Any) -> None:
+        searches.append(text)
+
+    monkeypatch.setattr(prompt_handlers, "tell", fake_tell)
+    monkeypatch.setattr(prompt_handlers, "run_find", fake_find)
+    message = SimpleNamespace(
+        text="fix the login bug",
+        chat=SimpleNamespace(id=chat_id, type="private"),
+        message_thread_id=None,
+        message_id=12,
+        from_user=SimpleNamespace(id=1001),
+    )
+
+    await prompt_handlers.plain_text(
+        message,  # type: ignore[arg-type]
+        Route(chat_id=chat_id, kind="dm"),
+        fake_tenant(_CountingClient()),
+        NonceStore(),
+        db=db,
+    )
+    return bubbles, searches
+
+
+async def test_the_dm_root_offers_the_topic_it_handed_the_work_to(
+    db: Database, monkeypatch: Any
+) -> None:
+    """**The bug this whole change is about.**
+
+    ``/new`` in a DM opens a topic and binds the session to it, which leaves the
+    root holding nothing — so every following line, typed or dictated, answered
+    "No session here" while the session plainly existed one room away. The root
+    is the cockpit, and a cockpit offers a button instead of a dead end.
+    """
+    await workspaces_repo.upsert(db, "ws-dm", chat_id=1020, topic_id=99)
+    await sessions_repo.upsert(
+        db, "sess-dm", workspace_id="ws-dm", chat_id=1020, thread_id=99, title="Login"
+    )
+    await chats_repo.bind(
+        db, 1020, 99, workspace_id="ws-dm", session_id="sess-dm", kind="topic"
+    )
+    await chats_repo.touch_prompt(db, 1020, 99, focus_for_ms=1000)
+
+    bubbles, searches = await _dm_root_text(db, monkeypatch, chat_id=1020)
+
+    assert searches == [], "the root sends, it does not search — General does that"
+    text, markup = bubbles[0]
+    assert text == core_handlers.DM_COCKPIT_HINT
+    assert markup is not None
+    assert markup.inline_keyboard[0][0].text == "Send to Login"
+
+
+async def test_a_dm_with_nothing_running_still_gets_the_honest_nudge(
+    db: Database, monkeypatch: Any
+) -> None:
+    """No cockpit to be. Inventing a destination would be worse than saying so."""
+    bubbles, searches = await _dm_root_text(db, monkeypatch, chat_id=1021)
+
+    assert searches == []
+    assert bubbles == [
+        ("No session here. Use <code>/new</code> or <code>/s</code>.", None)
+    ]
+
+
+async def test_a_bound_dm_root_still_prompts_and_pays_for_no_cockpit_lookup(
+    db: Database, monkeypatch: Any
+) -> None:
+    """A linear DM — topics refused — is unchanged: the root *is* the seat."""
+    submitted: list[str] = []
+
+    async def fake_submit(**kwargs: Any) -> tuple[str, str]:
+        submitted.append(kwargs["session_id"])
+        return ("m1", "queued")
+
+    async def fake_tell(_message: Any, text: str, **kwargs: Any) -> Any:
+        return None
+
+    async def fake_react(_message: Any) -> bool:
+        return True
+
+    monkeypatch.setattr(prompt_handlers, "submit_prompt", fake_submit)
+    monkeypatch.setattr(prompt_handlers, "tell", fake_tell)
+    monkeypatch.setattr(prompt_handlers, "react_received", fake_react)
+    await sessions_repo.upsert(db, "sess-linear", chat_id=1022, thread_id=0)
+    message = SimpleNamespace(
+        text="go",
+        chat=SimpleNamespace(id=1022, type="private"),
+        message_thread_id=None,
+        message_id=13,
+        from_user=SimpleNamespace(id=1001),
+    )
+
+    await prompt_handlers.plain_text(
+        message,  # type: ignore[arg-type]
+        Route(
+            chat_id=1022,
+            kind="dm",
+            session=SessionRow(id="sess-linear", chat_id=1022, thread_id=0),
+        ),
+        fake_tenant(_CountingClient()),
+        NonceStore(),
+        db=db,
+    )
+
+    assert submitted == ["sess-linear"]
+
+
+async def test_the_prompt_receipt_carries_no_stop_of_its_own(
+    db: Database, monkeypatch: Any
+) -> None:
+    """One task, one Stop. Two of them is two answers to "is this still going?".
+
+    The receipt used to carry a Stop on the theory that a refused 👀 left the
+    user without one — but the reaction has nothing to do with the pinned card,
+    which appears either way and owns Stop. And this was the wrong one to keep:
+    a bubble is static, so its Stop stayed live on screen for fifteen minutes
+    after the turn ended, targeting the *session*, which meant tapping it then
+    killed whatever was running by then. The card's is edited away the moment
+    the turn is over.
+    """
+    bubbles: list[tuple[str, Any]] = []
+
+    async def fake_submit(**_kwargs: Any) -> tuple[str, str]:
+        return ("m1", "queued")
+
+    async def fake_tell(_message: Any, text: str, **kwargs: Any) -> Any:
+        bubbles.append((text, kwargs.get("reply_markup")))
+        return None
+
+    async def refused(_message: Any) -> bool:
+        return False
+
+    monkeypatch.setattr(prompt_handlers, "submit_prompt", fake_submit)
+    monkeypatch.setattr(prompt_handlers, "tell", fake_tell)
+    monkeypatch.setattr(prompt_handlers, "react_received", refused)
+    await sessions_repo.upsert(db, "sess-receipt", chat_id=1050, thread_id=7)
+    message = SimpleNamespace(
+        text="go",
+        chat=SimpleNamespace(id=1050, type="private"),
+        message_thread_id=7,
+        message_id=14,
+        from_user=SimpleNamespace(id=1001),
+    )
+
+    await prompt_handlers.plain_text(
+        message,  # type: ignore[arg-type]
+        Route(
+            chat_id=1050,
+            thread_id=7,
+            kind="dm",
+            session=SessionRow(
+                id="sess-receipt", chat_id=1050, thread_id=7, title="Login"
+            ),
+        ),
+        fake_tenant(_CountingClient()),
+        NonceStore(),
+        db=db,
+    )
+
+    text, markup = bubbles[-1]
+    assert text.startswith("→ <b>Login</b>"), "the receipt itself is still useful"
+    assert markup is None, "the card owns Stop; this is a receipt, not a control"
+
+
+def test_only_a_live_card_offers_the_one_stop() -> None:
+    """…and the card that owns it takes it away the moment the turn is over."""
+    live = CardState(kind=CardKind.WORKING, buttons=(CardButton.STOP,))
+    finished = CardState(kind=CardKind.DONE, buttons=(CardButton.STOP,))
+
+    assert card_buttons(live) == (CardButton.STOP,)
+    assert card_buttons(finished) == ()
+
+
+def test_a_dm_topic_has_no_link_so_the_card_says_where_it_went() -> None:
+    """``jump_url`` is ``None`` in a private chat — Telegram publishes no syntax.
+
+    Left as a bare ``→ label`` with no button, ``/new`` read as though nothing
+    had happened, which is exactly how it was reported.
+    """
+    made = CreatedBinding("ws", "sess", 99, "Login · api/main")
+
+    text, markup = created_card(1030, made)
+
+    assert markup is None
+    assert "its own topic" in text
+
+    # A group topic can be linked, so it still is — no regression there.
+    group_text, group_markup = created_card(-1001234, made)
+    assert group_markup is not None
+    assert group_markup.inline_keyboard[0][0].text == "Open topic"
+    assert "its own topic" not in group_text
+
+
+# ── /s may reach a room, never re-address it ─────────────────────────────────
+
+
+def test_a_workspace_with_a_room_is_opened_not_switched_to() -> None:
+    """``/s`` binds the session to the seat it was run from. That is a *move*."""
+    homed = WorkspaceRow(id="w", chat_id=1040, topic_id=99)
+
+    assert homed_elsewhere(homed, Route(chat_id=1040, kind="dm")) == (1040, 99)
+    # Standing in the room already: nothing to open, so switching is fine.
+    assert homed_elsewhere(homed, Route(chat_id=1040, thread_id=99, kind="dm")) is None
+    # A linear workspace has no room of its own and stays switchable.
+    assert homed_elsewhere(WorkspaceRow(id="w"), Route(chat_id=1040, kind="dm")) is None
+    assert homed_elsewhere(None, (1040, 0)) is None
+
+
+async def test_s_from_the_dm_root_names_a_topics_task_instead_of_stealing_it(
+    db: Database, monkeypatch: Any
+) -> None:
+    """The recovery that used to break the thing it was recovering from.
+
+    Binding here would set ``sessions.thread_id = 0``, so every later reply
+    landed in the root and the topic the owner was reading went silent.
+    """
+    sent: list[tuple[str, Any]] = []
+
+    async def fake_tell(_message: Any, text: str, **kwargs: Any) -> None:
+        sent.append((text, kwargs.get("reply_markup")))
+
+    monkeypatch.setattr(power_handlers, "tell", fake_tell)
+    await workspaces_repo.upsert(db, "ws-room", chat_id=1041, topic_id=99)
+    await sessions_repo.upsert(
+        db, "sess-room", workspace_id="ws-room", chat_id=1041, thread_id=99, title="Log"
+    )
+    message = SimpleNamespace(
+        text="/s",
+        chat=SimpleNamespace(id=1041, type="private"),
+        message_thread_id=None,
+        message_id=14,
+        from_user=SimpleNamespace(id=1001),
+    )
+
+    await power_handlers.switch_session(
+        message,  # type: ignore[arg-type]
+        Route(chat_id=1041, kind="dm"),
+        fake_tenant(_CountingClient()),
+        _NullFsm(),  # type: ignore[arg-type]
+        NonceStore(),
+        db=db,
+    )
+
+    text, markup = sent[0]
+    assert markup is None, "no button may re-address a session that has a room"
+    assert "their own topic" in text
+    assert "Log" in text
+
+
+async def test_s_still_switches_a_linear_dms_sessions(
+    db: Database, monkeypatch: Any
+) -> None:
+    """A workspace with no room is what `/s` was written for. Unchanged."""
+    sent: list[tuple[str, Any]] = []
+
+    async def fake_tell(_message: Any, text: str, **kwargs: Any) -> None:
+        sent.append((text, kwargs.get("reply_markup")))
+
+    monkeypatch.setattr(power_handlers, "tell", fake_tell)
+    await workspaces_repo.upsert(db, "ws-linear", chat_id=1042)
+    await sessions_repo.upsert(
+        db, "sess-a", workspace_id="ws-linear", chat_id=1042, thread_id=0, title="A"
+    )
+    message = SimpleNamespace(
+        text="/s",
+        chat=SimpleNamespace(id=1042, type="private"),
+        message_thread_id=None,
+        message_id=15,
+        from_user=SimpleNamespace(id=1001),
+    )
+
+    await power_handlers.switch_session(
+        message,  # type: ignore[arg-type]
+        Route(chat_id=1042, kind="dm"),
+        fake_tenant(_CountingClient()),
+        _NullFsm(),  # type: ignore[arg-type]
+        NonceStore(),
+        db=db,
+    )
+
+    _text, markup = sent[0]
+    assert markup is not None
+    assert markup.inline_keyboard[0][0].text.endswith("A · ?")
+
+
+async def test_a_stale_switch_button_cannot_move_a_room_bound_session(
+    db: Database,
+) -> None:
+    """Minted before the workspace had a topic; tapped after. Refuse, don't move."""
+    await workspaces_repo.upsert(db, "ws-late", chat_id=1043, topic_id=99)
+    await sessions_repo.upsert(
+        db, "sess-late", workspace_id="ws-late", chat_id=1043, thread_id=99
+    )
+    nonces = NonceStore()
+    tapped = button(
+        "switch", "switch", "sess-late", store=nonces, user_id=1001, chat_id=1043
+    )
+    answers: list[str] = []
+
+    async def answer(text: str | None = None, **_: Any) -> bool:
+        answers.append(text or "")
+        return True
+
+    query = SimpleNamespace(
+        data=tapped.callback_data,
+        from_user=SimpleNamespace(id=1001),
+        message=None,
+        bot=None,
+        answer=answer,
+    )
+
+    await power_handlers.switch_callback(query, nonces, db=db)  # type: ignore[arg-type]
+
+    assert answers == ["That task has its own topic. Open it there."]
+    session = await sessions_repo.get(db, "sess-late")
+    assert session is not None and session.thread_id == 99, "still addressed there"
 
 
 async def test_a_reply_telegram_will_not_thread_still_arrives() -> None:

@@ -16,7 +16,7 @@ from typing import Any, Final, Protocol
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 from aiogram.fsm.context import FSMContext
-from aiogram.types import Message, ReactionTypeEmoji
+from aiogram.types import InlineKeyboardMarkup, Message, ReactionTypeEmoji
 
 from ctb.bot.handlers.topics import (
     TopicCreateError,
@@ -25,11 +25,13 @@ from ctb.bot.handlers.topics import (
     dm_topic_support,
     forum_support,
     human_name,
+    jump_url,
     require_topic,
     resolve_db,
     send_html,
     topic_label,
 )
+from ctb.bot.keyboards import keyboard, url_button
 from ctb.bot.middleware.routing import Route
 from ctb.bot.middleware.tenancy import TenantSettings
 from ctb.conductor.client import ConductorClient
@@ -703,6 +705,29 @@ async def create_and_bind_input(
         deep_link,
         linear_reason=seat.refusal,
     )
+
+
+def created_card(
+    chat_id: int, created: CreatedBinding
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    """One face for "the workspace exists now", wherever it was asked for.
+
+    Telegram publishes no link syntax for a topic inside a *private* chat, so a
+    DM's brand-new topic gets no button. With nothing but ``→ label`` left in
+    the root, ``/new`` read as though it had done nothing — while the work had
+    in fact moved one room over, and the root had stopped being a seat. Say
+    which room, since we cannot link to it.
+    """
+    text = f"→ <b>{escape(created.label)}</b>"
+    target = (
+        jump_url(chat_id, created.thread_id) if created.thread_id else created.deep_link
+    )
+    if target:
+        label = "Open topic" if created.thread_id else "Open in Conductor"
+        return text, keyboard([[url_button(label, target)]])
+    if created.thread_id:
+        text += "\n<i>Opened as its own topic · it is in this chat's topic list.</i>"
+    return text, None
 
 
 async def require_session(message: Message, route: Route) -> str | None:

@@ -69,7 +69,7 @@ from ctb.conductor.models import (
     WorkspaceStatusValue,
 )
 from ctb.db import NO_THREAD_ID
-from ctb.db.connection import Database, now_ms
+from ctb.db.connection import Database
 from ctb.db.repo import chats, events, prompts, sessions, transcript, workspaces
 from ctb.db.repo.prompts import PromptRow
 from ctb.db.repo.transcript import AdvanceItem, DeliveryDraft
@@ -165,8 +165,10 @@ class Destination:
     chat_id: int
     thread_id: int = NO_THREAD_ID
     verbosity: Verbosity = Verbosity.NORMAL
-    #: Telegram push policy. Content is still delivered when true.
-    silent: bool = False
+    #: Telegram push policy for *transcript content*. Delivery is unaffected.
+    #: Defaults to true, matching ``chats.notify``'s own default: a turn is
+    #: quiet, and the buzz is the one that says it finished.
+    silent: bool = True
 
 
 #: Turns one transcript message into the delivery rows it should produce.
@@ -185,25 +187,27 @@ async def destination_for(db: Database, session_id: str) -> Destination | None:
     if row is None or not row.is_bound or row.chat_id is None:
         return None
     verbosity = Verbosity.NORMAL
-    silent = False
+    silent = True
     chat = await chats.get(db, row.chat_id, row.thread_id)
     if chat is not None:
         try:
             verbosity = Verbosity(chat.verbosity)
         except ValueError:  # pragma: no cover - CHECK constraint prevents this
             verbosity = Verbosity.NORMAL
-        # None of these suppress *delivery* — only the buzz.
+        # This suppresses the *buzz*, never delivery.
         #
-        # `off` used to be a synonym for `quiet`: both read
-        # `notify != "loud" and not is_focused()`, so a topic set to off still
-        # pushed for the whole focus window. A setting that does nothing is
-        # worse than no setting.
-        if chat.notify == "loud":
-            silent = False
-        elif chat.notify == "off":
-            silent = True
-        else:
-            silent = not chat.is_focused(now_ms())
+        # `quiet` — the default — no longer pushes at all. A turn is not one
+        # reply: an agent narrates, so "one buzz per reply" was still six or
+        # eight buzzes for one task, and the focus window promoted quiet topics
+        # to loud for the 30 minutes *after a prompt* — precisely the window a
+        # long task runs in. The signal that window was reaching for is "the
+        # task is done", and that now exists as one notification of its own
+        # (:meth:`ctb.bot.actions.BotActionSink._announce_finish`).
+        #
+        # So the three settings are three behaviours, which is the only reason
+        # to have three: `loud` pushes every reply *and* the finish, `quiet`
+        # pushes only the finish, `off` pushes nothing.
+        silent = chat.notify != "loud"
     return Destination(
         chat_id=row.chat_id,
         thread_id=row.thread_id,
@@ -272,15 +276,14 @@ def _deliveries_from_render(
                 if parts[index].kind is not PartKind.DOCUMENT:
                     parts[index] = replace(parts[index], quick_replies=choices)
                     break
-        # Errors always push loudly. Normal answers follow /notify and focus.
+        # Errors always push loudly. Normal answers follow /notify, which under
+        # the default (`quiet`) now means "not at all" — the turn's one buzz
+        # arrives when it finishes. Only `loud` still pushes per reply, and then
+        # once per reply rather than once per chunk: a long answer is up to
+        # three messages plus a document, and the first part is the one that
+        # says an answer has arrived.
         has_error = any(block.kind is BlockKind.ERROR for block in result.chat)
         if not has_error:
-            # One buzz per reply, not one per chunk. A long answer is split into
-            # up to three messages plus a document, and the focus window that
-            # promotes them lasts 30 minutes — so a single prompt could vibrate
-            # a phone four times, and a busy morning made `notify=quiet` feel
-            # like it was doing nothing at all. The first part is the one that
-            # says an answer has arrived; the rest are the same answer.
             parts = [
                 replace(part, silent=destination.silent or index > 0)
                 for index, part in enumerate(parts)

@@ -10,11 +10,13 @@ from typing import Any, cast
 import pytest
 
 from ctb.bot.handlers.common import MOBILE_REPLY_INSTRUCTION
+from ctb.bot.handlers.core import DM_COCKPIT_HINT
 from ctb.bot.keyboards import NonceStore
 from ctb.bot.middleware.routing import Route
 from ctb.bot.wizards import new_workspace
 from ctb.conductor.models import PostMessageResult, PostState, SqlResult
 from ctb.db.connection import Database, now_ms
+from ctb.db.repo import chats as chats_repo
 from ctb.db.repo import prompts as prompts_repo
 from ctb.db.repo import sessions as sessions_repo
 from ctb.db.repo import tenancy
@@ -357,6 +359,61 @@ async def test_general_voice_searches_and_never_posts(
     assert len(client.queries) == 1
     assert client.posts == []
     assert "No matches" in str(bot.messages[-1]["text"])
+
+
+async def test_a_dictated_task_in_the_dm_root_offers_the_topic_it_belongs_to(
+    db: Database, settings_factory: Any, system_db: Database
+) -> None:
+    """The spoken half of the DM-root cockpit, and the reason it is shared code.
+
+    Dictating into the root is how the dead end was reported: the session was
+    one topic away and voice answered "No session here". It must now say what
+    the typed path says, through the same `cockpit_markup` — the two surfaces
+    disagreeing about an unaddressed line is what sent a prompt to `/find` once.
+    """
+    settings = settings_factory(voice_enabled=True)
+    bot = FakeBot()
+    client = FakeClient()
+    service = make_service(settings, db, system_db, bot=bot, client=client)
+    await workspaces_repo.upsert(db, "ws-voice", chat_id=1001, topic_id=99)
+    await sessions_repo.upsert(
+        db, "sess-voice", workspace_id="ws-voice", chat_id=1001, thread_id=99, title="A"
+    )
+    await chats_repo.bind(
+        db, 1001, 99, workspace_id="ws-voice", session_id="sess-voice", kind="topic"
+    )
+    await chats_repo.touch_prompt(db, 1001, 99, focus_for_ms=1000)
+    await voice_repo.create(
+        db,
+        chat_id=1001,
+        tg_message_id=58,
+        thread_id=0,
+        user_id=1001,
+        file_id="file-1",
+        file_unique_id="unique-1",
+        file_name=None,
+        mime_type="audio/ogg",
+        duration_seconds=8,
+        file_size=100,
+        route_kind="dm",
+        route_session_id=None,
+        route_workspace_id=None,
+        provider="elevenlabs",
+        model="scribe_v2",
+        action_id="voice-operation-dm-root",
+    )
+    claimed = await voice_repo.claim_next(db)
+    assert claimed is not None
+
+    await service._process(claimed)
+
+    assert client.posts == [], "the root never sends on its own"
+    assert client.queries == [], "and it does not search either — General does"
+    sent = bot.messages[-1]
+    assert DM_COCKPIT_HINT in str(sent["text"])
+    markup = sent.get("reply_markup")
+    assert markup is not None
+    assert markup.inline_keyboard[0][0].text == "Send to A"
 
 
 async def test_recovery_reuses_conductor_message_id(

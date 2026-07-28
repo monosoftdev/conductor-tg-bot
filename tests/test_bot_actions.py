@@ -1,17 +1,17 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Final
 
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.methods import GetForumTopicIconStickers
 
 from ctb import signals
-from ctb.bot.actions import BotActionSink
+from ctb.bot.actions import BotActionSink, finish_line
 from ctb.bot.handlers import topics
 from ctb.bot.handlers.core import status_icon
 from ctb.db.connection import Database
-from ctb.db.repo import prompts, sessions, workspaces
+from ctb.db.repo import chats, prompts, sessions, workspaces
 from ctb.delivery.outbox import Priority
 from ctb.delivery.status_card import CARD_EMOJI
 from ctb.turn.state import (
@@ -160,12 +160,143 @@ async def test_finalize_turns_prompt_receipt_into_completion_reaction(
     assert bot.reactions[0]["reaction"][0].emoji == "👍"
 
 
+# ── one buzz per turn, at the end of it ──────────────────────────────────────
+
+
+def _notices(recorder: Recorder) -> list[tuple[str, dict[str, Any]]]:
+    return [payload for kind, payload in recorder.calls if kind == "notice"]
+
+
+async def test_a_finished_turn_is_the_only_thing_that_buzzes(
+    db: Database, system_db: Database
+) -> None:
+    """**The point of the change.**
+
+    Every line a turn emits is delivered silently under the default `quiet`,
+    because a phone that buzzes eight times for one task is a phone you mute.
+    This is the one push, and it fires when the work is done — which is also
+    where the per-file counts went after they left the chat.
+    """
+    await _bound(db)
+    recorder = Recorder()
+    sink = BotActionSink(Bot(), db, system_db, recorder, recorder)  # type: ignore[arg-type]
+
+    await sink.handle(
+        (
+            Finalize(
+                TurnSummary(
+                    duration_ms=92_000, tool_calls=12, files_changed=5, prompts=1
+                )
+            ),
+        ),
+        session_id="sess-1",
+        chat_id=-1001,
+        thread_id=42,
+    )
+
+    notices = _notices(recorder)
+    assert len(notices) == 1
+    html, sent = notices[0]
+    assert html == "✅ <b>Done</b> · 1m32s · 12 tools · 5 files"
+    assert sent["silent"] is False, "this is the notification"
+    assert sent["chat_id"] == -1001 and sent["thread_id"] == 42
+
+
+async def test_the_same_turn_is_never_announced_twice(
+    db: Database, system_db: Database
+) -> None:
+    """A `Finalize` re-derived after a redeploy must land on the same row."""
+    await _bound(db)
+    recorder = Recorder()
+    sink = BotActionSink(Bot(), db, system_db, recorder, recorder)  # type: ignore[arg-type]
+    action = Finalize(TurnSummary(duration_ms=1000, prompts=1))
+
+    for _ in range(2):
+        await sink.handle((action,), session_id="sess-1", chat_id=-1001, thread_id=42)
+
+    keys = {sent["key"] for _html, sent in _notices(recorder)}
+    assert len(keys) == 1, "the outbox dedupes on this key; it must be stable"
+
+
+async def test_notify_off_gets_no_completion_buzz_either(
+    db: Database, system_db: Database
+) -> None:
+    """`off` means off. A setting that leaks one push is not a setting."""
+    await _bound(db)
+    await chats.ensure(db, -1001, 42, kind="topic")
+    await chats.set_notify(db, -1001, 42, notify="off")
+    recorder = Recorder()
+    sink = BotActionSink(Bot(), db, system_db, recorder, recorder)  # type: ignore[arg-type]
+
+    await sink.handle(
+        (Finalize(TurnSummary(prompts=1)),),
+        session_id="sess-1",
+        chat_id=-1001,
+        thread_id=42,
+    )
+
+    assert _notices(recorder) == []
+
+
+async def test_a_failed_turn_leads_with_the_reason(
+    db: Database, system_db: Database
+) -> None:
+    assert finish_line(TurnSummary(ok=False, error="rate limited")) == (
+        "⚠️ <b>Stopped</b> · rate limited"
+    )
+    # One file is a file, not "1 files".
+    assert finish_line(TurnSummary(files_changed=1)) == "✅ <b>Done</b> · 1 file"
+    # A turn that did nothing measurable still says it finished.
+    assert finish_line(TurnSummary()) == "✅ <b>Done</b>"
+
+
+async def test_an_unenqueueable_receipt_never_takes_down_the_turn(
+    db: Database, system_db: Database
+) -> None:
+    """The receipt describes the work. It may not be able to destroy it."""
+    await _bound(db)
+
+    class Exploding(Recorder):
+        async def enqueue_notice(self, html: str, **kwargs: Any) -> int:
+            raise RuntimeError("outbox is down")
+
+    recorder = Exploding()
+    sink = BotActionSink(Bot(), db, system_db, recorder, recorder)  # type: ignore[arg-type]
+
+    await sink.handle(
+        (Finalize(TurnSummary(prompts=1)),),
+        session_id="sess-1",
+        chat_id=-1001,
+        thread_id=42,
+    )
+
+
+#: What a real ``getForumTopicIconStickers`` looks like enough of: every state
+#: served, and — as Telegram genuinely does — some of them carrying the U+FE0F
+#: presentation selector the state table writes without.
+_FULL_PACK: Final[tuple[tuple[str, str], ...]] = (
+    ("✅", "id-done"),
+    ("⚡️", "id-working"),
+    ("⌛", "id-initializing"),
+    ("💭", "id-idle"),
+    ("❗️", "id-error"),
+    ("💤", "id-sleeping"),
+    ("🏁", "id-archived"),
+)
+
+
 class _IconBot(Bot):
     """A bot whose topic-icon pack Telegram will actually serve."""
 
-    def __init__(self, *, pack: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        pack: bool = True,
+        icons: tuple[tuple[str, str], ...] = _FULL_PACK,
+    ) -> None:
         super().__init__()
         self._pack = pack
+        self._icons = icons
         self.pack_calls = 0
 
     async def get_forum_topic_icon_stickers(self) -> list[Any]:
@@ -175,8 +306,8 @@ class _IconBot(Bot):
                 method=GetForumTopicIconStickers(), message="Bad Request: nope"
             )
         return [
-            SimpleNamespace(emoji="✅", custom_emoji_id="id-done"),
-            SimpleNamespace(emoji="⚡", custom_emoji_id="id-working"),
+            SimpleNamespace(emoji=emoji, custom_emoji_id=icon_id)
+            for emoji, icon_id in self._icons
         ]
 
 
@@ -230,6 +361,111 @@ async def test_renaming_to_the_same_title_costs_no_api_call(db: Database) -> Non
     assert await topics.apply_marker(
         double, db, "ws-1", TopicMarker.IDLE, label="api/dev"
     )
+
+
+async def test_the_icon_moves_with_the_state_not_just_the_name(db: Database) -> None:
+    """**The point of the icon channel.**
+
+    The badge beside the row is what you scan a topic list by, and it was
+    landing on every state as the same emoji. A transition has to move both
+    channels or the list stops answering the question you open it for.
+    """
+    await _bound(db)
+    bot = _IconBot()
+    topics._ICON_IDS.clear()
+    double: Any = bot
+
+    for marker in (TopicMarker.WORKING, TopicMarker.DONE, TopicMarker.SLEEPING):
+        assert await topics.apply_marker(double, db, "ws-1", marker)
+
+    assert [rename["icon_custom_emoji_id"] for rename in bot.renames] == [
+        "id-working",
+        "id-done",
+        "id-sleeping",
+    ]
+    assert bot.pack_calls == 1, "the pack is a Telegram constant, fetched once"
+
+
+async def test_a_pack_that_spells_an_emoji_with_a_selector_still_matches(
+    db: Database,
+) -> None:
+    """The silent failure, in one line.
+
+    Telegram serves ``⚡️`` (U+26A1 U+FE0F); the state table asks for ``⚡``.
+    An exact-string lookup missed, returned ``None``, and aiogram then omitted
+    the field — for which Telegram keeps the *existing* icon. Every rename
+    reported success and no icon ever moved.
+    """
+    await _bound(db)
+    bot = _IconBot(icons=(("⚡️", "id-working"),))
+    topics._ICON_IDS.clear()
+
+    assert await topics.apply_marker(bot, db, "ws-1", TopicMarker.WORKING)  # type: ignore[arg-type]
+
+    assert bot.renames[0]["icon_custom_emoji_id"] == "id-working"
+
+
+async def test_a_state_falls_back_to_an_emoji_the_pack_does_carry(
+    db: Database,
+) -> None:
+    """Nobody can read the pack from the source, so a state names alternatives."""
+    await _bound(db)
+    # No ⚡ — the second choice for WORKING is 🛠.
+    bot = _IconBot(icons=(("🛠", "id-tools"),))
+    topics._ICON_IDS.clear()
+
+    assert await topics.apply_marker(bot, db, "ws-1", TopicMarker.WORKING)  # type: ignore[arg-type]
+
+    assert bot.renames[0]["icon_custom_emoji_id"] == "id-tools"
+
+
+async def test_a_pack_of_an_unexpected_shape_still_renames(db: Database) -> None:
+    """``getForumTopicIconStickers`` is untyped at the wire and every field is
+    optional, so a shape we cannot walk has to be as survivable as a 500."""
+    await _bound(db)
+    bot = _IconBot()
+    bot.get_forum_topic_icon_stickers = _not_a_list  # type: ignore[method-assign]
+    topics._ICON_IDS.clear()
+
+    assert await topics.apply_marker(bot, db, "ws-1", TopicMarker.WORKING)  # type: ignore[arg-type]
+
+    assert bot.renames[0]["name"].startswith(signals.WORKING)
+    assert bot.renames[0]["icon_custom_emoji_id"] is None
+    assert topics._ICON_IDS == {}, "a half-parsed pack is not a pack"
+
+
+async def _not_a_list() -> Any:
+    return True
+
+
+async def test_a_pack_carrying_none_of_them_still_renames(db: Database) -> None:
+    """A missing icon is cosmetic. A skipped rename is a topic that lies."""
+    await _bound(db)
+    bot = _IconBot(icons=(("🍕", "id-pizza"),))
+    topics._ICON_IDS.clear()
+
+    assert await topics.apply_marker(bot, db, "ws-1", TopicMarker.WORKING)  # type: ignore[arg-type]
+
+    assert bot.renames[0]["name"].startswith(signals.WORKING)
+    assert bot.renames[0]["icon_custom_emoji_id"] is None
+
+
+def test_no_two_states_wear_the_same_first_icon() -> None:
+    """``IDLE`` and ``SLEEPING`` both asked for 💤.
+
+    A topic is idle most of its life, so one shared sleep badge *was* most of
+    what "all the icons are the same" looked like from the topic list.
+    """
+    first = [marker.icons[0] for marker in TopicMarker]
+
+    assert all(marker.icons for marker in TopicMarker), "every state wants an icon"
+    assert len(set(first)) == len(first), f"duplicate state icons: {first}"
+    assert TopicMarker.IDLE.icons[0] != TopicMarker.SLEEPING.icons[0]
+
+
+def test_an_icon_is_compared_by_identity_not_presentation() -> None:
+    assert topics.icon_key("⚡️") == topics.icon_key("⚡") == "⚡"
+    assert topics.icon_key("✅") == "✅", "an emoji with no selector is untouched"
 
 
 def test_every_surface_uses_one_glyph_per_state() -> None:

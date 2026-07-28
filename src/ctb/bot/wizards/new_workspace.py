@@ -47,10 +47,11 @@ from ctb.bot.handlers.common import (
     CreateRequest,
     all_projects,
     create_and_bind,
+    created_card,
     short_error,
     tell,
 )
-from ctb.bot.handlers.topics import edit_html, jump_url, resolve_client, resolve_db
+from ctb.bot.handlers.topics import edit_html, resolve_client, resolve_db
 from ctb.bot.keyboards import (
     Action,
     Cb,
@@ -59,7 +60,6 @@ from ctb.bot.keyboards import (
     button,
     keyboard,
     resolve,
-    url_button,
 )
 from ctb.bot.middleware.routing import Route
 from ctb.bot.middleware.tenancy import TenantContext, TenantSettings
@@ -608,15 +608,22 @@ async def wizard_callback(
 
 
 @router.message(NewWorkspace.branch, F.text & ~F.text.startswith("/"))
-async def typed_branch(message: Message, state: FSMContext, nonces: NonceStore) -> None:
+async def typed_branch(
+    message: Message, route: Route, state: FSMContext, nonces: NonceStore
+) -> None:
     branch = (message.text or "").strip()[:160]
     if not branch:
         return
     await state.update_data({"branch": branch})
+    # `route.thread_id`, never the raw `message_thread_id`: `start_wizard` wrote
+    # this row under the seat the router resolved, which folds a forum's
+    # General back to 0 and reads a DM topic Telegram does not tag. Reading it
+    # back by a second rule is how the card is "not found" and the wizard
+    # answers by posting a fresh message instead of editing the one on screen.
     row = await wizard_repo.get(
         resolve_db(None),
         message.chat.id,
-        message.message_thread_id or NO_THREAD_ID,
+        route.thread_id,
         user_id=message.from_user.id if message.from_user else 0,
     )
     # Continue by editing the one wizard card, not the user's branch message.
@@ -639,7 +646,7 @@ async def typed_prompt(
     wizard_row = await wizard_repo.get(
         resolve_db(db),
         message.chat.id,
-        message.message_thread_id or NO_THREAD_ID,
+        route.thread_id,
         user_id=message.from_user.id if message.from_user else 0,
     )
     request = request_from_wizard(data, message.text or "", settings=tenant.settings)
@@ -672,15 +679,8 @@ async def typed_prompt(
         )
         return
     await state.clear()
-    target = (
-        jump_url(message.chat.id, created.thread_id)
-        if created.thread_id
-        else created.deep_link
-    )
-    label = "Open topic" if created.thread_id else "Open in Conductor"
-    markup = keyboard([[url_button(label, target)]]) if target else None
     # Same shape as `/new` and adopt: one event should not have three faces.
-    text = f"→ <b>{escape(created.label)}</b>"
+    text, markup = created_card(message.chat.id, created)
     if wizard_row is not None and wizard_row.tg_message_id is not None:
         card = message.model_copy(update={"message_id": wizard_row.tg_message_id})
         await _edit(card, text, markup)

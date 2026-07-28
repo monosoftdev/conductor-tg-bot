@@ -11,19 +11,54 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 from aiogram.types import ReactionTypeEmoji
 
+from ctb import signals
 from ctb.bot.handlers import topics
 from ctb.db import NO_THREAD_ID
 from ctb.db.connection import Database, tenant_scope
-from ctb.db.repo import prompts, sessions, tenancy
+from ctb.db.repo import chats, prompts, sessions, tenancy
 from ctb.delivery.outbox import Outbox, Priority
+from ctb.delivery.render.adapters.base import one_line
 from ctb.delivery.render.html import escape
 from ctb.delivery.status_card import StatusCards
 from ctb.logging import get_logger
-from ctb.turn.state import Action, Finalize, Notify, NotifyLevel, SetTopicMarker
+from ctb.turn.machine import format_duration
+from ctb.turn.state import (
+    Action,
+    Finalize,
+    Notify,
+    NotifyLevel,
+    SetTopicMarker,
+    TurnSummary,
+)
 
-__all__ = ["BotActionSink"]
+__all__ = ["BotActionSink", "finish_line"]
 
 log = get_logger(__name__)
+
+
+def finish_line(summary: TurnSummary) -> str:
+    """``✅ <b>Done</b> · 1m32s · 12 tools · 5 files`` — the completion receipt.
+
+    Deliberately the same vocabulary as the status card above it (``signals``,
+    ``format_duration``): two surfaces describing one event must not word it
+    differently. Failure leads with the marker and the reason, because that is
+    the whole message when a turn did not work.
+    """
+    marker = signals.DONE if summary.ok else signals.ERROR
+    head = "Done" if summary.ok else "Stopped"
+    parts: list[str] = []
+    if summary.duration_ms > 0:
+        parts.append(format_duration(summary.duration_ms))
+    if summary.tool_calls:
+        parts.append(f"{summary.tool_calls} tools")
+    if summary.files_changed:
+        parts.append(
+            f"{summary.files_changed} file{'' if summary.files_changed == 1 else 's'}"
+        )
+    if not summary.ok and summary.error:
+        parts.append(one_line(summary.error)[:120])
+    tail = "".join(f" · {escape(part)}" for part in parts)
+    return f"{marker} <b>{head}</b>{tail}"
 
 
 class BotActionSink:
@@ -116,6 +151,12 @@ class BotActionSink:
                     count=max(1, action.summary.prompts),
                     ok=action.summary.ok,
                 )
+                await self._announce_finish(
+                    action.summary,
+                    session_id=session_id,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                )
 
     async def _notify(
         self,
@@ -137,6 +178,54 @@ class BotActionSink:
             priority=Priority.ERROR if loud else Priority.NORMAL,
             silent=not loud,
         )
+
+    async def _announce_finish(
+        self,
+        summary: TurnSummary,
+        *,
+        session_id: str,
+        chat_id: int,
+        thread_id: int,
+    ) -> None:
+        """The one notification a turn is allowed to make.
+
+        Everything a turn emits is delivered silently under the default
+        ``/notify quiet`` — the narration, the answer, the file edits — because
+        a phone that buzzes eight times for one task is a phone you mute. This
+        is the buzz, and there is exactly one of it: the moment the work is
+        finished, which is the only moment worth interrupting somebody for.
+
+        **It has to be a message.** The status card already says ``done`` and
+        would be the natural home for this, but a card is an *edit* and Telegram
+        never notifies for an edit. A card cannot ring a phone.
+
+        It also carries what the chat no longer prints per file: how many tools
+        ran and how many files changed. That trade is the point — one line at
+        the end instead of twenty while you are trying to read the answer.
+
+        Keyed on the cursor the session finished at, so a ``Finalize``
+        re-derived after a redeploy lands on the same primary key instead of
+        announcing one turn twice. Never raises: a missing receipt must not
+        take down the poller that produced the work it is describing.
+        """
+        try:
+            row = await sessions.get(self._db, session_id)
+            chat = await chats.get(self._db, chat_id, thread_id)
+            if chat is not None and chat.notify == "off":
+                return
+            await self._outbox.enqueue_notice(
+                finish_line(summary),
+                session_id=session_id,
+                key=f"turn-done:{session_id}:{row.cursor_session_index if row else 0}",
+                chat_id=chat_id,
+                thread_id=thread_id,
+                priority=Priority.NORMAL,
+                silent=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - a receipt never stops a turn
+            log.warning(
+                "bot.finish_notice_failed", session_id=session_id, error=repr(exc)
+            )
 
     async def _set_topic_marker(self, session_id: str, action: SetTopicMarker) -> None:
         row = await sessions.get(self._db, session_id)

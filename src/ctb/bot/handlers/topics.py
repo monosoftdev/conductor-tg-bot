@@ -24,17 +24,27 @@ The name is ``<marker> <task> · <project>/<branch>`` — a **state prefix** tha
 changes, and a **label** that never does. :func:`topic_label` builds the label
 once, at creation, from the opening prompt; :func:`apply_marker` only ever
 touches the prefix. Prefixes come from :mod:`ctb.signals`, so the topic list,
-the status card and ``/board`` all say the same thing:
+the status card and ``/board`` all say the same thing.
 
-| Conductor state          | Topic name                       |
-|--------------------------|----------------------------------|
-| workspace initializing   | ``⏳ fix login · api/main``      |
-| ready + session idle     | ``fix login · api/main``         |
-| session working          | ``⚙️ fix login · api/main``      |
-| turn finished, unread    | ``✅ fix login · api/main``      |
-| session error            | ``⚠️ fix login · api/main``      |
-| workspace sleeping       | ``💤 fix login · api/main``      |
-| archived / deleted       | ``🗄 fix login · api/main``, topic closed |
+A topic has **two** state channels and both move on every transition: the name
+prefix, and ``icon_custom_emoji_id`` — the round badge Telegram draws beside the
+row, which is what you actually scan a long list by. (``icon_color`` is the
+third and is fixed at creation, so it can only ever mean *which workspace*.)
+
+| Conductor state          | Topic name                       | Icon |
+|--------------------------|----------------------------------|------|
+| workspace initializing   | ``⏳ fix login · api/main``      | ⌛ |
+| ready + session idle     | ``fix login · api/main``         | 💭 |
+| session working          | ``⚙️ fix login · api/main``      | ⚡ |
+| turn finished, unread    | ``✅ fix login · api/main``      | ✅ |
+| session error            | ``⚠️ fix login · api/main``      | ❗ |
+| workspace sleeping       | ``💤 fix login · api/main``      | 💤 |
+| archived / deleted       | ``🗄 fix login · api/main``, topic closed | 🏁 |
+
+The icons are *requests*: Telegram serves bots a fixed pack and silently keeps
+the current icon for a request it cannot honour, so each state names several
+acceptable emoji and :func:`topic_icon_id` takes the first the pack carries.
+``scripts/probe_topic_icons.py`` prints what a live token is actually offered.
 
 The task leads because Telegram clips a topic row from the right and a phone
 shows perhaps thirty characters of it. A branch is nearly always ``main``, so
@@ -97,6 +107,8 @@ __all__ = [
     "ensure_topic",
     "forum_support",
     "human_name",
+    "icon_key",
+    "icon_pack",
     "jump_url",
     "marker_for",
     "require_topic",
@@ -106,6 +118,7 @@ __all__ = [
     "telegram_reason",
     "topic_label",
     "topic_icon_color",
+    "topic_icon_id",
     "topic_title",
 ]
 
@@ -299,38 +312,90 @@ def topic_icon_color(label: str) -> int:
 #: Emoji → custom-emoji id for the topic-icon pack, fetched once per process.
 #: Telegram serves bots a fixed set (``getForumTopicIconStickers``) and refuses
 #: anything outside it, so the ids cannot be hard-coded from documentation —
-#: they have to be asked for.
+#: they have to be asked for. Keys are :func:`icon_key`-normalised.
 _ICON_IDS: dict[str, str] = {}
 _ICON_LOCK = asyncio.Lock()
+
+#: U+FE0F and U+FE0E ask for the emoji or text *presentation* of a code point.
+#: They carry no identity, and the two sides disagree about them constantly:
+#: the state table says ``⚙`` where Telegram's pack serves ``⚙️``. An exact
+#: string lookup missed every such pair, returned ``None``, and — because
+#: aiogram omits an unset optional and Telegram keeps the existing value for an
+#: omitted field — left the icon exactly as it was. Every rename looked like it
+#: worked and the icon never moved.
+_PRESENTATION_SELECTORS: Final[dict[int, int | None]] = {0xFE0E: None, 0xFE0F: None}
+
+
+def icon_key(emoji: str) -> str:
+    """Compare emoji by identity, not by presentation."""
+    return emoji.translate(_PRESENTATION_SELECTORS)
+
+
+async def icon_pack(bot: Bot) -> dict[str, str]:
+    """``{emoji: custom_emoji_id}`` for every icon Telegram will accept.
+
+    Fetched once per process and never invalidated — the pack is a Telegram
+    constant, not per-chat state. An empty dict means "we could not ask", and
+    the next call tries again; it is one API call, and getting the icons after
+    a transient failure is worth more than remembering the failure.
+    """
+    if _ICON_IDS:
+        return _ICON_IDS
+    async with _ICON_LOCK:
+        if _ICON_IDS:  # another caller may have filled it while we waited
+            return _ICON_IDS
+        try:
+            # The parse is inside the try with the call, deliberately. Every
+            # field here is optional in the schema and the whole result is
+            # untyped at the wire, so a shape we did not expect is exactly as
+            # survivable as a network error — and this decorates a rename that
+            # has to happen either way. A stale topic title is a lie; a missing
+            # icon is a missing icon.
+            for sticker in await bot.get_forum_topic_icon_stickers():
+                emoji = getattr(sticker, "emoji", None)
+                sticker_id = getattr(sticker, "custom_emoji_id", None)
+                if emoji and sticker_id:
+                    _ICON_IDS.setdefault(icon_key(emoji), sticker_id)
+        except Exception as exc:  # noqa: BLE001 - never propagate; see above
+            log.warning("topics.icon_pack_unavailable", error=repr(exc))
+            _ICON_IDS.clear()
+            return {}
+        # Logged because the pack is the one input to this that nobody can read
+        # from the source. If a marker later resolves to nothing, this line is
+        # what says whether the pack was small or the request was wrong.
+        log.info("topics.icon_pack_loaded", icons=len(_ICON_IDS))
+    return _ICON_IDS
 
 
 async def topic_icon_id(bot: Bot, marker: TopicMarker) -> str | None:
     """The custom-emoji id for this state's icon, or ``None`` to leave it alone.
 
-    Never raises and never blocks a rename: if the pack cannot be fetched, or
-    does not contain the wanted emoji, the caller renames without touching the
-    icon. A missing icon is cosmetic; a failed rename is a topic that lies.
+    Walks :attr:`TopicMarker.icons` in order and takes the first the pack
+    carries, so one absent emoji costs a fallback rather than the whole icon.
+
+    Never raises and never blocks a rename: with no pack and no match the
+    caller renames without touching the icon. A missing icon is cosmetic; a
+    failed rename is a topic that lies.
     """
-    wanted = marker.icon
+    wanted = marker.icons
     if not wanted:
         return None
-    if not _ICON_IDS:
-        async with _ICON_LOCK:
-            if not _ICON_IDS:  # another caller may have filled it while we waited
-                try:
-                    for sticker in await bot.get_forum_topic_icon_stickers():
-                        emoji = getattr(sticker, "emoji", None)
-                        sticker_id = getattr(sticker, "custom_emoji_id", None)
-                        if emoji and sticker_id and emoji not in _ICON_IDS:
-                            _ICON_IDS[emoji] = sticker_id
-                except Exception as exc:
-                    # Deliberately every exception, not just TelegramAPIError.
-                    # This decorates a rename that has to happen either way, so
-                    # there is no failure here worth propagating — a stale
-                    # topic title is a lie, a missing icon is a missing icon.
-                    log.warning("topics.icon_pack_unavailable", error=repr(exc))
-                    return None
-    return _ICON_IDS.get(wanted)
+    pack = await icon_pack(bot)
+    if not pack:
+        return None
+    for emoji in wanted:
+        found = pack.get(icon_key(emoji))
+        if found is not None:
+            return found
+    # Not a failure worth a rename, but worth saying out loud: this state will
+    # keep whatever icon the topic already had, for every workspace, forever.
+    log.warning(
+        "topics.icon_unavailable",
+        marker=marker.value,
+        wanted=list(wanted),
+        pack=len(pack),
+    )
+    return None
 
 
 def marker_for(
