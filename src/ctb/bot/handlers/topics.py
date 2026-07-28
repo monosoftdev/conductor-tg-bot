@@ -20,14 +20,25 @@ tick would spend the whole flood budget on cosmetics. The last applied prefix
 lives in ``workspaces.topic_marker``, and :func:`apply_marker` is a no-op when
 the marker has not actually changed — that check is the rule, in code.
 
-| Conductor state          | Topic name        |
-|--------------------------|-------------------|
-| workspace initializing   | ``~ proj/branch`` |
-| ready + session idle     | ``proj/branch``   |
-| session working          | ``● proj/branch`` |
-| session error            | ``! proj/branch`` |
-| workspace sleeping       | ``· proj/branch`` |
-| archived / deleted       | ``x proj/branch``, topic closed |
+The name is always ``<marker> <project>/<branch>`` — :func:`topic_label` builds
+the stable half and it is **never** the text of a prompt. Prefixes come from
+:mod:`ctb.signals`, so the topic list, the status card and the transcript all
+say the same thing:
+
+| Conductor state          | Topic name          |
+|--------------------------|---------------------|
+| workspace initializing   | ``⏳ proj/branch``  |
+| ready + session idle     | ``proj/branch``     |
+| session working          | ``⚙️ proj/branch``  |
+| turn finished, unread    | ``✅ proj/branch``  |
+| session error            | ``⚠️ proj/branch``  |
+| workspace sleeping       | ``💤 proj/branch``  |
+| archived / deleted       | ``🗄 proj/branch``, topic closed |
+
+**There is no bot-managed "General" topic.** Every topic here belongs to one
+workspace. The always-present seat is the chat root — Telegram's own General in
+a forum, the plain conversation in a DM — and it is addressed as
+``NO_THREAD_ID``, never created and never renamed.
 
 This module has no router. It is imported by the handlers that do.
 """
@@ -696,7 +707,10 @@ async def apply_marker(
     row = await workspaces_repo.get(db, workspace_id)
     if row is None or row.chat_id is None or row.topic_id is None:
         return False
-    name = label or row.topic_name or row.name or workspace_id
+    # Never `row.name`: that is the *Conductor* workspace name, `tg-<chat>-<nonce>`.
+    # Renaming somebody's topic to an internal id because one column came back
+    # NULL is worse than the generic label a fresh topic would have been given.
+    name = label or row.topic_name or topic_label(row.project_id, row.branch)
     title = topic_title(marker, name)
     # Compare the *rendered title*, not just the marker. Comparing markers
     # meant `/name -w` with an unchanged name always spent an API call, while a

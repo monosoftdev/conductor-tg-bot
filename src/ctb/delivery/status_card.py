@@ -14,7 +14,12 @@ apply. Three rules enforce that here rather than trusting every producer:
 * a new card supersedes an *unfinished* old one — the old message is deleted,
   not orphaned. A workspace that wakes and then takes a prompt used to leave
   ``⏳ waking`` on screen with a working Stop while ``⚙️ working`` ran below it,
-  and two Stops is two answers to "is this still going?".
+  and two Stops is two answers to "is this still going?";
+* and that only holds while the card is *in this process*. ``_cards`` is memory
+  and the message id is not, so a deploy landing mid-turn found an empty map,
+  posted a second card and left the first frozen with a live Stop — the same
+  two Stops by a different road. :meth:`StatusCards._adopt_once` reads the id
+  back off the session row before the first action of a process.
 
 The machine goes straight from ``queued`` to ``working``: only the kinds in
 :data:`_LIVE_KINDS` are re-rendered on every tick, so anything else would leave
@@ -375,6 +380,10 @@ class _Card:
     #: The turn is over: drop this card once its final text has landed, so the
     #: next turn posts a fresh one and the finished card stays as history.
     retire_when_clean: bool = False
+    #: False on a card adopted from a previous process before any action has
+    #: told us what it should say. Rendering one would overwrite a true
+    #: ``waking · preparing`` with this dataclass's ``QUEUED`` default.
+    state_known: bool = True
 
     @property
     def key(self) -> tuple[int, int]:
@@ -422,6 +431,9 @@ class StatusCards:
         #: message" service bubble per turn — a push-shaped notification that
         #: says nothing. Pin the first card in a topic and leave the pin alone.
         self._pinned: set[tuple[int, int]] = set()
+        #: Topics whose stored card id has already been looked up. One read per
+        #: topic per process; see :meth:`_adopt_once`.
+        self._adopted: set[tuple[int, int]] = set()
         self._task: asyncio.Task[None] | None = None
         self._counters: dict[str, int] = {
             "posted": 0,
@@ -498,12 +510,14 @@ class StatusCards:
             deep_link=deep_link,
         )
         card.message_id = message_id
+        self._adopted.add(card.key)
         if message_id is not None:
             # A previous incarnation already posted and pinned this topic's
             # card; adopting it must not re-pin after the next repost.
             self._pinned.add(card.key)
         if state is not None:
             card.state = state
+        card.state_known = state is not None
         card.dirty = True
 
     # -- the machine's actions --------------------------------------------
@@ -523,6 +537,12 @@ class StatusCards:
         the machine routinely emits an ``EditStatusCard`` and a ``Finalize``
         together, and that must cost one API call, not two.
         """
+        await self._adopt_once(
+            session_id=session_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            deep_link=deep_link,
+        )
         touched = False
         finalized = False
         for action in actions:
@@ -564,6 +584,62 @@ class StatusCards:
             deep_link=deep_link,
         )
 
+    async def _adopt_once(
+        self,
+        *,
+        session_id: str,
+        chat_id: int,
+        thread_id: int,
+        deep_link: str | None,
+    ) -> None:
+        """Pick up the card a previous process left in this topic.
+
+        ``_cards`` is process memory; ``sessions.status_card_msg_id`` is not. A
+        redeploy mid-turn therefore leaves the machine's context saying the turn
+        *has* a card — so it emits ``EditStatusCard`` — while this object has
+        forgotten the message id and would post a **second** card, stranding the
+        first mid-turn with a live Stop on it. That is the two-Stop bug, and it
+        fires on every deploy that lands during a turn.
+
+        Once per topic per process. A row that says ``NULL`` is an answer, so it
+        is not re-asked; after a retire the id is genuinely gone and the next
+        turn is supposed to post a fresh card.
+        """
+        key = (chat_id, thread_id)
+        if key in self._adopted:
+            return
+        self._adopted.add(key)
+        if key in self._cards:
+            return
+        try:
+            row = await sessions_repo.get(self._db, session_id)
+        except Exception as exc:
+            # Losing the adoption costs a duplicate card, which the buttons
+            # guarantee in _apply already makes survivable. Never fatal.
+            _log.warning(
+                "status_card.adopt_failed", session_id=session_id, error=repr(exc)
+            )
+            return
+        if row is None or row.status_card_msg_id is None:
+            return
+        card = self._card(
+            session_id=session_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            deep_link=deep_link,
+        )
+        card.message_id = row.status_card_msg_id
+        # The machine knows the real state; this object does not, and the
+        # CardState default would render "queued" over a true "waking".
+        card.state_known = False
+        self._pinned.add(key)
+        _log.info(
+            "status_card.adopted",
+            session_id=session_id,
+            chat_id=chat_id,
+            message_id=row.status_card_msg_id,
+        )
+
     async def _apply(
         self,
         action: Action,
@@ -590,6 +666,7 @@ class StatusCards:
                 await self._supersede(card)
                 card.message_id = None
                 card.retire_when_clean = False
+                card.state_known = True
                 # A new turn: last turn's money is not this turn's money.
                 card.state = CardState(kind=kind, text=text, buttons=buttons)
                 self._on_kind(card, kind, now, previous=previous)
@@ -612,6 +689,9 @@ class StatusCards:
                     buttons=buttons,
                     activity=activity if activity is not None else card.state.activity,
                 )
+                # The machine has now said what this topic's card should read,
+                # so an adopted message id is safe to edit.
+                card.state_known = True
                 self._on_kind(card, kind, now, previous=previous)
                 if activity:
                     card.last_change_at = now
@@ -767,7 +847,11 @@ class StatusCards:
 
     async def _flush(self, card: _Card, *, force: bool = False) -> None:
         """Post or edit if something actually changed and the floor allows it."""
-        if not card.dirty:
+        if not card.dirty or not card.state_known:
+            # An adopted card stays dirty until the machine says what it is.
+            # An activity line or a cost is not a state, and rendering one on
+            # this dataclass's defaults would replace the true text with
+            # "queued" — the one thing worse than a stale card.
             return
         now = self._clock()
         if now < card.suppressed_until:

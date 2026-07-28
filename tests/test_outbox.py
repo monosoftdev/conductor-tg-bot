@@ -1503,6 +1503,53 @@ async def test_restore_adopts_a_card_from_a_previous_process(
     assert bot.calls_to("edit_message_text")[0]["message_id"] == 4242
 
 
+async def test_a_redeploy_mid_turn_leaves_one_card_and_one_stop(
+    bot: FakeBot, db: Database, clock: FakeClock, sleeper: Sleeper, session: str
+) -> None:
+    """The screenshot bug: two cards, two Stops, after a deploy mid-turn.
+
+    The old process posts the card and persists its id. The new process starts
+    with an empty ``_cards`` but a restored machine context that still says the
+    turn has one, so it emits ``EditStatusCard`` — and the first thing the boot
+    path actually emits is an ``UpdateActivity``, which used to be dropped.
+    """
+    before = StatusCards(bot, db, clock=clock, sleep=sleeper, pin=False)
+    await before.apply(
+        PostStatusCard(CardKind.QUEUED, "waking · preparing", (CardButton.STOP,)),
+        session_id=SESSION,
+        chat_id=CHAT,
+    )
+    posted = bot.calls_to("send_message")
+    assert len(posted) == 1
+    card_id = before.message_id_for(CHAT)
+    assert card_id is not None
+
+    # -- the deploy lands here: same DB, a brand-new StatusCards ------------
+    after = StatusCards(bot, db, clock=clock, sleep=sleeper, pin=False)
+    await after.apply(
+        UpdateActivity("Bash · gh pr view 1351"), session_id=SESSION, chat_id=CHAT
+    )
+    # An activity line is not a state: it must not render "queued" over the
+    # true "waking · preparing", and it must not post anything.
+    assert bot.calls_to("send_message") == posted
+    assert bot.calls_to("edit_message_text") == []
+
+    clock.advance(36.0)
+    await after.apply(
+        EditStatusCard(CardKind.WORKING, "working 36s", (CardButton.STOP,)),
+        session_id=SESSION,
+        chat_id=CHAT,
+    )
+
+    assert bot.calls_to("send_message") == posted, "a second card was posted"
+    edits = bot.calls_to("edit_message_text")
+    assert [edit["message_id"] for edit in edits] == [card_id]
+    # The elapsed counter re-anchors to this process, exactly as the machine's
+    # own `_rebase_clock` does — a deploy costs the duration, not the card.
+    assert "working" in edits[-1]["text"]
+    assert "Bash · gh pr view 1351" in edits[-1]["text"]
+
+
 async def test_pinning_failure_does_not_lose_the_card(
     bot: FakeBot, db: Database, clock: FakeClock, sleeper: Sleeper, session: str
 ) -> None:
