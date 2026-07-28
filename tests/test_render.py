@@ -313,15 +313,26 @@ def test_failed_tool_result_is_marked_but_not_promoted_to_error() -> None:
         ("edit_structured_patch", "README.md", 2, 1),
     ],
 )
-def test_file_edit_is_one_line_with_counts(
+def test_file_edit_is_one_card_line_with_counts(
     case: str, path: str, added: int, removed: int
 ) -> None:
+    """A file edit is progress, so it goes on the card, not into the chat.
+
+    As a bubble it was one notification per edited file — paths you cannot act
+    on from a phone, arriving ahead of the answer that explains them. The card
+    is a single message edited in place, which is where progress belongs.
+    """
     result = render(SYNTHETIC[case])
-    assert kinds(result) == {BlockKind.DIFF}
-    html = chat_text(result)
-    assert path in html
-    assert f"+{added}" in html
-    assert f"−{removed}" in html  # U+2212, per PLAN's `path +12 −3`
+    assert result.chat == (), "no bubble per edited file"
+    line = " ".join(result.activity)
+    assert path in line
+    assert f"+{added}" in line
+    assert f"−{removed}" in line  # U+2212, per PLAN's `path +12 −3`
+
+    # `verbose` is the setting that means "show me everything", and it still does.
+    verbose = render(SYNTHETIC[case], Verbosity.VERBOSE)
+    assert BlockKind.DIFF in kinds(verbose)
+    assert path in chat_text(verbose)
 
 
 def test_file_edit_body_is_an_attachment_only_when_verbose() -> None:
@@ -358,18 +369,18 @@ def test_multi_edit_counts_every_hunk() -> None:
 
 
 def test_one_message_can_narrate_edit_and_act() -> None:
-    """``[text, tool_use, tool_use]``: the edit lands, the narration does not.
+    """``[text, tool_use, tool_use]``: three signals, none of them a bubble.
 
-    The text sits in front of a tool call, so it is preamble — it becomes card
-    activity instead of a bubble. The diff one-liner is still the chat's
-    "did it work" signal.
+    The text sits in front of a tool call, so it is preamble; the edit is
+    progress; the command is a tool call. All three are "what it is doing right
+    now", and all three land on the one card, in order. The chat is left for the
+    answer.
     """
     result = render(SYNTHETIC["mixed_blocks"])
-    assert kinds(result) == {BlockKind.DIFF}
-    assert "Patching the chunker" not in chat_text(result)
-    assert "chunk.py" in chat_text(result)
+    assert result.chat == ()
     assert result.activity == (
         "Patching the chunker and re-running:",
+        "📝 src/ctb/delivery/render/chunk.py +1 −1",
         "Bash · pytest tests/test_chunk.py -q",
     )
 
@@ -953,7 +964,7 @@ def test_a_path_is_never_markdown_rendered() -> None:
     This is why the markdown renderer is applied to agent prose only, and
     every structural interpolation escapes with ``plain_html`` instead.
     """
-    html = chat_text(render(SYNTHETIC["edit_underscore_path"]))
+    html = chat_text(render(SYNTHETIC["edit_underscore_path"], Verbosity.VERBOSE))
     assert "<code>src/ctb/__init__.py</code>" in html
     assert "<b>init</b>" not in html
     assert "<i>" not in html
@@ -1116,10 +1127,12 @@ def test_a_huge_code_block_is_kept_whole_for_the_chunker() -> None:
 
 
 def test_a_huge_write_still_produces_a_one_line_summary() -> None:
+    """400 lines written is still one line — on the card, and nowhere else."""
     result = render(ADVERSARIAL["huge_write"])
-    assert kinds(result) == {BlockKind.DIFF}
-    assert "generated/big.sql" in chat_text(result)
-    assert "+400" in chat_text(result)
+    assert result.chat == ()
+    line = " ".join(result.activity)
+    assert "generated/big.sql" in line
+    assert "+400" in line
 
 
 def test_deeply_nested_tool_result_does_not_hang() -> None:

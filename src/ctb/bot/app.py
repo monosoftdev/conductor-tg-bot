@@ -42,6 +42,7 @@ from aiogram.client.session.middlewares.base import (
 from aiogram.exceptions import TelegramConflictError, TelegramUnauthorizedError
 from aiogram.fsm.state import State
 from aiogram.fsm.storage.base import DEFAULT_DESTINY, BaseStorage, StateType, StorageKey
+from aiogram.fsm.strategy import FSMStrategy
 from aiogram.methods import Response, TelegramMethod
 from aiogram.methods.base import TelegramType
 from aiogram.types import BotCommand, CallbackQuery, ErrorEvent, Message
@@ -608,6 +609,14 @@ def create_dispatcher(
     """Build a Dispatcher with our storage, middleware and workflow data."""
     dispatcher = Dispatcher(
         storage=storage or PostgresStorage(db),
+        # One wizard per *seat*, not per chat. aiogram's default keys FSM state
+        # on (chat, user), so a `/new` left half-finished in one topic ate the
+        # next line typed in every other topic of the same chat — the wizard
+        # router runs first, and its state filter matched. `wizard_state` was
+        # always keyed by (chat, thread, user); this is the strategy that agrees
+        # with it. `RoutingMiddleware._publish_seat` supplies the thread, which
+        # Telegram itself omits for a topic in a private chat.
+        fsm_strategy=FSMStrategy.USER_IN_TOPIC,
         settings=settings,
         db=db,
         system_db=system_db,
@@ -773,6 +782,16 @@ async def run_polling(
     except Exception as exc:
         # A stale command menu is inconvenient, never a reason to stop polling.
         log.warning("bot.menu_failed", error=repr(exc))
+    # Warm the topic-icon pack before anything renames. It is one call, cached
+    # for the life of the process, and fetching it lazily meant the *first*
+    # state change after a deploy — the `/new` somebody is watching — was the
+    # one that got no icon. `icon_pack` swallows its own failures.
+    #
+    # Imported here, not at module scope: every handler module imports this one
+    # for `register_router`, so the reverse edge only exists inside a call.
+    from ctb.bot.handlers.topics import icon_pack
+
+    await icon_pack(app.bot)
     extra: dict[str, Any] = (
         {} if allowed_updates is None else {"allowed_updates": allowed_updates}
     )

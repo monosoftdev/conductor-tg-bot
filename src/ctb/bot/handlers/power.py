@@ -60,6 +60,7 @@ from ctb.db.repo import sessions as sessions_repo
 from ctb.db.repo import transcript as transcript_repo
 from ctb.db.repo import workspaces as workspaces_repo
 from ctb.db.repo.sessions import SessionRow
+from ctb.db.repo.workspaces import WorkspaceRow
 from ctb.delivery.render.html import escape
 from ctb.turn import cursor as turn_cursor
 from ctb.turn.state import TopicMarker, TurnState
@@ -126,6 +127,27 @@ def switchable_sessions(
     if route.workspace_id is None:
         return []
     return [row for row in sessions if row.workspace_id == route.workspace_id]
+
+
+def homed_elsewhere(
+    workspace: WorkspaceRow | None, seat: tuple[int | None, int] | Route
+) -> tuple[int, int] | None:
+    """``(chat_id, topic_id)`` of the room this workspace lives in, if not here.
+
+    ``/s`` binds a session to the seat it is run from, which is right for the
+    linear DM it was written for and wrong the moment a workspace has a topic:
+    the bind re-addresses the transcript, so the topic the replies had been
+    landing in goes quiet and the root starts speaking for a room it is not.
+    A workspace with a room of its own is *opened*, never switched to.
+
+    ``None`` means there is nothing to open — no topic, or the caller is
+    already standing in it.
+    """
+    if workspace is None or not workspace.topic_id or workspace.chat_id is None:
+        return None
+    key = seat.key if isinstance(seat, Route) else seat
+    home = (workspace.chat_id, workspace.topic_id)
+    return None if home == key else home
 
 
 @router.message(Command("help", "start"))
@@ -239,14 +261,29 @@ async def switch_session(
         )
         return
     rows = []
+    elsewhere: list[str] = []
     for row in sessions[:12]:
-        label = safe_title(row.title, row.id[:8])
+        label = (
+            f"{status_icon(row.state)} {safe_title(row.title, row.id[:8])} "
+            f"· {row.model or '?'}"
+        )
+        home = homed_elsewhere(workspaces.get(row.workspace_id or ""), route)
+        if home is not None:
+            # This session already has a room, and it is not this one. Binding
+            # it here would re-address its transcript to this seat and leave its
+            # topic silent — the opposite of what "switch" promises. Offer the
+            # way in instead; a DM topic has no link syntax, so it gets named.
+            target = jump_url(*home)
+            if target:
+                rows.append([url_button(label, target)])
+            else:
+                elsewhere.append(label)
+            continue
         current = "✓ " if row.id == route.session_id else ""
-        model = row.model or "?"
         rows.append(
             [
                 button(
-                    f"{current}{status_icon(row.state)} {label} · {model}",
+                    f"{current}{label}",
                     "switch",
                     row.id,
                     store=nonces,
@@ -257,7 +294,15 @@ async def switch_session(
                 )
             ]
         )
-    await tell(message, "<b>Switch session</b>", reply_markup=keyboard(rows))
+    lines = ["<b>Switch session</b>" if rows else "<b>Open a task</b>"]
+    if elsewhere:
+        lines.append("<i>These have their own topic — open it from the list:</i>")
+        lines.extend(f"· {escape(name)}" for name in elsewhere)
+    await tell(
+        message,
+        "\n".join(lines),
+        reply_markup=keyboard(rows) if rows else None,
+    )
 
 
 @router.callback_query(Cb.filter(F.action == "switch"))
@@ -276,12 +321,9 @@ async def switch_callback(
     if session is None:
         await query.answer("Session is gone.", show_alert=True)
         return
+    seat = (ticket.chat_id or query.from_user.id, ticket.thread_id)
     if ticket.thread_id != 0:
-        chat = await chats_repo.get(
-            database,
-            ticket.chat_id or query.from_user.id,
-            ticket.thread_id,
-        )
+        chat = await chats_repo.get(database, *seat)
         if (
             chat is None
             or chat.workspace_id is None
@@ -292,15 +334,24 @@ async def switch_callback(
                 show_alert=True,
             )
             return
+    # The button should never have been a switch button (see `/s`), but a stale
+    # one minted before the workspace got its topic still resolves. Refuse
+    # rather than silently move replies out of the room somebody is reading.
+    home = await workspaces_repo.get(database, session.workspace_id or "")
+    if homed_elsewhere(home, seat) is not None:
+        await query.answer(
+            "That task has its own topic. Open it there.", show_alert=True
+        )
+        return
     await sessions_repo.bind(
         database,
         session.id,
-        chat_id=ticket.chat_id or query.from_user.id,
+        chat_id=seat[0],
         thread_id=ticket.thread_id,
     )
     await chats_repo.bind(
         database,
-        ticket.chat_id or query.from_user.id,
+        seat[0],
         ticket.thread_id,
         workspace_id=session.workspace_id,
         session_id=session.id,

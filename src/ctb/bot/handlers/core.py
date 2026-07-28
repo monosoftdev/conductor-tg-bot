@@ -18,10 +18,12 @@ from ctb.bot.handlers.common import (
     abandon_wizard,
     command_text,
     create_and_bind,
+    created_card,
     react_received,
     request_cancel,
     require_session,
     resolve_new_request,
+    safe_title,
     short_error,
     tell,
     workspace_name,
@@ -50,6 +52,7 @@ from ctb.bot.middleware.routing import Route
 from ctb.bot.middleware.tenancy import TenantContext
 from ctb.conductor.client import ConductorClient
 from ctb.db.connection import Database
+from ctb.db.repo import chats as chats_repo
 from ctb.db.repo import prompts as prompts_repo
 from ctb.db.repo import sessions as sessions_repo
 from ctb.db.repo import workspaces as workspaces_repo
@@ -208,16 +211,10 @@ async def new_workspace(
     except Exception as exc:
         await tell(message, f"New failed: {escape(short_error(exc))}", silent=False)
         return
-    target = (
-        jump_url(message.chat.id, created.thread_id)
-        if created.thread_id
-        else created.deep_link
-    )
-    label = "Open topic" if created.thread_id else "Open in Conductor"
-    markup = keyboard([[url_button(label, target)]]) if target else None
     # The topic's own card repeats "queued" two seconds later; this bubble only
-    # has to carry the jump link.
-    await tell(message, f"→ <b>{escape(created.label)}</b>", reply_markup=markup)
+    # has to say where that topic is.
+    text, markup = created_card(message.chat.id, created)
+    await tell(message, text, reply_markup=markup)
 
 
 @router.message(Command("board"))
@@ -464,6 +461,79 @@ async def stop(
     # thing is permanent noise. Fall back to it only if reactions are refused.
     if not await react_received(message):
         await tell(message, "Stopping…")
+
+
+#: What the DM root says when a line of work arrives in it. The root is not a
+#: seat once `/new` has moved the work into topics — it is the cockpit, and a
+#: cockpit never prompts on its own (PLAN §Safety rails). Saying so beats the
+#: "No session here" it used to answer, which was true and useless: the session
+#: existed, it just lived one topic away.
+DM_COCKPIT_HINT: Final = (
+    "This is the main chat · it doesn't run prompts.\n"
+    "Send it to a task below, or <code>/new</code> to start one."
+)
+
+
+async def cockpit_target(db: Database) -> tuple[str, str] | None:
+    """``(session_id, label)`` for the seat a cockpit's one button points at.
+
+    The most recently prompted bound seat — the thing "send it there" means
+    when the person did not say where. ``None`` when nothing has ever run, in
+    which case there is no cockpit to be and the caller says so plainly.
+    """
+    rows = sorted(
+        (row for row in await chats_repo.list_bound(db) if row.last_prompt_at),
+        key=lambda row: row.last_prompt_at or 0,
+        reverse=True,
+    )
+    for row in rows:
+        if not row.session_id:
+            continue
+        session = await sessions_repo.get(db, row.session_id)
+        label = safe_title(session.title if session else None, row.session_id[:8])
+        return row.session_id, label
+    return None
+
+
+async def cockpit_markup(
+    db: Database,
+    text: str,
+    *,
+    nonces: NonceStore,
+    user_id: int | None,
+    chat_id: int,
+    thread_id: int,
+) -> InlineKeyboardMarkup | None:
+    """The single-use "Send to …" button a cockpit offers instead of prompting.
+
+    Shared by the typed and the spoken path on purpose: the two surfaces
+    resolving "where would this have gone?" differently is the divergence that
+    once sent a dictated prompt to ``/find``.
+
+    :data:`CONTROL_TTL_S`, not the 60-second default — this is a phone control
+    on a line the owner may well come back to after reading the reply, not a
+    destructive confirm.
+    """
+    target = await cockpit_target(db)
+    if target is None:
+        return None
+    session_id, label = target
+    return keyboard(
+        [
+            [
+                button(
+                    f"Send to {label}",
+                    Action.SEND,
+                    f"{session_id}\n{text}",
+                    store=nonces,
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    ttl=CONTROL_TTL_S,
+                )
+            ]
+        ]
+    )
 
 
 async def run_find(

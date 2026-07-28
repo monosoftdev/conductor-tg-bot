@@ -23,8 +23,10 @@ from ctb.bot.handlers.common import (
     workspace_name,
 )
 from ctb.bot.handlers.core import (
+    DM_COCKPIT_HINT,
     board_lines,
     board_rows,
+    cockpit_markup,
     find_text,
     session_overview_lines,
 )
@@ -40,6 +42,7 @@ from ctb.bot.middleware.routing import Route
 from ctb.bot.middleware.tenancy import TenantSettings
 from ctb.conductor.client import ConductorClient
 from ctb.conductor.pool import ClientPool
+from ctb.db import NO_THREAD_ID
 from ctb.db.connection import Database, now_ms, tenant_scope
 from ctb.db.repo import chats as chats_repo
 from ctb.db.repo import prompts as prompts_repo
@@ -536,6 +539,27 @@ class VoiceService:
             )
             return True
         if not row.route_session_id:
+            # The DM root once `/new` moved this chat's work into topics. The
+            # typed path answers with one "Send to …" button rather than a dead
+            # end, and the spoken path must answer identically — the two
+            # surfaces disagreeing about where an unaddressed line goes is what
+            # sent a dictated prompt to `/find` once already.
+            if row.route_kind == "dm" and row.thread_id == NO_THREAD_ID:
+                markup = await cockpit_markup(
+                    self.db,
+                    text,
+                    nonces=self.nonces,
+                    user_id=row.user_id,
+                    chat_id=row.chat_id,
+                    thread_id=row.thread_id,
+                )
+                if markup is not None:
+                    await self._send(
+                        row,
+                        f"🎙 {escape(self._audit(text))}\n{DM_COCKPIT_HINT}",
+                        reply_markup=markup,
+                    )
+                    return True
             await self._send(row, "No session here. Use /new or /s.")
             return True
         _message_id, state = await submit_prompt(

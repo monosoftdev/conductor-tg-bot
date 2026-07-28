@@ -35,7 +35,7 @@ from aiogram.fsm.storage.base import (
     StateType,
     StorageKey,
 )
-from aiogram.methods import TelegramMethod
+from aiogram.methods import GetForumTopicIconStickers, TelegramMethod
 from aiogram.methods.base import TelegramType
 from aiogram.types import (
     CallbackQuery,
@@ -64,11 +64,13 @@ from ctb.bot.app import (
     build_app,
     clear_routers,
     create_bot,
+    create_dispatcher,
     install_middleware,
     register_router,
     registered_routers,
     run_polling,
 )
+from ctb.bot.handlers import topics
 from ctb.bot.keyboards import (
     CONTROL_TTL_S,
     NONCE_TTL_S,
@@ -670,6 +672,58 @@ async def test_the_tenant_context_reaches_the_handler(
     assert [data["tenant"].role for data in captured] == ["owner", "member"]
     assert [data["is_owner"] for data in captured] == [True, False]
     assert {data["tenant"].tenant_id for data in captured} == {BOOTSTRAP_TENANT_ID}
+
+
+async def test_each_dm_topic_gets_its_own_wizard(
+    bot: Bot, bot_settings: Settings, db: Database, system_db: Database, seated: None
+) -> None:
+    """The half-finished ``/new`` that ate the next line typed anywhere else.
+
+    Two things have to hold at once for this to work, and neither is visible
+    from the other's file: the dispatcher must key FSM state per topic, and
+    ``RoutingMiddleware`` must supply a thread for a DM topic, which Telegram
+    leaves empty because it does not set ``is_topic_message`` there. Built
+    through the production ``create_dispatcher`` on purpose — a test harness
+    that assembles its own would pass with the strategy left at its default.
+    """
+    dispatcher, _ = create_dispatcher(
+        settings=bot_settings,
+        system_db=system_db,
+        clients=cast(ClientPool, NullPool()),
+        db=db,
+        storage=PostgresStorage(db),
+        routers=(),
+    )
+    keys: list[Any] = []
+
+    async def handler(_event: Any, **data: Any) -> None:
+        keys.append(data["state"].key)
+
+    router = Router(name="capture-seat")
+    router.message.register(handler)
+    dispatcher.include_router(router)
+
+    for index, thread in enumerate((None, 99, 100)):
+        await dispatcher.feed_update(
+            bot,
+            Update(
+                update_id=index + 1,
+                message=Message(
+                    message_id=index + 1,
+                    date=NOW,
+                    chat=_chat(OWNER_ID, "private"),
+                    from_user=_user(OWNER_ID),
+                    text="hello",
+                    message_thread_id=thread,
+                    # Telegram's own behaviour, and the reason the strategy
+                    # alone is not enough: a DM topic is not tagged as one.
+                    is_topic_message=False,
+                ),
+            ),
+        )
+
+    assert [key.thread_id for key in keys] == [None, 99, 100]
+    assert len({key for key in keys}) == 3, "three seats, three wizards"
 
 
 async def test_owners_are_told_about_a_stranger_once_per_day(
@@ -1629,6 +1683,39 @@ async def test_polling_propagates_cancellation(
     app.dispatcher.start_polling = cancelled  # type: ignore[method-assign]
     with pytest.raises(asyncio.CancelledError):
         await run_polling(app)
+
+
+async def test_polling_warms_the_topic_icon_pack_before_serving(
+    bot: Bot,
+    session: RecordingSession,
+    bot_settings: Settings,
+    db: Database,
+    system_db: Database,
+) -> None:
+    """Fetched lazily, the *first* state change after a deploy got no icon.
+
+    That is the `/new` somebody is watching. One call at boot, cached for the
+    life of the process, and every rename after it can carry a badge.
+    """
+    topics._ICON_IDS.clear()
+    app = build_app(
+        settings=bot_settings,
+        db=db,
+        system_db=system_db,
+        clients=cast(ClientPool, NullPool()),
+        bot=bot,
+        routers=[],
+    )
+
+    async def stop(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    app.dispatcher.start_polling = stop  # type: ignore[method-assign]
+    await run_polling(app)
+
+    assert any(isinstance(call, GetForumTopicIconStickers) for call in session.calls), (
+        "the pack is asked for at boot, not on the first rename"
+    )
 
 
 async def test_app_close_closes_the_session(

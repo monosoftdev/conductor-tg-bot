@@ -459,21 +459,44 @@ async def test_destination_for_an_unbound_session_is_none(
     assert await cursor.destination_for(db, session.session_id) is None
 
 
-async def test_quiet_destination_is_silent_until_topic_is_focused(
+async def test_quiet_stays_quiet_even_in_the_topic_you_are_standing_in(
     db: Database, fake: FakeConductor
 ) -> None:
+    """The focus window used to promote a quiet topic to loud for 30 minutes.
+
+    That window opens on a prompt, which is exactly the window a long task runs
+    in — so `quiet` buzzed for every line of narration of the task you had just
+    started, and felt like it did nothing at all. The signal it was reaching for
+    is "the task is done", and that is now one notification of its own.
+    """
     session = fake.add_session()
     await bind(db, session)
     await chats.set_notify(db, CHAT_ID, THREAD_ID, notify="quiet")
+    await chats.touch_prompt(db, CHAT_ID, THREAD_ID, focus_for_ms=60_000)
 
     quiet = await cursor.destination_for(db, session.session_id)
+
     assert quiet is not None
     assert quiet.silent is True
 
-    await chats.touch_prompt(db, CHAT_ID, THREAD_ID, focus_for_ms=60_000)
-    focused = await cursor.destination_for(db, session.session_id)
-    assert focused is not None
-    assert focused.silent is False
+
+async def test_a_session_with_no_chat_row_defaults_to_quiet(
+    db: Database, fake: FakeConductor
+) -> None:
+    """The dataclass default and the column default have to agree.
+
+    Left at `False`, a session bound without a `chats` row pushed every single
+    line — the loudest possible behaviour from the absence of a setting.
+    """
+    session = fake.add_session()
+    await bind(db, session)
+    await chats.delete(db, CHAT_ID, THREAD_ID)
+
+    destination = await cursor.destination_for(db, session.session_id)
+
+    assert destination is not None
+    assert destination.silent is True
+    assert cursor.Destination(chat_id=CHAT_ID).silent is True
 
 
 async def test_quiet_delivery_sets_telegram_silent_flag(
@@ -524,11 +547,13 @@ async def test_loud_pushes_even_when_the_topic_is_not_focused(
 async def test_a_split_reply_buzzes_once_not_once_per_chunk(
     db: Database, fake: FakeConductor, client: ConductorClient
 ) -> None:
-    """A long answer is several messages. It is still one answer."""
+    """A long answer is several messages. It is still one answer.
+
+    Only under `loud`, which is now the one setting that pushes content at all.
+    """
     session = fake.add_session(seed=[assistant("x" * 9_000)])
     await bind(db, session)
-    await chats.set_notify(db, CHAT_ID, THREAD_ID, notify="quiet")
-    await chats.touch_prompt(db, CHAT_ID, THREAD_ID, focus_for_ms=60_000)
+    await chats.set_notify(db, CHAT_ID, THREAD_ID, notify="loud")
 
     await cursor.drain(client, db, session.session_id)
 
@@ -541,6 +566,32 @@ async def test_a_split_reply_buzzes_once_not_once_per_chunk(
     silent = [json.loads(row.payload_json or "{}").get("silent", False) for row in rows]
     assert silent[0] is False, "the first part announces the answer"
     assert all(silent[1:]), "the rest are the same answer"
+
+
+async def test_a_quiet_turn_never_pushes_a_single_line(
+    db: Database, fake: FakeConductor, client: ConductorClient
+) -> None:
+    """**The point of the change.**
+
+    An agentic turn narrates: several assistant messages, each split into
+    several parts. Under the old rule every one of those *messages* buzzed, so
+    one prompt vibrated a phone six or eight times before the work was done.
+    Under `quiet` — the default — none of them do, and the buzz is
+    `BotActionSink._announce_finish` when the turn is over.
+    """
+    session = fake.add_session(
+        seed=[assistant("looking at it"), assistant("fixing it"), assistant("done")]
+    )
+    await bind(db, session)
+    await chats.touch_prompt(db, CHAT_ID, THREAD_ID, focus_for_ms=60_000)
+
+    await cursor.drain(client, db, session.session_id)
+
+    rows = await deliveries.list_for_session(db, session.session_id)
+    assert rows, "content is still delivered — only the push is suppressed"
+    assert all(
+        json.loads(row.payload_json or "{}").get("silent", False) for row in rows
+    )
 
 
 # ── the replay attack ────────────────────────────────────────────────────────

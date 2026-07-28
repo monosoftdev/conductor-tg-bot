@@ -77,7 +77,11 @@ the chat, and posts a pinned status card that updates as the agent works. The
 answer arrives in that topic.
 
 From then on, **just type in the topic** to continue that session. No command
-needed.
+needed — it stays on that task until your next `/new`.
+
+Telegram publishes no link to a topic inside a private chat, so there is no
+"Open topic" button to tap here. The bot says which one it opened; you pick it
+from the topic list at the top of the chat.
 
 > **No topics in your chat?** You may see *Topics unavailable here · one
 > workspace at a time.* Telegram, not the bot, decides whether a private chat
@@ -104,9 +108,54 @@ needed.
 `/help` prints a short version of this in the chat.
 
 Plain text is a **prompt** wherever a session is bound: a workspace topic, or
-your private chat itself. The one place it is not is a group's **General**,
-where it searches instead — that is the cockpit, and a prompt typed there would
-be a prompt sent to whichever session you last used.
+your private chat itself when it has no topics. Two places it is not:
+
+- A group's **General** searches instead. That is the cockpit, and a prompt
+  typed there would be a prompt sent to whichever session you last used.
+- **The main chat of a private chat that does have topics.** Once `/new` has
+  moved your work into topics, the root is a cockpit too. Type a task there and
+  you get one button — *Send to «that task»* — instead of a guess. `/new` starts
+  a new one.
+
+`/s` reaches a session; it never moves one. A task that has a topic of its own
+is listed so you can open it, because binding it to where you typed `/s` would
+re-address its replies and leave its topic silent. Only tasks without a topic —
+a linear chat's — are switched to in place.
+
+### While it works, your phone stays quiet
+
+A task is not one reply — the agent narrates, edits files, runs things. Two
+rules keep that from becoming twenty notifications:
+
+- **Progress goes on the pinned card, not into the chat.** Tool calls, the file
+  it is editing right now, the elapsed clock — one message, edited in place. No
+  bubble per changed file.
+- **Nothing pushes until it is finished.** Then one line arrives and your phone
+  buzzes once: `✅ Done · 1m32s · 12 tools · 5 files`. Errors are the exception
+  and always push immediately.
+
+`/notify` changes that per topic: `loud` also pushes every reply, `quiet` (the
+default) pushes only the finish, `off` never pushes. `/mode verbose` puts the
+file edits and their patches back into the chat if you want them there.
+
+### Reading the topic list
+
+Each topic says what its task is doing twice, so you can read the list without
+opening anything: the **badge** beside the row, and the **first character** of
+the name.
+
+| | Badge | Name |
+|---|---|---|
+| Starting up | ⌛ | `⏳ fix login · api/main` |
+| Working now | ⚡ | `⚙️ fix login · api/main` |
+| Finished, unread | ✅ | `✅ fix login · api/main` |
+| Quiet | 💭 | `fix login · api/main` |
+| Error | ❗ | `⚠️ fix login · api/main` |
+| Asleep | 💤 | `💤 fix login · api/main` |
+| Archived | 🏁 | `🗄 fix login · api/main` |
+
+The colour of a topic never changes — Telegram fixes it when the topic is made,
+so it means *which task*, not what it is doing.
 
 ---
 

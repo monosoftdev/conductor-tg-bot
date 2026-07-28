@@ -17,12 +17,11 @@ from ctb.bot.app import register_router
 from ctb.bot.handlers.common import (
     react_received,
     request_cancel,
-    safe_title,
     short_error,
     submit_prompt,
     tell,
 )
-from ctb.bot.handlers.core import run_find
+from ctb.bot.handlers.core import DM_COCKPIT_HINT, cockpit_markup, run_find
 from ctb.bot.handlers.topics import resolve_client, resolve_db, topic_title
 from ctb.bot.keyboards import (
     CONTROL_TTL_S,
@@ -39,7 +38,6 @@ from ctb.bot.middleware.tenancy import TenantContext
 from ctb.conductor.client import ConductorClient
 from ctb.db import NO_THREAD_ID
 from ctb.db.connection import Database
-from ctb.db.repo import chats as chats_repo
 from ctb.db.repo import prompts as prompts_repo
 from ctb.db.repo import sessions as sessions_repo
 from ctb.db.repo import transcript as transcript_repo
@@ -125,50 +123,40 @@ async def plain_text(
     if not text:
         await tell(message, "Empty message · send the instruction again.")
         return
-    if is_general_cockpit(message, route):
-        # No send path exists here. Search first; an explicit single-use button
-        # is required to turn this text into a prompt. The button rides on the
-        # search results — one typed line must never cost two notifications.
-        database = resolve_db(db)
-        rows = sorted(
-            (
-                row
-                for row in await chats_repo.list_bound(database)
-                if row.last_prompt_at
-            ),
-            key=lambda row: row.last_prompt_at or 0,
-            reverse=True,
+    database = resolve_db(db)
+    general = is_general_cockpit(message, route)
+    # The DM root, once `/new` has moved this chat's work into its own topic,
+    # is the same kind of seat General is: it addresses nothing, so it offers
+    # one explicit button rather than guessing. Computed only for those two —
+    # every other line is a prompt and must not pay for two extra queries.
+    if general or (route.is_dm and not route.session_id):
+        cockpit = await cockpit_markup(
+            database,
+            text,
+            nonces=nonces,
+            user_id=message.from_user.id if message.from_user else None,
+            chat_id=message.chat.id,
+            thread_id=message.message_thread_id or 0,
         )
-        markup = None
-        if rows and rows[0].session_id:
-            session = await sessions_repo.get(database, rows[0].session_id)
-            destination = safe_title(
-                session.title if session else None, rows[0].session_id[:8]
-            )
-            markup = keyboard(
-                [
-                    [
-                        button(
-                            f"Send to {destination}",
-                            Action.SEND,
-                            f"{rows[0].session_id}\n{text}",
-                            store=nonces,
-                            user_id=message.from_user.id if message.from_user else None,
-                            chat_id=message.chat.id,
-                            thread_id=message.message_thread_id or 0,
-                        )
-                    ]
-                ]
-            )
-        await run_find(message, text, client=tenant.client, reply_markup=markup)
-        return
+        if general:
+            # No send path exists here. Search first; an explicit single-use
+            # button is required to turn this text into a prompt. The button
+            # rides on the search results — one typed line must never cost two
+            # notifications.
+            await run_find(message, text, client=tenant.client, reply_markup=cockpit)
+            return
+        # Unlike General, the root does not search: a person typing a task into
+        # their own chat wants it *sent*, not looked up. With nothing ever run
+        # there is no cockpit to be, and the nudge below is the honest answer.
+        if cockpit is not None:
+            await tell(message, DM_COCKPIT_HINT, reply_markup=cockpit)
+            return
 
     if not route.session_id:
         await tell(
             message, "No session here. Use <code>/new</code> or <code>/s</code>."
         )
         return
-    database = resolve_db(db)
     try:
         _, state = await submit_prompt(
             db=database,

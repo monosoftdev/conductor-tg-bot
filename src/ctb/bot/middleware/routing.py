@@ -43,7 +43,11 @@ from dataclasses import dataclass, replace
 from typing import Any, Final
 
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
-from aiogram.dispatcher.middlewares.user_context import EVENT_CONTEXT_KEY, EventContext
+from aiogram.dispatcher.middlewares.user_context import (
+    EVENT_CONTEXT_KEY,
+    EVENT_THREAD_ID_KEY,
+    EventContext,
+)
 from aiogram.types import (
     CallbackQuery,
     MaybeInaccessibleMessage,
@@ -200,6 +204,7 @@ class RoutingMiddleware(BaseMiddleware):
         thread_id = _thread_id(context, event)
         kind = _chat_kind(context, thread_id)
         reply_to = _reply_to_message_id(event)
+        context = self._publish_seat(context, thread_id, data)
 
         tenant = data.get("tenant")
         route = Route(
@@ -223,6 +228,40 @@ class RoutingMiddleware(BaseMiddleware):
         data[ROUTE_KEY] = route
         bind_log_context(session_id=route.session_id, workspace_id=route.workspace_id)
         return await handler(event, data)
+
+    @staticmethod
+    def _publish_seat(
+        context: EventContext, thread_id: int, data: dict[str, Any]
+    ) -> EventContext:
+        """Hand aiogram's FSM the same seat this middleware resolved.
+
+        ``FSMStrategy.USER_IN_TOPIC`` keys wizard state on
+        ``EventContext.thread_id``, and Telegram only fills that in when it also
+        sets ``is_topic_message`` — documented for forums, never promised for a
+        topic in a private chat. Left alone, every seat in a DM shares one
+        wizard: an unfinished ``/new`` in the root then swallows the next line
+        typed in *any* topic and spends it on a second workspace instead of
+        prompting the session that topic is bound to.
+
+        :func:`_thread_id` has already answered this exact question — including
+        folding a forum's General back to :data:`NO_THREAD_ID` — so the answer
+        is published rather than recomputed by a second, differing rule.
+        ``install_middleware`` re-registers the FSM middleware behind us so it
+        reads what this writes.
+        """
+        seat = thread_id or None
+        if context.thread_id == seat:
+            return context
+        updated = replace(context, thread_id=seat)
+        data[EVENT_CONTEXT_KEY] = updated
+        # aiogram's own backward-compatible mirror of the same value. Nothing
+        # here reads it, but leaving it disagreeing with the context beside it
+        # is how the next reader gets the old answer.
+        if seat is None:
+            data.pop(EVENT_THREAD_ID_KEY, None)
+        else:
+            data[EVENT_THREAD_ID_KEY] = seat
+        return updated
 
     async def _resolve(self, db: Database, route: Route) -> Route:
         chat_id = route.chat_id

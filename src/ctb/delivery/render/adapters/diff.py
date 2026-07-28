@@ -1,10 +1,15 @@
-"""File edits: one line in the chat, the whole diff on demand.
+"""File edits: one line on the **card**, the whole diff on demand.
 
-A file-editing tool call is the one kind of tool call that carries information
-the chat wants — *which file, how much* — so PLAN §Adapters gives it a line of
-its own (``path +12 −3``) instead of folding it into the status card. The diff
-body itself is an attachment, because a 400-line patch in a phone chat buries
-the answer that follows it.
+A file-editing tool call carries something a bare tool call does not — *which
+file, how much* — so it gets a line of its own (``path +12 −3``) rather than
+being folded away entirely. But that line is progress, and progress belongs on
+the status card, which is edited in place: as a chat bubble it was one
+notification per file, naming paths nobody can act on from a phone, arriving
+ahead of the answer that explains them. ``verbose`` moves it back into the chat
+along with the patch.
+
+The diff body is an attachment either way, because a 400-line patch in a phone
+chat buries the answer that follows it.
 
 Detection is by shape: a tool call whose arguments name a path *and* carry an
 edit payload (``old_string``/``new_string``, ``content``, ``patch``,
@@ -28,6 +33,7 @@ from ctb.delivery.render.adapters.shapes import (
     tool_name,
 )
 from ctb.delivery.render.types import (
+    ActivityLine,
     Block,
     BlockKind,
     DocumentBlock,
@@ -254,12 +260,28 @@ def file_edit_blocks(
     verbosity: Verbosity = Verbosity.NORMAL,
     source_message_id: str | None = None,
 ) -> list[Block]:
-    """One-line summary always; the ``.diff`` body only when verbose.
+    """The card gets the line. The chat gets it only when verbose.
 
-    At ``normal`` the body is reachable through the "show diff" button, which
-    calls :func:`diff_document` — attaching it unasked would put a file in the
-    chat for every edit of a twenty-edit turn.
+    It used to be a chat bubble per edited file, and that was the single
+    largest source of turn noise: a twenty-file turn was twenty notifications
+    naming paths you cannot open from a phone, arriving *before* the answer
+    that explains them. A file being written is **progress, not content** — so
+    it goes where progress goes, the one status card that is edited in place
+    rather than re-sent, and the count lands on the finished card
+    (``✅ done in 1m32s · 12 tools · 5 files``).
+
+    ``verbose`` still puts the line and the patch itself in the chat, which is
+    what that setting is for.
     """
+    if not verbosity.at_least(Verbosity.VERBOSE):
+        return [
+            ActivityLine(
+                # Plain text: the card escapes what it is given.
+                text=f"📝 {edit.summary}",
+                kind=BlockKind.DIFF,
+                source_message_id=source_message_id,
+            )
+        ]
     summary = TextBlock(
         html=(
             f"📝 <code>{plain_html(edit.path)}</code> "
@@ -269,8 +291,7 @@ def file_edit_blocks(
         source_message_id=source_message_id,
     )
     blocks: list[Block] = [summary]
-    if verbosity.at_least(Verbosity.VERBOSE):
-        document = diff_document(edit, source_message_id=source_message_id)
-        if document is not None:
-            blocks.append(document)
+    document = diff_document(edit, source_message_id=source_message_id)
+    if document is not None:
+        blocks.append(document)
     return blocks

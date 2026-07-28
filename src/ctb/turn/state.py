@@ -360,12 +360,21 @@ class TopicMarker(StrEnum):
         return _TOPIC_PREFIXES[self]
 
     @property
-    def icon(self) -> str:
-        """The emoji this state wants as the topic's icon, if one is free.
+    def icons(self) -> tuple[str, ...]:
+        """Emoji this state would accept as the topic's icon, best first.
 
         ``icon_color`` is fixed at creation and can only ever mean *which
         workspace*; ``icon_custom_emoji_id`` can change on every rename, so
-        state goes here. Empty means "leave the icon alone".
+        state goes here.
+
+        **A tuple, not one emoji.** Telegram serves bots a fixed pack
+        (``getForumTopicIconStickers``) and refuses anything outside it, and an
+        unresolvable request is not an error — aiogram omits the field and
+        Telegram keeps whatever icon the topic already had. One wanted emoji
+        the pack happens not to carry therefore looked exactly like "the icon
+        never changes", which is how every topic ended up wearing the same one.
+        Naming alternatives costs nothing and fails visibly instead of
+        silently. Empty means "leave the icon alone".
         """
         return _TOPIC_ICONS[self]
 
@@ -382,17 +391,23 @@ _TOPIC_PREFIXES: Final[dict[TopicMarker, str]] = {
     TopicMarker.ARCHIVED: f"{signals.ARCHIVED} ",
 }
 
-#: Wanted icon per state. Telegram only serves a fixed pack of ~112 emoji to
-#: bots, so these are *requests*: the resolver drops any the pack lacks and
-#: leaves the icon unchanged rather than failing the rename.
-_TOPIC_ICONS: Final[dict[TopicMarker, str]] = {
-    TopicMarker.INITIALIZING: "⌛",
-    TopicMarker.IDLE: "💤",
-    TopicMarker.DONE: "✅",
-    TopicMarker.WORKING: "⚡",
-    TopicMarker.ERROR: "❗",
-    TopicMarker.SLEEPING: "💤",
-    TopicMarker.ARCHIVED: "🏁",
+#: Wanted icons per state, **best first**. Telegram only serves a fixed pack to
+#: bots, so these are *requests*: :func:`ctb.bot.handlers.topics.topic_icon_id`
+#: takes the first the pack actually carries, and leaves the icon unchanged
+#: rather than failing the rename if it carries none of them.
+#:
+#: ``IDLE`` and ``SLEEPING`` deliberately no longer share ``💤``. They are
+#: different facts — "bound and quiet" against "the workspace is asleep" — and
+#: since a topic spends most of its life idle, one sleep icon on everything was
+#: most of what "all the icons are the same" actually looked like.
+_TOPIC_ICONS: Final[dict[TopicMarker, tuple[str, ...]]] = {
+    TopicMarker.INITIALIZING: ("⌛", "⏳", "🕒", "🔄"),
+    TopicMarker.IDLE: ("💭", "📝", "✏", "💬"),
+    TopicMarker.DONE: ("✅", "☑", "🎉", "👍"),
+    TopicMarker.WORKING: ("⚡", "🛠", "🔧", "⚙", "🔥"),
+    TopicMarker.ERROR: ("❗", "⚠", "❌", "🆘"),
+    TopicMarker.SLEEPING: ("💤", "🌙", "😴"),
+    TopicMarker.ARCHIVED: ("🏁", "📦", "🗂", "🔒"),
 }
 
 

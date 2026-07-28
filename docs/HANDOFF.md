@@ -14,7 +14,7 @@ create a supergroup, enable Topics or grant admin rights.
 
 Verified offline, on every commit:
 
-- **2,058 tests pass** against a real PostgreSQL 16.
+- **2,092 tests pass** against a real PostgreSQL 16.
 - `ruff format --check`, `ruff check`, `pyright` — all clean.
 - The real runtime boots against a real database: all six services start,
   `/health` returns `ok`, the lease is acquired, shutdown is clean.
@@ -53,6 +53,90 @@ path, not the hoped-for one:
 Known gap: `/board` adoption in a DM (`adopt.py`) is still linear — it does not
 open a topic. `tests/test_bot_adopt.py` records it with an unchanged assertion,
 so fixing it will fail that test rather than change behaviour silently.
+
+## A DM with topics had three dead ends (2026-07-28)
+
+The first live pass on a topics-enabled DM found the same complaint from three
+directions — *"`/new` doesn't do anything and then it says there is no
+session"*. Each has its own cause and its own test; all three are fixed.
+
+1. **The root was orphaned, not a cockpit.** `/new` binds the session to the
+   topic it just opened, so the DM root holds nothing — and answered "No session
+   here" to every line typed or dictated into it. It now answers the way a
+   cockpit does: one *Send to «task»* button, shared by the typed and the spoken
+   path through `core.cockpit_markup` so they cannot drift. Deliberately **not**
+   General's search: a task typed into your own chat wants sending, not looking
+   up. With nothing ever run there is no cockpit to be, and the old nudge stands.
+2. **`/s` moved a session instead of reaching it.** Binding re-addresses the
+   transcript, so `/s` from the root pointed a topic-bound session at thread 0
+   and its topic went quiet — the recovery broke what it was recovering.
+   `power.homed_elsewhere` now decides: a workspace with a room of its own is
+   *opened* (a jump button where Telegram gives a link, its name where it does
+   not, as in a DM), never switched to. The callback re-checks, so a button
+   minted before the topic existed is refused rather than obeyed.
+3. **One wizard served every seat in a chat.** aiogram keyed FSM state on
+   `(chat, user)`, so a half-finished `/new` swallowed the next line typed in
+   *any* topic and spent it on a second workspace. Fixed in two halves that only
+   work together: `FSMStrategy.USER_IN_TOPIC`, plus
+   `RoutingMiddleware._publish_seat`, because Telegram omits `is_topic_message`
+   in a private chat and aiogram would otherwise read no thread at all.
+   `tests/test_middleware.py::test_each_dm_topic_gets_its_own_wizard` drives the
+   production `create_dispatcher` for exactly that reason.
+
+One thing found on the way and worth remembering: **`jump_url` is `None` for a
+private chat.** Telegram publishes no link syntax for a DM topic, so `/new` there
+had produced a bare `→ label` and no button — which is why it read as having
+done nothing. `common.created_card` now names the room instead, and is the one
+face `/new`, the wizard and adopt all use.
+
+## The topic icon was the same on every topic (2026-07-28)
+
+A topic carries state in two places and only one of them was moving. The name
+prefix changed on every transition; ``icon_custom_emoji_id`` — the badge you
+actually scan a list by — did not, for two independent reasons:
+
+- **Presentation selectors.** Telegram's pack serves `⚡️` (U+26A1 U+FE0F) where
+  the state table asked for `⚡`. The lookup was an exact string match, so it
+  missed — and an unresolved icon is *not* an error: aiogram omits an unset
+  optional, and Telegram keeps the existing value for an omitted field. Every
+  rename returned success and the badge never moved. `icon_key` now compares by
+  identity, and each state names several acceptable emoji instead of one, so a
+  pack that lacks the first choice costs a fallback rather than the icon.
+- **`IDLE` and `SLEEPING` both asked for 💤.** A topic is idle most of its life,
+  so one shared sleep badge was most of what "they all look the same" was.
+
+The pack is also warmed at boot rather than on first rename — fetched lazily,
+the first state change after a deploy was the one that got no icon — and
+`scripts/probe_topic_icons.py` prints what a live token is actually offered.
+The emoji in `_TOPIC_ICONS` are still educated guesses until somebody runs it.
+
+## One notification per task, not twenty (2026-07-28)
+
+A single prompt could vibrate a phone eight times before the work was done: an
+agentic turn narrates, and every assistant message was a push. Three changes,
+none of which touches delivery — content is still queued and sent exactly as
+before, only the push flag and the destination of *progress* moved.
+
+- **A file edit is progress, so it goes on the card.** `📝 path +12 −3` was a
+  chat bubble per edited file: names you cannot act on from a phone, arriving
+  ahead of the answer that explains them. It is now an `ActivityLine`, which
+  lands on the one pinned message that is edited in place, and the count lands
+  on the finished card and in the completion line. `/mode verbose` still puts
+  the line *and* the patch in the chat.
+- **`quiet` finally means quiet.** The focus window used to promote a quiet
+  topic to loud for 30 minutes after a prompt — exactly the window a long task
+  runs in — so the default setting felt like it did nothing. `loud` pushes every
+  reply and the finish, `quiet` pushes only the finish, `off` pushes nothing.
+  Three settings, three behaviours.
+- **`BotActionSink._announce_finish` is the one buzz.** It fires on the
+  machine's `Finalize`, keyed on the cursor the session finished at so a
+  redeploy cannot announce one turn twice. It has to be a *message*: the status
+  card already says `done`, but a card is an edit and Telegram never notifies
+  for an edit. A card cannot ring a phone.
+
+`Destination.silent` now defaults to `True`, matching `chats.notify`'s own
+default — left at `False`, a session bound without a `chats` row pushed every
+line, which is the loudest possible behaviour from the absence of a setting.
 
 ## What changed from the single-user design
 
@@ -161,19 +245,24 @@ None of this can be proven offline.
    and set the state icon. Do this *first* — it decides whether the default
    install has a topic list or the linear fallback, and everything else on this
    list is cheaper to interpret once it is known.
-3. Walk the default sign-up from a phone: `/start` → `/key` → `/new` → an
+3. **Run `scripts/probe_topic_icons.py`.** Token only, no chat, read-only, five
+   seconds. It prints the icon pack Telegram actually serves this bot and what
+   each state resolves to, and exits non-zero if any state would fall through
+   to "icon unchanged". The wanted emoji in `_TOPIC_ICONS` are educated
+   guesses; this is the thing that turns them into facts.
+4. Walk the default sign-up from a phone: `/start` → `/key` → `/new` → an
    answer arrives, all in one private chat.
-4. Walk the optional group: `/team` → supergroup with Topics → `/setup <code>`
+5. Walk the optional group: `/team` → supergroup with Topics → `/setup <code>`
    → `/new` in General.
-5. Two real teams at once, each with its own key, staying separate.
-6. Redeploy mid-turn; the answer arrives exactly once.
-7. Watch `/health` for real Conductor and Telegram 429s, and tune the two rate
+6. Two real teams at once, each with its own key, staying separate.
+7. Redeploy mid-turn; the answer arrives exactly once.
+8. Watch `/health` for real Conductor and Telegram 429s, and tune the two rate
    budgets — the current numbers are under the documented ceilings but have
    never met real traffic.
-8. Voice: a team storing its own speech key, then 30 owner recordings
+9. Voice: a team storing its own speech key, then 30 owner recordings
    before moving `voice_mode` from `prompts` to `commands`.
-9. Re-probe a sleeping workspace (probe assumption 8 is still unmeasured).
-10. Curate real tool-heavy and error transcripts; the non-trivial renderer
+10. Re-probe a sleeping workspace (probe assumption 8 is still unmeasured).
+11. Curate real tool-heavy and error transcripts; the non-trivial renderer
     fixtures are still labelled synthetic.
 
 ## Before opening registration to strangers

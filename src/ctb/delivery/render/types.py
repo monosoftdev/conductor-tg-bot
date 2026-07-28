@@ -122,7 +122,10 @@ class BlockKind(StrEnum):
 DEFAULT_MIN_VERBOSITY: Final[dict[BlockKind, Verbosity]] = {
     BlockKind.ANSWER: Verbosity.QUIET,
     BlockKind.ERROR: Verbosity.QUIET,
-    BlockKind.DIFF: Verbosity.NORMAL,
+    # A file edit reaches `normal` as a card activity line, not as chat text —
+    # see `adapters/diff.file_edit_blocks`. This entry governs the chat copy,
+    # which is the verbose-only one.
+    BlockKind.DIFF: Verbosity.VERBOSE,
     BlockKind.TOOL: Verbosity.VERBOSE,
     BlockKind.TOOL_RESULT: Verbosity.VERBOSE,
     BlockKind.THINKING: Verbosity.VERBOSE,
