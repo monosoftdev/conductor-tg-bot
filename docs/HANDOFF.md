@@ -14,7 +14,7 @@ create a supergroup, enable Topics or grant admin rights.
 
 Verified offline, on every commit:
 
-- **2,092 tests pass** against a real PostgreSQL 16.
+- **2,094 tests pass** against a real PostgreSQL 16.
 - `ruff format --check`, `ruff check`, `pyright` — all clean.
 - The real runtime boots against a real database: all six services start,
   `/health` returns `ok`, the lease is acquired, shutdown is clean.
@@ -137,6 +137,21 @@ before, only the push flag and the destination of *progress* moved.
 `Destination.silent` now defaults to `True`, matching `chats.notify`'s own
 default — left at `False`, a session bound without a `chats` row pushed every
 line, which is the loudest possible behaviour from the absence of a setting.
+
+### …and one Stop, not two
+
+The prompt receipt (`→ Login · queued`, shown when the 👀 reaction is refused)
+carried its own Stop, on the theory that a refused reaction left the owner
+without a control. It does not: the reaction has nothing to do with the pinned
+card, which appears either way and already owns Stop. Every task showed two,
+which is two answers to "is this still going?".
+
+The card is the right owner and the bubble was the wrong one to keep, not merely
+the spare. A bubble is a *static* message: its Stop stayed live on screen for
+fifteen minutes after the turn ended, and it targets the **session**, so tapping
+it then cancelled whatever was running by then. `card_buttons` strips Stop from a
+terminal card the moment the turn is over, which is the property that makes a
+control honest.
 
 ## What changed from the single-user design
 

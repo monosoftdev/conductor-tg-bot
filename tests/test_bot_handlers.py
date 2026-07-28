@@ -93,9 +93,10 @@ from ctb.db.repo.chats import ChatRow
 from ctb.db.repo.sessions import SessionRow
 from ctb.db.repo.tenancy import TenantRow
 from ctb.db.repo.workspaces import WorkspaceRow
+from ctb.delivery.status_card import CardState, card_buttons
 from ctb.settings import Settings
 from ctb.turn.cursor import quick_replies_for
-from ctb.turn.state import Cancel, TopicMarker, TurnState
+from ctb.turn.state import Cancel, CardButton, CardKind, TopicMarker, TurnState
 from tests.pg import BOOTSTRAP_TENANT_ID
 
 
@@ -1653,6 +1654,72 @@ async def test_a_bound_dm_root_still_prompts_and_pays_for_no_cockpit_lookup(
     )
 
     assert submitted == ["sess-linear"]
+
+
+async def test_the_prompt_receipt_carries_no_stop_of_its_own(
+    db: Database, monkeypatch: Any
+) -> None:
+    """One task, one Stop. Two of them is two answers to "is this still going?".
+
+    The receipt used to carry a Stop on the theory that a refused 👀 left the
+    user without one — but the reaction has nothing to do with the pinned card,
+    which appears either way and owns Stop. And this was the wrong one to keep:
+    a bubble is static, so its Stop stayed live on screen for fifteen minutes
+    after the turn ended, targeting the *session*, which meant tapping it then
+    killed whatever was running by then. The card's is edited away the moment
+    the turn is over.
+    """
+    bubbles: list[tuple[str, Any]] = []
+
+    async def fake_submit(**_kwargs: Any) -> tuple[str, str]:
+        return ("m1", "queued")
+
+    async def fake_tell(_message: Any, text: str, **kwargs: Any) -> Any:
+        bubbles.append((text, kwargs.get("reply_markup")))
+        return None
+
+    async def refused(_message: Any) -> bool:
+        return False
+
+    monkeypatch.setattr(prompt_handlers, "submit_prompt", fake_submit)
+    monkeypatch.setattr(prompt_handlers, "tell", fake_tell)
+    monkeypatch.setattr(prompt_handlers, "react_received", refused)
+    await sessions_repo.upsert(db, "sess-receipt", chat_id=1050, thread_id=7)
+    message = SimpleNamespace(
+        text="go",
+        chat=SimpleNamespace(id=1050, type="private"),
+        message_thread_id=7,
+        message_id=14,
+        from_user=SimpleNamespace(id=1001),
+    )
+
+    await prompt_handlers.plain_text(
+        message,  # type: ignore[arg-type]
+        Route(
+            chat_id=1050,
+            thread_id=7,
+            kind="dm",
+            session=SessionRow(
+                id="sess-receipt", chat_id=1050, thread_id=7, title="Login"
+            ),
+        ),
+        fake_tenant(_CountingClient()),
+        NonceStore(),
+        db=db,
+    )
+
+    text, markup = bubbles[-1]
+    assert text.startswith("→ <b>Login</b>"), "the receipt itself is still useful"
+    assert markup is None, "the card owns Stop; this is a receipt, not a control"
+
+
+def test_only_a_live_card_offers_the_one_stop() -> None:
+    """…and the card that owns it takes it away the moment the turn is over."""
+    live = CardState(kind=CardKind.WORKING, buttons=(CardButton.STOP,))
+    finished = CardState(kind=CardKind.DONE, buttons=(CardButton.STOP,))
+
+    assert card_buttons(live) == (CardButton.STOP,)
+    assert card_buttons(finished) == ()
 
 
 def test_a_dm_topic_has_no_link_so_the_card_says_where_it_went() -> None:

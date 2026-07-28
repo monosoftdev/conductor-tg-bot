@@ -24,13 +24,10 @@ from ctb.bot.handlers.common import (
 from ctb.bot.handlers.core import DM_COCKPIT_HINT, cockpit_markup, run_find
 from ctb.bot.handlers.topics import resolve_client, resolve_db, topic_title
 from ctb.bot.keyboards import (
-    CONTROL_TTL_S,
     Action,
     Cb,
     NonceError,
     NonceStore,
-    button,
-    keyboard,
     resolve,
 )
 from ctb.bot.middleware.routing import Route
@@ -179,32 +176,20 @@ async def plain_text(
         else route.session_id[:8]
     )
     wording = f"queued ({pending} pending)" if pending > 1 else state
-    markup = keyboard(
-        [
-            [
-                button(
-                    "Stop",
-                    Action.STOP,
-                    route.session_id,
-                    store=nonces,
-                    user_id=message.from_user.id if message.from_user else None,
-                    chat_id=message.chat.id,
-                    thread_id=message.message_thread_id or 0,
-                    # A turn outlives the 60-second default many times over,
-                    # and this bubble is the fallback shown precisely where the
-                    # 👀 reaction was refused — i.e. where it is the only Stop
-                    # the user has. Same lifetime as every other control.
-                    ttl=CONTROL_TTL_S,
-                    restartable=True,
-                )
-            ]
-        ]
-    )
-    await tell(
-        message,
-        f"→ <b>{escape(destination)}</b> · {escape(wording)}",
-        reply_markup=markup,
-    )
+    # **No Stop here.** This bubble is a receipt, and it carried one on the
+    # theory that a refused 👀 left the user without a control — but the
+    # reaction has nothing to do with the pinned card, which appears either way
+    # and owns Stop. Every task therefore showed two, which is two answers to
+    # "is this still going?".
+    #
+    # The card is the right owner and this was the wrong one, not merely the
+    # spare: a bubble is a *static* message, so its Stop was still on screen,
+    # still tappable, fifteen minutes after the turn ended — and it targets the
+    # session rather than the turn, so tapping it then killed whatever was
+    # running by *then*. The card's Stop is edited away the moment the turn
+    # reaches a terminal state (`card_buttons`), which is the property that
+    # makes a control honest.
+    await tell(message, f"→ <b>{escape(destination)}</b> · {escape(wording)}")
 
 
 @router.callback_query(Cb.filter(F.action == Action.STOP.value))
