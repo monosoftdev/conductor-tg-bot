@@ -21,4 +21,7 @@ data/
 # Probe output contains real transcript content (your source code). Only the
 # curated, reviewed fixtures under tests/fixtures/ are committed.
 probe-out/
+# Screenshots, pasted transcripts and scratch notes from a working session.
+# Excluded here, not just in .git/info/exclude, which never leaves this clone.
+.context/
 /actionlint

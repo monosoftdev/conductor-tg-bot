@@ -109,7 +109,7 @@ def is_general_cockpit(message: Message, route: Route) -> bool:
 )
 async def unsupported_attachment(message: Message) -> None:
     """Never silently imply that Conductor saw a binary attachment."""
-    await tell(message, "📎 Not forwarded — text or voice only.", silent=False)
+    await tell(message, "📎 Not forwarded — text or voice only.")
 
 
 @router.message(F.text & ~F.text.startswith("/"))
@@ -425,7 +425,6 @@ async def edited_text(message: Message) -> None:
     await tell(
         message,
         "Edit not resent · send the correction as a new message.",
-        silent=False,
     )
 
 
@@ -471,7 +470,6 @@ async def edited_payload(message: Message) -> None:
     await tell(
         message,
         "Edit not resent · send the correction as a new message.",
-        silent=False,
     )
 
 
@@ -489,6 +487,6 @@ async def unsupported_message(message: Message) -> None:
     if message.content_type in _SERVICE_CONTENT:
         return
     if message.content_type == ContentType.TEXT:
-        await tell(message, "Unknown command · use /help.", silent=False)
+        await tell(message, "Unknown command · use /help.")
         return
-    await tell(message, "📎 Not forwarded — text or voice only.", silent=False)
+    await tell(message, "📎 Not forwarded — text or voice only.")

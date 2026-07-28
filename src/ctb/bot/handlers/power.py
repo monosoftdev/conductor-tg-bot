@@ -72,24 +72,24 @@ register_router(router, order=30)
 #: ``/new`` opens either way. It used to open with "General ·", which named a
 #: room a DM-only user does not have.
 _HELP = """<b>Phone loop</b>
-Here · <code>/new</code>, <code>/attach</code>, <code>/board</code>, or search
+Here · <code>/new</code>, <code>/attach</code>, <code>/board</code>
 In a workspace · send text, voice, or audio
 Result · tap a numbered choice; ✓ is recommended
 
-<code>/mode</code> controls this session
-<code>/s</code> switches session · inside a workspace, only its own
-<code>/fork</code> starts another session here
-<code>/notify</code> sets alerts here
+<code>/stop</code> cancels this turn · also on the pinned card
+<code>/find text</code> searches every transcript you can reach
+<code>/mode</code> agent, model, effort
+<code>/name text</code> renames this session · <code>-w</code> renames the topic
+<code>/s</code> switches session · <code>/fork</code> starts another here
+<code>/notify</code> loud·quiet·off · <code>/done</code> archives, always confirms
 
 <b>Your team</b>
 <code>/team</code> adds a group for several people · optional
 <code>/invite id</code> adds someone · <code>/members</code> lists them
 <code>/key</code> (privately) sets your Conductor key
+<code>/use name</code> picks which team your DMs mean · <code>/leave</code> exits
 <code>/export</code> downloads your data · <code>/privacy</code> explains it
-<code>/use name</code> picks which team your DMs mean · <code>/leave</code> exits one
 <code>/voice on</code> needs your own <code>/voicekey</code> first
-
-Stop from the pinned card. /done always confirms.
 Voice commands need “command” or “команда”."""
 
 #: Buttons ``/s`` shows in General before it says how many it hid.

@@ -70,6 +70,7 @@ from ctb.delivery.outbox import (
 from ctb.delivery.render.chunk import MessagePart, PartKind
 from ctb.delivery.render.types import CodeBlock, TextBlock
 from ctb.delivery.status_card import (
+    CARD_MIN_EDIT_INTERVAL_S,
     CardState,
     StatusCards,
     card_buttons,
@@ -1365,9 +1366,18 @@ async def test_typing_is_sent_every_four_seconds_while_working(
     assert len(bot.calls_to("send_chat_action")) == 2
 
 
-async def test_ten_quiet_minutes_add_stalled_and_a_check_button(
+async def test_the_card_runs_no_stall_detector_of_its_own(
     cards: StatusCards, bot: FakeBot, clock: FakeClock, session: str
 ) -> None:
+    """ "Is it stuck?" is the turn machine's question, and only its question.
+
+    The card used to answer it too, from `last_change_at` — which moves only on
+    a kind change or a tool-activity line. A turn streaming nothing but text
+    therefore got `stalled?` at ten minutes *while it was writing*, and the
+    clear was gated on a kind change, so it kept saying it. The machine
+    measures real transcript deltas and sends `CardKind.STALLED` when it means
+    it.
+    """
     await cards.apply(
         PostStatusCard(CardKind.QUEUED, "queued"), session_id=SESSION, chat_id=CHAT
     )
@@ -1376,11 +1386,34 @@ async def test_ten_quiet_minutes_add_stalled_and_a_check_button(
         session_id=SESSION,
         chat_id=CHAT,
     )
-    clock.advance(601.0)
+
+    clock.advance(3601.0)
     await cards.tick()
 
-    edits = bot.calls_to("edit_message_text")
-    assert edits and "stalled?" in edits[-1]["text"]
+    assert "stalled?" not in bot.calls_to("edit_message_text")[-1]["text"]
+    state = cards.state_for(CHAT)
+    assert state is not None and CardButton.CHECK not in state.buttons
+
+
+async def test_the_machine_saying_stalled_is_what_shows_it(
+    cards: StatusCards, bot: FakeBot, clock: FakeClock, session: str
+) -> None:
+    await cards.apply(
+        PostStatusCard(CardKind.QUEUED, "queued"), session_id=SESSION, chat_id=CHAT
+    )
+    clock.advance(CARD_MIN_EDIT_INTERVAL_S + 1)
+    await cards.apply(
+        EditStatusCard(
+            CardKind.STALLED,
+            "working 20m01s · stalled?",
+            (CardButton.CHECK, CardButton.STOP),
+        ),
+        session_id=SESSION,
+        chat_id=CHAT,
+    )
+
+    text = bot.calls_to("edit_message_text")[-1]["text"]
+    assert "stalled?" in text
     state = cards.state_for(CHAT)
     assert state is not None and CardButton.CHECK in state.buttons
 

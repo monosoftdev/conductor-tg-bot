@@ -1087,6 +1087,36 @@ class Outbox:
             reason=reason,
         )
 
+    async def _say_a_reply_was_dropped(self, row: DeliveryRow) -> None:
+        """Tell the topic that part of an answer will not arrive.
+
+        Best effort by construction: this runs *because* sending to this chat
+        keeps failing, so it may well fail too. It is enqueued rather than sent
+        so it inherits the same retry and ordering as everything else, and its
+        `once_key` keeps a burst of failed parts to one line.
+        """
+        try:
+            await self._enqueue_dropped_notice(row)
+        except Exception as exc:  # never let the notice break the claim loop
+            _log.warning(
+                "outbox.drop_notice_failed",
+                session_id=row.session_id,
+                error=repr(exc)[:200],
+            )
+
+    async def _enqueue_dropped_notice(self, row: DeliveryRow) -> None:
+        await self.enqueue_notice(
+            "⚠️ Part of a reply could not be delivered after "
+            f"{self._max_attempts} attempts. Open 📄 Transcript on the card, "
+            "or read it in Conductor — nothing was lost there.",
+            session_id=row.session_id,
+            key=f"delivery-dropped:{row.session_id}:{row.session_index}",
+            chat_id=row.chat_id,
+            thread_id=row.thread_id,
+            priority=Priority.ERROR,
+            silent=False,
+        )
+
     async def _fail(
         self, row: DeliveryRow, *, exc: BaseException, retry: bool
     ) -> _Outcome:
@@ -1110,6 +1140,11 @@ class Outbox:
                 attempts=row.attempts + 1,
                 error=repr(exc)[:500],
             )
+            # This module's whole claim is that a reply is never lost. When one
+            # is, the person waiting for it is the last who should find out
+            # from a log line — so say it in the chat, with the one control
+            # that can still retrieve the text.
+            await self._say_a_reply_was_dropped(row)
         await deliveries_repo.mark_failed(
             self._db, row.key, error=repr(exc)[:500], retry=will_retry
         )

@@ -14,7 +14,7 @@ create a supergroup, enable Topics or grant admin rights.
 
 Verified offline, on every commit:
 
-- **2,031 tests pass** against a real PostgreSQL 16.
+- **2,058 tests pass** against a real PostgreSQL 16.
 - `ruff format --check`, `ruff check`, `pyright` — all clean.
 - The real runtime boots against a real database: all six services start,
   `/health` returns `ok`, the lease is acquired, shutdown is clean.

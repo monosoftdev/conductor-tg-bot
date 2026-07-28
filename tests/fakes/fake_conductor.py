@@ -769,7 +769,7 @@ class FakeSession:
                 return base | {
                     "type": "system",
                     "subtype": "init",
-                    "cwd": "/home/vercel-sandbox/repo",
+                    "cwd": "/home/agent/repo",
                     "tools": ["Bash", "Read", "Edit", "Write"],
                     "mcp_servers": [{"name": "conductor", "status": "connected"}],
                     "model": self.model_full,

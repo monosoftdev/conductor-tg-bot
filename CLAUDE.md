@@ -4,9 +4,8 @@ A Telegram bot that drives [Conductor](https://conductor.build) cloud coding age
 **Multi-tenant**: one bot token serves many workspaces, each with its own Conductor API key.
 Python 3.13 + aiogram 3 + httpx + PostgreSQL, one stateless Railway service.
 
-**This repo is standalone.** It is not part of `reclaimly-be` and shares no code with it. Ignore any
-reclaimly-be conventions (Alembic migrations, `schema/db.sql`, DB attribute guides, org statuses) —
-none apply here.
+**This repo is standalone.** It shares no code with any other project, so conventions from a
+sibling repository — migration tooling, schema layout, DB attribute guides — do not apply here.
 
 ## Read first
 
@@ -127,7 +126,7 @@ key.
 > **Run only the tests for what you changed. CI runs the whole suite, in
 > parallel, and nothing merges until it is green.**
 
-The full suite is ~1,900 tests. Running all of it after every edit is the single
+The full suite is ~2,000 tests. Running all of it after every edit is the single
 biggest waste of time in this repo, and it buys nothing a shared runner cannot
 buy more cheaply. So locally:
 

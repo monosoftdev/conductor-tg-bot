@@ -4,6 +4,17 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python 3.13](https://img.shields.io/badge/python-3.13-blue.svg)](https://www.python.org/downloads/)
 
+> **Status: alpha.** Every path is covered by 2,058 tests against a real
+> PostgreSQL, and CI gates every merge — but the bot has **not yet been run
+> against a live Conductor account and a live Telegram deployment end to end**.
+> What is proven and what is not is listed under
+> [What is still unproven](#what-is-still-unproven). Treat it as something to
+> read, fork and try, not something to put in front of a customer today.
+
+**Who this is for:** developers who already run [Conductor](https://conductor.build)
+cloud coding agents and want to drive them from a phone — start a workspace,
+send a prompt, read the answer, stop a runaway turn — without opening a laptop.
+
 Drive [Conductor](https://conductor.build) cloud coding agents from Telegram.
 Each workspace gets its own topic — in your private chat with the bot, or in a
 shared group. Send a prompt, watch one compact status card, and get the answer
@@ -138,7 +149,7 @@ curl http://127.0.0.1:8080/health
 
 `ctb_app` is deliberately not a member of `ctb_worker`, so there is no
 `SET ROLE` path from the request path to the bypass role. Repository SQL
-contains no `WHERE tenant_id = ?` anywhere: a forgotten filter returns zero rows
+contains no `WHERE tenant_id = ?` in any tenant-scoped query: a forgotten filter returns zero rows
 rather than another customer's data.
 
 ### Key rotation
@@ -176,8 +187,8 @@ assume it; `overlapSeconds=0` stops the old deployment before the new one polls.
 
 ```bash
 docker compose up -d --wait db
-.venv/bin/python -m pytest -q          # 2031 tests
-.venv/bin/python -m pytest -q -m "not db"   # the 1423 that need no server
+.venv/bin/python -m pytest -q          # 2,058 tests
+.venv/bin/python -m pytest -q -m "not db"   # the 1,442 that need no server
 .venv/bin/python -m ruff format --check src scripts tests
 .venv/bin/python -m ruff check src scripts tests
 .venv/bin/python -m pyright
@@ -222,6 +233,18 @@ Read [`CONTRIBUTING.md`](CONTRIBUTING.md) for the four gates and the
 conventions that are not negotiable. Security reports go through
 [`SECURITY.md`](SECURITY.md), never a public issue.
 
-Architecture and the failure contract are in [`docs/`](docs/).
+Architecture and the failure contract are in [`docs/`](docs/), which has its
+own [index](docs/README.md) saying which files describe the system as built and
+which are kept for their reasoning. Changes worth knowing about are in
+[`CHANGELOG.md`](CHANGELOG.md).
+
+## Third-party licences
+
+This project is MIT (see [`LICENSE`](LICENSE)). Its dependencies are permissive
+with one exception worth naming: **psycopg is LGPL-3.0-only**, and a Docker
+image built from this repository therefore ships LGPL binaries. That does not
+affect your use of this source, and psycopg's own source is available from
+[PyPI](https://pypi.org/project/psycopg/); if you redistribute an image, the
+LGPL's relinking and source-offer terms apply to that component.
 
 MIT licensed, © 2026 Reclaimly, Inc. Not affiliated with Conductor or Telegram.

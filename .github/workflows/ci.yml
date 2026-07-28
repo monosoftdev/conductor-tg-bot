@@ -20,6 +20,11 @@ on:
   pull_request:
   merge_group:
 
+# Nothing in this workflow writes to the repository. Least privilege by default,
+# so a compromised dependency in a test run cannot push, tag or comment.
+permissions:
+  contents: read
+
 concurrency:
   # `ref_name`, not `ref`: a push gives `postgres-multi-tenant` and a pull
   # request's `head_ref` gives the same string, so the two events for one
@@ -65,7 +70,10 @@ jobs:
       # once. Lint the pipeline with the pipeline.
       - name: Workflows
         if: always()
-        uses: docker://rhysd/actionlint:latest
+        # Pinned, not `latest`: this image executes in CI, and on a public
+        # repository an unpinned third-party action is somebody else's
+        # push away from being ours.
+        uses: docker://rhysd/actionlint:1.7.7
         with:
           args: -color
 

@@ -69,7 +69,7 @@ finish between polls, so if `idle` persists, check the transcript for the reply 
 
 | Decision | Choice |
 |---|---|
-| Repo | New standalone repo at `~/Documents/Reclaimly/conductor-tg-bot`, pushed to a new **private** repo under the `Reclaimly` GitHub org |
+| Repo | A standalone repository, since made public under the MIT licence |
 | Stack | Python 3.13, aiogram 3.30, httpx 0.28, aiosqlite, pydantic-settings, structlog |
 | Hosting | One Railway service, Dockerfile builder, `numReplicas = 1`, volume at `/data`, Telegram **long polling** (no public webhook URL to manage) |
 | Chat layout | Private Telegram **supergroup with Forum Topics**. One topic per workspace. `General` = cockpit. DM = degraded fallback mode |
@@ -375,7 +375,9 @@ Renamed only on state *transitions*, never on a timer (rename is an API call).
 
 ### Commands
 
-BotFather menu — six, the whole daily loop:
+BotFather menu — the daily loop. *(Shipped with seventeen: this six plus
+`/attach`, `/s`, `/fork`, `/notify`, `/setup`, `/invite`, `/use`, `/health`,
+`/register`, `/key` and `/help` — see `src/ctb/bot/app.py`.)*
 
 | Command | Syntax | Help | Driven by |
 |---|---|---|---|
@@ -390,7 +392,7 @@ Power (via `/help`, not in the menu): `/s [query]` switch bound session · `/for
 in this workspace · `/name <text>` rename (`-w` for workspace) · `/open` deep link · `/desk` handoff
 card · `/log [n]` raw messages as `.md` · `/notify loud|quiet|off` · `/defaults` · `/sql <SELECT>` ·
 `/tidy` close archived + 7-day-idle topics.
-Admin: `/allow <id>` · `/deny <id>` · `/health` (poll lag, circuit state, last 20 `api_events`,
+Admin: `/allow <id>` · `/deny <id>` *(shipped as `/invite` and `/remove`)* · `/health` (poll lag, circuit state, last 20 `api_events`,
 pending deliveries, unknown content types, lease holder, uptime).
 
 Rule applied throughout: nothing destructive is argument-driven, nothing frequent is

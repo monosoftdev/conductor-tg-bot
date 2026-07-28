@@ -577,8 +577,10 @@ async def test_binary_attachment_is_never_silently_ignored(monkeypatch: Any) -> 
     monkeypatch.setattr(prompt_handlers, "tell", fake_tell)
     await prompt_handlers.unsupported_attachment(SimpleNamespace())  # type: ignore[arg-type]
 
-    # Shorter, but still a push: the user believes they just sent something.
-    assert replies == [("📎 Not forwarded — text or voice only.", False)]
+    # Answered, but not a push. "Never silently ignored" is about getting a
+    # reply; the phone is already in the reader's hand, and `tell` reserves the
+    # buzz for something they have to act on.
+    assert replies == [("📎 Not forwarded — text or voice only.", True)]
 
 
 async def test_unknown_commands_and_future_payloads_always_answer(
@@ -598,8 +600,8 @@ async def test_unknown_commands_and_future_payloads_always_answer(
     )
 
     assert replies == [
-        ("Unknown command · use /help.", False),
-        ("📎 Not forwarded — text or voice only.", False),
+        ("Unknown command · use /help.", True),
+        ("📎 Not forwarded — text or voice only.", True),
     ]
 
 
@@ -637,8 +639,8 @@ async def test_edit_and_stale_callback_never_fail_silently(monkeypatch: Any) -> 
     )
 
     assert replies == [
-        ("Edit not resent · send the correction as a new message.", False),
-        ("Edit not resent · send the correction as a new message.", False),
+        ("Edit not resent · send the correction as a new message.", True),
+        ("Edit not resent · send the correction as a new message.", True),
     ]
     assert answers == [("Expired control · run /mode for fresh buttons.", True)]
 
@@ -835,7 +837,7 @@ async def test_board_counts_workspaces_not_sessions(db: Database) -> None:
                     "session_id": f"session-{index}",
                     "workspace_id": "workspace-busy",
                     "session_title": "Review project architecture",
-                    "workspace_name": "reclaimly-be/main",
+                    "workspace_name": "acme-api/main",
                     "workspace_state": "ready",
                     "model": "opus-5-1m",
                     "transcript_updated_at": 300 - index,
@@ -847,7 +849,7 @@ async def test_board_counts_workspaces_not_sessions(db: Database) -> None:
                     "session_id": "session-other",
                     "workspace_id": "workspace-quiet",
                     "session_title": "Something else",
-                    "workspace_name": "tg-1132334-iszvwjeb",
+                    "workspace_name": "tg-100200300-iszvwjeb",
                     "workspace_state": "ready",
                     "model": "opus-5-1m",
                     "transcript_updated_at": 100,
@@ -1757,7 +1759,9 @@ async def test_a_wizard_button_minted_before_a_redeploy_still_works(
     )
 
     assert tap.answers == [""]
-    assert edits == ["Agent?"]
+    # The breadcrumb carries what has been picked so far, so a mis-tap is
+    # visible before a workspace has been paid for.
+    assert edits == ["<i>project-1/dev</i>\nAgent?"]
     assert (await _seat(db).get_data())["branch"] == "dev"
 
 
@@ -2061,7 +2065,9 @@ async def test_a_button_from_an_older_build_redraws_the_card_instead_of_dead_end
     )
 
     assert stale.answers == [new_workspace.REFRESHED_MESSAGE]
-    assert edits == ["Branch? Type it or tap."], "the step is redrawn, not skipped"
+    assert edits == ["<i>project-1</i>\nBranch? Type it or tap."], (
+        "the step is redrawn, not skipped"
+    )
     # The redraw is not a state change: the wizard is still on branch.
     assert (await _seat(db).get_data())["step"] == "branch"
 
@@ -2322,12 +2328,12 @@ def test_a_topic_name_always_fits_telegrams_limit() -> None:
 
 
 def test_the_reconciliation_key_never_reaches_a_person() -> None:
-    """``tg-1132334-iszvwjeb`` is how an ambiguous create is reconciled.
+    """``tg-100200300-iszvwjeb`` is how an ambiguous create is reconciled.
 
-    It was rendered straight into ``+ Open tg-1132334-iszvwjeb`` and, through
+    It was rendered straight into ``+ Open tg-100200300-iszvwjeb`` and, through
     adoption, into the topic title itself.
     """
-    assert topics.human_name("tg-1132334-iszvwjeb") == ""
+    assert topics.human_name("tg-100200300-iszvwjeb") == ""
     assert topics.human_name("tg-100200300-a1b2c3d4") == ""
     assert topics.human_name(None) == ""
     assert topics.human_name("  ") == ""
@@ -2340,7 +2346,7 @@ def test_the_reconciliation_key_never_reaches_a_person() -> None:
 async def test_the_board_falls_back_to_the_task_when_the_name_is_internal(
     db: Database,
 ) -> None:
-    """What the user saw: a button reading `+ Open tg-1132334-iszvwjeb`."""
+    """What the user saw: a button reading `+ Open tg-100200300-iszvwjeb`."""
 
     class Internal:
         async def sql(self, _query: str) -> SqlResult:
@@ -2350,7 +2356,7 @@ async def test_the_board_falls_back_to_the_task_when_the_name_is_internal(
                         "session_id": "s-1",
                         "workspace_id": "w-1",
                         "session_title": "Review project architecture",
-                        "workspace_name": "tg-1132334-iszvwjeb",
+                        "workspace_name": "tg-100200300-iszvwjeb",
                         "workspace_state": "ready",
                         "model": "opus-5-1m",
                         "transcript_updated_at": 1,
@@ -2362,7 +2368,7 @@ async def test_the_board_falls_back_to_the_task_when_the_name_is_internal(
     rows = await core_handlers.board_rows(db, Internal())  # type: ignore[arg-type]
     line = core_handlers.board_lines(rows)[1]
 
-    assert "tg-1132334" not in line
+    assert "tg-100200300" not in line
     assert "Review project architecture" in line
 
 
@@ -2415,3 +2421,35 @@ async def test_a_rename_in_an_unknown_topic_is_left_alone(db: Database) -> None:
     await prompt_handlers.tidy_rename_notice(service, db=db)  # type: ignore[arg-type]
 
     assert service.deleted is False
+
+
+def test_the_wizard_shows_what_has_been_picked_so_far() -> None:
+    """Five taps used to leave no trace of themselves."""
+    data = {
+        "projects": {"p-1": "acme-api"},
+        "project_id": "p-1",
+        "branch": "main",
+        "agent": "claude",
+        "model": "opus-5-1m",
+        "effort": "high",
+    }
+
+    assert new_workspace.chosen_line(data, upto="project") == ""
+    assert new_workspace.chosen_line(data, upto="branch") == "acme-api"
+    assert new_workspace.chosen_line(data, upto="agent") == "acme-api/main"
+    assert new_workspace.chosen_line(data, upto="model") == "acme-api/main · claude"
+    # The final card, before anything is paid for, shows all of it.
+    assert (
+        new_workspace.chosen_line(data, upto="")
+        == "acme-api/main · claude · opus-5-1m · high"
+    )
+
+
+def test_the_breadcrumb_names_the_project_not_its_id() -> None:
+    data = {"projects": {"p-1": "acme-api"}, "project_id": "p-1", "branch": "dev"}
+    assert new_workspace.chosen_line(data, upto="agent") == "acme-api/dev"
+
+
+def test_the_breadcrumb_skips_what_has_not_been_answered() -> None:
+    data = {"projects": {}, "project_id": "p-1", "agent": "codex"}
+    assert new_workspace.chosen_line(data, upto="") == "p-1 · codex"

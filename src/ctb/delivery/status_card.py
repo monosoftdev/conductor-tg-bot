@@ -81,7 +81,6 @@ __all__ = [
     "BUTTON_LABELS",
     "CARD_EMOJI",
     "CARD_MIN_EDIT_INTERVAL_S",
-    "CARD_STALL_AFTER_S",
     "CARD_TICK_S",
     "CardSender",
     "CardState",
@@ -103,8 +102,14 @@ CARD_MIN_EDIT_INTERVAL_S: Final = 3.0
 #: ``sendChatAction("typing")`` every 4s while WORKING — Telegram expires the
 #: indicator after ~5s, so this is the slowest cadence that looks continuous.
 TYPING_INTERVAL_S: Final = 4.0
-#: "At 10 min with no new messages the card adds `stalled?` + a Check button."
-CARD_STALL_AFTER_S: Final = 600.0
+#: "Is it stuck?" is answered in exactly one place: the turn machine's rule 21,
+#: which measures it against real transcript deltas and emits `CardKind.STALLED`
+#: with the word and the Check button. The card used to run a *second* detector
+#: off `last_change_at` — which only moves on a kind change or a tool-activity
+#: line, so a turn streaming nothing but text was called `stalled?` at ten
+#: minutes while it was actively writing, and, because the clear was gated on a
+#: kind change, kept saying it for the rest of the turn. Two clocks rendering
+#: one word, disagreeing.
 #: How often :meth:`StatusCards.run` re-renders live cards. The 3s edit floor,
 #: not this, decides how many API calls that costs.
 CARD_TICK_S: Final = 1.0
@@ -296,7 +301,6 @@ class CardState:
     buttons: tuple[CardButton, ...] = ()
     #: Monotonic seconds when the turn started, for the live elapsed counter.
     started_at: float | None = None
-    stalled: bool = False
     summary: TurnSummary | None = None
     #: USD this turn has cost, from the agent's own ``result`` payload. Shown
     #: only on a finished card, so it can never sit beside a live clock.
@@ -343,7 +347,7 @@ def _segments(state: CardState, *, now: float) -> list[str]:
     if state.activity and state.kind not in TERMINAL_KINDS:
         # "What it is doing right now" only makes sense while there is a now.
         segments.append(state.activity)
-    if state.stalled or state.kind is CardKind.STALLED:
+    if state.kind is CardKind.STALLED:
         segments.append(_STALLED_SEGMENT)
     summary = state.summary
     if summary is not None and state.kind is CardKind.DONE and summary.files_changed:
@@ -403,7 +407,6 @@ class StatusCards:
         keyboard: KeyboardFactory = default_keyboard,
         min_edit_interval: float = CARD_MIN_EDIT_INTERVAL_S,
         typing_interval: float = TYPING_INTERVAL_S,
-        stall_after: float = CARD_STALL_AFTER_S,
         tick_interval: float = CARD_TICK_S,
         pin: bool = True,
         pacer: TelegramPacer | None = None,
@@ -415,7 +418,6 @@ class StatusCards:
         self._keyboard = keyboard
         self._min_edit_interval = max(0.0, min_edit_interval)
         self._typing_interval = max(0.1, typing_interval)
-        self._stall_after = max(0.0, stall_after)
         self._tick_interval = max(0.01, tick_interval)
         self._pin = pin
         #: The *same* instance the outbox uses, in production. Cards are a
@@ -735,12 +737,7 @@ class StatusCards:
                     thread_id=thread_id,
                     deep_link=deep_link,
                 )
-                card.state = replace(
-                    card.state,
-                    summary=summary,
-                    stalled=False,
-                    activity="",
-                )
+                card.state = replace(card.state, summary=summary, activity="")
                 card.typing = False
                 card.dirty = True
                 return True
@@ -752,13 +749,11 @@ class StatusCards:
     ) -> None:
         """Keep the elapsed-time anchor and the stall clock honest."""
         if kind is CardKind.QUEUED:
-            card.state = replace(card.state, started_at=None, stalled=False)
+            card.state = replace(card.state, started_at=None)
         elif kind in (CardKind.STARTED, CardKind.WORKING) and (
             card.state.started_at is None
         ):
             card.state = replace(card.state, started_at=now)
-        if kind is not CardKind.STALLED and kind is not previous:
-            card.state = replace(card.state, stalled=False)
         if kind is not previous:
             card.last_change_at = now
 
@@ -786,18 +781,6 @@ class StatusCards:
                     self._typing_interval
                 ):
                     await self._send_typing(card, now)
-                if (
-                    card.state.kind is CardKind.WORKING
-                    and not card.state.stalled
-                    and self._stall_after > 0
-                    and (now - card.last_change_at) >= self._stall_after
-                ):
-                    card.state = replace(
-                        card.state,
-                        stalled=True,
-                        buttons=_with_check(card.state.buttons),
-                    )
-                    card.dirty = True
                 if card.state.kind in _LIVE_KINDS:
                     # Cheap: _flush suppresses the API call when the rendered
                     # text is unchanged, and the 3s floor caps it regardless.
@@ -1118,7 +1101,3 @@ class StatusCards:
             thread_id=card.thread_id,
             error=repr(exc)[:500],
         )
-
-
-def _with_check(buttons: tuple[CardButton, ...]) -> tuple[CardButton, ...]:
-    return buttons if CardButton.CHECK in buttons else (*buttons, CardButton.CHECK)

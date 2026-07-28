@@ -2,7 +2,8 @@
 
 Three fixture corpora, three jobs:
 
-* ``probe_verified.jsonl`` — real envelopes from the Phase 0 live run. These
+* ``probe_verified.jsonl`` — real envelope *shapes* from the Phase 0 live run,
+  with every identifier replaced before the repository was made public. These
   pin the shapes we *know*.
 * ``synthetic_unverified.jsonl`` — hand-written tool calls, diffs, reasoning
   and failures. The org had no sessions carrying those when the probe ran, so
