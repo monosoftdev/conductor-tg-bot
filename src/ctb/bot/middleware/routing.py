@@ -52,7 +52,7 @@ from aiogram.types import (
 )
 from aiogram.types import Update as TgUpdate
 
-from ctb.db import NO_THREAD_ID
+from ctb.db import GENERAL_TOPIC_ID, NO_THREAD_ID
 from ctb.db.connection import Database, get_database
 from ctb.db.repo import chats as chats_repo
 from ctb.db.repo import deliveries as deliveries_repo
@@ -280,9 +280,19 @@ def _thread_id(context: EventContext, event: TelegramObject) -> int:
     one — so a private chat falls back to the raw ``message_thread_id``. In a
     private chat there is nothing else it could mean.
     """
-    if context.thread_id:
-        return context.thread_id
     chat = context.chat
+    if context.thread_id:
+        if context.thread_id == GENERAL_TOPIC_ID and (
+            chat is not None and chat.type in {"group", "supergroup"}
+        ):
+            # A forum's built-in General topic is thread 1, and Telegram tags
+            # its messages inconsistently. Left alone it produces a *second*
+            # identity for the one seat that is always there: a `chats` row, a
+            # focus, wizard state and deliveries all keyed on 1, while `/setup`
+            # wrote 0. Normalise once, here, instead of patching `{0, 1}` into
+            # each of the many places that ask.
+            return NO_THREAD_ID
+        return context.thread_id
     if chat is None or chat.type != "private":
         return NO_THREAD_ID
     message = _message_of(event)

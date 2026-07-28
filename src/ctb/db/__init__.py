@@ -22,6 +22,12 @@ from ctb.db.migrate import apply_migrations, current_schema_version
 #: silently break the uniqueness of the `(chat_id, thread_id)` routing key.
 NO_THREAD_ID: Final = 0
 
+#: A forum supergroup's built-in General topic. Telegram assigns it thread 1 and
+#: tags its messages inconsistently, so routing folds it into `NO_THREAD_ID`:
+#: the one seat that is always present must have exactly one identity, or
+#: `/setup` binds 0 while the prompts typed beside it bind 1.
+GENERAL_TOPIC_ID: Final = 1
+
 #: `content_json` is capped at this many bytes per transcript message. The
 #: content is the user's source code; we keep enough to render, not an archive.
 MAX_CONTENT_BYTES: Final = 64 * 1024
@@ -30,6 +36,7 @@ MAX_CONTENT_BYTES: Final = 64 * 1024
 TRANSCRIPT_RETENTION_DAYS: Final = 30
 
 __all__ = [
+    "GENERAL_TOPIC_ID",
     "MAX_CONTENT_BYTES",
     "NO_THREAD_ID",
     "TRANSCRIPT_RETENTION_DAYS",

@@ -634,7 +634,8 @@ async def typed_prompt(
     )
     label = "Open topic" if created.thread_id else "Open in Conductor"
     markup = keyboard([[url_button(label, target)]]) if target else None
-    text = f"✓ <b>{escape(created.label)}</b>"
+    # Same shape as `/new` and adopt: one event should not have three faces.
+    text = f"→ <b>{escape(created.label)}</b>"
     if wizard_row is not None and wizard_row.tg_message_id is not None:
         card = message.model_copy(update={"message_id": wizard_row.tg_message_id})
         await _edit(card, text, markup)

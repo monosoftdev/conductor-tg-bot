@@ -914,6 +914,34 @@ async def test_general_is_thread_zero_and_is_not_a_topic(db: Database) -> None:
     assert route.session_id is None
 
 
+async def test_general_tagged_as_thread_one_is_still_thread_zero(db: Database) -> None:
+    """Telegram tags a forum's General topic as thread ``1``, inconsistently.
+
+    Untouched that gives the one seat that is always present two identities:
+    ``/setup`` binds ``(chat, 0)`` while the prompts typed beside it bind
+    ``(chat, 1)`` — a different chats row, focus, wizard state and delivery
+    stream, in the same visible room.
+    """
+    await seed_binding(
+        db, chat_id=GROUP_ID, thread_id=TOPIC_ID, session_id="sess-topic"
+    )
+    update = Update(update_id=1, message=_message(OWNER_ID, thread_id=1))
+    route = await route_for(RoutingMiddleware(db=db), update, db)
+    assert route.key == (GROUP_ID, 0)
+    assert route.is_general
+    assert not route.is_topic
+
+
+async def test_a_dm_thread_one_is_a_real_topic(db: Database) -> None:
+    """The fold is forum-only. A DM topic numbered 1 is somebody's workspace."""
+    update = Update(
+        update_id=1,
+        message=_message(OWNER_ID, chat_id=DM_ID, chat_type="private", thread_id=1),
+    )
+    route = await route_for(RoutingMiddleware(db=db), update, db)
+    assert route.key == (DM_ID, 1)
+
+
 async def test_dm_falls_out_as_thread_zero(db: Database) -> None:
     """The NULL/DM case: a private chat has no thread, so ``thread_id == 0``."""
     await seed_binding(
@@ -1153,10 +1181,16 @@ def test_confirm_button_contains_the_name() -> None:
     assert markup.inline_keyboard[1][0].text == "Cancel"
 
 
-def test_a_very_long_name_still_shows_its_distinguishing_tail() -> None:
-    label = confirm_label("Archive", "monorepo/" + "x" * 80 + "/feature-branch")
-    assert label.startswith("Archive ")
-    assert label.endswith("feature-branch")
+def test_a_very_long_name_keeps_the_verb_and_the_start_of_the_name() -> None:
+    """Destructive confirms must never lose the verb to a long name.
+
+    Labels lead with what distinguishes them now, so truncation keeps the head:
+    the tail of a topic label is a branch that is nearly always ``main``.
+    """
+    label = confirm_label("Archive", "drop the stale migrations · " + "x" * 80)
+
+    assert label.startswith("Archive drop the stale migrations")
+    assert label.endswith("…")
     assert len(label) <= 48 + len("Archive ")
 
 

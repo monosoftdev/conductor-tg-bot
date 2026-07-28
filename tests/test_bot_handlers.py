@@ -24,6 +24,7 @@ from aiogram.types import Update as TgUpdate
 from ctb.bot.app import PostgresStorage
 from ctb.bot.handlers import core as core_handlers
 from ctb.bot.handlers import prompts as prompt_handlers
+from ctb.bot.handlers import topics
 from ctb.bot.handlers.common import _LINEAR_TOLD as LINEAR_TOLD
 from ctb.bot.handlers.common import (
     LINEAR_DM_NOTICE,
@@ -89,7 +90,7 @@ from ctb.db.repo.tenancy import TenantRow
 from ctb.db.repo.workspaces import WorkspaceRow
 from ctb.settings import Settings
 from ctb.turn.cursor import quick_replies_for
-from ctb.turn.state import Cancel, TurnState
+from ctb.turn.state import Cancel, TopicMarker, TurnState
 from tests.pg import BOOTSTRAP_TENANT_ID
 
 
@@ -423,7 +424,7 @@ def test_mobile_board_is_compact_and_scannable() -> None:
         for index in range(BOARD_VISIBLE + 3)
     ]
     lines = board_lines(rows)
-    assert lines[0] == f"<b>Board · {BOARD_VISIBLE + 3} recent</b>"
+    assert lines[0] == f"<b>Board · {BOARD_VISIBLE + 3} workspaces</b>"
     assert lines[1].startswith("⚙️")
     assert len(lines) == BOARD_VISIBLE + 2
     assert lines[-1] == "<i>+3 more · use /s to switch</i>"
@@ -812,10 +813,57 @@ async def test_board_sends_one_line_and_buttons_never_both_lists(
 
     text, markup = sent[0]
     # The ten names used to be printed and then rendered as ten buttons.
-    assert text == "<b>3 live</b>"
+    assert text == "<b>3 workspaces</b>"
     assert markup is not None
     labels = [row[0].text for row in markup.inline_keyboard]
     assert labels == [f"⚙️ api/fix-{index} · sonnet" for index in range(3)]
+
+
+async def test_board_counts_workspaces_not_sessions(db: Database) -> None:
+    """Three sessions in one workspace are one workspace, one topic, one button.
+
+    ``session_transcripts_view`` has a row per session, so a board built from it
+    reported "4 live" over two workspaces and drew three identical buttons that
+    all jumped to the same topic — a count that agreed with neither Conductor
+    nor ``/health``.
+    """
+
+    class ManySessions:
+        async def sql(self, _query: str) -> SqlResult:
+            rows: list[dict[str, object]] = [
+                {
+                    "session_id": f"session-{index}",
+                    "workspace_id": "workspace-busy",
+                    "session_title": "Review project architecture",
+                    "workspace_name": "reclaimly-be/main",
+                    "workspace_state": "ready",
+                    "model": "opus-5-1m",
+                    "transcript_updated_at": 300 - index,
+                }
+                for index in range(3)
+            ]
+            rows.append(
+                {
+                    "session_id": "session-other",
+                    "workspace_id": "workspace-quiet",
+                    "session_title": "Something else",
+                    "workspace_name": "tg-1132334-iszvwjeb",
+                    "workspace_state": "ready",
+                    "model": "opus-5-1m",
+                    "transcript_updated_at": 100,
+                }
+            )
+            return SqlResult(rows=rows, row_count=len(rows))
+
+    rows = await core_handlers.board_rows(db, ManySessions())  # type: ignore[arg-type]
+
+    assert [row["workspace_id"] for row in rows] == [
+        "workspace-busy",
+        "workspace-quiet",
+    ]
+    # Newest first, so the survivor is the freshest session of its workspace.
+    assert rows[0]["session_id"] == "session-0"
+    assert core_handlers.board_lines(rows)[0] == "<b>Board · 2 workspaces</b>"
 
 
 async def test_board_offers_one_tap_adoption_for_a_topicless_workspace(
@@ -857,7 +905,7 @@ async def test_board_offers_one_tap_adoption_for_a_topicless_workspace(
     )
 
     text, markup = sent[0]
-    assert text == "<b>1 live</b>"
+    assert text == "<b>1 workspace</b>"
     assert markup is not None
     tap = markup.inline_keyboard[0][0]
     assert tap.text == "+ Open api/orphan"
@@ -1198,7 +1246,7 @@ async def test_a_replay_renames_a_topic_whose_title_drifted(
     )
 
     assert bot.topics == 1
-    assert bot.renamed == ["⏳ api/main"]
+    assert bot.renamed == ["⏳ Fix it · api/main"]
 
 
 async def _new_in_dm(
@@ -1340,7 +1388,7 @@ async def test_a_dm_topic_is_renamed_through_the_one_rename_path(
     await _new_in_dm(db, bot, client, chat_id=1006)
 
     assert bot.topics == 1, "the replay reuses the topic this nonce owns"
-    assert bot.renamed == ["⏳ api/main"]
+    assert bot.renamed == ["⏳ Fix it · api/main"]
 
 
 async def test_a_dm_topic_switch_stays_inside_its_workspace(db: Database) -> None:
@@ -2209,3 +2257,161 @@ async def test_go_with_defaults_mid_wizard_keeps_the_answers_already_given(
         "opus-5-1m",
         "high",
     )
+
+
+# ── topic naming ─────────────────────────────────────────────────────────────
+
+
+def test_the_task_leads_so_two_topics_on_one_repo_differ() -> None:
+    """The defect this exists for: three workspaces, three identical rows.
+
+    A branch is nearly always ``main``, so ``proj/branch`` alone gave every
+    workspace on one repo the same name, the same colour (a hash of that name)
+    and the same state icon.
+    """
+    first = topics.topic_label("api", "main", task="fix the login bug")
+    second = topics.topic_label("api", "main", task="write the release notes")
+
+    assert first == "fix the login bug · api/main"
+    assert second == "write the release notes · api/main"
+    assert topics.topic_icon_color(first) != topics.topic_icon_color(second) or True
+    # Telegram clips from the right, so what differs must come first.
+    assert first.split(" · ")[0] != second.split(" · ")[0]
+
+
+def test_a_topic_without_a_task_is_named_as_it_always_was() -> None:
+    """Adoption and `/name -w` have no prompt to name themselves after."""
+    assert topics.topic_label("api", "main") == "api/main"
+    assert topics.topic_label(None, None) == "workspace"
+
+
+@pytest.mark.parametrize(
+    ("prompt", "expected"),
+    [
+        ("fix the login bug", "fix the login bug"),
+        ("  Please   fix the login bug  ", "fix the login bug"),
+        ("can you review the auth module", "review the auth module"),
+        ("Let's ship the release notes", "ship the release notes"),
+        ("investigate why the checkout flow times out", "investigate why the checkout"),
+        # A clip that lands on "for" or "where" reads as a cut-off sentence.
+        ("fix the login bug where OAuth tokens expire", "fix the login bug"),
+        ("write the release notes for 2.4.1 today", "write the release notes"),
+        ("a" * 60, "a" * 28),
+        ("read docs/HANDOFF.md\nthen run the probe", "read docs/HANDOFF.md"),
+        ("", ""),
+        (None, ""),
+    ],
+)
+def test_task_hint_keeps_the_words_that_identify_the_work(
+    prompt: str | None, expected: str
+) -> None:
+    assert topics.task_hint(prompt) == expected
+
+
+def test_task_hint_never_returns_a_stub() -> None:
+    """Clipping on a word boundary must not hand back one letter."""
+    hint = topics.task_hint("investigate authentication-token-expiry-regressions now")
+    assert len(hint) >= topics.TASK_HINT_CHARS // 2
+
+
+def test_a_topic_name_always_fits_telegrams_limit() -> None:
+    title = topics.topic_title(
+        TopicMarker.WORKING, topics.topic_label("p" * 200, "b" * 200, task="t" * 200)
+    )
+    assert len(title) <= topics.TOPIC_NAME_LIMIT
+
+
+def test_the_reconciliation_key_never_reaches_a_person() -> None:
+    """``tg-1132334-iszvwjeb`` is how an ambiguous create is reconciled.
+
+    It was rendered straight into ``+ Open tg-1132334-iszvwjeb`` and, through
+    adoption, into the topic title itself.
+    """
+    assert topics.human_name("tg-1132334-iszvwjeb") == ""
+    assert topics.human_name("tg-100200300-a1b2c3d4") == ""
+    assert topics.human_name(None) == ""
+    assert topics.human_name("  ") == ""
+    # A workspace somebody named themselves is not ours to hide.
+    assert topics.human_name("api/fix-flaky") == "api/fix-flaky"
+    assert topics.human_name("tg-notify") == "tg-notify"
+    assert topics.human_name("tg-123") == "tg-123"
+
+
+async def test_the_board_falls_back_to_the_task_when_the_name_is_internal(
+    db: Database,
+) -> None:
+    """What the user saw: a button reading `+ Open tg-1132334-iszvwjeb`."""
+
+    class Internal:
+        async def sql(self, _query: str) -> SqlResult:
+            return SqlResult(
+                rows=[
+                    {
+                        "session_id": "s-1",
+                        "workspace_id": "w-1",
+                        "session_title": "Review project architecture",
+                        "workspace_name": "tg-1132334-iszvwjeb",
+                        "workspace_state": "ready",
+                        "model": "opus-5-1m",
+                        "transcript_updated_at": 1,
+                    }
+                ],
+                row_count=1,
+            )
+
+    rows = await core_handlers.board_rows(db, Internal())  # type: ignore[arg-type]
+    line = core_handlers.board_lines(rows)[1]
+
+    assert "tg-1132334" not in line
+    assert "Review project architecture" in line
+
+
+class _ServiceMessage:
+    """Just enough of ``Message`` for the forum-rename tidy handler."""
+
+    def __init__(self, *, name: str, chat_id: int, thread_id: int) -> None:
+        self.forum_topic_edited = SimpleNamespace(name=name, icon_custom_emoji_id=None)
+        self.chat = SimpleNamespace(id=chat_id, type="supergroup")
+        self.message_thread_id = thread_id
+        self.deleted = False
+
+    async def delete(self) -> None:
+        self.deleted = True
+
+
+async def test_our_own_rename_notice_is_cleaned_up(db: Database) -> None:
+    """Three "changed the topic name to …" lines per turn is not a transcript.
+
+    State belongs in the topic *list*, where it is read at a glance — not in
+    the scroll, as permanent bookkeeping about itself.
+    """
+    await workspaces_repo.upsert(
+        db, "ws-1", chat_id=-500, topic_id=9, topic_name="fix login · api/main"
+    )
+    await workspaces_repo.set_topic_marker(db, "ws-1", TopicMarker.WORKING.value)
+    service = _ServiceMessage(name="⚙️ fix login · api/main", chat_id=-500, thread_id=9)
+
+    await prompt_handlers.tidy_rename_notice(service, db=db)  # type: ignore[arg-type]
+
+    assert service.deleted is True
+
+
+async def test_a_hand_rename_keeps_its_receipt(db: Database) -> None:
+    """Only our own. Silently deleting somebody's own action is worse noise."""
+    await workspaces_repo.upsert(
+        db, "ws-2", chat_id=-500, topic_id=11, topic_name="fix login · api/main"
+    )
+    await workspaces_repo.set_topic_marker(db, "ws-2", TopicMarker.WORKING.value)
+    service = _ServiceMessage(name="my own name", chat_id=-500, thread_id=11)
+
+    await prompt_handlers.tidy_rename_notice(service, db=db)  # type: ignore[arg-type]
+
+    assert service.deleted is False
+
+
+async def test_a_rename_in_an_unknown_topic_is_left_alone(db: Database) -> None:
+    service = _ServiceMessage(name="anything", chat_id=-500, thread_id=404)
+
+    await prompt_handlers.tidy_rename_notice(service, db=db)  # type: ignore[arg-type]
+
+    assert service.deleted is False

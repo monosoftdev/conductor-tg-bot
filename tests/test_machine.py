@@ -429,11 +429,13 @@ def test_rule_08_does_not_fire_once_the_turn_has_started() -> None:
     ("workspace", "marker"),
     [
         (WorkspaceStatusValue.INITIALIZING, TopicMarker.INITIALIZING),
-        (WorkspaceStatusValue.SLEEPING, TopicMarker.SLEEPING),
+        # QUEUED carries an outstanding prompt, so 💤 would be a lie: the reader
+        # is waiting on us, not looking at a parked workspace. IDLE has none.
+        (WorkspaceStatusValue.SLEEPING, TopicMarker.INITIALIZING),
         (WorkspaceStatusValue.UPDATING, TopicMarker.INITIALIZING),
     ],
 )
-@pytest.mark.parametrize("start", [TurnState.IDLE, TurnState.QUEUED])
+@pytest.mark.parametrize("start", [TurnState.QUEUED])
 def test_rule_09_workspace_waking(
     workspace: WorkspaceStatusValue, marker: TopicMarker, start: TurnState
 ) -> None:
@@ -450,6 +452,33 @@ def test_rule_09_workspace_waking(
     assert card.text == "waking · cloning repo"
     assert actions_of(result, Notify) == []
     assert cadence_set(result) == CADENCE_WAKING_MS
+
+
+def test_rule_09_says_asleep_only_when_nothing_is_waiting() -> None:
+    """💤 is "parked", not "starting up". With nothing outstanding it is true."""
+    parked = step(ctx(TurnState.IDLE), Ws(WorkspaceStatusValue.SLEEPING), T0 + 1)
+    assert actions_of(parked, SetTopicMarker)[0].marker is TopicMarker.SLEEPING
+
+
+def test_a_prompt_marks_the_topic_waiting_before_anything_runs() -> None:
+    """The topic list must stop saying ✅ the moment a new prompt is accepted."""
+    result = step(ctx(TurnState.IDLE), PostOk("m-new", "queued", 7), T0 + 1)
+
+    assert result.state is TurnState.QUEUED
+    assert actions_of(result, SetTopicMarker)[0].marker is TopicMarker.INITIALIZING
+
+
+def test_a_waking_turn_never_flickers_through_a_blank_prefix() -> None:
+    """⏳ → blank → ⚙️ inside two polls was two renames saying nothing.
+
+    Every rename is a permanent "changed the topic name to …" line in the
+    topic, so a prefix that lives for one poll interval is pure scroll.
+    """
+    waking = step(ctx(TurnState.QUEUED), Ws(WorkspaceStatusValue.INITIALIZING), T0 + 1)
+    ready = step(waking.context, Ws(WorkspaceStatusValue.READY), T0 + 40)
+
+    assert actions_of(waking, SetTopicMarker)[0].marker is TopicMarker.INITIALIZING
+    assert actions_of(ready, SetTopicMarker)[0].marker is TopicMarker.INITIALIZING
 
 
 def test_rule_09_never_notifies() -> None:
@@ -471,7 +500,9 @@ def test_rule_10_waking_ready_resumes_the_queue() -> None:
     assert result.context.start_witnessed is False
     assert cadence_set(result) == CADENCE_QUEUED_MS
     assert [action.message_id for action in actions_of(result, RePost)] == [MID]
-    assert actions_of(result, SetTopicMarker)[0].marker is TopicMarker.IDLE
+    # Still ⏳: the workspace is up, the turn is not. A blank prefix here lived
+    # one poll interval and cost a permanent rename line to say it.
+    assert actions_of(result, SetTopicMarker)[0].marker is TopicMarker.INITIALIZING
 
 
 def test_rule_10_waking_ready_with_nothing_outstanding_goes_idle() -> None:

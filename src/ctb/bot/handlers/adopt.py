@@ -39,6 +39,7 @@ from ctb.bot.handlers.common import short_error
 from ctb.bot.handlers.topics import (
     attach_topic,
     discard_topic,
+    human_name,
     jump_url,
     marker_for,
     require_topic,
@@ -310,7 +311,11 @@ async def _adopt_workspace(
         workspace.lifecycle_step = status.lifecycle_step
     if workspace.status.is_gone:
         raise AdoptError("Archived in Conductor. Restore it there first.")
-    label = topic_label(workspace.name or workspace_id[:8], workspace.branch)
+    # `workspace.name` is `tg-<chat>-<nonce>` for anything this bot created, and
+    # this label is written to the topic title *and* persisted as `topic_name`.
+    label = topic_label(
+        human_name(workspace.name) or workspace_id[:8], workspace.branch
+    )
     marker = marker_for(workspace_status=workspace.status)
 
     remembered = _remembered_topic(local, chat_id) if chat_type != "private" else None

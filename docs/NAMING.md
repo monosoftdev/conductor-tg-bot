@@ -61,10 +61,33 @@ them side by side.
 ## Topic titles
 
 ```
-<prefix><project>/<branch>
+<prefix><task> · <project>/<branch>
+⚙️ fix the login bug · api/main
 ```
 
 Clipped to Telegram's 128-character limit, prefix included.
+
+**The task leads.** Telegram clips a topic row from the right, and a phone shows
+perhaps thirty characters of it, so whatever identifies the workspace has to be
+in front. It was `<project>/<branch>` alone — and since a branch is nearly always
+`main`, three workspaces on one repo were three rows reading `reclaimly-be/main`,
+in the same colour (it is a hash of the label) with the same state icon. The list
+could not answer the one question you open it to ask.
+
+The task is the first ~28 characters of the **opening** prompt, taken once, at
+creation, with throat-clearing (`please`, `can you`, `let's`) stripped. It never
+changes afterwards: `apply_marker` only ever rewrites the prefix. A name that
+moved with the conversation would make the list unlearnable and cost a rename a
+turn.
+
+A workspace with no prompt to be named after — one adopted from the laptop, or
+renamed by hand with `/name -w` — falls back to `<project>/<branch>`.
+
+**The Conductor name is never a title.** Every workspace this bot creates is
+called `tg-<chatid>-<nonce>` on the Conductor side, because `POST /v0/workspaces`
+takes no idempotency key and that string is how an ambiguous create is
+reconciled. It is bookkeeping. `human_name()` filters it out of every button,
+list and title; the fallback is the session's own title.
 
 **`done` and `idle` are different states.** They used to share a blank prefix,
 so "finished, you haven't read it" and "quiet, nothing to do" looked identical
@@ -82,13 +105,35 @@ change (`apply_marker`). Never on a timer: a rename is an API call, and a
 5-second init card that renamed on every tick would spend the whole flood
 budget on cosmetics.
 
+**Every rename costs a permanent line in the topic.** Telegram answers
+`editForumTopic` with a `forum_topic_edited` service message, and there is no
+way to suppress it. Two things follow.
+
+First, a prefix that lives for one poll interval is not worth a rename. A waking
+workspace used to go `⏳ → (blank) → ⚙️` inside two polls, and a sleeping one
+`💤 → (blank) → ⚙️`, because rule 10 marked the topic *idle* the moment the
+workspace came up — while a prompt was outstanding and a turn was about to
+start. Both now hold `⏳` until the turn actually begins: same information, two
+fewer lines. `💤` is reserved for a workspace with nothing queued, which is the
+only time it is true.
+
+Second, `tidy_rename_notice` deletes the service message when the new title is
+the one we just applied. A rename somebody made by hand keeps its receipt. It
+needs a delete permission a group grants and a DM does not, so it is best
+effort — a topic with one extra line in it is still a working topic.
+
+A prompt accepted into a quiet topic marks it `⏳` immediately. That is one more
+rename than before in the common flow, and it is the one worth paying for: the
+list is the only surface you can read without opening anything, and it used to
+keep saying `✅` from the *previous* turn until the agent produced output.
+
 `/tidy` renames to archived **before** closing a topic — closing alone left
 whatever prefix was last applied, so a swept topic could sit in the list
 reading "⚙️ working" about a session nobody was running.
 
 `/fork` resets the marker to idle. The title is unchanged (a fork shares the
-workspace, so `project/branch` still describes it), but the previous session's
-✅ would otherwise be a claim about work the new session has not done.
+workspace, so the label still describes it), but the previous session's ✅
+would otherwise be a claim about work the new session has not done.
 
 ---
 
