@@ -423,7 +423,7 @@ def test_mobile_board_is_compact_and_scannable() -> None:
         for index in range(BOARD_VISIBLE + 3)
     ]
     lines = board_lines(rows)
-    assert lines[0] == f"<b>Board · {BOARD_VISIBLE + 3} recent</b>"
+    assert lines[0] == f"<b>Board · {BOARD_VISIBLE + 3} workspaces</b>"
     assert lines[1].startswith("⚙️")
     assert len(lines) == BOARD_VISIBLE + 2
     assert lines[-1] == "<i>+3 more · use /s to switch</i>"
@@ -812,10 +812,57 @@ async def test_board_sends_one_line_and_buttons_never_both_lists(
 
     text, markup = sent[0]
     # The ten names used to be printed and then rendered as ten buttons.
-    assert text == "<b>3 live</b>"
+    assert text == "<b>3 workspaces</b>"
     assert markup is not None
     labels = [row[0].text for row in markup.inline_keyboard]
     assert labels == [f"⚙️ api/fix-{index} · sonnet" for index in range(3)]
+
+
+async def test_board_counts_workspaces_not_sessions(db: Database) -> None:
+    """Three sessions in one workspace are one workspace, one topic, one button.
+
+    ``session_transcripts_view`` has a row per session, so a board built from it
+    reported "4 live" over two workspaces and drew three identical buttons that
+    all jumped to the same topic — a count that agreed with neither Conductor
+    nor ``/health``.
+    """
+
+    class ManySessions:
+        async def sql(self, _query: str) -> SqlResult:
+            rows: list[dict[str, object]] = [
+                {
+                    "session_id": f"session-{index}",
+                    "workspace_id": "workspace-busy",
+                    "session_title": "Review project architecture",
+                    "workspace_name": "reclaimly-be/main",
+                    "workspace_state": "ready",
+                    "model": "opus-5-1m",
+                    "transcript_updated_at": 300 - index,
+                }
+                for index in range(3)
+            ]
+            rows.append(
+                {
+                    "session_id": "session-other",
+                    "workspace_id": "workspace-quiet",
+                    "session_title": "Something else",
+                    "workspace_name": "tg-1132334-iszvwjeb",
+                    "workspace_state": "ready",
+                    "model": "opus-5-1m",
+                    "transcript_updated_at": 100,
+                }
+            )
+            return SqlResult(rows=rows, row_count=len(rows))
+
+    rows = await core_handlers.board_rows(db, ManySessions())  # type: ignore[arg-type]
+
+    assert [row["workspace_id"] for row in rows] == [
+        "workspace-busy",
+        "workspace-quiet",
+    ]
+    # Newest first, so the survivor is the freshest session of its workspace.
+    assert rows[0]["session_id"] == "session-0"
+    assert core_handlers.board_lines(rows)[0] == "<b>Board · 2 workspaces</b>"
 
 
 async def test_board_offers_one_tap_adoption_for_a_topicless_workspace(
@@ -857,7 +904,7 @@ async def test_board_offers_one_tap_adoption_for_a_topicless_workspace(
     )
 
     text, markup = sent[0]
-    assert text == "<b>1 live</b>"
+    assert text == "<b>1 workspace</b>"
     assert markup is not None
     tap = markup.inline_keyboard[0][0]
     assert tap.text == "+ Open api/orphan"

@@ -82,13 +82,17 @@ _ACTIVE_STATES: Final[frozenset[TurnState]] = frozenset(
         TurnState.CANCELLING,
     }
 )
+#: One row per **session**, so several rows can share a workspace. The limit is
+#: deliberately larger than :data:`BOARD_VISIBLE`: it is spent on sessions and
+#: :func:`board_rows` then collapses them to workspaces, so a chatty workspace
+#: with a dozen sessions must not push every other workspace off the board.
 _BOARD_SQL: Final = """
 SELECT session_id, workspace_id, session_title, workspace_name, workspace_state,
        model, transcript_updated_at
   FROM session_transcripts_view
  WHERE workspace_state NOT IN ('archived', 'deleted')
  ORDER BY transcript_updated_at DESC
- LIMIT 20
+ LIMIT 60
 """.strip()
 
 
@@ -263,7 +267,9 @@ async def board(
                     )
                 ]
             )
-    lines = [f"<b>{len(rows)} live</b>"]
+    # "live" said nothing about what was being counted, which is how a board of
+    # two workspaces came to announce "4 live" and look plausible.
+    lines = [f"<b>{len(rows)} workspace{'' if len(rows) == 1 else 's'}</b>"]
     if len(rows) > BOARD_VISIBLE:
         lines.append(f"<i>+{len(rows) - BOARD_VISIBLE} more · /s</i>")
     await tell(
@@ -284,8 +290,21 @@ async def board_rows(
     try:
         result = await client.sql(_BOARD_SQL)
         rows = []
+        seen: set[str] = set()
         for raw in result.rows:
             item = dict(raw)
+            # The view has one row per *session*. A workspace with three
+            # sessions is still one workspace, one topic and one button — left
+            # alone this counted rows and reported "4 live" over two
+            # workspaces, under three identical buttons that all jumped to the
+            # same topic. Rows arrive newest-first, so the first one seen for a
+            # workspace is the one worth showing. A row with no workspace id
+            # cannot be collapsed and is kept as-is.
+            workspace_id = str(item.get("workspace_id") or "")
+            if workspace_id:
+                if workspace_id in seen:
+                    continue
+                seen.add(workspace_id)
             session = sessions_by_id.get(str(item.get("session_id") or ""))
             item["display_state"] = (
                 str(session.state)
@@ -396,7 +415,7 @@ async def attach_workspace(
 
 def board_lines(rows: list[dict[str, object]]) -> list[str]:
     """Text-only board. ``/board`` uses buttons; this is the voice path's copy."""
-    lines = [f"<b>Board · {len(rows)} recent</b>"]
+    lines = [f"<b>Board · {len(rows)} workspace{'' if len(rows) == 1 else 's'}</b>"]
     for row in rows[:BOARD_VISIBLE]:
         wid = str(row.get("workspace_id") or "")
         name = str(row.get("workspace_name") or row.get("session_title") or wid[:8])
