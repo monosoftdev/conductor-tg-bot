@@ -45,7 +45,7 @@ jobs:
     name: format · lint · types
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
@@ -81,7 +81,7 @@ jobs:
     name: tests (no database)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
@@ -125,7 +125,7 @@ jobs:
         ports:
           - 5433:5432
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
@@ -150,7 +150,7 @@ jobs:
     name: docker build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The default builder is the plain `docker` driver, which cannot export
       # to a cache backend — `cache-to: type=gha` fails it before it builds
@@ -198,7 +198,7 @@ jobs:
         ports:
           - 5433:5432
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
