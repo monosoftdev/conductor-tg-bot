@@ -66,7 +66,13 @@ from enum import StrEnum
 from typing import Final
 
 from aiogram.filters.callback_data import CallbackData
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+)
 
 from ctb.db import NO_THREAD_ID
 from ctb.logging import get_logger
@@ -77,6 +83,9 @@ __all__ = [
     "CALLBACK_PREFIX",
     "CONFIRM_TEMPLATE",
     "CONTROL_TTL_S",
+    "HOME_ATTACH",
+    "HOME_LABELS",
+    "HOME_NEW",
     "MAX_BUTTON_TEXT",
     "NONCE_TTL_S",
     "PLAIN_STYLE",
@@ -93,6 +102,7 @@ __all__ = [
     "confirm_keyboard",
     "confirm_label",
     "get_nonce_store",
+    "home_keyboard",
     "keyboard",
     "parse",
     "quick_reply_keyboard",
@@ -661,6 +671,34 @@ def keyboard(
     rows: Iterable[Sequence[InlineKeyboardButton]],
 ) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[list(row) for row in rows if row])
+
+
+#: The two things a chat with no workspace open can do, as the persistent
+#: bottom keyboard. This is the *only* reply keyboard in the bot, and it is
+#: deliberately tiny: a reply keyboard is chat-wide and cannot be addressed to
+#: one topic, so anything on it has to make sense in every room at once.
+#:
+#: Both entries are safe to press from Telegram's *New Chat* seat, which turns
+#: whatever it sends into a new thread — because both **consume** that thread,
+#: opening the workspace inside it. A ``/board`` button was drafted here and cut
+#: for exactly that reason: it answers and leaves the room behind, and in a
+#: threaded DM the topic list already *is* the board.
+HOME_NEW: Final = "➕ New workspace"
+HOME_ATTACH: Final = "📎 Attach existing"
+#: Buttons send their label as an ordinary message, so these strings are also a
+#: reserved vocabulary: typing one by hand runs the command. Emoji-prefixed so
+#: no prompt collides with one by accident.
+HOME_LABELS: Final[frozenset[str]] = frozenset({HOME_NEW, HOME_ATTACH})
+
+
+def home_keyboard() -> ReplyKeyboardMarkup:
+    """The launcher, pinned under the composer until something replaces it."""
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=HOME_NEW), KeyboardButton(text=HOME_ATTACH)]],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Describe a task…",
+    )
 
 
 def confirm_keyboard(

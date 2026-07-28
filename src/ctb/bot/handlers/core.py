@@ -212,8 +212,11 @@ async def new_workspace(
         await tell(message, f"New failed: {escape(short_error(exc))}", silent=False)
         return
     # The topic's own card repeats "queued" two seconds later; this bubble only
-    # has to say where that topic is.
-    text, markup = created_card(message.chat.id, created)
+    # has to say where that topic is — and nothing at all when it is right here.
+    # `route.thread_id`, not the raw `message_thread_id` — the router folds a
+    # forum's General back to 0 and fills in the thread Telegram omits for a DM
+    # topic, and the sibling callers in the wizard already read it from there.
+    text, markup = created_card(message.chat.id, created, from_thread=route.thread_id)
     await tell(message, text, reply_markup=markup)
 
 
@@ -329,6 +332,67 @@ async def board_rows(
     return rows
 
 
+def row_name(row: dict[str, object]) -> str:
+    workspace_id = str(row.get("workspace_id") or "")
+    return human_name(str(row.get("workspace_name") or "")) or str(
+        row.get("session_title") or workspace_id[:8]
+    )
+
+
+def adoptable(
+    board: list[dict[str, object]],
+    local: Collection[WorkspaceRow],
+    *,
+    query: str = "",
+    exclude: Collection[str] = (),
+    limit: int = ADOPTABLE_SCAN,
+) -> list[dict[str, object]]:
+    """Workspaces with no room in this chat yet, from data already fetched.
+
+    Pure, and given both sources on purpose. It used to re-read every candidate
+    with ``workspaces_repo.get`` inside the loop — one query per row to answer a
+    question one query answers for all of them.
+
+    The two sources are a **union**, not a filter of one by the other.
+    ``session_transcripts_view`` has a row only once a session has said
+    something, so a workspace opened on the laptop a minute ago is missing from
+    it — and it is exactly the one somebody reaches for ``/attach`` to find.
+    """
+    homed = {row.id for row in local if row.chat_id is not None and row.topic_id}
+    listed = {str(row.get("workspace_id") or "") for row in board}
+    candidates = [*board]
+    candidates.extend(
+        {
+            "workspace_id": row.id,
+            "workspace_name": row.name or "",
+            "workspace_state": row.status or "unknown",
+            "display_state": row.status or "unknown",
+            "model": row.model or "",
+        }
+        for row in local
+        if row.id not in listed and row.id not in homed
+    )
+    needle = query.strip().casefold()
+    seen = set(exclude)
+    out: list[dict[str, object]] = []
+    for row in candidates:
+        workspace_id = str(row.get("workspace_id") or "")
+        if not workspace_id or workspace_id in seen or workspace_id in homed:
+            continue
+        name = row_name(row)
+        if (
+            needle
+            and needle not in name.casefold()
+            and needle not in workspace_id.casefold()
+        ):
+            continue
+        seen.add(workspace_id)
+        out.append(row)
+        if len(out) >= limit:
+            break
+    return out
+
+
 async def adoptable_rows(
     database: Database,
     client: ConductorClient,
@@ -337,36 +401,18 @@ async def adoptable_rows(
     exclude: Collection[str] = (),
     limit: int = ADOPTABLE_SCAN,
 ) -> list[dict[str, object]]:
-    """Org-wide workspaces that have no topic in this bot yet.
+    """:func:`adoptable`, fetching its own inputs. Never raises.
 
-    Never raises: ``/s`` still lists the topics it knows when ``POST /v0/sql``
-    is unavailable — :func:`board_rows` already falls back to the local cache,
-    and anything past that degrades to "no suggestions".
+    ``/s`` still lists the topics it knows when ``POST /v0/sql`` is unavailable
+    — :func:`board_rows` already falls back to the local cache, and anything
+    past that degrades to "no suggestions".
     """
     try:
-        rows = await board_rows(database, client)
+        board = await board_rows(database, client)
+        local = await workspaces_repo.list_all(database)
     except Exception:
         return []
-    needle = query.strip().casefold()
-    seen = set(exclude)
-    out: list[dict[str, object]] = []
-    for row in rows:
-        wid = str(row.get("workspace_id") or "")
-        if not wid or wid in seen:
-            continue
-        local = await workspaces_repo.get(database, wid)
-        if local is not None and local.chat_id is not None and local.topic_id:
-            continue
-        name = human_name(str(row.get("workspace_name") or "")) or str(
-            row.get("session_title") or wid[:8]
-        )
-        if needle and needle not in name.casefold() and needle not in wid.casefold():
-            continue
-        seen.add(wid)
-        out.append(row)
-        if len(out) >= limit:
-            break
-    return out
+    return adoptable(board, local, query=query, exclude=exclude, limit=limit)
 
 
 @router.message(Command("attach"))
@@ -376,25 +422,41 @@ async def attach_workspace(
     state: FSMContext,
     nonces: NonceStore,
     db: Database | None = None,
+    query: str | None = None,
 ) -> None:
-    """Open a cloud workspace created outside Telegram."""
+    """Open a cloud workspace created outside Telegram.
+
+    ``query`` is explicit because the launcher button calls this directly, and
+    a reply keyboard sends its *label* as an ordinary message: ``command_text``
+    would read "📎 Attach existing" as ``Attach existing`` and filter every
+    workspace out, so the one button that exists to find them found none.
+    """
     await abandon_wizard(state)
     database = resolve_db(db)
-    rows = await adoptable_rows(
-        database,
-        tenant.client,
-        query=command_text(message),
-        limit=BOARD_VISIBLE,
-    )
+    if query is None:
+        query = command_text(message)
+    try:
+        client = tenant.client
+    except Exception as exc:
+        # `tenant.client` raises for a team with no key stored. Evaluated here,
+        # inside the guard, because the launcher button puts this one tap away
+        # from somebody who has not run `/key` yet — and an unguarded raise
+        # answers "⚠️ Request failed" instead of naming the missing step.
+        await tell(message, f"Cannot look: {escape(short_error(exc))}", silent=False)
+        return
+    # One fetch of each source, shared by the list and by the empty-state line.
+    # `nothing_to_attach` used to re-run `board_rows` — a second `POST /v0/sql`
+    # and a second full scan, on the path that already found nothing.
+    board = await board_rows(database, client)
+    local = await workspaces_repo.list_all(database)
+    rows = adoptable(board, local, query=query, limit=BOARD_VISIBLE)
     if not rows:
-        await tell(message, "No unattached cloud workspace matches.")
+        await tell(message, nothing_to_attach(local, query))
         return
     buttons = []
     for row in rows:
         workspace_id = str(row.get("workspace_id") or "")
-        name = human_name(str(row.get("workspace_name") or "")) or str(
-            row.get("session_title") or workspace_id[:8]
-        )
+        name = row_name(row)
         buttons.append(
             [
                 adopt_button(
@@ -412,6 +474,31 @@ async def attach_workspace(
         message,
         "<b>Open laptop workspace</b> · continues from now",
         reply_markup=keyboard(buttons),
+    )
+
+
+def nothing_to_attach(local: Collection[WorkspaceRow], query: str) -> str:
+    """Why ``/attach`` has nothing to offer — there are three reasons.
+
+    "No unattached cloud workspace matches" was every one of them at once, and
+    the most common by far is the *least* alarming: everything you have is
+    already open here, one thread each. Reading that as "the bot cannot see my
+    workspaces" is what makes ``/attach`` look broken when it is working.
+
+    Counted over rooms this chat actually holds, never over "workspaces that
+    exist" — a row with no topic is one :func:`adoptable` would have offered, so
+    reaching this line means it is not there, and calling it "already open"
+    would point somebody at a thread that does not exist.
+    """
+    if query:
+        return f"Nothing unattached matches <b>{escape(query)}</b>."
+    total = sum(1 for row in local if row.chat_id is not None and row.topic_id)
+    if not total:
+        return "No workspaces in Conductor yet · describe a task here to start one."
+    plural = "" if total == 1 else "s"
+    return (
+        f"All {total} workspace{plural} already open here · "
+        "pick one from the thread list, or <code>/board</code>."
     )
 
 

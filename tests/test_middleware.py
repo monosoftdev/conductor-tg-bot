@@ -29,6 +29,7 @@ from aiogram.dispatcher.middlewares.user_context import (
 )
 from aiogram.enums import ChatMemberStatus
 from aiogram.exceptions import TelegramConflictError
+from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import (
     DEFAULT_DESTINY,
     BaseStorage,
@@ -65,14 +66,18 @@ from ctb.bot.app import (
     clear_routers,
     create_bot,
     create_dispatcher,
+    discover_routers,
     install_middleware,
     register_router,
     registered_routers,
     run_polling,
 )
+from ctb.bot.handlers import home as home_handlers
 from ctb.bot.handlers import topics
 from ctb.bot.keyboards import (
     CONTROL_TTL_S,
+    HOME_LABELS,
+    HOME_NEW,
     NONCE_TTL_S,
     Action,
     Cb,
@@ -97,6 +102,7 @@ from ctb.bot.middleware import (
     TenantMiddleware,
 )
 from ctb.bot.middleware.context import new_request_id
+from ctb.bot.wizards import new_workspace
 from ctb.conductor.pool import ClientPool, MissingKeyError
 from ctb.db.connection import Database, tenant_scope
 from ctb.db.errors import DatabaseError
@@ -724,6 +730,86 @@ async def test_each_dm_topic_gets_its_own_wizard(
 
     assert [key.thread_id for key in keys] == [None, 99, 100]
     assert len({key for key in keys}) == 3, "three seats, three wizards"
+
+
+async def test_a_launcher_button_beats_the_wizard_and_the_prompt_path(
+    bot: Bot,
+    bot_settings: Settings,
+    db: Database,
+    system_db: Database,
+    seated: None,
+    monkeypatch: Any,
+) -> None:
+    """The launcher is a reply keyboard, so its presses arrive as *text*.
+
+    That makes the router order load-bearing rather than cosmetic. Home sits at
+    4, ahead of the wizard at 5 and the plain-text catch-all at 900, so a press
+    is never swallowed as an answer to a half-finished ``/new`` — somebody who
+    taps *New workspace* mid-form means start over, not "the branch is called
+    ➕ New workspace" — and never spent as a prompt in a workspace room.
+
+    Driven through the production ``create_dispatcher`` with the real
+    ``discover_routers`` for exactly that reason: a harness that includes only
+    the router under test would pass with the order set to anything at all.
+    """
+    reached: list[str] = []
+
+    async def fake_start_wizard(*_args: Any, **_kwargs: Any) -> None:
+        reached.append("new")
+
+    async def fake_attach(*_args: Any, **_kwargs: Any) -> None:
+        reached.append("attach")
+
+    monkeypatch.setattr(new_workspace, "start_wizard", fake_start_wizard)
+    monkeypatch.setattr(home_handlers, "attach_workspace", fake_attach)
+    routers = discover_routers()
+    # The handler routers are module-level singletons and aiogram refuses to
+    # attach one to a second Dispatcher. Whether an earlier test in this
+    # process already did is not this test's business, so take them and give
+    # them back.
+    for router in routers:
+        router._parent_router = None  # noqa: SLF001
+    dispatcher, _ = create_dispatcher(
+        settings=bot_settings,
+        system_db=system_db,
+        clients=cast(ClientPool, NullPool()),
+        db=db,
+        storage=PostgresStorage(db),
+        routers=routers,
+    )
+    try:
+        # Mid-wizard, in a seat that is *also* a live workspace room: both of
+        # the handlers that would otherwise claim this text are armed.
+        state = FSMContext(
+            storage=PostgresStorage(db),
+            key=StorageKey(
+                bot_id=bot.id, chat_id=DM_ID, user_id=OWNER_ID, thread_id=99
+            ),
+        )
+        for index, label in enumerate(sorted(HOME_LABELS)):
+            await state.set_state(new_workspace.NewWorkspace.prompt)
+            await dispatcher.feed_update(
+                bot,
+                Update(
+                    update_id=index + 1,
+                    message=Message(
+                        message_id=index + 1,
+                        date=NOW,
+                        chat=_chat(DM_ID, "private"),
+                        from_user=_user(OWNER_ID),
+                        text=label,
+                        message_thread_id=99,
+                        is_topic_message=False,
+                    ),
+                ),
+            )
+    finally:
+        for router in routers:
+            router._parent_router = None  # noqa: SLF001
+
+    assert reached == [
+        "new" if label == HOME_NEW else "attach" for label in sorted(HOME_LABELS)
+    ]
 
 
 async def test_owners_are_told_about_a_stranger_once_per_day(

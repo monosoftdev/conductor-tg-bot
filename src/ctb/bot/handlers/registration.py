@@ -64,6 +64,7 @@ from ctb.bot.keyboards import (
     NonceError,
     NonceStore,
     confirm_keyboard,
+    home_keyboard,
     resolve,
 )
 from ctb.bot.middleware.tenancy import TenantContext, forget_cached
@@ -778,7 +779,15 @@ async def set_key(
     # This is the end of sign-up, so say so and name the next thing to *do*.
     # It used to hand out a binding code here, which made a supergroup read as
     # step three of three rather than an option nobody has to take.
-    await tell(message, stored + "\n" + await _ready(tenant.row) + note)
+    #
+    # The launcher keyboard rides on this one message because this is the first
+    # moment the bot can do anything at all — before a key there is nothing for
+    # either button to reach.
+    await tell(
+        message,
+        stored + "\n" + await _ready(tenant.row) + note,
+        reply_markup=home_keyboard() if message.chat.type == "private" else None,
+    )
 
 
 async def _store_speech_key(

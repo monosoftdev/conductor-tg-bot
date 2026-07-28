@@ -35,10 +35,13 @@ from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
 
 from ctb.bot.app import register_router
-from ctb.bot.handlers.common import short_error
+from ctb.bot.handlers.common import note_linear_seat, short_error
 from ctb.bot.handlers.topics import (
+    TopicCreateError,
     attach_topic,
+    claim_topic,
     discard_topic,
+    dm_topic_support,
     human_name,
     jump_url,
     marker_for,
@@ -60,6 +63,7 @@ from ctb.bot.keyboards import (
     resolve,
     url_button,
 )
+from ctb.bot.middleware.routing import Route
 from ctb.bot.middleware.tenancy import TenantContext
 from ctb.conductor.client import ConductorClient
 from ctb.conductor.models import Session, TranscriptMessage, Workspace
@@ -138,6 +142,10 @@ class AdoptResult:
     sessions: int = 1
     #: The workspace was asleep when it was adopted.
     sleeping: bool = False
+    #: The snapshot card actually landed in :attr:`thread_id`. ``send_html``
+    #: never raises, so without this the caller can only *assume* the room has
+    #: something in it — and an assumption is not allowed to suppress a reply.
+    carded: bool = False
 
 
 # ── the button ───────────────────────────────────────────────────────────────
@@ -255,12 +263,16 @@ async def adopt_workspace(
     chat_type: str,
     workspace_id: str,
     session_hint: str | None = None,
+    claim_thread: int = NO_THREAD_ID,
 ) -> AdoptResult:
     """Bind an existing remote workspace to a topic in this chat.
 
     Idempotent: a workspace that already owns a live topic here is jumped to,
     never duplicated. A deleted topic is replaced; a binding in another chat
     is refused so opening it here cannot silently break the original route.
+
+    ``claim_thread`` is an empty thread this adoption may move into instead of
+    opening one — see :attr:`ctb.bot.middleware.routing.Route.claimable_thread`.
     """
     entry = _locks.setdefault(workspace_id, _WorkspaceLock(asyncio.Lock()))
     # Increment before the first await. A waiter therefore keeps the entry in
@@ -276,6 +288,7 @@ async def adopt_workspace(
                 chat_type=chat_type,
                 workspace_id=workspace_id,
                 session_hint=session_hint,
+                claim_thread=claim_thread,
             )
     finally:
         entry.users -= 1
@@ -292,6 +305,7 @@ async def _adopt_workspace(
     chat_type: str,
     workspace_id: str,
     session_hint: str | None,
+    claim_thread: int = NO_THREAD_ID,
 ) -> AdoptResult:
     local = await workspaces_repo.get(db, workspace_id)
     if (
@@ -318,7 +332,11 @@ async def _adopt_workspace(
     )
     marker = marker_for(workspace_status=workspace.status)
 
-    remembered = _remembered_topic(local, chat_id) if chat_type != "private" else None
+    # A private chat used to be excluded here, back when a DM had exactly one
+    # linear seat and no topic to remember. It can have both now, and skipping
+    # the check meant a second `/attach` of the same workspace opened a second
+    # room beside the first instead of jumping to it.
+    remembered = _remembered_topic(local, chat_id)
     existing_thread: int | None = None
     if remembered is not None and await _topic_exists(
         bot, chat_id, remembered, label, marker
@@ -377,12 +395,44 @@ async def _adopt_workspace(
     # at a topic that does not exist is worse than a command that failed.
     thread_id = NO_THREAD_ID
     fresh = False
-    if chat_type != "private":
-        if existing_thread is not None:
-            thread_id = existing_thread
-        else:
-            thread_id = await require_topic(bot, chat_id, label, marker=marker)
-            fresh = True
+    claimed = False
+    named = False
+    if existing_thread is not None:
+        thread_id = existing_thread
+    elif (
+        claim_thread
+        and (
+            claim := await claim_topic(bot, chat_id, claim_thread, label, marker=marker)
+        ).alive
+    ):
+        # The `/attach` that produced this button was itself typed into an empty
+        # thread. Adopt into that one: opening a sibling left the request and the
+        # workspace in different rooms, and in a threaded DM the room this used
+        # to fall back to — thread 0 — is not one a person can read at all.
+        # `claim_topic` renames it *and* proves it is still there, which is the
+        # same order `require_topic` imposes on a room we open ourselves.
+        thread_id = claim_thread
+        claimed = True
+        named = claim.named
+    elif chat_type != "private":
+        thread_id = await require_topic(bot, chat_id, label, marker=marker)
+        fresh = True
+    else:
+        # A DM with no thread to claim: open one if this bot may, and fall back
+        # to the linear seat if it may not. Never fail the adoption over it.
+        support = await dm_topic_support(bot)
+        refusal = support.detail or support.reason if support.degraded else None
+        if refusal is None:
+            try:
+                thread_id = await require_topic(bot, chat_id, label, marker=marker)
+                fresh = True
+            except TopicCreateError as exc:
+                refusal = exc.reason
+        if refusal is not None:
+            # The same one line `/new` says, through the same once-per-chat
+            # gate. Dropping a workspace into the linear seat *silently* is how
+            # a DM that cannot have topics looks like a bot that lost the reply.
+            await note_linear_seat(bot, chat_id, refusal)
 
     prior_session = await sessions_repo.get(db, chosen.id)
     try:
@@ -397,6 +447,7 @@ async def _adopt_workspace(
             label=label,
             marker=marker,
             fresh=fresh,
+            record_marker=fresh or named or not claimed,
         )
     except BaseException:
         if fresh:
@@ -414,7 +465,7 @@ async def _adopt_workspace(
         sleeping=workspace.status.is_waking,
     )
 
-    await send_html(bot, chat_id, card, thread_id=thread_id, silent=True)
+    posted = await send_html(bot, chat_id, card, thread_id=thread_id, silent=True)
 
     log.info(
         "adopt.bound",
@@ -432,6 +483,7 @@ async def _adopt_workspace(
         already=False,
         sessions=len(remote_sessions),
         sleeping=workspace.status.is_waking,
+        carded=posted is not None,
     )
 
 
@@ -523,6 +575,7 @@ async def _bind(
     label: str,
     marker: TopicMarker,
     fresh: bool,
+    record_marker: bool = True,
 ) -> cursor.SeekResult:
     """Write the binding, seeding the cursor between "known" and "polled".
 
@@ -587,7 +640,11 @@ async def _bind(
                 topic_id=thread_id,
                 topic_name=label,
             )
-            await workspaces_repo.set_topic_marker(db, workspace.id, marker.value)
+            if record_marker:
+                # ``False`` only when a claimed thread refused the rename, so
+                # the topic list is not showing this marker and recording it
+                # would make the next transition skip the rename that fixes it.
+                await workspaces_repo.set_topic_marker(db, workspace.id, marker.value)
             await chats_repo.ensure(db, chat_id, thread_id, kind="topic")
         else:
             await workspaces_repo.upsert(db, workspace.id, chat_id=chat_id)
@@ -626,6 +683,7 @@ async def _bind(
 @router.callback_query(Cb.filter(F.action == Action.ADOPT.value))
 async def adopt_callback(
     query: CallbackQuery,
+    route: Route,
     nonces: NonceStore,
     tenant: TenantContext,
     db: Database | None = None,
@@ -641,6 +699,7 @@ async def adopt_callback(
         await query.answer("Expired. Run /board again.", show_alert=True)
         return
     chat_id = ticket.chat_id or query.from_user.id
+    chat_type = _chat_type(query, chat_id)
     # Opening costs several API calls; answer first so Telegram stops spinning.
     await query.answer("Opening…")
     try:
@@ -649,9 +708,10 @@ async def adopt_callback(
             db=resolve_db(db),
             client=resolve_client(client, tenant),
             chat_id=chat_id,
-            chat_type=_chat_type(query, chat_id),
+            chat_type=chat_type,
             workspace_id=workspace_id,
             session_hint=session_hint or None,
+            claim_thread=route.claimable_thread,
         )
     except Exception as exc:
         await send_html(
@@ -662,23 +722,45 @@ async def adopt_callback(
             silent=False,
         )
         return
+    if result.carded and result.thread_id == ticket.thread_id:
+        # Adopted into the very thread the button was tapped in, and the
+        # snapshot card is on screen there. A button pointing at this room
+        # would not be. Gated on the card having *landed*, never on the seats
+        # matching: `send_html` returns None rather than raising, and a
+        # suppressed reply on top of a failed one is a tap with no output at
+        # all (CLAUDE.md — never gate a sendMessage on a conclusion).
+        return
     target = jump_url(chat_id, result.thread_id)
     label = "Open topic" if target else "Open in Conductor"
     link = target or result.deep_link
     await send_html(
         query.bot,
         chat_id,
-        ack_line(result),
+        ack_line(result, linkable=target is not None),
         thread_id=ticket.thread_id,
         reply_markup=keyboard([[url_button(label, link)]]) if link else None,
         silent=True,
     )
 
 
-def ack_line(result: AdoptResult) -> str:
-    """Two words and a name. The card in the topic carries the detail."""
-    suffix = " · already open" if result.already else ""
-    return f"→ <b>{escape(result.name)}</b>{suffix}"
+def ack_line(result: AdoptResult, *, linkable: bool = True) -> str:
+    """Two words and a name. The card in the topic carries the detail.
+
+    ``linkable`` is false in a private chat, where Telegram publishes no link
+    syntax for a thread — so the ack is read *outside* the room it names and
+    the only button on offer opens a browser. Name the room instead, exactly as
+    :func:`~ctb.bot.handlers.common.created_card` does for the same reason: the
+    thread list is the whole navigation, and "already open" without saying
+    *where* is what left somebody stranded in a thread called "/attach".
+    """
+    if not result.already:
+        return f"→ <b>{escape(result.name)}</b>"
+    where = (
+        ""
+        if linkable
+        else "\n<i>It is in this chat's thread list, under that name.</i>"
+    )
+    return f"→ <b>{escape(result.name)}</b> · already open{where}"
 
 
 def _chat_type(query: CallbackQuery, chat_id: int) -> str:

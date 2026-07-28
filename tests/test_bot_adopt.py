@@ -23,9 +23,13 @@ from typing import Any, cast
 
 import pytest
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.base import StorageKey
 from aiogram.methods import SendMessage
 
+from ctb.bot.app import PostgresStorage
 from ctb.bot.handlers import adopt as adopt_handlers
+from ctb.bot.handlers import common
 from ctb.bot.handlers import core as core_handlers
 from ctb.bot.handlers import power as power_handlers
 from ctb.bot.handlers import prompts as prompt_handlers
@@ -37,7 +41,11 @@ from ctb.bot.handlers.adopt import (
     adopt_workspace,
     snapshot_card,
 )
-from ctb.bot.handlers.common import MOBILE_REPLY_INSTRUCTION, augment_prompt
+from ctb.bot.handlers.common import (
+    LINEAR_DM_NOTICE,
+    MOBILE_REPLY_INSTRUCTION,
+    augment_prompt,
+)
 from ctb.bot.keyboards import NonceStore
 from ctb.bot.middleware.routing import Route
 from ctb.bot.middleware.tenancy import TenantContext, TenantSettings
@@ -91,6 +99,14 @@ CHAT_ID = -1002000000000
 FIRST_TOPIC = 101
 
 
+def _seat(db: Database, *, user_id: int = 1001, thread_id: int | None = None) -> Any:
+    """A DB-backed FSM context, as the dispatcher would hand a handler."""
+    return FSMContext(
+        storage=PostgresStorage(db),
+        key=StorageKey(bot_id=0, chat_id=CHAT_ID, user_id=user_id, thread_id=thread_id),
+    )
+
+
 class _Bot:
     """Just enough of ``Bot`` for the topic + card half of adoption."""
 
@@ -104,8 +120,22 @@ class _Bot:
         self.edit_error: Exception | None = None
         #: Threads Telegram has forgotten — a topic deleted from the phone.
         self.dead: set[int] = set()
+        #: @BotFather's Threaded Mode, as ``getMe`` reports it. ``None`` is the
+        #: shape Telegram actually sends when it is off, and the bot tries
+        #: anyway; ``False`` is the only explicit refusal.
+        self.has_topics_enabled: bool | None = True
+        #: Telegram refusing ``createForumTopic`` — the Bot API 10.0 DM
+        #: regression, and the branch adoption's linear fallback exists for.
+        self.create_error: Exception | None = None
+
+    async def get_me(self) -> Any:
+        return SimpleNamespace(
+            id=42, has_topics_enabled=self.has_topics_enabled, username="ctb"
+        )
 
     async def create_forum_topic(self, **kwargs: Any) -> Any:
+        if self.create_error is not None:
+            raise self.create_error
         thread_id = FIRST_TOPIC + len(self.topics)
         self.topics.append(thread_id)
         self.renamed.append(str(kwargs["name"]))
@@ -218,6 +248,7 @@ async def _adopt(
     *,
     chat_type: str = "supergroup",
     session_hint: str | None = None,
+    claim_thread: int = 0,
 ) -> AdoptResult:
     return await adopt_workspace(
         bot=bot,  # type: ignore[arg-type]
@@ -227,6 +258,7 @@ async def _adopt(
         chat_type=chat_type,
         workspace_id=session.workspace_id,
         session_hint=session_hint,
+        claim_thread=claim_thread,
     )
 
 
@@ -428,20 +460,43 @@ async def test_a_partial_binding_repairs_the_remembered_topic_in_place(
     assert bot.cards_in(77)
 
 
-async def test_a_dm_binds_the_single_seat_without_a_topic(
+async def test_a_dm_that_can_host_topics_gets_one_like_any_other_chat(
     db: Database, client: ConductorClient, fake: FakeConductor
 ) -> None:
-    """Adoption is still linear in a DM — the known gap, asserted on purpose.
+    """The two entry points finally agree.
 
-    ``/new`` now opens a topic per workspace in a private chat exactly as it
-    does in a group (``tests/test_bot_handlers.py``); ``_open`` here does not
-    yet, so a workspace adopted from ``/board`` takes the DM's single seat and
-    displaces whatever was in it. Nothing is lost and nothing dead-ends, but the
-    two entry points disagree, and this test is what will fail when that is
-    fixed rather than a silent behaviour change.
+    ``/new`` has opened a topic per workspace in a private chat for a while;
+    adoption did not, so a workspace opened from ``/board`` took the DM's
+    single seat instead. In a *threaded* DM that seat is Telegram's "New Chat"
+    composer, which shows nothing and creates a thread out of anything typed
+    into it — so the transcript was being delivered to a room the owner cannot
+    read. This is the fix, and the assertion that used to record the gap.
     """
     session = _seeded(fake)
     bot = _Bot()
+
+    outcome = await _adopt(bot, db, client, session, chat_type="private")
+
+    assert bot.topics == [FIRST_TOPIC]
+    assert outcome.thread_id == FIRST_TOPIC
+    chat = await chats_repo.get(db, CHAT_ID, FIRST_TOPIC)
+    assert chat is not None and chat.kind == "topic"
+    assert chat.session_id == session.session_id
+    assert bot.cards_in(FIRST_TOPIC)
+
+
+async def test_a_dm_with_threads_off_still_falls_back_to_the_linear_seat(
+    db: Database, client: ConductorClient, fake: FakeConductor
+) -> None:
+    """A refusal degrades; it never fails the adoption.
+
+    Only an explicit ``has_topics_enabled: False`` counts as a refusal, and
+    thread 0 is a perfectly readable seat in a DM that has no threads — it is
+    unreadable only in one that does.
+    """
+    session = _seeded(fake)
+    bot = _Bot()
+    bot.has_topics_enabled = False
 
     outcome = await _adopt(bot, db, client, session, chat_type="private")
 
@@ -450,6 +505,48 @@ async def test_a_dm_binds_the_single_seat_without_a_topic(
     chat = await chats_repo.get(db, CHAT_ID, 0)
     assert chat is not None and chat.kind == "dm"
     assert chat.session_id == session.session_id
+
+
+async def test_adopting_into_the_thread_it_was_asked_from_opens_nothing_new(
+    db: Database, client: ConductorClient, fake: FakeConductor
+) -> None:
+    """``/attach`` typed into "New Chat" lands in the thread Telegram just made.
+
+    Telegram opened that thread the moment the command was sent and named it
+    after the command — so ``/attach`` produced a stray thread called
+    "/attach" *and* a second one for the workspace. The room the request is
+    already in is the room, and it is renamed to the workspace.
+    """
+    session = _seeded(fake)
+    bot = _Bot()
+
+    outcome = await _adopt(
+        bot, db, client, session, chat_type="private", claim_thread=555
+    )
+
+    assert bot.topics == []
+    assert outcome.thread_id == 555
+    # It wore "/attach" until this rename; the topic list is how you navigate.
+    assert any(outcome.name in name for name in bot.renamed)
+    chat = await chats_repo.get(db, CHAT_ID, 555)
+    assert chat is not None and chat.session_id == session.session_id
+    workspace = await workspaces_repo.get(db, session.workspace_id)
+    assert workspace is not None and workspace.topic_id == 555
+
+
+async def test_a_second_attach_in_a_dm_jumps_instead_of_opening_a_sibling(
+    db: Database, client: ConductorClient, fake: FakeConductor
+) -> None:
+    """The remembered-topic path used to be skipped in a private chat entirely."""
+    session = _seeded(fake)
+    bot = _Bot()
+
+    first = await _adopt(bot, db, client, session, chat_type="private")
+    second = await _adopt(bot, db, client, session, chat_type="private")
+
+    assert bot.topics == [FIRST_TOPIC]
+    assert second.thread_id == first.thread_id
+    assert second.already
 
 
 # ── which session ────────────────────────────────────────────────────────────
@@ -745,6 +842,7 @@ async def test_a_prompt_in_the_adopted_topic_reaches_the_adopted_session(
         ),
         fake_tenant(client),
         NonceStore(),
+        _seat(db),
         db=db,
     )
 
@@ -940,6 +1038,7 @@ async def test_the_callback_opens_the_topic_and_answers_with_a_jump(
 
     await adopt_handlers.adopt_callback(
         query,  # type: ignore[arg-type]
+        Route(chat_id=CHAT_ID, kind="supergroup"),
         store,
         fake_tenant(client),
         db=db,
@@ -965,6 +1064,7 @@ async def test_a_refused_adoption_answers_in_the_chat_not_only_the_toast(
 
     await adopt_handlers.adopt_callback(
         query,  # type: ignore[arg-type]
+        Route(chat_id=CHAT_ID, kind="supergroup"),
         store,
         fake_tenant(client),
         db=db,
@@ -983,3 +1083,88 @@ class _NullState:
 
     async def clear(self) -> None:
         return None
+
+
+def _refused(message: str) -> TelegramBadRequest:
+    return TelegramBadRequest(
+        method=SendMessage(chat_id=CHAT_ID, text="x"), message=message
+    )
+
+
+async def test_a_dm_that_cannot_open_a_topic_says_so_and_still_binds(
+    db: Database, client: ConductorClient, fake: FakeConductor
+) -> None:
+    """The likeliest real DM path, and it was on no test at all.
+
+    `dm_topic_support` says go ahead — `getMe` reports threaded mode on — and
+    `createForumTopic` then refuses, which is the Bot API 10.0 regression the
+    whole degradation story is written for. Adoption must not fail, and the one
+    line explaining why this chat suddenly holds one workspace must be said.
+    """
+    common._LINEAR_TOLD.discard(CHAT_ID)
+    session = _seeded(fake)
+    bot = _Bot()
+    bot.create_error = _refused("Bad Request: not enough rights to create a topic")
+
+    outcome = await _adopt(bot, db, client, session, chat_type="private")
+
+    assert outcome.thread_id == 0, "the linear seat, not a failed command"
+    chat = await chats_repo.get(db, CHAT_ID, 0)
+    assert chat is not None and chat.session_id == session.session_id
+    assert LINEAR_DM_NOTICE in [str(item["text"]) for item in bot.sent]
+
+
+async def test_a_thread_deleted_before_the_tap_gets_a_real_topic_instead(
+    db: Database, client: ConductorClient, fake: FakeConductor
+) -> None:
+    """A claimed thread is only a promise until an API call uses it.
+
+    `/attach` posts a list and waits; the room Telegram opened for the command
+    can be deleted from the phone in that window. Binding a workspace to it
+    would leave the transcript addressed to nothing.
+    """
+    session = _seeded(fake)
+    bot = _Bot()
+    bot.dead.add(555)
+
+    outcome = await _adopt(
+        bot, db, client, session, chat_type="private", claim_thread=555
+    )
+
+    assert outcome.thread_id == FIRST_TOPIC
+    assert bot.topics == [FIRST_TOPIC], "a room that exists, not the one that did not"
+
+
+async def test_a_claimed_thread_that_refuses_its_new_name_is_still_used(
+    db: Database, client: ConductorClient, fake: FakeConductor
+) -> None:
+    """Whether a bot may rename a thread a *user* opened in a DM is unverified.
+
+    Being unable to retitle a room is not being unable to use it — so the
+    workspace moves in, and the marker is deliberately left unrecorded so the
+    next state transition retries the rename rather than believing a title
+    Telegram never showed.
+    """
+    session = _seeded(fake)
+    bot = _Bot()
+    bot.edit_error = _refused("Bad Request: not enough rights to manage this topic")
+
+    outcome = await _adopt(
+        bot, db, client, session, chat_type="private", claim_thread=555
+    )
+
+    assert outcome.thread_id == 555
+    workspace = await workspaces_repo.get(db, session.workspace_id)
+    assert workspace is not None
+    assert workspace.topic_id == 555
+    assert workspace.topic_marker is None, "nothing to skip on the next transition"
+
+
+def test_an_already_open_workspace_names_its_room_when_it_cannot_link_to_one() -> None:
+    """A DM has no thread-link syntax, so "already open" must say *where*."""
+    result = AdoptResult(
+        workspace_id="w", session_id="s", thread_id=42, name="api/main", already=True
+    )
+
+    assert "thread list" in ack_line(result, linkable=False)
+    assert "thread list" not in ack_line(result, linkable=True)

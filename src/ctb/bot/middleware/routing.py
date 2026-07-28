@@ -165,6 +165,33 @@ class Route:
         """A workspace's own room — in a group or in a DM."""
         return self.thread_id != NO_THREAD_ID and self.kind in {"topic", "dm"}
 
+    @property
+    def claimable_thread(self) -> int:
+        """A thread this update may *move into*, or :data:`NO_THREAD_ID`.
+
+        Telegram's *New Chat* seat in a threaded DM is a composer, not a room:
+        anything sent there — a command included — makes the client open a new
+        thread named after that first line, and the update arrives already
+        inside it. Opening a second topic beside that one is how one ``/new``
+        came to leave a stray ``/new`` thread behind every time. So an empty
+        thread the request already sits in *is* the room.
+
+        Empty means: a private chat's thread with no session and no workspace
+        bound to it. A group is deliberately excluded — its General is thread 0
+        anyway, and a topic in a group is somebody's room, not scratch space.
+
+        It lives here, beside :attr:`is_dm` and :attr:`is_topic`, because the
+        seat is the router's own conclusion: it folds a forum's General back to
+        0 and supplies the thread Telegram omits for a DM topic. Anything that
+        answers this question from a raw ``Message`` — or, as the voice worker
+        first did, from a stored row — is a second rule, and the two drift.
+        """
+        if not self.is_private or not self.thread_id:
+            return NO_THREAD_ID
+        if self.session_id or (self.chat is not None and self.chat.workspace_id):
+            return NO_THREAD_ID
+        return self.thread_id
+
 
 class RoutingMiddleware(BaseMiddleware):
     """Put a :class:`Route` in the handler data for every update."""

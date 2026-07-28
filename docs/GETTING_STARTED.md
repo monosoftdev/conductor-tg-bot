@@ -66,27 +66,39 @@ You should see **ready**. Sign-up is over.
 
 ## Step 3 — Run something
 
-In the same private chat:
+If your chat has threads, Telegram shows a **New Chat** seat at the top of the
+list. It is not a room you can read — it is a composer: anything you send there
+makes Telegram open a **new thread** named after that first line.
+
+So say what you want:
 
 ```
-/new fix the flaky test in checkout_test.py
+fix the flaky test in checkout_test.py
 ```
 
-The bot creates a Conductor workspace, opens a **topic** for it right there in
-the chat, and posts a pinned status card that updates as the agent works. The
-answer arrives in that topic.
+Telegram opens a thread. The bot reads the task back with the project, branch
+and model it would use, and one button — **▶️ Start workspace**. Tap it and
+**that thread becomes the workspace**: the pinned status card, the agent's
+replies and everything you type next all live there. Nothing is left behind in
+*New Chat*, and no second thread appears beside it.
 
-From then on, **just type in the topic** to continue that session. No command
-needed — it stays on that task until your next `/new`.
+Two buttons sit under the composer for the same job. **➕ New workspace** walks
+the full form instead of guessing; **📎 Attach existing** opens a workspace you
+made on the laptop. Both land in the thread you press them from, so pressing
+one in *New Chat* consumes the thread it creates. `/home` brings them back if
+you ever hide them.
 
-Telegram publishes no link to a topic inside a private chat, so there is no
-"Open topic" button to tap here. The bot says which one it opened; you pick it
-from the topic list at the top of the chat.
+Got the wording wrong? Type it again — while the card is up, a new line
+**replaces** the task rather than starting a second workspace.
 
-> **No topics in your chat?** You may see *Topics unavailable here · one
+`/new fix the flaky test` still works and behaves the same way: it uses the
+thread it was typed in rather than opening one beside it.
+
+> **No threads in your chat?** You may see *Topics unavailable here · one
 > workspace at a time.* Telegram, not the bot, decides whether a private chat
-> can hold topics — see [below](#when-your-private-chat-has-no-topics). The bot
-> keeps working; it just holds one workspace at a time, and `/s` switches.
+> can hold them — see [below](#when-your-private-chat-has-no-topics). The bot
+> keeps working; it just holds one workspace at a time, `/s` switches, and
+> plain text there is a prompt for whatever is bound.
 
 ---
 
@@ -94,7 +106,9 @@ from the topic list at the top of the chat.
 
 | What you want | What you send |
 |---|---|
-| Start something new | `/new [project:] your prompt` |
+| Start something new | Type the task in a new thread, then **▶️** |
+| …choosing project and model | **➕ New workspace**, or `/new` |
+| …in one line | `/new [project:] your prompt` |
 | Continue | Type, speak, or send audio **in that topic** |
 | Stop the current turn | Tap **⏹** on the pinned card, or `/stop` |
 | See what this session is doing | `/mode` |
@@ -108,14 +122,16 @@ from the topic list at the top of the chat.
 `/help` prints a short version of this in the chat.
 
 Plain text is a **prompt** wherever a session is bound: a workspace topic, or
-your private chat itself when it has no topics. Two places it is not:
+your private chat itself when it has no topics. Three places it is not:
 
 - A group's **General** searches instead. That is the cockpit, and a prompt
   typed there would be a prompt sent to whichever session you last used.
-- **The main chat of a private chat that does have topics.** Once `/new` has
-  moved your work into topics, the root is a cockpit too. Type a task there and
-  you get one button — *Send to «that task»* — instead of a guess. `/new` starts
-  a new one.
+- **An empty thread in your private chat** — including the one Telegram opens
+  the moment you type in *New Chat*. There is nothing to prompt yet, so the
+  line is read as a **new task** and you get a card offering to start it.
+- **The main chat of a private chat that does have topics**, if a message ever
+  reaches it. Type a task and you get one button — *Send to «that task»* —
+  instead of a guess.
 
 `/s` reaches a session; it never moves one. A task that has a topic of its own
 is listed so you can open it, because binding it to where you typed `/s` would

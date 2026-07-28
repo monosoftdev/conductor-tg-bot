@@ -48,6 +48,7 @@ from ctb.bot.handlers.common import (
     all_projects,
     create_and_bind,
     created_card,
+    quota_error,
     short_error,
     tell,
 )
@@ -86,9 +87,12 @@ _STEP_CODES: Final[dict[str, str]] = {
     "effort": "e",
 }
 _STEP_BY_CODE: Final[dict[str, str]] = {v: k for k, v in _STEP_CODES.items()}
-#: Step-independent codes. Neither collides with a step letter.
+#: Step-independent codes. None collides with a step letter.
 _DEFAULTS_CODE: Final = "d"
 _CANCEL_CODE: Final = "c"
+#: The confirm card's two: create it now, or open the full form first.
+_CREATE_CODE: Final = "g"
+_OPTIONS_CODE: Final = "o"
 #: ``secrets.token_urlsafe(4)`` is always six url-safe characters, so the
 #: wizard id can be split off the target by position.
 _WID_LEN: Final = 6
@@ -116,11 +120,19 @@ class NewWorkspace(StatesGroup):
     model = State()
     effort = State()
     prompt = State()
+    #: The task is already known — the line that opened this thread. One tap
+    #: from a workspace, and typing again replaces the task rather than
+    #: starting a second one.
+    confirm = State()
 
 
 #: What ``wizard_state.state_key`` holds while the card reads "Send the first
 #: prompt." The voice path has no aiogram FSM filter, so it matches on this.
 PROMPT_STATE_KEY: Final = NewWorkspace.prompt.state
+#: The same, for the confirm card. The spoken path writes this into
+#: ``wizard_state`` itself, so a tap on the card it posts resolves exactly as a
+#: tap on a typed one does.
+CONFIRM_STATE_KEY: Final = NewWorkspace.confirm.state
 
 
 def request_from_wizard(
@@ -177,20 +189,47 @@ def _button(
     message: Message,
     wid: str,
 ) -> InlineKeyboardButton:
+    return _seat_button(
+        label,
+        code,
+        nonces=nonces,
+        wid=wid,
+        user_id=message.from_user.id if message.from_user else None,
+        chat_id=message.chat.id,
+        thread_id=message.message_thread_id or NO_THREAD_ID,
+    )
+
+
+def _seat_button(
+    label: str,
+    code: str,
+    *,
+    nonces: NonceStore,
+    wid: str,
+    user_id: int | None,
+    chat_id: int,
+    thread_id: int,
+) -> InlineKeyboardButton:
+    """The same ticket without a ``Message`` to read it off.
+
+    The spoken path has a seat and a user id but never an update, and the two
+    surfaces minting *differently scoped* tickets for the same card is the kind
+    of divergence that ends with a button that answers "expired" to its owner.
+    """
     return button(
         label,
         Action.WIZARD,
         f"{wid}{code}",
         store=nonces,
-        user_id=message.from_user.id if message.from_user else None,
-        chat_id=message.chat.id,
-        thread_id=message.message_thread_id or NO_THREAD_ID,
+        user_id=user_id,
+        chat_id=chat_id,
+        thread_id=thread_id,
         ttl=WIZARD_TTL,
         style=(
             "danger"
             if code == _CANCEL_CODE
             else "success"
-            if code == _DEFAULTS_CODE
+            if code in {_DEFAULTS_CODE, _CREATE_CODE}
             else "primary"
         ),
         # The owner redeploys constantly, and the FSM behind this card already
@@ -329,11 +368,183 @@ async def start_wizard(
         )
 
 
+#: How much of the task the confirm card echoes back. Long enough to recognise
+#: a dictation that came out wrong, short enough to leave the buttons on screen.
+TASK_ECHO_CHARS: Final = 220
+
+
+async def start_task(
+    message: Message,
+    text: str,
+    *,
+    route: Route,
+    tenant: TenantContext,
+    state: FSMContext,
+    db: Database | None = None,
+    client: ConductorClient | None = None,
+    nonces: NonceStore | None = None,
+) -> None:
+    """A task arrived in an empty thread. Offer to make it a workspace.
+
+    This is the whole shape of a threaded DM: *New Chat* is a composer, so a
+    line typed there becomes a thread, and the natural reading of a thread with
+    nothing in it is "a task I have not started yet". Answering "No session
+    here" was true and useless — the person had just said what they wanted.
+
+    It stops one step short of doing it. A workspace bills from the moment it
+    exists, so the last thing between a typo and a container is a card that
+    says what is about to be created and a button that says create it.
+    """
+    from ctb.bot.keyboards import get_nonce_store
+
+    store = nonces or get_nonce_store()
+    database = resolve_db(db)
+    defaults = tenant.settings
+    try:
+        projects = await all_projects(resolve_client(client, tenant))
+    except Exception as exc:
+        await tell(
+            message, f"Projects failed: {escape(short_error(exc))}", silent=False
+        )
+        return
+    if not projects:
+        await tell(message, "No Conductor projects found.")
+        return
+    chat = route.chat or await chats_repo.ensure(
+        database, message.chat.id, route.thread_id, kind=route.kind
+    )
+    await state.set_data(
+        await task_data(
+            database, chat=chat, defaults=defaults, projects=projects, text=text
+        )
+    )
+    body, markup = await _confirm_card(message, state, store)
+    sent = await tell(message, body, reply_markup=markup)
+    if sent and message.from_user:
+        await wizard_repo.merge_data(
+            database,
+            message.chat.id,
+            route.thread_id,
+            user_id=message.from_user.id,
+            patch={},
+            tg_message_id=sent.message_id,
+        )
+
+
+async def task_data(
+    database: Database,
+    *,
+    chat: Any,
+    defaults: TenantSettings,
+    projects: Sequence[Any],
+    text: str,
+) -> dict[str, Any]:
+    """The wizard data a task-first run starts from.
+
+    Shared with the spoken path, which has no aiogram FSM and writes the same
+    shape straight into ``wizard_state``. One builder, so a dictated task and a
+    typed one cannot resolve a different project or a different model.
+    """
+    known = {item.id: item.name or item.id[:8] for item in projects}
+    project_id = chat.default_project_id if chat is not None else None
+    if project_id not in known:
+        project_id = await _last_used_project(database, known) or projects[0].id
+    return {
+        "wid": new_wizard_id(),
+        "projects": known,
+        "project_id": project_id,
+        "step": "confirm",
+        "options": [],
+        "branch": (chat.default_branch if chat else None) or defaults.default_branch,
+        "agent": (chat.default_agent if chat else None) or defaults.default_agent,
+        "model": (chat.default_model if chat else None) or defaults.default_model,
+        "effort": (chat.default_effort if chat else None) or defaults.default_effort,
+        "prompt": text.strip(),
+    }
+
+
+async def _last_used_project(
+    database: Database, known: Mapping[str, str]
+) -> str | None:
+    """The project this team most recently pointed a chat at, if it still exists."""
+    recent = sorted(await chats_repo.list_all(database), key=lambda row: row.updated_at)
+    for row in reversed(recent):
+        if row.default_project_id in known:
+            return row.default_project_id
+    return None
+
+
+def task_echo(text: str) -> str:
+    collapsed = " ".join(text.split())
+    if len(collapsed) <= TASK_ECHO_CHARS:
+        return collapsed
+    return collapsed[: TASK_ECHO_CHARS - 1].rstrip() + "…"
+
+
+def confirm_card(
+    data: Mapping[str, Any],
+    *,
+    nonces: NonceStore,
+    user_id: int | None,
+    chat_id: int,
+    thread_id: int,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """The one card that stands between a typed line and a paid container.
+
+    Pure: it reads the wizard data and mints buttons. Persisting the step is
+    the caller's job, because the two surfaces persist it differently — aiogram
+    FSM for a typed line, ``wizard_state`` directly for a dictated one.
+    """
+    wid = str(data.get("wid") or "")
+    chosen = chosen_line(data, upto="")
+    lines = [f"<b>{escape(task_echo(str(data.get('prompt') or '')))}</b>"]
+    if chosen:
+        lines.append(f"<i>{escape(chosen)}</i>")
+
+    def control(label: str, code: str) -> InlineKeyboardButton:
+        return _seat_button(
+            label,
+            code,
+            nonces=nonces,
+            wid=wid,
+            user_id=user_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+        )
+
+    return "\n".join(lines), keyboard(
+        [
+            [control("▶️ Start workspace", _CREATE_CODE)],
+            [control("⚙️ Change", _OPTIONS_CODE), control("Cancel", _CANCEL_CODE)],
+        ]
+    )
+
+
+async def _confirm_card(
+    message: Message,
+    state: FSMContext,
+    nonces: NonceStore,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """:func:`confirm_card` for the typed path, with the FSM step persisted."""
+    data = await state.get_data()
+    wid = str(data.get("wid") or "") or new_wizard_id()
+    await state.set_state(NewWorkspace.confirm)
+    patch = {"wid": wid, "step": "confirm", "options": []}
+    await state.update_data(patch)
+    return confirm_card(
+        {**data, **patch},
+        nonces=nonces,
+        user_id=message.from_user.id if message.from_user else None,
+        chat_id=message.chat.id,
+        thread_id=message.message_thread_id or NO_THREAD_ID,
+    )
+
+
 #: The order the wizard asks in, which is the order the breadcrumb reads in.
 _CHOSEN_ORDER: Final = ("project", "branch", "agent", "model", "effort")
 
 
-def chosen_line(data: dict[str, Any], upto: str) -> str:
+def chosen_line(data: Mapping[str, Any], upto: str) -> str:
     """What has been picked so far — ``api/main · claude``.
 
     Five taps used to leave no trace: each step replaced the last and the final
@@ -357,7 +568,7 @@ def chosen_line(data: dict[str, Any], upto: str) -> str:
     return " · ".join(parts)
 
 
-def _ask(data: dict[str, Any], step: str, question: str) -> str:
+def _ask(data: Mapping[str, Any], step: str, question: str) -> str:
     """The question, under the breadcrumb of everything answered before it."""
     chosen = chosen_line(data, step)
     return f"<i>{escape(chosen)}</i>\n{question}" if chosen else question
@@ -367,16 +578,43 @@ async def _edit(
     message: Message,
     text: str,
     markup: InlineKeyboardMarkup | None,
-) -> None:
+) -> bool:
+    """Rewrite the one wizard card. ``False`` when the card is no longer there."""
     if message.bot is None:
         raise RuntimeError("Telegram bot is not bound to the message")
-    await edit_html(
+    return await edit_html(
         message.bot,
         message.chat.id,
         message.message_id,
         text,
         reply_markup=markup,
     )
+
+
+async def _ask_project(message: Message, state: FSMContext, nonces: NonceStore) -> None:
+    """Re-offer the projects this run already fetched.
+
+    ``start_wizard`` asks this first from a live listing; the confirm card's
+    "⚙️ Change" asks it again from ``data["projects"]``, because the project is
+    the one field the card *guessed* and therefore the one most worth being
+    able to correct. Sending it to the branch step instead left a mis-guessed
+    repo unreachable from the card — Cancel and start over, or pay for a
+    container against the wrong repository.
+    """
+    data = await state.get_data()
+    projects = data.get("projects")
+    known = projects if isinstance(projects, Mapping) else {}
+    markup = await _offer(
+        message,
+        state,
+        nonces,
+        step="project",
+        fsm_state=NewWorkspace.project,
+        options=[(str(name), str(pid)) for pid, name in list(known.items())[:10]],
+        defaults=bool(data.get("project_id")),
+        columns=1,
+    )
+    await _edit(message, "Project?", markup)
 
 
 async def _ask_branch(
@@ -451,6 +689,13 @@ async def _ask_effort(message: Message, state: FSMContext, nonces: NonceStore) -
 
 async def _ask_prompt(message: Message, state: FSMContext, nonces: NonceStore) -> None:
     data = await state.get_data()
+    if data.get("prompt"):
+        # The task was known before the form was: this run started from a line
+        # typed into an empty thread, and "⚙️ Change" only came back here to fix
+        # the model. Asking for the prompt again would throw that line away.
+        body, markup = await _confirm_card(message, state, nonces)
+        await _edit(message, body, markup)
+        return
     markup = await _offer(
         message,
         state,
@@ -501,6 +746,8 @@ async def _reask(
     whole ``/new``.
     """
     match step:
+        case "project":
+            await _ask_project(message, state, nonces)
         case "branch":
             await _ask_branch(message, state, nonces, settings)
         case "agent":
@@ -509,7 +756,7 @@ async def _reask(
             await _ask_model(message, state, nonces)
         case "effort":
             await _ask_effort(message, state, nonces)
-        case "prompt":
+        case "prompt" | "confirm":
             await _ask_prompt(message, state, nonces)
         case _:
             return False
@@ -540,8 +787,10 @@ def _pick(code: str, data: Mapping[str, Any]) -> tuple[str, str] | str:
 async def wizard_callback(
     query: CallbackQuery,
     state: FSMContext,
+    route: Route,
     nonces: NonceStore,
     tenant: TenantContext,
+    db: Database | None = None,
 ) -> None:
     try:
         ticket = resolve(query, expect=Action.WIZARD, store=nonces)
@@ -585,6 +834,16 @@ async def wizard_callback(
         await query.answer()
         await _ask_prompt(_card(query), state, nonces)
         return
+    if code == _OPTIONS_CODE:
+        await query.answer()
+        await _ask_project(_card(query), state, nonces)
+        return
+    if code == _CREATE_CODE:
+        await query.answer("Starting…")
+        await _create_from_card(
+            _card(query), state, route=route, tenant=tenant, db=db, data=data
+        )
+        return
     picked = _pick(code, data)
     if isinstance(picked, str):
         await query.answer(picked, show_alert=True)
@@ -605,6 +864,98 @@ async def wizard_callback(
         if selected == "default":
             await state.update_data({"effort": None})
         await _ask_prompt(_card(query), state, nonces)
+
+
+async def _create_from_card(
+    card: Message,
+    state: FSMContext,
+    *,
+    route: Route,
+    tenant: TenantContext,
+    db: Database | None,
+    data: Mapping[str, Any],
+) -> None:
+    """Spend the money the confirm card was holding back, and report on it.
+
+    The card is both the button that was tapped and the surface the answer is
+    written on, so one event still has one face — and the idempotency key is
+    the card's own message id, which does not change when a tap is retried.
+    """
+    request = request_from_wizard(
+        data, str(data.get("prompt") or ""), settings=tenant.settings
+    )
+    if request is None or not request.prompt:
+        await state.clear()
+        await _edit(card, "Wizard closed · /new to start again.", None)
+        return
+    refusal = await quota_error(resolve_db(db), tenant.settings)
+    if refusal is not None:
+        await state.clear()
+        await _edit(card, escape(refusal), None)
+        return
+    try:
+        created = await create_and_bind(
+            message=card, route=route, request=request, db=db, client=tenant.client
+        )
+    except Exception as exc:
+        # Clear first, for the same reason `typed_prompt` does: the next line
+        # typed here is meant for a session, not for a second attempt at this.
+        await state.clear()
+        await _edit(
+            card,
+            f"New failed: {escape(short_error(exc))}\n"
+            "Nothing was created. Run <code>/new</code> to try again.",
+            None,
+        )
+        return
+    await state.clear()
+    text, markup = created_card(card.chat.id, created, from_thread=route.thread_id)
+    await _edit(card, text, markup)
+
+
+@router.message(NewWorkspace.confirm, F.text & ~F.text.startswith("/"))
+async def typed_confirm(
+    message: Message,
+    route: Route,
+    state: FSMContext,
+    nonces: NonceStore,
+    db: Database | None = None,
+) -> None:
+    """A second line while the confirm card is up **replaces** the task.
+
+    Never a second workspace, and never a prompt: nothing exists to prompt yet.
+    Dictation gets a word wrong often enough that "say it again" has to be the
+    cheapest possible repair.
+    """
+    text = (message.text or "").strip()
+    if not text:
+        return
+    database = resolve_db(db)
+    user_id = message.from_user.id if message.from_user else 0
+    await state.update_data({"prompt": text})
+    row = await wizard_repo.get(
+        database, message.chat.id, route.thread_id, user_id=user_id
+    )
+    card = (
+        message.model_copy(update={"message_id": row.tg_message_id})
+        if row is not None and row.tg_message_id
+        else None
+    )
+    body, markup = await _confirm_card(card or message, state, nonces)
+    if card is not None and await _edit(card, body, markup):
+        return
+    # The card was deleted, or there never was one. Post a new one and remember
+    # it, or the next correction posts a third.
+    sent = await tell(message, body, reply_markup=markup)
+    if sent is not None and user_id:
+        await wizard_repo.merge_data(
+            database,
+            message.chat.id,
+            route.thread_id,
+            user_id=user_id,
+            patch={},
+            tg_message_id=sent.message_id,
+        )
 
 
 @router.message(NewWorkspace.branch, F.text & ~F.text.startswith("/"))
@@ -656,6 +1007,15 @@ async def typed_prompt(
             message, "Wizard expired. Run <code>/new</code> again.", silent=False
         )
         return
+    # `resolve_new_request` guards the one-line `/new text` path, and the wizard
+    # has never gone through it — so a team at its limit could spend past it by
+    # taking the form instead. That was always wrong; it matters now because the
+    # form is the *usual* way in rather than the long way round.
+    refusal = await quota_error(resolve_db(db), tenant.settings)
+    if refusal is not None:
+        await state.clear()
+        await tell(message, escape(refusal), silent=False)
+        return
     try:
         created = await create_and_bind(
             message=message,
@@ -680,7 +1040,7 @@ async def typed_prompt(
         return
     await state.clear()
     # Same shape as `/new` and adopt: one event should not have three faces.
-    text, markup = created_card(message.chat.id, created)
+    text, markup = created_card(message.chat.id, created, from_thread=route.thread_id)
     if wizard_row is not None and wizard_row.tg_message_id is not None:
         card = message.model_copy(update={"message_id": wizard_row.tg_message_id})
         await _edit(card, text, markup)
