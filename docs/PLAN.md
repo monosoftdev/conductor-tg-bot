@@ -219,6 +219,12 @@ Singleton `httpx.AsyncClient` with: explicit `User-Agent: conductor-tg-bot/<ver>
 HALF_OPEN probe → CLOSED), per-endpoint timeouts (connect 5s; read 20s status/messages; 30s POST
 message; 60s `/sql`).
 
+A streak that never leaves one *resource* path (`/workspaces/ws_7/status`) isolates that path alone
+instead of opening the tenant-wide circuit; collection paths (`/projects`) and streaks spanning two
+resources still open everything. One workspace whose status endpoint 500s forever otherwise froze
+its tenant permanently — its poller wins every half-open probe slot, so the window never closes and
+the archive that would retire it fails fast behind it.
+
 Retry policy: connect/timeout/502/503/504 → full-jitter backoff base 0.5s cap 30s ×5; `retryable:
 true` → retry regardless of code; `retryable: false` → never; 429 → honor `Retry-After` and open the
 circuit; 401/403 → **fatal**, stop all pollers, DM owner once, keep bot alive for `/health` (never
@@ -433,8 +439,9 @@ Header line on every completed turn (redundant in a topic, but survives forwardi
 
 The **pinned status card** per topic carries the live state and absorbs the tool-call noise:
 `⏳ queued` → `▶️ started` → `⚙️ working 1m20s · running pytest` → `✅ done in 1m32s · 3 files`.
-Buttons: `Stop` while running; `Transcript` / `Retry` / `Open in Conductor` (the `deepLink`) when
-finished. `sendChatAction("typing")` every 4s while WORKING. No transient "🔄" messages that need
+Buttons: `Stop` while running; `Transcript` / `Retry` / `Open in Conductor` (the `deepLink`) /
+`Archive` when finished — the finished card is where the room is most likely finished with, so it
+carries the way out, opening the same named confirm `/done` does. `sendChatAction("typing")` every 4s while WORKING. No transient "🔄" messages that need
 cleanup. At 10 min with no new messages the card adds `stalled?` + a `Check` button.
 
 `/desk` produces the "I'm back at my Mac" handoff card: workspace, branch, last turn's one-liner,

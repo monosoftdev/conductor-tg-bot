@@ -86,6 +86,7 @@ __all__ = [
     "CircuitBreaker",
     "CircuitState",
     "ConductorClient",
+    "Isolation",
     "TokenBucket",
     "TransportFailure",
 ]
@@ -306,6 +307,14 @@ class CircuitState(StrEnum):
     HALF_OPEN = "half_open"
 
 
+@dataclass(frozen=True, slots=True)
+class Isolation:
+    """One resource held out of service by :class:`CircuitBreaker`."""
+
+    until: float
+    reason: str
+
+
 class CircuitBreaker:
     """Three consecutive failures open the circuit for a jittered window.
 
@@ -319,6 +328,17 @@ class CircuitBreaker:
     A success does **not** clear an open window. That matters for 429: the window
     is set to ``Retry-After``, and the in-flight retry that then succeeds must not
     unleash every other poller early.
+
+    **One sick resource is not a sick API.** A call that addresses an individual
+    resource carries a ``target`` (``/workspaces/ws_7/status``); a collection
+    call has none (``/projects``). A streak that never leaves a single target is
+    news about that target alone, so it *isolates* that path — every other call
+    keeps running, including the archive that would retire the sick workspace.
+    Without that, a workspace whose status endpoint 500s forever holds the
+    tenant-wide circuit open forever: its poller wins every half-open probe
+    slot, so the window can never close and every user action fails fast behind
+    it. Failures that span two targets (or any collection call) still open the
+    whole circuit — that is a real outage.
     """
 
     def __init__(
@@ -340,6 +360,11 @@ class CircuitBreaker:
         self._opened_until = 0.0
         self._opened_by: str | None = None
         self._probe_in_flight = False
+        #: The targets of the current failure streak, capped at the threshold so
+        #: an endlessly-failing resource cannot make one unrelated 5xx look like
+        #: a two-target outage.
+        self._streak: deque[str | None] = deque(maxlen=max(1, threshold))
+        self._isolated: dict[str, Isolation] = {}
 
     @property
     def state(self) -> CircuitState:
@@ -353,15 +378,28 @@ class CircuitBreaker:
     def opened_by(self) -> str | None:
         return self._opened_by
 
+    @property
+    def isolated(self) -> Mapping[str, Isolation]:
+        return self._isolated
+
     def retry_after(self) -> float:
         return max(0.0, self._opened_until - self._clock())
 
-    def check(self) -> None:
+    def check(self, target: str | None = None) -> None:
         """Gate one logical request. Raises :class:`CircuitOpen` to fail fast.
 
         Synchronous on purpose: it must not yield between the state test and the
         probe claim, or two tasks would both become the probe.
         """
+        if target is not None:
+            isolation = self._isolated.get(target)
+            if isolation is not None:
+                remaining = isolation.until - self._clock()
+                if remaining > 0:
+                    raise CircuitOpen(retry_after=remaining, opened_by=isolation.reason)
+                # The window is up and this call is the probe. The entry stays
+                # until something succeeds, so a repeat failure re-isolates at
+                # once instead of spending another full streak to re-learn it.
         if self._state is CircuitState.OPEN:
             remaining = self.retry_after()
             if remaining > 0:
@@ -375,21 +413,55 @@ class CircuitBreaker:
                 )
             self._probe_in_flight = True
 
-    def record_ok(self) -> None:
+    def record_ok(self, target: str | None = None) -> None:
         """A healthy round trip — any response the server actually produced."""
         self._probe_in_flight = False
         self._consecutive_failures = 0
+        self._streak.clear()
+        if target is not None:
+            self._isolated.pop(target, None)
         if self._state is CircuitState.HALF_OPEN:
             self._state = CircuitState.CLOSED
             self._opened_by = None
 
-    def record_failure(self, reason: str) -> None:
+    def record_failure(self, reason: str, target: str | None = None) -> None:
         """A 5xx or a transport error."""
         was_probing = self._state is CircuitState.HALF_OPEN
         self._probe_in_flight = False
+        if target is not None and target in self._isolated:
+            # The one call let through when an isolation window expired failed
+            # again. That is still news about the resource, not the API, so it
+            # goes straight back into isolation without touching the streak —
+            # and, if it also held the half-open probe slot, hands the slot on
+            # rather than re-opening the whole circuit on one sick resource.
+            self._isolate(target, reason)
+            return
         self._consecutive_failures += 1
-        if was_probing or self._consecutive_failures >= self._threshold:
+        self._streak.append(target)
+        if was_probing:
             self.trip(None, reason)
+            return
+        if self._consecutive_failures < self._threshold:
+            return
+        if target is not None and set(self._streak) == {target}:
+            self._isolate(target, reason)
+            self._consecutive_failures = 0
+            self._streak.clear()
+            return
+        self.trip(None, reason)
+
+    def _isolate(self, target: str, reason: str) -> None:
+        now = self._clock()
+        # Drop entries nobody has retried since a full window after they
+        # expired; the dict is a cache of sick resources, not a ledger.
+        stale = [
+            key
+            for key, held in self._isolated.items()
+            if key != target and held.until + self._open_seconds < now
+        ]
+        for key in stale:
+            del self._isolated[key]
+        self._isolated[target] = Isolation(now + self._window(), reason)
 
     def trip(self, seconds: float | None, reason: str) -> None:
         """Open the circuit explicitly (429 passes its ``Retry-After`` here)."""
@@ -398,6 +470,7 @@ class CircuitBreaker:
         self._opened_until = self._clock() + window
         self._opened_by = reason
         self._probe_in_flight = False
+        self._streak.clear()
 
     def _window(self) -> float:
         spread = self._jitter * (2.0 * self._rng.random() - 1.0)
@@ -409,6 +482,11 @@ class CircuitBreaker:
             "consecutive_failures": self._consecutive_failures,
             "retry_after": round(self.retry_after(), 3),
             "opened_by": self._opened_by,
+            "isolated": {
+                target: round(held.until - self._clock(), 3)
+                for target, held in self._isolated.items()
+                if held.until > self._clock()
+            },
         }
 
 
@@ -583,12 +661,16 @@ class ConductorClient:
         is_write = (method in _WRITE_METHODS) if write is None else write
         limit = self._max_attempts if max_attempts is None else max(1, max_attempts)
         query = {k: v for k, v in (params or {}).items() if v is not None}
+        # A path that differs from its template addresses one resource; a path
+        # that is its own template addresses a collection, and its failures are
+        # news about the whole API. See :class:`CircuitBreaker`.
+        target = f"{method} {path}" if path != endpoint else None
 
         async with self._gate or _NULL_GATE, self._semaphore:
             # Gated once per logical request: an in-flight retry has already been
             # budgeted, and re-checking would turn a 5xx on a write into
             # CircuitOpen, destroying the "this may have landed" information.
-            self._circuit.check()
+            self._circuit.check(target)
             attempt = 0
             while True:
                 attempt += 1
@@ -618,7 +700,9 @@ class ConductorClient:
                         request_id=None,
                         session_id=session_id,
                     )
-                    self._circuit.record_failure(f"{method} {endpoint}: transport")
+                    self._circuit.record_failure(
+                        f"{method} {endpoint}: transport", target
+                    )
                     never_sent = isinstance(
                         exc, (httpx.ConnectError, httpx.ConnectTimeout)
                     )
@@ -665,7 +749,7 @@ class ConductorClient:
                             request_id=request_id,
                         )
                     if error is None:
-                        self._circuit.record_ok()
+                        self._circuit.record_ok(target)
                         # A 2xx proves the key works, so a *transient* 403 (the
                         # proxy in front of the API rejects some client
                         # signatures) must not latch the bot dead: the
@@ -723,9 +807,11 @@ class ConductorClient:
                         error.retry_after, f"{method} {endpoint}: 429 rate limited"
                     )
                 elif error.status >= 500:
-                    self._circuit.record_failure(f"{method} {endpoint}: {error.status}")
+                    self._circuit.record_failure(
+                        f"{method} {endpoint}: {error.status}", target
+                    )
                 else:
-                    self._circuit.record_ok()
+                    self._circuit.record_ok(target)
 
                 if isinstance(error, AuthFatal):
                     self._auth_failures += 1

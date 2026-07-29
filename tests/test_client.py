@@ -299,6 +299,99 @@ async def test_half_open_probe_failure_reopens_the_circuit(
         assert recorder.count == 4
 
 
+def sick(*paths: str) -> Recorder:
+    """500 for the named paths, a healthy reply for everything else."""
+
+    def respond(request: httpx.Request, _n: int) -> httpx.Response:
+        if request.url.path.endswith(paths):
+            return httpx.Response(500, json={"userMessage": "boom"})
+        return httpx.Response(200, json=_ANY_SHAPE | {"status": "ready"})
+
+    return Recorder(respond)
+
+
+async def test_one_sick_resource_is_isolated_not_the_whole_api(
+    settings: Settings,
+) -> None:
+    """The bug: a workspace whose status 500s forever froze its whole tenant.
+
+    Its poller wins every half-open probe slot, so the window never closes and
+    the archive that would retire it fails fast behind it.
+    """
+    recorder = sick("/workspaces/ws-sick/status")
+    client, _, _ = make_client(recorder, settings, max_attempts=1)
+    async with client:
+        for _ in range(3):
+            with pytest.raises(ApiError):
+                await client.get_workspace_status("ws-sick")
+        assert client.circuit.state is CircuitState.CLOSED
+        assert "GET /workspaces/ws-sick/status" in client.circuit.isolated
+
+        # That one path now fails fast…
+        with pytest.raises(CircuitOpen):
+            await client.get_workspace_status("ws-sick")
+        assert recorder.count == 3
+
+        # …and everything else, the archive included, still goes out.
+        await client.archive_workspace("ws-sick")
+        await client.list_projects()
+        await client.get_workspace_status("ws-well")
+        assert recorder.count == 6
+
+
+async def test_two_sick_resources_still_open_the_whole_circuit(
+    settings: Settings,
+) -> None:
+    recorder = sick("/status")
+    client, _, _ = make_client(recorder, settings, max_attempts=1)
+    async with client:
+        for workspace in ("ws-a", "ws-b", "ws-a"):
+            with pytest.raises(ApiError):
+                await client.get_workspace_status(workspace)
+        assert client.circuit.state is CircuitState.OPEN
+        with pytest.raises(CircuitOpen):
+            await client.list_projects()
+    assert recorder.count == 3
+
+
+async def test_a_still_sick_resource_re_isolates_on_its_first_retry(
+    settings: Settings,
+) -> None:
+    recorder = sick("/workspaces/ws-sick/status")
+    client, clock, _ = make_client(recorder, settings, max_attempts=1)
+    async with client:
+        for _ in range(3):
+            with pytest.raises(ApiError):
+                await client.get_workspace_status("ws-sick")
+        held = client.circuit.isolated["GET /workspaces/ws-sick/status"]
+        clock.advance(held.until - clock() + 0.001)
+
+        with pytest.raises(ApiError):  # the one call let through still fails
+            await client.get_workspace_status("ws-sick")
+        assert client.circuit.state is CircuitState.CLOSED
+        with pytest.raises(CircuitOpen):
+            await client.get_workspace_status("ws-sick")
+        assert recorder.count == 4
+
+
+async def test_a_recovered_resource_leaves_isolation(settings: Settings) -> None:
+    recorder = sequence(
+        *(httpx.Response(500, json={"userMessage": "boom"}) for _ in range(3)),
+        httpx.Response(200, json=_ANY_SHAPE | {"status": "ready"}),
+    )
+    client, clock, _ = make_client(recorder, settings, max_attempts=1)
+    async with client:
+        for _ in range(3):
+            with pytest.raises(ApiError):
+                await client.get_workspace_status("ws-flaky")
+        held = client.circuit.isolated["GET /workspaces/ws-flaky/status"]
+        clock.advance(held.until - clock() + 0.001)
+
+        status = await client.get_workspace_status("ws-flaky")
+        assert status.status is WorkspaceStatusValue.READY
+        assert client.circuit.isolated == {}
+
+
 async def test_a_4xx_does_not_open_the_circuit(settings: Settings) -> None:
     recorder = always(400, {"userMessage": "bad model"})
     client, _, _ = make_client(recorder, settings, max_attempts=1)
