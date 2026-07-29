@@ -43,6 +43,12 @@ _COLUMNS: tuple[tuple[LiteralString, LiteralString, str], ...] = (
         "WHERE id = %s",
         "elevenlabs_api_key",
     ),
+    (
+        "SELECT id, github_key_ct, github_key_kid FROM tenants "
+        "WHERE github_key_ct IS NOT NULL",
+        "UPDATE tenants SET github_key_ct = %s, github_key_kid = %s WHERE id = %s",
+        "github_api_token",
+    ),
 )
 
 

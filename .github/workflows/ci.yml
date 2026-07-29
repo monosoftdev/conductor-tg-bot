@@ -206,7 +206,7 @@ jobs:
       - run: pip install -e '.[dev]'
 
       # The tests never run `python -m ctb`. This does: bootstrap for real, boot
-      # the real runtime against a real database, confirm the six services start
+      # the real runtime against a real database, confirm the seven services start
       # and /health answers. It catches what a unit test cannot — a broken
       # factory, a missing grant, an import cycle that only bites at startup.
       - name: Bootstrap

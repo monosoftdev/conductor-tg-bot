@@ -67,6 +67,7 @@ __all__ = [
     "remove_member",
     "set_conductor_key",
     "set_elevenlabs_key",
+    "set_github_key",
     "set_status",
     "unbind_chat",
     "update_defaults",
@@ -82,6 +83,7 @@ _TENANT_COLUMNS = """
     id, slug, name, status, conductor_api_url, conductor_key_ct,
     conductor_key_kid, conductor_key_fp, conductor_key_at, conductor_key_by,
     elevenlabs_key_ct, elevenlabs_key_kid, elevenlabs_key_fp, elevenlabs_key_at,
+    github_key_ct, github_key_kid, github_key_fp, github_key_at,
     default_agent, default_model, default_effort, default_branch, voice_enabled,
     voice_mode, max_pollers, max_pending_deliveries, max_workspaces,
     auth_failed_at, auth_failed_reason, created_at, updated_at, suspended_at,
@@ -113,6 +115,10 @@ class TenantRow:
     elevenlabs_key_kid: str | None = None
     elevenlabs_key_fp: str | None = None
     elevenlabs_key_at: int | None = None
+    github_key_ct: bytes | None = None
+    github_key_kid: str | None = None
+    github_key_fp: str | None = None
+    github_key_at: int | None = None
     default_agent: str = "claude"
     default_model: str = "opus-5-1m"
     default_effort: str = "high"
@@ -146,6 +152,10 @@ class TenantRow:
             elevenlabs_key_kid=as_opt_str(row["elevenlabs_key_kid"]),
             elevenlabs_key_fp=as_opt_str(row["elevenlabs_key_fp"]),
             elevenlabs_key_at=as_opt_int(row["elevenlabs_key_at"]),
+            github_key_ct=_as_bytes(row["github_key_ct"]),
+            github_key_kid=as_opt_str(row["github_key_kid"]),
+            github_key_fp=as_opt_str(row["github_key_fp"]),
+            github_key_at=as_opt_int(row["github_key_at"]),
             default_agent=as_str(row["default_agent"], "claude"),
             default_model=as_str(row["default_model"], "opus-5-1m"),
             default_effort=as_str(row["default_effort"], "high"),
@@ -424,6 +434,36 @@ async def set_elevenlabs_key(
         UPDATE tenants
            SET elevenlabs_key_ct = ?, elevenlabs_key_kid = ?,
                elevenlabs_key_fp = ?, elevenlabs_key_at = ?, updated_at = ?
+         WHERE id = ?
+        """,
+        (
+            ciphertext,
+            kid,
+            fingerprint,
+            None if ciphertext is None else stamp,
+            stamp,
+            tenant_id,
+        ),
+    )
+    return await get(db, tenant_id)
+
+
+async def set_github_key(
+    db: Database,
+    tenant_id: uuid.UUID,
+    *,
+    ciphertext: bytes | None,
+    kid: str | None,
+    fingerprint: str | None,
+    at: int | None = None,
+) -> TenantRow | None:
+    """Store (or, with ``ciphertext=None``, revoke) this team's GitHub token."""
+    stamp = now_ms() if at is None else at
+    await db.execute(
+        """
+        UPDATE tenants
+           SET github_key_ct = ?, github_key_kid = ?,
+               github_key_fp = ?, github_key_at = ?, updated_at = ?
          WHERE id = ?
         """,
         (

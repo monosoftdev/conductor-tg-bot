@@ -20,7 +20,8 @@ Everything else is additive, and nothing else is required:
   The code is issued privately and hashed at rest, because a shared bot can be
   added to any group by anyone: being added is not consent, and without the
   code somebody could bind the bot to a team that is not theirs.
-* ``/voicekey`` stores a speech key.
+* ``/voicekey`` stores a speech key; ``/gitkey`` stores a GitHub token, which
+  is what turns CI watching on for a team.
 
 ``/start``, ``/register``, ``/help``, ``/privacy`` and ``/platform`` are the
 only commands a non-member can reach in a private chat, and ``/setup`` the only
@@ -74,8 +75,16 @@ from ctb.db.connection import Database, now_ms, tenant_scope
 from ctb.db.repo import chats as chats_repo
 from ctb.db.repo import tenancy
 from ctb.delivery.render.html import escape
+from ctb.github.client import check_github_token
+from ctb.github.pool import GITHUB_KEY_PURPOSE
 from ctb.logging import get_logger
-from ctb.runtime import client_pool, provider_pool, secret_box, system_database
+from ctb.runtime import (
+    client_pool,
+    github_pool,
+    provider_pool,
+    secret_box,
+    system_database,
+)
 from ctb.settings import Settings
 from ctb.voice.pool import ELEVENLABS_KEY_PURPOSE
 from ctb.voice.provider import check_elevenlabs_key
@@ -138,6 +147,58 @@ _GROUP_STEPS: Final = (
     "3 · Send there <code>/setup {code}</code>\n\n"
     "15 minutes, one use. <code>/team</code> mints another."
 )
+
+
+#: The three credentials this bot can hold, and how to go and get one.
+CONDUCTOR: Final = "conductor"
+SPEECH: Final = "speech"
+GITHUB: Final = "github"
+
+#: Written to be followed on a phone, with a thumb, in another app: numbered
+#: steps, the exact menu names, and a link that lands on the page rather than
+#: on a home page to navigate from. Only the first one is required — the other
+#: two say so in their own first line, because a guide that does not say
+#: "optional" reads as a chore somebody has to do before anything works.
+_KEY_GUIDES: Final[dict[str, str]] = {
+    CONDUCTOR: (
+        "🔑 <b>Conductor API key</b> · required\n\n"
+        "1 · Open <b>conductor.build</b> and sign in\n"
+        "2 · <b>Settings</b> → <b>API keys</b> → <b>New key</b>\n"
+        "3 · Copy it and send it here:\n"
+        "<code>/key cnd_live_…</code>\n\n"
+        "I check the key works, encrypt it, and delete your message. "
+        "It pays for your own agents, so nobody else can spend on it."
+    ),
+    SPEECH: (
+        "🎙 <b>Speech key</b> · optional, for voice notes\n\n"
+        "1 · Open <b>elevenlabs.io</b> and sign in\n"
+        "2 · Your avatar (top right) → <b>API keys</b> → <b>Create</b>\n"
+        "3 · Copy it and send it here:\n"
+        "<code>/voicekey sk_…</code>\n\n"
+        "Storing it turns voice on — there is no second switch, and "
+        "<code>/voice off</code> pauses it without deleting the key. "
+        "Audio leaves this system under <i>your</i> key, billed to you."
+    ),
+    GITHUB: (
+        "🔎 <b>GitHub token</b> · optional, for CI\n\n"
+        "1 · Open\n"
+        "<code>github.com/settings/personal-access-tokens/new</code>\n"
+        "2 · <b>Repository access</b> → pick the repos your agents work in\n"
+        "3 · <b>Permissions</b> → <b>Repository</b>, set <b>Read-only</b> on:\n"
+        "• Pull requests\n• Checks\n• Commit statuses\n"
+        "4 · <b>Generate token</b>, copy it, send it here:\n"
+        "<code>/gitkey github_pat_…</code>\n\n"
+        "Read-only is all it needs — this bot never writes to your code. "
+        "With it, a turn that opens a pull request gets one line here when "
+        "the checks finish, and a <b>Fix CI</b> button if they fail. "
+        "Without it, nothing about CI appears at all."
+    ),
+}
+
+
+def key_guide(kind: str) -> str:
+    """The step-by-step for one credential. Shown by the bare command."""
+    return _KEY_GUIDES.get(kind, _KEY_GUIDES[CONDUCTOR])
 
 
 #: Anything this long, unbroken and key-shaped is a credential, whatever
@@ -638,7 +699,7 @@ async def _setup_dm(
     await tell(message, "DM ready · <code>/new &lt;prompt&gt;</code> starts one.")
 
 
-@router.message(Command("key", "voicekey"))
+@router.message(Command("key", "voicekey", "gitkey"))
 async def set_key(
     message: Message,
     tenant: TenantContext | None,
@@ -647,7 +708,9 @@ async def set_key(
 ) -> None:
     """Store a sealed API key, and get it out of Telegram immediately."""
     await abandon_wizard(state)
-    speech = (message.text or "").startswith("/voicekey")
+    text = message.text or ""
+    speech = text.startswith("/voicekey")
+    git = text.startswith("/gitkey")
     if message.chat.type != "private":
         # Refuse *and* clean up: the key is already in a group's history.
         deleted = await _delete(message)
@@ -693,16 +756,19 @@ async def set_key(
 
     if not value:
         await tell(
-            message,
-            "Send <code>/key &lt;your Conductor API key&gt;</code>.\n"
-            "I delete your message straight away and store the key encrypted.",
+            message, key_guide(GITHUB if git else SPEECH if speech else CONDUCTOR)
         )
         return
 
     system = system_database()
     box = secret_box()
     fingerprint = box.fingerprint_of(value, tenant_id=tenant.tenant_id)
-    current = tenant.row.elevenlabs_key_fp if speech else tenant.row.conductor_key_fp
+    if git:
+        current = tenant.row.github_key_fp
+    elif speech:
+        current = tenant.row.elevenlabs_key_fp
+    else:
+        current = tenant.row.conductor_key_fp
 
     if current == fingerprint:
         await tell(message, "That is already the stored key. Nothing changed." + note)
@@ -712,7 +778,14 @@ async def set_key(
     # mysterious auth failure an hour later. `/voicekey` used to skip this, so a
     # mistyped speech key was accepted with "Speech key stored" and only failed
     # at the first voice note — which reads as "voice is broken".
-    if speech:
+    if git:
+        checked = await check_github_token(value)
+        if checked is not None:
+            await tell(
+                message, f"GitHub rejected that token · {escape(checked)}" + note
+            )
+            return
+    elif speech:
         checked = await check_elevenlabs_key(value)
         if checked is not None:
             await tell(
@@ -727,11 +800,32 @@ async def set_key(
             )
             return
 
-    sealed = box.seal(
-        value,
-        tenant_id=tenant.tenant_id,
-        purpose=ELEVENLABS_KEY_PURPOSE if speech else CONDUCTOR_KEY_PURPOSE,
-    )
+    if git:
+        purpose = GITHUB_KEY_PURPOSE
+    elif speech:
+        purpose = ELEVENLABS_KEY_PURPOSE
+    else:
+        purpose = CONDUCTOR_KEY_PURPOSE
+    sealed = box.seal(value, tenant_id=tenant.tenant_id, purpose=purpose)
+    if git:
+        await tenancy.set_github_key(
+            system,
+            tenant.tenant_id,
+            ciphertext=sealed,
+            kid=box.active_kid,
+            fingerprint=fingerprint,
+        )
+        forget_cached(tenant.tenant_id)
+        pool = github_pool()
+        if pool is not None:
+            await pool.forget(tenant.tenant_id)
+        await tell(
+            message,
+            "🔎 GitHub token stored and checked.\n"
+            "When a turn opens a pull request I will watch its checks and say "
+            "here whether they passed." + note,
+        )
+        return
     if speech:
         # Storing a key *is* the request to use it. Two switches in series made
         # a dead end: "/voice on" said store a key, and storing a key said turn
@@ -915,6 +1009,9 @@ async def revoke(message: Message, tenant: TenantContext, state: FSMContext) -> 
     await tenancy.set_elevenlabs_key(
         system, tenant.tenant_id, ciphertext=None, kid=None, fingerprint=None
     )
+    await tenancy.set_github_key(
+        system, tenant.tenant_id, ciphertext=None, kid=None, fingerprint=None
+    )
     await tenancy.set_status(system, tenant.tenant_id, "pending")
     log.info("registration.key_revoked", tenant=tenant.slug)
     forget_cached(tenant.tenant_id)
@@ -930,7 +1027,8 @@ async def deauthorize(tenant_id: object) -> None:
 
     The database row is only half of a revocation. A built ``ConductorClient``
     holds the plaintext key in an httpx ``Authorization`` header and an
-    ``ElevenLabsProvider`` holds the speech key in a field; both outlive the row
+    an ``ElevenLabsProvider`` holds the speech key in a field, and a
+    ``GitHubClient`` holds its token in one too; all three outlive the row
     unless something says so. ``ClientPool`` would eventually sweep on its idle
     TTL — up to fifteen minutes — and the provider pool has no sweep at all, so
     without this a key the owner just deleted stays live in the process.
@@ -945,6 +1043,10 @@ async def deauthorize(tenant_id: object) -> None:
     if providers is not None:
         with suppress(Exception):
             await providers.forget(tenant_id)  # type: ignore[arg-type]
+    repos = github_pool()
+    if repos is not None:
+        with suppress(Exception):
+            await repos.forget(tenant_id)  # type: ignore[arg-type]
 
 
 async def _check_conductor_key(api_key: str, api_url: str) -> str | None:

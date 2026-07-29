@@ -84,6 +84,7 @@ __all__ = [
     "FocusTracker",
     "Outbox",
     "Priority",
+    "notice_message_id",
     "QuickReplyFactory",
     "SEND_BURST",
     "SEND_RATE_PER_MINUTE",
@@ -201,6 +202,16 @@ class Priority(IntEnum):
 
 
 # ── focus: the topic the thumb is in ─────────────────────────────────────────
+
+
+def notice_message_id(key: str) -> str:
+    """A notice's delivery id, namespaced away from transcript message ids.
+
+    Public because a caller that wants to *revise* the notice it queued has to
+    find the row again, and guessing the prefix at the other end is how the two
+    drift apart.
+    """
+    return f"notice:{key}"
 
 
 class FocusTracker:
@@ -610,7 +621,7 @@ class Outbox:
         return await self.enqueue_parts(
             parts,
             session_id=session_id,
-            message_id=f"notice:{key}",
+            message_id=notice_message_id(key),
             chat_id=chat_id,
             thread_id=thread_id,
             session_index=session_index,

@@ -1107,6 +1107,204 @@ class TestVoiceToggle:
         assert said[-1] == "Owners only."
 
 
+class TestKeyGuides:
+    """A bare key command has to be a set-up guide, not a syntax reminder.
+
+    Somebody standing in Telegram with no key does not know where the key
+    lives. Every one of these is followed with a thumb, in another app.
+    """
+
+    async def _tenant(self, system_db: Database) -> TenantRow:
+        row = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
+        assert row is not None
+        return row
+
+    @pytest.mark.parametrize(
+        ("command", "must_mention"),
+        [
+            ("/key", "conductor.build"),
+            ("/voicekey", "elevenlabs.io"),
+            ("/gitkey", "github.com/settings/personal-access-tokens"),
+        ],
+    )
+    async def test_it_says_where_to_go_and_what_to_click(
+        self,
+        db: Database,
+        system_db: Database,
+        said: list[str],
+        command: str,
+        must_mention: str,
+    ) -> None:
+        row = await self._tenant(system_db)
+
+        await registration.set_key(
+            dm(command), context(row), voice_settings(), NullState()
+        )
+
+        guide = said[-1]
+        assert must_mention in guide
+        assert "1 · " in guide and "2 · " in guide, "numbered steps, not prose"
+        assert command in guide, "the command it ends on is the one just typed"
+
+    async def test_only_the_conductor_key_is_presented_as_required(
+        self, db: Database, system_db: Database, said: list[str]
+    ) -> None:
+        """A guide that does not say "optional" reads as a chore."""
+        row = await self._tenant(system_db)
+
+        for command in ("/voicekey", "/gitkey"):
+            await registration.set_key(
+                dm(command), context(row), voice_settings(), NullState()
+            )
+            assert "optional" in said[-1]
+
+        await registration.set_key(
+            dm("/key"), context(row), voice_settings(), NullState()
+        )
+        assert "required" in said[-1]
+
+    async def test_the_github_guide_asks_for_read_only(
+        self, db: Database, system_db: Database, said: list[str]
+    ) -> None:
+        """The bot never writes to a customer's code; the guide must not ask to."""
+        row = await self._tenant(system_db)
+
+        await registration.set_key(
+            dm("/gitkey"), context(row), voice_settings(), NullState()
+        )
+
+        guide = said[-1].casefold()
+        assert "read-only" in guide
+        assert "write" not in guide.replace("never writes", "")
+
+
+class TestGitHubTokenIntake:
+    """`/gitkey` is what turns CI watching on for a team."""
+
+    async def _tenant(self, system_db: Database) -> TenantRow:
+        row = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
+        assert row is not None
+        return row
+
+    async def test_a_good_token_is_sealed_and_stored(
+        self,
+        db: Database,
+        system_db: Database,
+        said: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        async def accept(_token: str, **_kw: Any) -> None:
+            return None
+
+        monkeypatch.setattr(registration, "check_github_token", accept)
+        row = await self._tenant(system_db)
+
+        await registration.set_key(
+            dm("/gitkey ghp_good"), context(row), voice_settings(), NullState()
+        )
+
+        after = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
+        assert after is not None and after.github_key_ct is not None
+        # Sealed, not stored: the row never holds the token itself.
+        assert b"ghp_good" not in bytes(after.github_key_ct)
+        assert "GitHub token stored" in said[-1]
+        # The other two credentials are untouched by the third.
+        assert after.conductor_key_ct is not None
+        assert after.elevenlabs_key_ct is None
+
+    async def test_a_rejected_token_is_not_stored_but_is_still_deleted(
+        self,
+        db: Database,
+        system_db: Database,
+        said: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        async def refuse(_token: str, **_kw: Any) -> str:
+            return "GitHub rejected that token."
+
+        monkeypatch.setattr(registration, "check_github_token", refuse)
+        bot = FakeBot()
+        row = await self._tenant(system_db)
+
+        await registration.set_key(
+            dm("/gitkey ghp_typo", bot=bot),
+            context(row),
+            voice_settings(),
+            NullState(),
+        )
+
+        assert "GitHub rejected" in said[-1]
+        assert bot.deleted, "a refused token is still a live token in history"
+        after = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
+        assert after is not None and after.github_key_ct is None
+
+    async def test_a_token_sent_to_a_group_is_refused_and_deleted(
+        self,
+        db: Database,
+        system_db: Database,
+        said: list[str],
+    ) -> None:
+        bot = FakeBot()
+        message = SimpleNamespace(
+            text="/gitkey ghp_oops",
+            chat=SimpleNamespace(id=-100999, type="supergroup", title="Team"),
+            message_thread_id=None,
+            message_id=11,
+            from_user=SimpleNamespace(
+                id=OWNER, username=None, first_name="U", last_name=None
+            ),
+            bot=bot,
+        )
+        row = await self._tenant(system_db)
+
+        await registration.set_key(message, context(row), voice_settings(), NullState())
+
+        assert "Never send an API key to a group" in said[-1]
+        assert bot.deleted
+        after = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
+        assert after is not None and after.github_key_ct is None
+
+    async def test_only_owners_may_store_it(
+        self,
+        db: Database,
+        system_db: Database,
+        said: list[str],
+    ) -> None:
+        row = await self._tenant(system_db)
+
+        await registration.set_key(
+            dm("/gitkey ghp_good"),
+            context(row, role="member"),
+            voice_settings(),
+            NullState(),
+        )
+
+        after = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
+        assert after is not None and after.github_key_ct is None
+
+    async def test_revoke_takes_the_github_token_too(
+        self,
+        db: Database,
+        system_db: Database,
+        said: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        async def accept(_token: str, **_kw: Any) -> None:
+            return None
+
+        monkeypatch.setattr(registration, "check_github_token", accept)
+        row = await self._tenant(system_db)
+        await registration.set_key(
+            dm("/gitkey ghp_good"), context(row), voice_settings(), NullState()
+        )
+
+        await registration.revoke(dm("/revoke"), context(row), NullState())
+
+        after = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
+        assert after is not None
+        assert after.github_key_ct is None and after.github_key_fp is None
+
+
 class TestSpeechKeyIntake:
     """`/voicekey` used to accept anything and fail at the first voice note."""
 

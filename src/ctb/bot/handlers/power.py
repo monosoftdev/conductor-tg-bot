@@ -88,10 +88,10 @@ Result · tap a numbered choice; ✓ is recommended
 <b>Your team</b>
 <code>/team</code> adds a group for several people · optional
 <code>/invite id</code> adds someone · <code>/members</code> lists them
-<code>/key</code> (privately) sets your Conductor key
+Privately · <code>/key</code> Conductor · <code>/voicekey</code> voice ·
+<code>/gitkey</code> CI · send one bare and I walk you through getting it
 <code>/use name</code> picks which team your DMs mean · <code>/leave</code> exits
 <code>/export</code> downloads your data · <code>/privacy</code> explains it
-<code>/voice on</code> needs your own <code>/voicekey</code> first
 Voice commands need “command” or “команда”."""
 
 #: Buttons ``/s`` shows in General before it says how many it hid.

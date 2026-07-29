@@ -106,6 +106,7 @@ class Built:
     cards: Runner
     supervisor: Runner
     voice: Runner
+    ci: Runner
     health: Runner
     app: App
 
@@ -135,6 +136,7 @@ def fake_factories(
         cards=runner("status_cards"),
         supervisor=runner("supervisor"),
         voice=runner("voice"),
+        ci=runner("ci"),
         health=runner("health"),
         app=App(events),
     )
@@ -171,6 +173,7 @@ def fake_factories(
         make_status_cards=make("status_cards", built.cards),
         make_supervisor=make("supervisor", built.supervisor),
         make_voice=make("voice", built.voice),
+        make_ci=make("ci", built.ci),
         make_health_monitor=make("health_monitor", object()),
         make_health_server=make("health_server", built.health),
         make_app=make("app", built.app),
@@ -199,7 +202,7 @@ async def test_boot_order_and_signal_style_shutdown_are_clean(
     shutdown.set()
     await asyncio.wait_for(task, timeout=1)
 
-    assert events[:12] == [
+    assert events[:13] == [
         "build:logging",
         "build:db",
         "build:migrate",
@@ -209,6 +212,7 @@ async def test_boot_order_and_signal_style_shutdown_are_clean(
         "build:status_cards",
         "build:supervisor",
         "build:voice",
+        "build:ci",
         "build:health_monitor",
         "build:health_server",
         "build:app",
@@ -218,13 +222,15 @@ async def test_boot_order_and_signal_style_shutdown_are_clean(
         built.outbox,
         built.cards,
         built.voice,
+        built.ci,
         built.supervisor,
         built.health,
     ):
         assert service.started.is_set()
         assert service.cancelled
-    assert events[-9:] == [
+    assert events[-10:] == [
         "stop:voice",
+        "stop:ci",
         "stop:supervisor",
         "stop:status_cards",
         "stop:outbox",
@@ -337,6 +343,7 @@ async def test_invalid_configuration_fails_before_logging_or_io(
         make_status_cards=factories.make_status_cards,
         make_supervisor=factories.make_supervisor,
         make_voice=factories.make_voice,
+        make_ci=factories.make_ci,
         make_health_monitor=factories.make_health_monitor,
         make_health_server=factories.make_health_server,
         make_app=factories.make_app,
@@ -472,6 +479,7 @@ async def test_production_factories_build_every_component_without_network(
             "outbox",
             "status_cards",
             "voice",
+            "ci",
             "supervisor",
             "health",
         ]

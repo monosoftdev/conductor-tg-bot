@@ -443,6 +443,69 @@ async def test_cancel_goes_through_supervisor_machine() -> None:
     assert not await request_cancel(None, "session-1", requested_by=1001)
 
 
+async def test_fix_ci_sends_the_agent_looking_before_fixing(db: Database) -> None:
+    """The bot knows a check went red, not why. The prompt must not guess."""
+    await sessions_repo.upsert(db, "sess-ci", chat_id=-1001, thread_id=7)
+    nonces = NonceStore()
+    client = PromptClient()
+    tapped = button(
+        "🔧 Fix CI",
+        keyboards.Action.FIX_CI,
+        "sess-ci",
+        store=nonces,
+        chat_id=-1001,
+        thread_id=7,
+        restartable=True,
+    )
+    assert tapped.callback_data is not None
+    query = _Tap(tapped.callback_data)
+
+    await prompt_handlers.fix_ci_callback(
+        query,  # type: ignore[arg-type]
+        nonces,
+        fake_tenant(client),
+        db=db,
+    )
+
+    assert query.answers == ["On it"]
+    assert len(client.posts) == 1
+    session_id, body, _ = client.posts[0]
+    assert session_id == "sess-ci"
+    assert "gh pr checks" in body
+    assert "unrelated to your change" in body, "no forcing a green tick"
+
+    stored = await prompts_repo.list_for_session(db, "sess-ci", limit=1)
+    assert stored and stored[0].chat_id == -1001 and stored[0].thread_id == 7
+
+
+async def test_fix_ci_still_works_after_the_redeploy_it_will_outlive(
+    db: Database,
+) -> None:
+    await sessions_repo.upsert(db, "sess-ci", chat_id=-1001, thread_id=7)
+    before = NonceStore()
+    tapped = button(
+        "🔧 Fix CI",
+        keyboards.Action.FIX_CI,
+        "sess-ci",
+        store=before,
+        chat_id=-1001,
+        thread_id=7,
+        restartable=True,
+    )
+    assert tapped.callback_data is not None
+    client = PromptClient()
+
+    # A brand-new process: the store remembers nothing.
+    await prompt_handlers.fix_ci_callback(
+        _Tap(tapped.callback_data),  # type: ignore[arg-type]
+        NonceStore(),
+        fake_tenant(client),
+        db=db,
+    )
+
+    assert len(client.posts) == 1
+
+
 async def test_submit_persists_and_posts_same_augmented_body(db: Database) -> None:
     await sessions_repo.upsert(db, "session-1")
     client = PromptClient()

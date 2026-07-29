@@ -56,6 +56,18 @@ Optionally, to talk to it:
 That one turns voice on by itself — there is no second switch. `/voice off`
 pauses it later without throwing the key away.
 
+And, to be told whether CI passed on the pull requests your agents open:
+
+```
+/gitkey github_pat_xxxxxxxx
+```
+
+Read-only is enough. See [Watching CI](#watching-ci).
+
+Do not go hunting for any of these. Send the command **bare** — `/key`,
+`/voicekey`, `/gitkey` — and the bot replies with a numbered, click-by-click
+guide to getting that particular key.
+
 > **Never send a key to a group.** If you do, the bot deletes it and tells you
 > to rotate it — but other members may have already seen it. It catches a key
 > typed on the wrong command too, so `/voice sk_...` is handled the same way.
@@ -332,6 +344,43 @@ Then send a voice note in a topic and it becomes a prompt. To use voice for
 > speech vendor under **your** key, billed to you. The bot asks the vendor not
 > to retain it, but zero retention is an enterprise-tier promise. If that
 > matters to you, leave voice off.
+
+---
+
+## Watching CI
+
+Store a GitHub token — privately, like every other key — and the bot watches
+what happens after a turn opens a pull request:
+
+```
+/gitkey                       # bot replies with the step-by-step
+/gitkey github_pat_xxxxxxxx   # read-only is all it needs
+```
+
+The token is a **fine-grained** personal access token from
+`github.com/settings/personal-access-tokens/new`, scoped to the repositories
+your agents work in, with *Read-only* on **Pull requests**, **Checks** and
+**Commit statuses**. Nothing else — the bot never writes to your code.
+
+When a turn ends on a `https://github.com/owner/repo/pull/NN` link, the bot
+polls that pull request's checks and posts **one** line in the same topic when
+they settle:
+
+```
+✅ CI passed · owner/repo#24 · 6 checks
+⚠️ CI failed · owner/repo#24 · types, tests      [🔧 Fix CI]
+```
+
+**Fix CI** sends the failure back to the agent that opened the PR — it reads
+the failing job with `gh` and pushes a fix, or says the failure is unrelated to
+its change. The button still works hours later, after a redeploy.
+
+Said once, per commit: re-reading the same red run is silence, but a new commit
+that goes red again says so. A merged or closed pull request stops the watch,
+and so does three hours of nothing happening.
+
+The token reads your private source, so it is sealed like every other key and
+never shared between teams. `/revoke` deletes it along with the rest.
 
 ---
 
