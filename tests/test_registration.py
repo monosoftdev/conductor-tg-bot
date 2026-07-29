@@ -1212,6 +1212,31 @@ class TestGitHubTokenIntake:
         assert after.conductor_key_ct is not None
         assert after.elevenlabs_key_ct is None
 
+    async def test_schema_001_keeps_the_bot_working_without_accepting_a_token(
+        self,
+        db: Database,
+        system_db: Database,
+        said: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        async def old_schema(_db: Database) -> int:
+            return 1
+
+        async def must_not_call_github(_token: str, **_kw: Any) -> None:
+            raise AssertionError("an unavailable integration validated a token")
+
+        monkeypatch.setattr(registration, "current_schema_version", old_schema)
+        monkeypatch.setattr(registration, "check_github_token", must_not_call_github)
+        row = await self._tenant(system_db)
+
+        await registration.set_key(
+            dm("/gitkey ghp_good"), context(row), voice_settings(), NullState()
+        )
+
+        assert "temporarily unavailable" in said[-1]
+        after = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
+        assert after is not None and after.github_key_ct is None
+
     async def test_a_rejected_token_is_not_stored_but_is_still_deleted(
         self,
         db: Database,

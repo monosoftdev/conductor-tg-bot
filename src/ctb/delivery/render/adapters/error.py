@@ -8,6 +8,7 @@ accepting POSTs — the one thing the chat must never do with that is stay quiet
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from typing import Any, ClassVar, Final
 
@@ -46,6 +47,35 @@ _MESSAGE_KEYS: Final = (
     "detail",
 )
 
+_USAGE_LIMIT_RE: Final = re.compile(
+    r"\b(?:usage|token)\s+limit\b"
+    r"|\b(?:rate|weekly|5[\s-]?hour|7[\s-]?day)\s+limit\b",
+    re.IGNORECASE,
+)
+
+
+def _usage_limit_header(source: Mapping[str, Any], body: str) -> str | None:
+    """A provider quota is more actionable than a generic failed-turn label."""
+    if not _USAGE_LIMIT_RE.search(body):
+        return None
+    identity = " ".join(
+        filter(
+            None,
+            (
+                body,
+                first_str(source, "provider", "agent", "model"),
+            ),
+        )
+    )
+    folded = normalize(identity)
+    if "codex" in folded or "chatgpt" in folded:
+        provider = "Codex"
+    elif "opus" in folded:
+        provider = "Opus"
+    else:
+        provider = "Agent"
+    return f"⛔ <b>{provider} usage limit reached</b>"
+
 
 class ErrorAdapter(Adapter):
     """Matches a truthy failure signal anywhere in the envelope."""
@@ -67,8 +97,8 @@ class ErrorAdapter(Adapter):
         body = truncate_text(body.strip(), _BODY_LIMIT)
 
         reason = first_str(source, "stop_reason", "terminal_reason", "subtype")
-        header = "⚠️ <b>Turn failed</b>"
-        if reason and normalize(reason) != "error":
+        header = _usage_limit_header(source, body) or "⚠️ <b>Turn failed</b>"
+        if header.startswith("⚠️") and reason and normalize(reason) != "error":
             header = f"{header} · <code>{plain_html(reason)}</code>"
 
         if not body:

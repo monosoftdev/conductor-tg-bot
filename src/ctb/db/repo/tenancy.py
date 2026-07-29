@@ -79,11 +79,27 @@ ROLE_ORDER: Final[dict[str, int]] = {"member": 0, "admin": 1, "owner": 2}
 
 type TenantStatus = str  # 'pending' | 'active' | 'suspended' | 'deleted'
 
-_TENANT_COLUMNS = """
+# GitHub/CI arrived in migration 002.  A rolling deploy can briefly run this
+# code against a database that still has only 001, and CI is optional, so the
+# four new fields must not make the core tenant lookup fail.  Reading through
+# the row's JSON representation returns NULL for a column that is not present.
+# The bytea value is represented as ``\x<hex>`` and decoded back to the exact
+# sealed bytes when the column does exist.
+#
+# Keep this compatibility projection until migration 002 is old enough that no
+# supported deployment can still be on 001.  It is deliberately read-only:
+# storing a GitHub token still requires 002.
+_TENANT_COLUMNS = r"""
     id, slug, name, status, conductor_api_url, conductor_key_ct,
     conductor_key_kid, conductor_key_fp, conductor_key_at, conductor_key_by,
     elevenlabs_key_ct, elevenlabs_key_kid, elevenlabs_key_fp, elevenlabs_key_at,
-    github_key_ct, github_key_kid, github_key_fp, github_key_at,
+    CASE
+        WHEN to_jsonb(tenants) ->> 'github_key_ct' IS NULL THEN NULL::bytea
+        ELSE decode(substr(to_jsonb(tenants) ->> 'github_key_ct', 3), 'hex')
+    END AS github_key_ct,
+    to_jsonb(tenants) ->> 'github_key_kid' AS github_key_kid,
+    to_jsonb(tenants) ->> 'github_key_fp' AS github_key_fp,
+    (to_jsonb(tenants) ->> 'github_key_at')::bigint AS github_key_at,
     default_agent, default_model, default_effort, default_branch, voice_enabled,
     voice_mode, max_pollers, max_pending_deliveries, max_workspaces,
     auth_failed_at, auth_failed_reason, created_at, updated_at, suspended_at,

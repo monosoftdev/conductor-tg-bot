@@ -287,6 +287,21 @@ async def _give_token(system_db: Database) -> None:
 
 
 class TestTheLoop:
+    async def test_disabled_watcher_never_touches_the_optional_table(self) -> None:
+        class NoDatabase:
+            async def fetch_all(self, *_args: Any, **_kwargs: Any) -> Any:
+                raise AssertionError("disabled CI queried its ledger")
+
+        watch = CiWatcher(
+            system_db=NoDatabase(),  # type: ignore[arg-type]
+            outbox=FakeOutbox(),  # type: ignore[arg-type]
+            clients=FakePool(None),  # type: ignore[arg-type]
+            enabled=False,
+        )
+
+        assert await watch.tick() == 0
+        assert watch.health() == {"enabled": False, "polls": 0, "notices": 0}
+
     async def test_a_red_run_is_announced_once_with_a_fix_button(
         self, db: Database, system_db: Database
     ) -> None:

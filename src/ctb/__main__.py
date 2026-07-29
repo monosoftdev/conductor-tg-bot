@@ -57,6 +57,9 @@ type Factory = Callable[..., Any]
 type AsyncFactory = Callable[..., Awaitable[Any]]
 
 _SIGNALS: Final[tuple[signal.Signals, ...]] = (signal.SIGINT, signal.SIGTERM)
+# Migration 002 contains only the optional GitHub token fields and CI ledger.
+# Core Telegram/Conductor behavior remains available on schema 001.
+_CI_SCHEMA_VERSION: Final = 2
 
 #: Services whose failure is logged and contained instead of ending the process.
 #: Voice is off by default, costs money, and depends on a third party — it is a
@@ -457,7 +460,7 @@ def _default_make_supervisor(
     )
 
 
-def _default_make_ci(system_db: Any, outbox: Any) -> Any:
+def _default_make_ci(system_db: Any, outbox: Any, enabled: bool = True) -> Any:
     from ctb.ci.watcher import CiWatcher
     from ctb.github.pool import GitHubPool
     from ctb.runtime import secret_box, set_github_pool
@@ -470,7 +473,12 @@ def _default_make_ci(system_db: Any, outbox: Any) -> Any:
     # Published so /revoke can evict a decrypted token rather than leaving it
     # live in an Authorization header for the life of the process.
     set_github_pool(clients)
-    return CiWatcher(system_db=system_db, outbox=outbox, clients=clients)
+    return CiWatcher(
+        system_db=system_db,
+        outbox=outbox,
+        clients=clients,
+        enabled=enabled,
+    )
 
 
 def _default_make_health_monitor(system_db: Any, clients: Any, holder: str) -> Any:
@@ -645,7 +653,14 @@ async def build_runtime(
             runtime.clients,
             runtime.supervisor,
         )
-        runtime.ci = made.make_ci(runtime.system_db, runtime.outbox)
+        ci_enabled = version >= _CI_SCHEMA_VERSION
+        if not ci_enabled:
+            log.warning(
+                "runtime.ci_disabled",
+                schema_version=version,
+                required_schema_version=_CI_SCHEMA_VERSION,
+            )
+        runtime.ci = made.make_ci(runtime.system_db, runtime.outbox, ci_enabled)
         runtime.health_monitor = made.make_health_monitor(
             runtime.system_db,
             runtime.clients,

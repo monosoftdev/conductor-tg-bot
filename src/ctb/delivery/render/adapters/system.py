@@ -62,14 +62,22 @@ _LIMIT_LABELS: Final[dict[str, str]] = {
 }
 
 
-def _limit_label(limit_type: str | None) -> str:
+def _limit_label(limit_type: str | None, provider: str | None = None) -> str:
     """``seven_day`` → ``weekly limit``. Never an API token in a chat bubble."""
     if not limit_type:
-        return "usage limit"
-    known = _LIMIT_LABELS.get(normalize(limit_type))
-    if known:
-        return known
-    return limit_type.replace("_", " ").replace("-", " ").strip() or "usage limit"
+        label = "usage limit"
+    else:
+        known = _LIMIT_LABELS.get(normalize(limit_type))
+        label = (
+            known
+            or limit_type.replace("_", " ").replace("-", " ").strip()
+            or "usage limit"
+        )
+    # Claude's weekly Opus type already names the model.  Codex events may use
+    # the same generic five-hour/weekly windows, with the provider beside them.
+    if "codex" in normalize(provider) and "codex" not in normalize(label):
+        return f"Codex {label}"
+    return label
 
 
 def _epoch_seconds(value: Any) -> float | None:
@@ -177,11 +185,15 @@ class RateLimitAdapter(Adapter):
 
     def render(self, message: TranscriptMessage, context: RenderContext) -> list[Block]:
         payload = raw_payload(message.content)
-        info = mapping_of(
-            payload.get("rate_limit_info") or payload.get("rateLimitInfo")
+        info = (
+            mapping_of(payload.get("rate_limit_info") or payload.get("rateLimitInfo"))
+            or payload
         )
         status = normalize(first_str(info, "status") or "unknown")
-        label = _limit_label(first_str(info, "rateLimitType", "rate_limit_type"))
+        label = _limit_label(
+            first_str(info, "rateLimitType", "rate_limit_type", "limitType"),
+            first_str(info, "provider", "agent", "model"),
+        )
         resets = _reset_phrase(info, context.now_epoch_s or time.time())
 
         if status in _OK_STATUSES:

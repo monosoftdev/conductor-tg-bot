@@ -109,6 +109,7 @@ class Built:
     ci: Runner
     health: Runner
     app: App
+    ci_enabled: bool | None = None
 
 
 def fake_factories(
@@ -118,6 +119,7 @@ def fake_factories(
     fail_service: str | None = None,
     returning_service: str | None = None,
     fail_at: str | None = None,
+    schema_version: int = 2,
 ) -> tuple[RuntimeFactories, Built]:
     def runner(name: str) -> Runner:
         return Runner(
@@ -151,7 +153,7 @@ def fake_factories(
         events.append("build:migrate")
         if fail_at == "migrate":
             raise RuntimeError("bad migration")
-        return 1
+        return schema_version
 
     def make(name: str, value: Any) -> Callable[..., Any]:
         def factory(*_args: Any) -> Any:
@@ -161,6 +163,13 @@ def fake_factories(
             return value
 
         return factory
+
+    def make_ci(_db: Any, _outbox: Any, enabled: bool) -> Runner:
+        events.append("build:ci")
+        if fail_at == "ci":
+            raise RuntimeError("bad ci")
+        built.ci_enabled = enabled
+        return built.ci
 
     factories = RuntimeFactories(
         load_settings=lambda: settings,
@@ -173,7 +182,7 @@ def fake_factories(
         make_status_cards=make("status_cards", built.cards),
         make_supervisor=make("supervisor", built.supervisor),
         make_voice=make("voice", built.voice),
-        make_ci=make("ci", built.ci),
+        make_ci=make_ci,
         make_health_monitor=make("health_monitor", object()),
         make_health_server=make("health_server", built.health),
         make_app=make("app", built.app),
@@ -181,6 +190,21 @@ def fake_factories(
         make_holder=lambda: "test:1:holder",
     )
     return factories, built
+
+
+async def test_schema_001_disables_only_the_optional_ci_worker(
+    settings: Settings,
+) -> None:
+    events: list[str] = []
+    factories, built = fake_factories(settings, events, schema_version=1)
+
+    runtime = await build_runtime(settings, factories=factories)
+    try:
+        assert built.ci_enabled is False
+        assert runtime.supervisor is built.supervisor
+        assert runtime.app is built.app
+    finally:
+        await runtime.close()
 
 
 async def test_boot_order_and_signal_style_shutdown_are_clean(
@@ -202,6 +226,7 @@ async def test_boot_order_and_signal_style_shutdown_are_clean(
     shutdown.set()
     await asyncio.wait_for(task, timeout=1)
 
+    assert built.ci_enabled is True
     assert events[:13] == [
         "build:logging",
         "build:db",
