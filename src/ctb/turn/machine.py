@@ -149,10 +149,15 @@ _QUEUE_BUTTONS: Final[tuple[CardButton, ...]] = (
     CardButton.STOP,
     CardButton.CLEAR_QUEUE,
 )
+#: A finished turn is exactly when the room is most likely finished with, so
+#: the card that says so carries the way out. ``ARCHIVE`` opens the same named
+#: confirm ``/done`` does — it never archives on one tap, because the workspace
+#: and its topic go with it.
 _DONE_BUTTONS: Final[tuple[CardButton, ...]] = (
     CardButton.TRANSCRIPT,
     CardButton.RETRY,
     CardButton.OPEN,
+    CardButton.ARCHIVE,
 )
 _ERROR_BUTTONS: Final[tuple[CardButton, ...]] = (
     CardButton.RETRY,

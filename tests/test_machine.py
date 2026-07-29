@@ -596,6 +596,9 @@ def test_rule_15_draining_finalizes_after_three_idles() -> None:
     assert summary.prompts == 1
     assert summary.duration_ms == int((30 + DRAIN_CONFIRMS - 1) * 1000)
     assert actions_of(last, EditStatusCard)[0].kind is CardKind.DONE
+    # The room is most likely finished with exactly here, so the way out is on
+    # the card that says so — no /done needed.
+    assert CardButton.ARCHIVE in actions_of(last, EditStatusCard)[0].buttons
     assert has_action(last, StopTyping)
     # DONE, not IDLE: the turn produced something to read, and a blank prefix
     # made that indistinguishable from a topic with nothing in it. The state is

@@ -439,8 +439,9 @@ Header line on every completed turn (redundant in a topic, but survives forwardi
 
 The **pinned status card** per topic carries the live state and absorbs the tool-call noise:
 `⏳ queued` → `▶️ started` → `⚙️ working 1m20s · running pytest` → `✅ done in 1m32s · 3 files`.
-Buttons: `Stop` while running; `Transcript` / `Retry` / `Open in Conductor` (the `deepLink`) when
-finished. `sendChatAction("typing")` every 4s while WORKING. No transient "🔄" messages that need
+Buttons: `Stop` while running; `Transcript` / `Retry` / `Open in Conductor` (the `deepLink`) /
+`Archive` when finished — the finished card is where the room is most likely finished with, so it
+carries the way out, opening the same named confirm `/done` does. `sendChatAction("typing")` every 4s while WORKING. No transient "🔄" messages that need
 cleanup. At 10 min with no new messages the card adds `stalled?` + a `Check` button.
 
 `/desk` produces the "I'm back at my Mac" handoff card: workspace, branch, last turn's one-liner,
