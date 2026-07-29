@@ -55,6 +55,10 @@ Two things the machine deliberately refuses to do:
 * ``DRAINING`` never finalizes while a POSTed prompt is still unwitnessed and
   younger than ``PROMPT_AGE_OUT_S``. Two prompts in flight means one finalize,
   after both are accounted for.
+* ``DRAINING`` never finalizes a turn the agent has not called finished, once
+  the agent has shown it files an end-of-turn record. ``idle`` during a long
+  tool call is byte-for-byte the same observation as ``idle`` after the last
+  one, so a run of them is not evidence of anything.
 """
 
 from __future__ import annotations
@@ -390,6 +394,7 @@ def _start_turn(tick: _Tick, now: float, index_at_post: int | None) -> None:
         tool_calls=0,
         delivered=0,
         turn_ids=frozenset(),
+        open_turn_ids=frozenset(),
         error_message=None,
         warned_no_output_at=None,
         waking_notified=False,
@@ -471,6 +476,9 @@ def _finalize(
         idle_decay_step=0,
         tool_calls=0,
         turn_ids=frozenset(),
+        # `marks_turn_end` deliberately survives: it is a fact about the agent,
+        # not about this turn.
+        open_turn_ids=frozenset(),
         error_message=None,
         warned_no_output_at=None,
         waking_notified=False,
@@ -725,6 +733,13 @@ def _drain_check(tick: _Tick, now: float, *, transition: int) -> TransitionResul
         live = tick.ctx.live_outstanding(now)
         if live > 0:
             return tick.result(transition, f"holding: {live} prompt(s) not witnessed")
+        if tick.ctx.turn_end_pending(now):
+            # The agent has not filed its end-of-turn record, so it is not
+            # done: this `idle` is the quiet between two tool calls, not the
+            # end of the work. Poll at the working cadence rather than ask
+            # /status the same question every 2s through a long silence.
+            tick.cadence(CADENCE_WORKING_MS, "awaiting the end-of-turn record")
+            return tick.result(transition, "holding: the turn has not reported done")
         _finalize_done(tick, now)
         return tick.result(15, "turn finished")
     _finalize(
@@ -970,6 +985,20 @@ _DELTA: Final[dict[TurnState, _DeltaFn]] = {
 }
 
 
+def _open_turns(context: TurnContext, evidence: Delta) -> frozenset[str]:
+    """Turns that have started and not yet reported themselves finished.
+
+    A page can open a turn and close it at once — the final assistant message
+    and the agent's end-of-turn record usually arrive together — so the close
+    is applied after the open. An end-of-turn record carrying no ``turnId``
+    closes everything: it says the work is over without saying which turn it
+    belonged to, and holding on an id it never named would hold forever.
+    """
+    if evidence.has_untagged_turn_end:
+        return frozenset()
+    return (context.open_turn_ids | evidence.turn_ids) - evidence.ended_turn_ids
+
+
 def _on_delta(tick: _Tick, evidence: Delta, now: float) -> TransitionResult:
     if evidence.n <= 0:
         return tick.result(None, "empty delta")
@@ -984,6 +1013,12 @@ def _on_delta(tick: _Tick, evidence: Delta, now: float) -> TransitionResult:
         delivered=context.delivered + evidence.n,
         tool_calls=context.tool_calls + evidence.tool_calls,
         turn_ids=context.turn_ids | evidence.turn_ids,
+        open_turn_ids=_open_turns(context, evidence),
+        marks_turn_end=(
+            context.marks_turn_end
+            or bool(evidence.ended_turn_ids)
+            or evidence.has_untagged_turn_end
+        ),
     )
     if witnessed:
         tick.evolve(
@@ -1137,6 +1172,8 @@ def _cursor_only_finalize(tick: _Tick, now: float) -> bool:
         return False
     if tick.ctx.live_outstanding(now) > 0:
         return False
+    if tick.ctx.turn_end_pending(now):
+        return False
     _finalize_done(tick, now)
     return True
 
@@ -1244,6 +1281,7 @@ def _timer_in_draining(tick: _Tick, now: float) -> TransitionResult:
     if (
         tick.ctx.consecutive_idle >= DRAIN_CONFIRMS
         and tick.ctx.live_outstanding(now) == 0
+        and not tick.ctx.turn_end_pending(now)
     ):
         _finalize_done(tick, now)
         return tick.result(15, "turn finished after the prompt aged out")

@@ -827,6 +827,36 @@ def test_build_delta_of_an_empty_page_is_none() -> None:
     assert cursor.build_delta([]) is None
 
 
+async def test_build_delta_reports_which_turns_the_agent_called_finished(
+    fake: FakeConductor,
+) -> None:
+    """The one positive proof a turn is over. ``idle`` is not one."""
+    mid_turn_session = fake.add_session(
+        seed=(
+            user_message("go"),
+            system_init(),
+            tool_use("Bash", tool_input={"command": "pytest"}),
+            assistant("done"),
+        )
+    )
+    mid_turn = cursor.build_delta(mid_turn_session.messages_model())
+
+    assert mid_turn is not None
+    assert mid_turn.turn_ids == frozenset({mid_turn_session.prompt_ids[0]})
+    # Nothing here says the turn is over — not the tool call, not the reply,
+    # and not the system/init that happens to carry a `subtype`.
+    assert mid_turn.ended_turn_ids == frozenset()
+    assert mid_turn.has_untagged_turn_end is False
+
+    finished_session = fake.add_session(
+        seed=(user_message("go"), assistant("done"), result("all done"))
+    )
+    finished = cursor.build_delta(finished_session.messages_model())
+
+    assert finished is not None
+    assert finished.ended_turn_ids == frozenset({finished_session.prompt_ids[0]})
+
+
 # ── rendering never stalls the cursor ────────────────────────────────────────
 
 

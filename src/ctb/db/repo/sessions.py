@@ -37,7 +37,13 @@ from ctb.db.repo._util import (
     bit,
     update_sql,
 )
-from ctb.turn.state import CADENCE_IDLE_DECAY_MS, PendingPrompt, TurnContext, TurnState
+from ctb.turn.state import (
+    AGENTS_MARKING_TURN_END,
+    CADENCE_IDLE_DECAY_MS,
+    PendingPrompt,
+    TurnContext,
+    TurnState,
+)
 
 __all__ = [
     "SessionRow",
@@ -556,6 +562,7 @@ async def load_turn_context(
         ),
         status_card_msg_id=row.status_card_msg_id,
         tool_calls=row.tool_calls,
+        marks_turn_end=(row.agent or "") in AGENTS_MARKING_TURN_END,
     )
 
 

@@ -67,6 +67,10 @@ key.
 - Models must match the agent or you get a 400. See `docs/PLAN.md` for the pairing table.
 - From the docs: *"Wait for `working` before trusting `idle`. A queued prompt hasn't started a turn
   yet, and the session reports `idle` until it does."*
+- **`idle` appears mid-turn too**, in the quiet of a long tool call, and is byte-for-byte the same
+  observation as the `idle` after the last one. The only positive proof a turn is over is the
+  agent's own end-of-turn record — `rawPayload.type == "result"`, correlated by `content.turnId`.
+  The machine will not finalize a turn it saw start until that record arrives.
 
 ## PostgreSQL facts this code depends on
 

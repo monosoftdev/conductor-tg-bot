@@ -21,7 +21,7 @@ Shapes here were verified against the live API during the Phase 0 probe — see
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any
+from typing import Any, Final
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic.alias_generators import to_camel
@@ -141,6 +141,15 @@ def _coerce_enum[E: StrEnum](enum_cls: type[E], value: Any, unknown: E) -> E:
 
 # ── transcript ───────────────────────────────────────────────────────────────
 
+#: ``rawPayload.type`` values that close a turn. ``error`` is here so a session
+#: that fails without an accounting record still finishes rather than hanging.
+_TURN_END_TYPES: Final = frozenset({"result", "error"})
+#: …and the ones that are always mid-turn. ``system/init`` carries a ``subtype``
+#: and would otherwise trip the shape fallback below.
+_MID_TURN_TYPES: Final = frozenset({"system", "assistant", "user", "rate_limit_event"})
+#: Metrics that describe a whole turn rather than one message.
+_TURN_METRICS: Final = ("num_turns", "duration_ms", "total_cost_usd", "usage")
+
 
 class TranscriptMessage(ApiModel):
     """One envelope from ``GET /v0/sessions/{id}/messages``."""
@@ -230,6 +239,30 @@ class TranscriptMessage(ApiModel):
         """True for a ``result`` payload flagged ``is_error``."""
         payload = self.raw_payload
         return bool(payload.get("is_error")) or payload.get("subtype") == "error"
+
+    @property
+    def ends_turn(self) -> bool:
+        """The agent's own end-of-turn record — one per prompt.
+
+        This is the only *positive* proof that a turn is over. ``GET /status``
+        reporting ``idle`` is not: the agent is idle between tool calls too,
+        and the mid-turn quiet stretch of a long tool run reads exactly like a
+        finished turn. The record is classified by shape as well as by name,
+        because ``type`` is a bare string and a second agent need not spell it
+        ``result``.
+        """
+        payload_type = self.raw_payload_type
+        if payload_type in _TURN_END_TYPES:
+            return True
+        if payload_type in _MID_TURN_TYPES:
+            return False
+        payload = self.raw_payload
+        if not payload:
+            return False
+        # Shape fallback: an end-of-turn accounting record, whatever it calls
+        # itself — a verdict plus at least one whole-turn metric.
+        has_verdict = "is_error" in payload or "subtype" in payload
+        return has_verdict and any(key in payload for key in _TURN_METRICS)
 
     @property
     def blocks(self) -> list[dict[str, Any]]:

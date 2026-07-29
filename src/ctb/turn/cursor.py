@@ -490,6 +490,7 @@ def build_delta(messages: Sequence[TranscriptMessage]) -> Delta | None:
         m.is_agent and m.raw_payload_type in ("assistant", "result", "user")
         for m in messages
     )
+    ended = {m.turn_id for m in messages if m.ends_turn and m.turn_id}
     return Delta(
         n=len(messages),
         max_index=max(m.session_index for m in messages),
@@ -498,6 +499,8 @@ def build_delta(messages: Sequence[TranscriptMessage]) -> Delta | None:
         witnessed_prompt_ids=frozenset(witnessed),
         tool_calls=tool_calls,
         has_error_result=any(m.is_result and m.is_error for m in messages),
+        ended_turn_ids=frozenset(ended),
+        has_untagged_turn_end=any(m.ends_turn and not m.turn_id for m in messages),
     )
 
 
