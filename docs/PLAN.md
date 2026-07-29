@@ -219,6 +219,12 @@ Singleton `httpx.AsyncClient` with: explicit `User-Agent: conductor-tg-bot/<ver>
 HALF_OPEN probe → CLOSED), per-endpoint timeouts (connect 5s; read 20s status/messages; 30s POST
 message; 60s `/sql`).
 
+A streak that never leaves one *resource* path (`/workspaces/ws_7/status`) isolates that path alone
+instead of opening the tenant-wide circuit; collection paths (`/projects`) and streaks spanning two
+resources still open everything. One workspace whose status endpoint 500s forever otherwise froze
+its tenant permanently — its poller wins every half-open probe slot, so the window never closes and
+the archive that would retire it fails fast behind it.
+
 Retry policy: connect/timeout/502/503/504 → full-jitter backoff base 0.5s cap 30s ×5; `retryable:
 true` → retry regardless of code; `retryable: false` → never; 429 → honor `Retry-After` and open the
 circuit; 401/403 → **fatal**, stop all pollers, DM owner once, keep bot alive for `/health` (never
