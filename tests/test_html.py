@@ -124,6 +124,11 @@ ADVERSARIAL: tuple[str, ...] = (
     "<blockquote expandable>quote</blockquote>",
     '<pre><code class="language-python">x = 1</code></pre>',
     "<b>" * 40 + "deep" + "</b>" * 40,
+    "| a | b |\n|---|---|\n| <b>x</b> | `y` |",
+    "| a | b |\n|:-:|--:|\n| \\| | **&** |\n| 🚀 | 日本語 |",
+    "| a | b | c |\n|---|---|---|\n| only |",
+    "|---|---|\n| orphan | delimiter |",
+    "| " + "wide " * 40 + " | b |\n|---|---|\n| x | y |",
     "",
     "   \n\n  ",
 )
@@ -302,6 +307,115 @@ def test_script_is_shown_not_executed_and_not_dropped() -> None:
     html = markdown_to_html("<script>alert('x')</script>")
     assert html == "&lt;script&gt;alert('x')&lt;/script&gt;"
     assert strip_html(html) == "<script>alert('x')</script>"
+
+
+# ── tables ───────────────────────────────────────────────────────────────────
+
+
+def table_lines(html: str) -> list[str]:
+    """The rendered table, as the reader's eye sees it: markup gone, rows kept."""
+    return strip_html(html).strip().splitlines()
+
+
+def test_a_narrow_table_becomes_an_aligned_monospace_grid() -> None:
+    html = markdown_to_html(
+        "| Name | Status | Time |\n"
+        "|------|--------|------|\n"
+        "| alpha | done | 1.2s |\n"
+        "| beta-service | failed | 0.4s |"
+    )
+    assert html.startswith("<pre>")
+    assert_valid_telegram_html(html)
+    lines = table_lines(html)
+    # Every separator sits in the same column on every row — the whole point.
+    columns = {
+        tuple(i for i, ch in enumerate(line) if ch == "│") for line in lines[::2]
+    }
+    assert len(columns) == 1
+    assert lines[1] == "─────────────┼────────┼─────"
+    assert lines[2] == "alpha        │ done   │ 1.2s"
+
+
+def test_alignment_markers_are_honoured() -> None:
+    html = markdown_to_html("| L | C | R |\n|:--|:-:|--:|\n| a | b | c |")
+    assert table_lines(html)[2] == "a │ b │ c"
+    wide = markdown_to_html("| L | C | R |\n|:--|:-:|--:|\n| aaa | bbb | ccc |")
+    assert table_lines(wide)[2] == "aaa │ bbb │ ccc"
+    assert table_lines(markdown_to_html("| L |  R |\n|:--|---:|\n| a | bb |"))[2] == (
+        "a │ bb"
+    )
+
+
+def test_a_table_too_wide_to_align_becomes_one_stanza_per_row() -> None:
+    """A phone cannot show eight columns. It can show eight lines."""
+    html = markdown_to_html(
+        "| Service | Region | Status | Latency | Owner |\n"
+        "|---|---|---|---|---|\n"
+        "| checkout-api | us-east-1 | healthy | 240ms | payments |\n"
+        "| search | eu-west-2 | degraded | 1.9s | discovery |"
+    )
+    assert "<pre>" not in html
+    assert_valid_telegram_html(html)
+    assert html.startswith("<b>checkout-api</b>\nRegion: us-east-1\n")
+    assert "\n\n<b>search</b>" in html
+
+
+def test_cell_markup_survives_in_the_layout_that_can_show_it() -> None:
+    stanzas = markdown_to_html(
+        "| Service | Note | Region | Owner | Age |\n"
+        "|---|---|---|---|---|\n"
+        "| api | **hot** and `cached` | us-east-1 | payments | 3d |"
+    )
+    assert "<b>hot</b>" in stanzas
+    assert "<code>cached</code>" in stanzas
+    # The grid is monospace, so a cell's markers are stripped rather than styled:
+    # nothing may open a tag inside <pre>.
+    grid = markdown_to_html("| A | B |\n|---|---|\n| **x** | `y` |")
+    assert grid == "<pre>A │ B\n──┼──\nx │ y</pre>"
+
+
+def test_escaped_pipes_and_html_in_cells_are_content_not_structure() -> None:
+    grid = markdown_to_html("| A | B |\n|---|---|\n| a \\| b | <i> |")
+    assert table_lines(grid)[2] == "a | b │ <i>"
+    assert_valid_telegram_html(grid)
+
+
+def test_a_line_break_tag_flattens_rather_than_splitting_a_row() -> None:
+    grid = markdown_to_html("| A | B |\n|---|---|\n| one<br>two | x |")
+    assert table_lines(grid)[2] == "one two │ x"
+
+
+def test_wide_characters_are_measured_at_the_width_they_occupy() -> None:
+    lines = table_lines(
+        markdown_to_html("| A | B |\n|---|---|\n| 日本 | x |\n| ab | y |")
+    )
+    assert lines[2] == "日本 │ x"
+    assert lines[3] == "ab   │ y"
+
+
+def test_a_ragged_row_neither_raises_nor_grows_bare_pipes() -> None:
+    lines = table_lines(markdown_to_html("| a | b |\n|---|---|\n| only |\n| x | y |"))
+    assert lines[2] == "only"
+    assert lines[3] == "x    │ y"
+
+
+def test_prose_containing_a_pipe_is_still_prose() -> None:
+    """The delimiter row is what makes a table; a pipe alone is punctuation."""
+    assert markdown_to_html("a | b\nc | d") == "a | b\nc | d"
+    assert markdown_to_html("| a | b |") == "| a | b |"
+    # Column counts that disagree are not a table either.
+    assert markdown_to_html("| a | b |\n|---|") == "| a | b |\n|---|"
+
+
+def test_a_table_inside_a_fence_is_left_exactly_as_written() -> None:
+    html = markdown_to_html("```\n| a | b |\n|---|---|\n```")
+    assert html == "<pre>| a | b |\n|---|---|</pre>"
+
+
+def test_text_around_a_table_keeps_its_place() -> None:
+    html = markdown_to_html("before\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\nafter")
+    assert html.startswith("before\n\n<pre>")
+    assert html.endswith("</pre>\n\nafter")
 
 
 # ── sanitiser ────────────────────────────────────────────────────────────────

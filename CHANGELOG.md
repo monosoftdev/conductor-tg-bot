@@ -29,6 +29,7 @@ account and a live Telegram deployment end to end — see
 
 ### Changed
 
+
 - One task is one notification. Under anything but `/notify loud` a topic's
   replies are now *held* until the turn ends and land as one batch ahead of the
   finish line, because a silent message still occupies a line in the tray. The
@@ -36,6 +37,13 @@ account and a live Telegram deployment end to end — see
   never notifies. Two valves keep it from becoming a delivery gate: a session
   whose poller has stopped writing is ignored, and no queue is held longer than
   half an hour whatever the state machine believes.
+- The output contract appended to every prompt now states the constraints it
+  used to imply: the bubble is 40 characters wide, a table has nowhere to go,
+  long code leaves the chat as an attachment, a reader on a phone has no shell
+  to run a suggested command in, and a `Choices:` option over 40 characters
+  loses its button. It also spends its words on the two round trips that cost
+  the most — burying "blocked" at the bottom, and asking a question the repo
+  already answers.
 - `/notify off` means off. It previously behaved identically to `quiet`,
   because the 30-minute focus window promoted both.
 - A split reply pushes one notification, not one per chunk.

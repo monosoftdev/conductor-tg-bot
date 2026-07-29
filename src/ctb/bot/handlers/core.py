@@ -35,6 +35,7 @@ from ctb.bot.handlers.topics import (
     jump_url,
     resolve_client,
     resolve_db,
+    send_html,
 )
 from ctb.bot.keyboards import (
     CONTROL_TTL_S,
@@ -51,6 +52,7 @@ from ctb.bot.keyboards import (
 from ctb.bot.middleware.routing import Route
 from ctb.bot.middleware.tenancy import TenantContext
 from ctb.conductor.client import ConductorClient
+from ctb.db import NO_THREAD_ID
 from ctb.db.connection import Database
 from ctb.db.repo import chats as chats_repo
 from ctb.db.repo import prompts as prompts_repo
@@ -774,6 +776,29 @@ async def done(
     await tell(message, ARCHIVE_CONSEQUENCE, reply_markup=markup)
 
 
+async def _reply_beside(
+    message: Message, html: str, *, reply_markup: InlineKeyboardMarkup | None = None
+) -> None:
+    """Answer a card *in the room the card is in*.
+
+    ``Message.answer`` addresses the thread only when Telegram set
+    ``is_topic_message``, which it does for a forum and — as
+    :func:`ctb.bot.middleware.routing._thread_id` already documents — not for a
+    topic in a private chat. So a reply to a card sitting in a workspace's DM
+    topic lands in the DM root, which is the *New Chat* composer: the one seat
+    that is not a room. Address the thread the card is in, explicitly.
+    """
+    if message.bot is None:  # pragma: no cover - a card always carries its bot
+        return
+    await send_html(
+        message.bot,
+        message.chat.id,
+        html,
+        thread_id=message.message_thread_id or NO_THREAD_ID,
+        reply_markup=reply_markup,
+    )
+
+
 @router.callback_query(Cb.filter(F.action == Action.ARCHIVE.value))
 async def confirm_archive(
     query: CallbackQuery,
@@ -812,8 +837,8 @@ async def confirm_archive(
                 reply_markup=None,
             )
             if not changed:
-                await query.message.answer(
-                    f"Archive failed: {escape(short_error(exc))}"
+                await _reply_beside(
+                    query.message, f"Archive failed: {escape(short_error(exc))}"
                 )
         return
     if isinstance(query.message, Message) and query.bot is not None:
@@ -825,7 +850,9 @@ async def confirm_archive(
             reply_markup=None,
         )
         if not changed:
-            await query.message.answer(f"Archived <b>{escape(ticket.label)}</b>.")
+            await _reply_beside(
+                query.message, f"Archived <b>{escape(ticket.label)}</b>."
+            )
 
 
 @router.callback_query(Cb.filter(F.action == Action.ARCHIVE_REQUEST.value))
@@ -862,7 +889,7 @@ async def request_archive(
     )
     await query.answer()
     if isinstance(query.message, Message):
-        await query.message.answer(ARCHIVE_CONSEQUENCE, reply_markup=markup)
+        await _reply_beside(query.message, ARCHIVE_CONSEQUENCE, reply_markup=markup)
 
 
 @router.callback_query(Cb.filter(F.action == Action.CANCEL.value))

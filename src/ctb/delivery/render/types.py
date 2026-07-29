@@ -249,3 +249,7 @@ class RenderContext:
     label: str = ""
     #: Extra hints an adapter may consult without changing this signature.
     hints: dict[str, str] = field(default_factory=dict)
+    #: Epoch seconds, for the one thing a renderer cannot derive from its
+    #: message: how long until a rate limit resets. ``None`` means "ask the
+    #: clock" — set it and the render is a pure function of its inputs.
+    now_epoch_s: float | None = None
