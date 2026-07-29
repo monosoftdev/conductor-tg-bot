@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from typing import Any, Final
 
@@ -36,17 +37,25 @@ class Recorder:
         self.calls.append(("notice", (html, kwargs)))
         return 1
 
+    async def send_text(self, html: str, **kwargs: Any) -> list[int]:
+        self.calls.append(("send_text", (html, kwargs)))
+        return [4242]
+
 
 class Bot:
     def __init__(self) -> None:
         self.renames: list[dict[str, Any]] = []
         self.reactions: list[dict[str, Any]] = []
+        self.pins: list[dict[str, Any]] = []
 
     async def edit_forum_topic(self, **kwargs: Any) -> None:
         self.renames.append(kwargs)
 
     async def set_message_reaction(self, **kwargs: Any) -> None:
         self.reactions.append(kwargs)
+
+    async def pin_chat_message(self, **kwargs: Any) -> None:
+        self.pins.append(kwargs)
 
 
 async def _bound(db: Database) -> None:
@@ -200,6 +209,49 @@ async def test_a_finished_turn_is_the_only_thing_that_buzzes(
     assert html == "✅ <b>Done</b> · 1m32s · 12 tools · 5 files"
     assert sent["silent"] is False, "this is the notification"
     assert sent["chat_id"] == -1001 and sent["thread_id"] == 42
+
+
+async def test_a_finished_turn_with_a_pull_request_posts_and_pins_review_link(
+    db: Database, system_db: Database
+) -> None:
+    await _bound(db)
+    await db.execute(
+        "INSERT INTO transcript_messages (session_id, message_id, session_index, "
+        "type, content_json, received_at_ms) VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            "sess-1",
+            "m-pr",
+            1,
+            "assistant",
+            json.dumps({"text": "PR: https://github.com/acme/api/pull/31"}),
+            now_ms(),
+        ),
+    )
+    recorder = Recorder()
+    bot = Bot()
+    sink = BotActionSink(bot, db, system_db, recorder, recorder)  # type: ignore[arg-type]
+
+    await sink.handle(
+        (Finalize(TurnSummary(prompts=1)),),
+        session_id="sess-1",
+        chat_id=-1001,
+        thread_id=42,
+    )
+
+    direct = [payload for kind, payload in recorder.calls if kind == "send_text"]
+    assert len(direct) == 1
+    html, sent = direct[0]
+    assert "PR ready for review" in html
+    assert "https://github.com/acme/api/pull/31" in html
+    assert sent["chat_id"] == -1001 and sent["thread_id"] == 42
+    assert sent["silent"] is True
+    assert bot.pins == [
+        {
+            "chat_id": -1001,
+            "message_id": 4242,
+            "disable_notification": True,
+        }
+    ]
 
 
 async def test_the_same_turn_is_never_announced_twice(

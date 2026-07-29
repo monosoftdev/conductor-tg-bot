@@ -18,6 +18,8 @@ from ctb.delivery.render.types import Block, RenderContext
 
 __all__ = ["UserEchoAdapter"]
 
+_CONTRACT_MARK = "OUTPUT CONTRACT"
+
 
 class UserEchoAdapter(Adapter):
     """Matches a user-authored envelope. Renders nothing."""
@@ -28,6 +30,8 @@ class UserEchoAdapter(Adapter):
         if normalize(msg_type) == "usermessage":
             return True
         if normalize(content.get("type")) == "usermessage":
+            return True
+        if _raw_user_prompt_echo(content):
             return True
         # Shape fallback: a prompt with a sender and a delivery state, and no
         # agent event underneath it.
@@ -40,3 +44,23 @@ class UserEchoAdapter(Adapter):
 
     def render(self, message: TranscriptMessage, context: RenderContext) -> list[Block]:
         return list(SUPPRESS)
+
+
+def _raw_user_prompt_echo(content: Mapping[str, Any]) -> bool:
+    payload = raw_payload(content)
+    if normalize(payload.get("type")) != "user":
+        return False
+    message = payload.get("message")
+    if not isinstance(message, Mapping):
+        return False
+    if normalize(message.get("role")) != "user":
+        return False
+    blocks = message.get("content")
+    if not isinstance(blocks, list):
+        return False
+    return any(
+        isinstance(block, Mapping)
+        and normalize(block.get("type")) == "text"
+        and _CONTRACT_MARK in str(block.get("text") or block.get("content") or "")
+        for block in blocks
+    )

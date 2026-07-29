@@ -28,9 +28,9 @@ from ctb.db.repo import (
 from ctb.db.repo.sessions import SessionRow
 from ctb.delivery.outbox import Outbox, Priority, notice_message_id
 from ctb.delivery.render.adapters.base import one_line
-from ctb.delivery.render.html import escape
+from ctb.delivery.render.html import escape, escape_attr
 from ctb.delivery.status_card import StatusCards
-from ctb.github.links import find_pull_request
+from ctb.github.links import PullRequestRef, find_pull_request
 from ctb.logging import get_logger
 from ctb.turn.machine import format_duration
 from ctb.turn.state import (
@@ -191,11 +191,98 @@ class BotActionSink:
                     chat_id=chat_id,
                     thread_id=thread_id,
                 )
-                await self._watch_ci(
-                    session_id=session_id, chat_id=chat_id, thread_id=thread_id
-                )
+                pr = await self._finished_pr(session_id)
+                if pr is not None:
+                    await self._share_review_pr(
+                        pr,
+                        session_id=session_id,
+                        chat_id=chat_id,
+                        thread_id=thread_id,
+                    )
+                    await self._watch_ci(
+                        pr,
+                        session_id=session_id,
+                        chat_id=chat_id,
+                        thread_id=thread_id,
+                    )
 
-    async def _watch_ci(self, *, session_id: str, chat_id: int, thread_id: int) -> None:
+    async def _finished_pr(self, session_id: str) -> PullRequestRef | None:
+        for stored in await transcript.recent(
+            self._db, session_id, limit=CI_SCAN_MESSAGES
+        ):
+            found = find_pull_request(stored.content_json or "")
+            if found is not None:
+                return found
+        return None
+
+    async def _share_review_pr(
+        self,
+        pr: PullRequestRef,
+        *,
+        session_id: str,
+        chat_id: int,
+        thread_id: int,
+    ) -> None:
+        """Send and pin the pull request link as the topic's review handle."""
+        try:
+            key = f"pr-review:{session_id}:{pr.owner}:{pr.repo}:{pr.number}"
+            message_id = notice_message_id(key)
+            row = await deliveries.get(self._db, (session_id, message_id, 0, chat_id))
+            if row is not None and row.tg_message_id is not None:
+                await self._pin_message(chat_id, row.tg_message_id)
+                return
+            if row is not None:
+                return
+
+            html = (
+                f'PR ready for review: <a href="{escape_attr(pr.url)}">'
+                f"{escape(pr.slug)}</a>"
+            )
+            sent = await self._outbox.send_text(
+                html, chat_id=chat_id, thread_id=thread_id, silent=True
+            )
+            if not sent:
+                return
+            created = await self._outbox.enqueue_notice(
+                html,
+                session_id=session_id,
+                key=key,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                priority=Priority.NORMAL,
+                silent=True,
+            )
+            if created:
+                await deliveries.mark_sent(
+                    self._db,
+                    (session_id, message_id, 0, chat_id),
+                    tg_message_id=sent[0],
+                )
+            await self._pin_message(chat_id, sent[0])
+        except Exception as exc:  # noqa: BLE001 - review link is a bonus
+            log.warning(
+                "bot.pr_review_notice_failed",
+                session_id=session_id,
+                pr=pr.slug,
+                error=repr(exc),
+            )
+
+    async def _pin_message(self, chat_id: int, message_id: int) -> None:
+        with contextlib.suppress(TelegramAPIError, AttributeError):
+            await self._bot.pin_chat_message(
+                chat_id=chat_id,
+                message_id=message_id,
+                disable_notification=True,
+            )
+
+    async def _watch_ci(
+        self,
+        pr: PullRequestRef | None = None,
+        *,
+        session_id: str,
+        chat_id: int,
+        thread_id: int,
+    ) -> None:
         """Start watching CI if this turn announced a pull request.
 
         The link *is* the announcement — the agent is asked to end on it — so
@@ -210,29 +297,25 @@ class BotActionSink:
             tenant_id = current_tenant()
             if tenant_id is None:
                 return
-            for stored in await transcript.recent(
-                self._db, session_id, limit=CI_SCAN_MESSAGES
-            ):
-                found = find_pull_request(stored.content_json or "")
-                if found is None:
-                    continue
-                tenant = await tenancy.get(self._system_db, tenant_id)
-                # No token, no watch: the row would only be claimed once and
-                # abandoned, and this way a team that has not opted in pays
-                # nothing at all.
-                if tenant is None or not tenant.github_key_fp:
-                    return
-                await ci.watch(
-                    self._db,
-                    owner=found.owner,
-                    repo=found.repo,
-                    pr_number=found.number,
-                    session_id=session_id,
-                    chat_id=chat_id,
-                    thread_id=thread_id,
-                )
-                log.info("bot.ci_watching", session_id=session_id, pr=found.slug)
+            found = pr or await self._finished_pr(session_id)
+            if found is None:
                 return
+            tenant = await tenancy.get(self._system_db, tenant_id)
+            # No token, no watch: the row would only be claimed once and
+            # abandoned, and this way a team that has not opted in pays
+            # nothing at all.
+            if tenant is None or not tenant.github_key_fp:
+                return
+            await ci.watch(
+                self._db,
+                owner=found.owner,
+                repo=found.repo,
+                pr_number=found.number,
+                session_id=session_id,
+                chat_id=chat_id,
+                thread_id=thread_id,
+            )
+            log.info("bot.ci_watching", session_id=session_id, pr=found.slug)
         except Exception as exc:  # noqa: BLE001 - never fails a finished turn
             log.warning("bot.ci_watch_failed", session_id=session_id, error=repr(exc))
 
