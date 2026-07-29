@@ -56,25 +56,50 @@ FOCUS_MS: Final = 30 * 60 * 1000
 DEFAULT_BRANCH: Final = "main"
 #: Appended to every Telegram prompt. The delimiter matters: without it a long
 #: task that carries its own style guidance averages this away instead of
-#: obeying it. Rule 5's wording is load-bearing — ``cursor.quick_replies_for``
-#: parses a literal ``Choices:`` line followed by ``1.``/``2.`` options into the
-#: quick-reply buttons, so that block's syntax must not drift.
+#: obeying it.
+#:
+#: Every clause here is a fact about this bot's own surface, not a preference,
+#: which is why the rules can be checked rather than argued with:
+#:
+#: * rule 1 — the status card already carries the tool line and the ``path +12
+#:   −3`` diff line, so narration is a second copy of what is on screen;
+#: * rule 4 — the phone bubble is ~40 characters wide, a markdown table wraps
+#:   into rubble there, ``markdown_to_html`` flattens a heading to bold, and
+#:   ``chunk_blocks`` turns code past :data:`MAX_INLINE_CODE_LINES` into a
+#:   ``.md`` attachment the reader must leave the chat to open;
+#: * rule 5 — the reader is on a phone with no shell, so "run this to check" is
+#:   an unfinished turn, not a handover;
+#: * rule 7 — ``cursor.quick_replies_for`` parses a literal ``Choices:`` line
+#:   followed by consecutive ``1.``/``2.`` options and gives up on any other
+#:   text after them, and ``keyboards.quick_replies_fit`` drops back to plain
+#:   text unless each option fits :data:`MAX_BUTTON_TEXT` once numbered. Under
+#:   40 characters is that budget with room to spare. The block's syntax must
+#:   not drift.
 MOBILE_REPLY_INSTRUCTION: Final = (
     "===\n"
-    "OUTPUT CONTRACT — I read this on a phone. This overrides any conflicting "
+    "OUTPUT CONTRACT — Telegram, phone screen. This overrides any conflicting "
     "style guidance above.\n"
-    "1. Say nothing until the work is done. No preamble, no narration between "
-    "tool calls, no 'Let me...', no plan restatement. One message, at the end.\n"
-    "2. Open with the outcome in one sentence: fixed / not fixed / what I "
-    "found. Never restate my question and never recap the steps you took.\n"
-    "3. Hard cap 6 lines and 80 words unless I explicitly ask for detail. "
-    "Plain sentences or '- ' bullets. No headings, no tables, no bold labels, "
-    "no closing summary.\n"
-    "4. Do not list the files you changed. I already see them.\n"
-    "5. Only if you need a decision from me: one line of context, then a line "
-    "that is exactly 'Choices:', then 2-4 numbered one-line options "
-    "('1. ...', '2. ...') with your recommendation first. Write nothing after "
-    "the last option. Otherwise never write a Choices block."
+    "1. Say nothing until the work is done, then one message. No preamble, "
+    "progress notes or plan restatement — I already see your tool calls and "
+    "file diffs.\n"
+    "2. Line 1 is the outcome: fixed / not fixed / blocked / what I found. "
+    "Anything broken or guessed belongs there, never at the bottom.\n"
+    "3. 6 lines and 80 words max unless I ask for detail. Never restate my "
+    "question, recap your steps, or list the files you changed.\n"
+    "4. Write for a 40-character screen: plain sentences or '- ' bullets, "
+    "`code` for paths, ```lang fences for code (a long one arrives as a file "
+    "attachment, so paste only what I must read). No tables — one bullet per "
+    "row. No headings, bold labels, emoji or closing summary.\n"
+    "5. I cannot run anything myself: verify before you claim it, and name "
+    "the evidence on the same line.\n"
+    "6. Decide anything reversible yourself and name the default you took. "
+    "Ask only when the repo cannot answer it and the answer changes the "
+    "work.\n"
+    "7. To ask: one line of context, then a line that is exactly 'Choices:', "
+    "then 2-4 options as '1. ...', '2. ...', recommendation first, each under "
+    "40 characters and readable alone (tapping one sends it back as my next "
+    "message). Nothing after the last option. Otherwise never write a Choices "
+    "block."
 )
 #: Said once when a chat that should have had a topic per workspace could not
 #: get one. What Telegram said is for the log — the tenant cannot flip another
@@ -89,7 +114,7 @@ _LINEAR_TOLD_MAX: Final = 4096
 
 _PROJECT_PREFIX = re.compile(r"^([^\s:]{1,80}):\s*(.+)$", re.S)
 #: A pick or an ack carries no new task, and the contract is already in the
-#: session from an earlier turn. Appending 140 words of formatting rules to the
+#: session from an earlier turn. Appending 240 words of formatting rules to the
 #: word "yes" only teaches the model that the reply is the important part.
 _TERSE_FOLLOW_UP: Final = re.compile(
     r"^(?:choose option\s+[1-4]\b.*"
