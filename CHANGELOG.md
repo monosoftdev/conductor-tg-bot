@@ -29,6 +29,13 @@ account and a live Telegram deployment end to end — see
 
 ### Changed
 
+- One task is one notification. Under anything but `/notify loud` a topic's
+  replies are now *held* until the turn ends and land as one batch ahead of the
+  finish line, because a silent message still occupies a line in the tray. The
+  live surface while the work runs is the pinned card, which is an edit and
+  never notifies. Two valves keep it from becoming a delivery gate: a session
+  whose poller has stopped writing is ignored, and no queue is held longer than
+  half an hour whatever the state machine believes.
 - `/notify off` means off. It previously behaved identically to `quiet`,
   because the 30-minute focus window promoted both.
 - A split reply pushes one notification, not one per chunk.

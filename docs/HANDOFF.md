@@ -228,6 +228,16 @@ before, only the push flag and the destination of *progress* moved.
   runs in — so the default setting felt like it did nothing. `loud` pushes every
   reply and the finish, `quiet` pushes only the finish, `off` pushes nothing.
   Three settings, three behaviours.
+- **Quiet now *holds*, not just mutes.** `disable_notification` removes the
+  sound, not the line in the tray, so a narrating agent was still eight
+  notifications for one task. Under anything but `loud`, `Outbox._sendable`
+  drops a destination whose session is mid-turn, and the batch goes out when
+  the turn ends — ahead of the finish line, which `max_pending_index` already
+  sorts last. The live surface in that window is the card, which is an edit and
+  never notifies. Two valves keep this from becoming a delivery gate and both
+  fail open: `deliveries.held_destinations` ignores a session whose poller has
+  stopped writing `updated_at`, and `MAX_HOLD_MS` releases a queue held half an
+  hour whatever the state machine believes.
 - **`BotActionSink._announce_finish` is the one buzz.** It fires on the
   machine's `Finalize`, keyed on the cursor the session finished at so a
   redeploy cannot announce one turn twice. It has to be a *message*: the status

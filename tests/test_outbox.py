@@ -56,6 +56,7 @@ from ctb.bot.keyboards import (
 )
 from ctb.bot.middleware.routing import RoutingMiddleware
 from ctb.db.connection import Database, now_ms
+from ctb.db.repo import chats as chats_repo
 from ctb.db.repo import deliveries as deliveries_repo
 from ctb.db.repo import sessions as sessions_repo
 from ctb.delivery.outbox import (
@@ -975,6 +976,133 @@ async def test_health_reports_counters(
     assert health["sent"] == 1
     assert health["entity_retries"] == 1
     assert health["claim_id"] == outbox.claim_id
+
+
+# ── one task, one notification ───────────────────────────────────────────────
+#
+# `disable_notification` takes the sound away, not the line in the tray, so
+# muting a narrating agent still left eight of them per task. Anything but
+# `/notify loud` therefore holds the topic's queue until the turn ends. Every
+# test below is really the same question asked twice: does it hold while the
+# turn is live, and does it fail *open* every other time.
+
+
+async def working(db: Database, *, at: int | None = None) -> None:
+    """Bind the session to the chat and put it mid-turn."""
+    await sessions_repo.bind(db, SESSION, chat_id=CHAT, thread_id=0)
+    await sessions_repo.update(db, SESSION, at=at, turn_state="WORKING")
+
+
+async def test_a_running_turn_holds_its_replies(
+    outbox: Outbox, bot: FakeBot, db: Database, session: str
+) -> None:
+    await working(db)
+    await enqueue(outbox)
+
+    assert await outbox.run_once() == 0
+    assert bot.calls_to("send_message") == []
+    assert outbox.health()["held"] == 1
+    assert await outbox.pending_count() == 1
+
+
+async def test_the_batch_lands_when_the_turn_finishes(
+    outbox: Outbox, bot: FakeBot, db: Database, session: str
+) -> None:
+    await working(db)
+    await enqueue(outbox, message_id="a")
+    await enqueue(outbox, message_id="b", session_index=1)
+    assert await outbox.run_once() == 0
+
+    await sessions_repo.update(db, SESSION, turn_state="IDLE")
+
+    assert await outbox.flush() == 2
+    assert len(bot.calls_to("send_message")) == 2
+
+
+async def test_the_finish_line_lands_last(
+    outbox: Outbox, bot: FakeBot, db: Database, session: str
+) -> None:
+    """The buzz is the *last* thing, not the first — it describes the batch."""
+    await working(db)
+    await enqueue(outbox, message_id="answer")
+    await outbox.enqueue_notice(
+        "✅ Done", session_id=SESSION, key="turn-done:1", chat_id=CHAT
+    )
+    assert await outbox.run_once() == 0
+
+    await sessions_repo.update(db, SESSION, turn_state="IDLE")
+    await outbox.flush()
+
+    assert [call["text"] for call in bot.calls_to("send_message")][-1] == "✅ Done"
+
+
+async def test_loud_still_sends_every_reply_as_it_arrives(
+    outbox: Outbox, bot: FakeBot, db: Database, session: str
+) -> None:
+    await working(db)
+    await chats_repo.ensure(db, CHAT, 0)
+    await chats_repo.set_notify(db, CHAT, 0, notify="loud")
+    await enqueue(outbox)
+
+    assert await outbox.run_once() == 1
+    assert outbox.health()["held"] == 0
+
+
+async def test_off_holds_too(
+    outbox: Outbox, bot: FakeBot, db: Database, session: str
+) -> None:
+    """`off` means no buzz, not "stream it at me" — only `loud` opts back in."""
+    await working(db)
+    await chats_repo.ensure(db, CHAT, 0)
+    await chats_repo.set_notify(db, CHAT, 0, notify="off")
+    await enqueue(outbox)
+
+    assert await outbox.run_once() == 0
+
+
+async def test_a_dead_poller_does_not_hold_the_output_hostage(
+    outbox: Outbox, bot: FakeBot, db: Database, session: str
+) -> None:
+    """`WORKING` written an hour ago means nobody is coming back for it."""
+    await working(db, at=now_ms() - 3_600_000)
+    await enqueue(outbox)
+
+    assert await outbox.run_once() == 1
+
+
+async def test_a_turn_that_never_ends_releases_the_queue_anyway(
+    outbox_factory: Callable[..., Outbox],
+    bot: FakeBot,
+    db: Database,
+    session: str,
+) -> None:
+    """The cap is on latency. A machine wedged in `WORKING` costs a wait."""
+    outbox = outbox_factory(max_hold_ms=0)
+    await working(db)
+    await enqueue(outbox)
+
+    assert await outbox.run_once() == 1
+
+
+async def test_an_unbound_session_is_never_held(
+    outbox: Outbox, bot: FakeBot, db: Database, session: str
+) -> None:
+    """A hold keys on the *destination*, and this session has none."""
+    await sessions_repo.update(db, SESSION, turn_state="WORKING")
+    await enqueue(outbox)
+
+    assert await outbox.run_once() == 1
+
+
+async def test_another_topic_drains_while_this_one_holds(
+    outbox: Outbox, bot: FakeBot, db: Database, session: str
+) -> None:
+    await working(db)
+    await enqueue(outbox, message_id="held")
+    await enqueue(outbox, message_id="free", chat_id=CHAT + 1)
+
+    assert await outbox.run_once() == 1
+    assert bot.calls_to("send_message")[0]["chat_id"] == CHAT + 1
 
 
 # ── the status card ──────────────────────────────────────────────────────────
