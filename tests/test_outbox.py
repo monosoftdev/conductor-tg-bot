@@ -14,10 +14,11 @@ and every sleep advances it.
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import json
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import pytest
@@ -109,6 +110,10 @@ class FakeBot:
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.script: dict[str, deque[BaseException | None]] = {}
         self._next_id = 1000
+        #: Runs once, *inside* the first ``send_message``, so a test can put
+        #: another task's work in the window where the real Bot API is waiting
+        #: on the network and the caller has no message id yet.
+        self.during_send_message: Callable[[], Awaitable[None]] | None = None
 
     # -- scripting --------------------------------------------------------
 
@@ -121,7 +126,11 @@ class FakeBot:
     # -- the Bot surface --------------------------------------------------
 
     async def send_message(self, **kwargs: Any) -> Any:
-        return self._record("send_message", kwargs)
+        result = self._record("send_message", kwargs)
+        hook, self.during_send_message = self.during_send_message, None
+        if hook is not None:
+            await hook()
+        return result
 
     async def send_document(self, **kwargs: Any) -> Any:
         return self._record("send_document", kwargs)
@@ -1262,6 +1271,41 @@ async def test_a_new_card_deletes_the_unfinished_one_it_replaces(
     assert [call["message_id"] for call in deleted] == [1001]
     assert len(bot.calls_to("send_message")) == 2
     assert cards.health()["superseded"] == 1
+
+
+async def test_the_tick_never_posts_a_second_copy_of_a_card_in_flight(
+    bot: FakeBot, db: Database, clock: FakeClock, session: str
+) -> None:
+    """The other road to two Stops, and the one `_supersede` cannot close.
+
+    ``_post`` learns the message id only when ``sendMessage`` returns, so for
+    the length of that round trip the card is dirty with ``message_id is None``
+    — and the tick loop is a *separate task* reading the same ``_Card``. It saw
+    exactly what the batch saw and posted the card again. Both copies carried
+    Stop; the loser kept the text it was posted with (``⏳ waking · preparing``)
+    while the winner ticked on to ``⚙️ working``, which is a live control on a
+    message that is no longer describing anything.
+    """
+    cards = StatusCards(bot, db, clock=clock, pin=False)
+    ticks: list[asyncio.Task[None]] = []
+
+    async def fire_the_tick_loop() -> None:
+        # A real task, as `run()` uses: the point is that it is *not* this one.
+        ticks.append(asyncio.create_task(cards.tick()))
+        await asyncio.sleep(0)
+
+    bot.during_send_message = fire_the_tick_loop
+    await cards.apply(
+        PostStatusCard(CardKind.WAKING, "waking · preparing", (CardButton.STOP,)),
+        session_id=SESSION,
+        chat_id=CHAT,
+        thread_id=5,
+    )
+    await asyncio.gather(*ticks)
+
+    assert len(bot.calls_to("send_message")) == 1
+    row = await sessions_repo.get(db, SESSION)
+    assert row is not None and row.status_card_msg_id == 1001
 
 
 async def test_a_refused_delete_still_takes_the_stale_stop_away(
