@@ -173,6 +173,70 @@ def test_probe_user_echo_is_suppressed() -> None:
     assert result.blocks == ()
 
 
+def test_raw_user_prompt_echo_with_mobile_contract_is_suppressed() -> None:
+    message = TranscriptMessage(
+        id="sess:1:0",
+        session_id="sess",
+        session_index=1,
+        type="agent",
+        content={
+            "type": "agent",
+            "rawPayload": {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "fix it\n\n===\nOUTPUT CONTRACT\n1. terse",
+                        }
+                    ],
+                },
+            },
+        },
+        received_at="2026-07-26 02:00:37.434+00",
+    )
+
+    result = render(message)
+
+    assert result.adapter == "user_echo"
+    assert result.blocks == ()
+
+
+def test_assistant_echoed_mobile_contract_is_cut_from_chat() -> None:
+    message = TranscriptMessage(
+        id="sess:2:0",
+        session_id="sess",
+        session_index=2,
+        type="agent",
+        content={
+            "type": "agent",
+            "rawPayload": {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "fix it\n\n===\nOUTPUT CONTRACT\n1. terse\n\n"
+                                "fixed; evidence: render test"
+                            ),
+                        }
+                    ],
+                },
+            },
+        },
+        received_at="2026-07-26 02:00:37.434+00",
+    )
+
+    text = chat_text(render(message))
+
+    assert "OUTPUT CONTRACT" not in text
+    assert "fix it" not in text
+    assert "fixed; evidence" in text
+
+
 def test_probe_assistant_answer_is_shown_at_every_verbosity() -> None:
     message = PROBE["probe_verified-4"]
     for verbosity in VERBOSITIES:

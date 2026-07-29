@@ -19,6 +19,7 @@ card activity rather than as a chat bubble.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from typing import Any, ClassVar, Final
 
@@ -58,6 +59,11 @@ __all__ = ["AssistantAdapter"]
 #: <blockquote> is still a wall, so it is clipped rather than chunked.
 THINKING_LIMIT: Final = 3000
 UNKNOWN_BLOCK_LIMIT: Final = 1000
+_CONTRACT_MARK: Final = "OUTPUT CONTRACT"
+_CONTRACT_END: Final = "Otherwise never write a Choices block."
+_OUTCOME_RE: Final = re.compile(
+    r"(?m)^(?:fixed|not fixed|blocked|what I found)\b.*"
+)
 
 _THINKING_KEYS: Final = (
     "thinking",
@@ -119,6 +125,9 @@ class AssistantAdapter(Adapter):
     ) -> list[Block]:
         text = first_str(block, "text", "content", strip=False)
         if not text or not text.strip():
+            return []
+        text = _without_echoed_prompt_contract(text)
+        if not text.strip():
             return []
         if not preamble:
             return text_to_blocks(
@@ -209,3 +218,17 @@ class AssistantAdapter(Adapter):
             kind=BlockKind.UNKNOWN,
             source_message_id=message.id,
         )
+
+
+def _without_echoed_prompt_contract(text: str) -> str:
+    """Drop a prompt echo if an agent repeats the Telegram-only contract."""
+    mark = text.find(_CONTRACT_MARK)
+    if mark < 0:
+        return text
+    outcome = _OUTCOME_RE.search(text, mark)
+    if outcome is not None:
+        return text[outcome.start() :].lstrip()
+    end = text.find(_CONTRACT_END, mark)
+    if end >= 0:
+        return text[end + len(_CONTRACT_END) :].lstrip()
+    return ""
