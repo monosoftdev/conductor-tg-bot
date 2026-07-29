@@ -308,22 +308,23 @@ def test_mobile_instruction_binds_narration_format_and_a_numeric_cap() -> None:
     assert text.startswith("===\n")
     assert "overrides any conflicting" in text
     # The narration between tool calls was 6 of the 9 bubbles in a real turn.
-    assert "no narration between tool calls" in text
-    assert "One message, at the end." in text
-    # Outcome first, no restatement, no step recap.
-    assert "Open with the outcome" in text
-    assert "never recap the steps" in text
+    assert "then one message" in text
+    assert "no progress notes" in text
+    # Outcome first, bad news first, no restatement, no step recap.
+    assert "Line 1 is the outcome" in text
+    assert "not at the bottom" in text
+    assert "recap your steps" in text
     # A measurable budget, not an adjective.
     assert "6 lines and 80 words" in text
-    # Formats that wrap badly at ~34 chars are named and banned.
-    for banned in ("No headings", "no tables", "no bold labels"):
+    # Formats that wrap badly at ~40 chars are named and banned.
+    for banned in ("No tables", "No headings", "bold labels"):
         assert banned in text
     # The chat already renders the diff lines.
-    assert "Do not list the files you changed" in text
+    assert "list the files you changed" in text
 
 
 def test_mobile_instruction_keeps_the_quick_reply_contract_parsable() -> None:
-    """Rule 5's syntax is what ``quick_replies_for`` turns into buttons."""
+    """Rule 7's syntax is what ``quick_replies_for`` turns into buttons."""
     reply = TranscriptMessage(
         id="m-1",
         session_id="session-1",
@@ -350,12 +351,47 @@ def test_mobile_instruction_keeps_the_quick_reply_contract_parsable() -> None:
     assert quick_replies_for(reply) == ("SQLite", "Postgres")
 
 
+def test_the_option_budget_the_contract_promises_is_the_button_budget() -> None:
+    """Rule 7 tells the agent 40 characters. The keyboard has to agree.
+
+    An option one character over ``MAX_BUTTON_TEXT`` is not a smaller button —
+    ``quick_replies_fit`` fails and the whole block degrades to plain text, so a
+    contract that promised a looser budget than the keyboard honours would ask
+    for exactly the answers that lose their buttons.
+    """
+    assert "under 40 characters" in MOBILE_REPLY_INSTRUCTION
+
+    assert keyboards.quick_replies_fit(["x" * 40] * 4)
+    # And the ceiling is real: the first option carries the extra "✓ ".
+    assert not keyboards.quick_replies_fit(["x" * 60, "ok"])
+
+
+def test_the_contract_never_parses_as_a_choices_block_itself() -> None:
+    """Rule 7 quotes its own syntax; an echo of it must not become buttons."""
+    echo = TranscriptMessage(
+        id="m-2",
+        session_id="session-1",
+        type="agent",
+        content={
+            "type": "agent",
+            "rawPayload": {
+                "type": "assistant",
+                "message": {
+                    "content": [{"type": "text", "text": MOBILE_REPLY_INSTRUCTION}]
+                },
+            },
+        },
+    )
+
+    assert quick_replies_for(echo) == ()
+
+
 @pytest.mark.parametrize(
     "terse",
     ["yes", "no", "1", "2.", "ok", "Do it", "Choose option 2: Postgres"],
 )
 def test_a_bare_pick_or_ack_does_not_carry_the_contract_again(terse: str) -> None:
-    """140 words of formatting rules bolted onto "yes" is 95% boilerplate."""
+    """240 words of formatting rules bolted onto "yes" is 97% boilerplate."""
     assert augment_prompt(terse) == terse.strip()
 
 

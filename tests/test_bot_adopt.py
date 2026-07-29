@@ -696,7 +696,7 @@ async def test_an_empty_transcript_says_nothing_yet_rather_than_faking_one(
 def test_the_card_shows_the_prompt_without_the_output_contract(
     message_factory: Callable[..., TranscriptMessage],
 ) -> None:
-    """Every Telegram prompt carries 140 words of formatting rules. Not content."""
+    """Every Telegram prompt carries 240 words of formatting rules. Not content."""
     assert "OUTPUT CONTRACT" in MOBILE_REPLY_INSTRUCTION
     echo = message_factory(
         4, kind="userMessage", text=augment_prompt("fix the flaky test")

@@ -29,6 +29,13 @@ account and a live Telegram deployment end to end — see
 
 ### Changed
 
+- The output contract appended to every prompt now states the constraints it
+  used to imply: the bubble is 40 characters wide, a table has nowhere to go,
+  long code leaves the chat as an attachment, a reader on a phone has no shell
+  to run a suggested command in, and a `Choices:` option over 40 characters
+  loses its button. It also spends its words on the two round trips that cost
+  the most — burying "blocked" at the bottom, and asking a question the repo
+  already answers.
 - `/notify off` means off. It previously behaved identically to `quiet`,
   because the 30-minute focus window promoted both.
 - A split reply pushes one notification, not one per chunk.
