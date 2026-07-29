@@ -56,6 +56,7 @@ class CiWatcher:
         system_db: Database,
         outbox: Outbox,
         clients: GitHubPool,
+        enabled: bool = True,
         nonces: NonceStore | None = None,
         batch: int = 16,
         tick_interval: float = TICK_INTERVAL_S,
@@ -65,6 +66,7 @@ class CiWatcher:
         self._db = system_db
         self._outbox = outbox
         self._clients = clients
+        self._enabled = enabled
         self._nonces = nonces
         self._batch = batch
         self._tick_interval = tick_interval
@@ -78,6 +80,13 @@ class CiWatcher:
     # -- lifecycle ------------------------------------------------------------
 
     async def run(self) -> None:
+        if not self._enabled:
+            # Migration 002 is intentionally not a prerequisite for the bot's
+            # core job.  Stay alive as an inert optional service so the runtime
+            # keeps its normal lifecycle without touching ``ci_watches``.
+            _log.warning("ci.disabled", reason="schema migration 002 not applied")
+            await self._stop.wait()
+            return
         while not self._stop.is_set():
             try:
                 await self.tick()
@@ -104,12 +113,18 @@ class CiWatcher:
                 await task
 
     def health(self) -> dict[str, Any]:
-        return {"polls": self._polls, "notices": self._notices}
+        return {
+            "enabled": self._enabled,
+            "polls": self._polls,
+            "notices": self._notices,
+        }
 
     # -- one pass -------------------------------------------------------------
 
     async def tick(self) -> int:
         """Poll every due watch. Returns how many were polled."""
+        if not self._enabled:
+            return 0
         due = await ci_repo.claim_due(self._db, limit=self._batch)
         for row in due:
             if self._stop.is_set():

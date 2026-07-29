@@ -632,6 +632,61 @@ def test_a_limit_that_bites_is_an_error_at_every_verbosity() -> None:
         )
 
 
+def test_a_flat_codex_limit_event_is_a_loud_provider_specific_error() -> None:
+    """Codex may put the quota fields directly on the transcript event."""
+    message = TranscriptMessage.model_validate(
+        {
+            "id": "00000000-0000-4000-8000-000000000001:10:0",
+            "sessionId": "00000000-0000-4000-8000-000000000001",
+            "sessionIndex": 10,
+            "type": "agent",
+            "content": {
+                "type": "agent",
+                "rawPayload": {
+                    "type": "rate_limit_event",
+                    "status": "rejected",
+                    "rateLimitType": "five_hour",
+                    "provider": "codex",
+                    "resetsAt": NOW + 3600,
+                },
+            },
+        }
+    )
+
+    for verbosity in VERBOSITIES:
+        result = render_at(message, verbosity)
+        assert BlockKind.ERROR in kinds(result)
+        assert chat_text(result) == (
+            "⛔ <b>Codex 5-hour limit reached · resets in 1h</b>"
+        )
+
+
+def test_a_codex_usage_limit_result_is_not_a_generic_turn_failure() -> None:
+    """Fallback for providers that expose the quota only as result text."""
+    message = TranscriptMessage.model_validate(
+        {
+            "id": "00000000-0000-4000-8000-000000000001:11:0",
+            "sessionId": "00000000-0000-4000-8000-000000000001",
+            "sessionIndex": 11,
+            "type": "agent",
+            "content": {
+                "type": "agent",
+                "rawPayload": {
+                    "type": "result",
+                    "subtype": "error",
+                    "is_error": True,
+                    "model": "gpt-5-codex",
+                    "result": "You've hit your usage limit. Try again at 4:00 PM.",
+                },
+            },
+        }
+    )
+
+    result = render(message)
+    assert chat_text(result).startswith("⛔ <b>Codex usage limit reached</b>")
+    assert "Try again at 4:00 PM." in chat_text(result)
+
+
 def test_an_unknown_status_is_treated_as_blocking() -> None:
     """Fail loud: a status nobody has seen is not evidence that work continues."""
     result = render_at(rate_limit(status="tarpitted"), Verbosity.NORMAL)

@@ -46,6 +46,7 @@ from ctb.db.migrate import (
     current_schema_version,
     discover_migrations,
 )
+from ctb.db.repo.tenancy import _TENANT_COLUMNS
 from ctb.delivery.render.types import (
     ActivityLine,
     BlockKind,
@@ -402,6 +403,39 @@ class TestMigrations:
     ) -> None:
         """``/health`` calls this on every report, as a role that cannot create."""
         assert await current_schema_version(db) >= 1
+
+    async def test_tenant_projection_treats_migration_002_fields_as_optional(
+        self, system_db: Database
+    ) -> None:
+        """The supervisor must keep reconciling while a deploy is still on 001."""
+        async with system_db.transaction():
+            await system_db.execute(
+                "CREATE TEMP TABLE legacy_tenants "
+                "(LIKE tenants INCLUDING DEFAULTS) ON COMMIT DROP"
+            )
+            for column in (
+                "github_key_ct",
+                "github_key_kid",
+                "github_key_fp",
+                "github_key_at",
+            ):
+                await system_db.execute(
+                    f"ALTER TABLE legacy_tenants DROP COLUMN {column}"
+                )
+            await system_db.execute(
+                "INSERT INTO legacy_tenants (slug, name) VALUES ('legacy', 'Legacy')"
+            )
+            projection = _TENANT_COLUMNS.replace(
+                "to_jsonb(tenants)", "to_jsonb(legacy_tenants)"
+            )
+            row = await system_db.fetch_one(f"SELECT {projection} FROM legacy_tenants")
+
+        assert row is not None
+        assert row["slug"] == "legacy"
+        assert row["github_key_ct"] is None
+        assert row["github_key_kid"] is None
+        assert row["github_key_fp"] is None
+        assert row["github_key_at"] is None
 
 
 class TestDatabase:

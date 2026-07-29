@@ -72,6 +72,7 @@ from ctb.bot.middleware.tenancy import TenantContext, forget_cached
 from ctb.conductor.client import ConductorClient
 from ctb.conductor.pool import CONDUCTOR_KEY_PURPOSE
 from ctb.db.connection import Database, now_ms, tenant_scope
+from ctb.db.migrate import current_schema_version
 from ctb.db.repo import chats as chats_repo
 from ctb.db.repo import tenancy
 from ctb.delivery.render.html import escape
@@ -761,6 +762,16 @@ async def set_key(
         return
 
     system = system_database()
+    if git and await current_schema_version(system) < 2:
+        # The credential has already been deleted from Telegram above.  Do not
+        # validate it against GitHub when this deployment cannot store it.
+        await tell(
+            message,
+            "GitHub CI setup is temporarily unavailable in this deployment. "
+            "Everything else keeps working normally." + note,
+            silent=not note,
+        )
+        return
     box = secret_box()
     fingerprint = box.fingerprint_of(value, tenant_id=tenant.tenant_id)
     if git:
@@ -1009,9 +1020,14 @@ async def revoke(message: Message, tenant: TenantContext, state: FSMContext) -> 
     await tenancy.set_elevenlabs_key(
         system, tenant.tenant_id, ciphertext=None, kid=None, fingerprint=None
     )
-    await tenancy.set_github_key(
-        system, tenant.tenant_id, ciphertext=None, kid=None, fingerprint=None
-    )
+    # On a rolling deploy from schema 001, avoid naming columns that do not
+    # exist; revoking the required Conductor key must continue to work.  Check
+    # the schema rather than the middleware snapshot, which can predate a token
+    # stored earlier in the same process.
+    if await current_schema_version(system) >= 2:
+        await tenancy.set_github_key(
+            system, tenant.tenant_id, ciphertext=None, kid=None, fingerprint=None
+        )
     await tenancy.set_status(system, tenant.tenant_id, "pending")
     log.info("registration.key_revoked", tenant=tenant.slug)
     forget_cached(tenant.tenant_id)
