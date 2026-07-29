@@ -7,6 +7,7 @@ the durable prompt ledger, then echo the *original* text's destination.
 from __future__ import annotations
 
 import contextlib
+from typing import Final
 
 from aiogram import F, Router
 from aiogram.enums import ContentType
@@ -301,6 +302,52 @@ async def retry_callback(
         await query.answer(f"Retry failed: {short_error(exc)}", show_alert=True)
         return
     await query.answer("Queued again")
+
+
+#: What "Fix CI" actually says to the agent. Deliberately about *finding out*
+#: first: the bot knows a check went red, not why, and a prompt that guesses the
+#: cause sends the agent looking for the wrong thing. The agent has ``gh``.
+FIX_CI_PROMPT: Final = (
+    "CI is failing on the pull request you opened. Use `gh pr checks` and "
+    "`gh run view --log-failed` to read the failing job, fix the cause, and "
+    "push to the same branch. If the failure is unrelated to your change, say "
+    "so instead of forcing a green tick."
+)
+
+
+@router.callback_query(Cb.filter(F.action == Action.FIX_CI.value))
+async def fix_ci_callback(
+    query: CallbackQuery,
+    nonces: NonceStore,
+    tenant: TenantContext,
+    db: Database | None = None,
+    client: ConductorClient | None = None,
+) -> None:
+    """Hand a red CI run back to the session that opened the pull request."""
+    try:
+        ticket = resolve(query, expect=Action.FIX_CI, store=nonces)
+    except NonceError as exc:
+        await query.answer(exc.user_message, show_alert=True)
+        return
+    try:
+        await submit_prompt(
+            db=resolve_db(db),
+            client=resolve_client(client, tenant),
+            session_id=ticket.target,
+            text=FIX_CI_PROMPT,
+            chat_id=ticket.chat_id
+            or (query.message.chat.id if query.message else query.from_user.id),
+            thread_id=ticket.thread_id
+            or (
+                (query.message.message_thread_id or 0)
+                if isinstance(query.message, Message)
+                else 0
+            ),
+        )
+    except Exception as exc:
+        await query.answer(f"Could not send: {short_error(exc)}", show_alert=True)
+        return
+    await query.answer("On it")
 
 
 @router.callback_query(Cb.filter(F.action == Action.CLEAR_QUEUE.value))

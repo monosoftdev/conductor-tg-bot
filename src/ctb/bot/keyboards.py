@@ -181,6 +181,10 @@ class Action(StrEnum):
     PICK = "pick"
     SEND = "send"
     PAGE = "page"
+    #: Hand a red CI run back to the agent that opened the pull request. The
+    #: prompt lives in the handler, not the payload: a stateless target must be
+    #: a bare id, and the whole point is that this survives a redeploy.
+    FIX_CI = "fixci"
 
 
 #: The status card's buttons, in the vocabulary the turn machine speaks.
@@ -218,6 +222,10 @@ RESTARTABLE_ACTIONS: Final[frozenset[str]] = frozenset(
         Action.CHECK.value,
         Action.ARCHIVE_REQUEST.value,
         Action.WIZARD.value,
+        # Sends a prompt, like RETRY. A CI notice outlives the deploy that
+        # posted it — often by hours — and a "Fix CI" that answers "expired"
+        # would be worse than no button at all.
+        Action.FIX_CI.value,
     }
 )
 

@@ -1107,6 +1107,133 @@ class TestVoiceToggle:
         assert said[-1] == "Owners only."
 
 
+class TestGitHubTokenIntake:
+    """`/gitkey` is what turns CI watching on for a team."""
+
+    async def _tenant(self, system_db: Database) -> TenantRow:
+        row = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
+        assert row is not None
+        return row
+
+    async def test_a_good_token_is_sealed_and_stored(
+        self,
+        db: Database,
+        system_db: Database,
+        said: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        async def accept(_token: str, **_kw: Any) -> None:
+            return None
+
+        monkeypatch.setattr(registration, "check_github_token", accept)
+        row = await self._tenant(system_db)
+
+        await registration.set_key(
+            dm("/gitkey ghp_good"), context(row), voice_settings(), NullState()
+        )
+
+        after = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
+        assert after is not None and after.github_key_ct is not None
+        # Sealed, not stored: the row never holds the token itself.
+        assert b"ghp_good" not in bytes(after.github_key_ct)
+        assert "GitHub token stored" in said[-1]
+        # The other two credentials are untouched by the third.
+        assert after.conductor_key_ct is not None
+        assert after.elevenlabs_key_ct is None
+
+    async def test_a_rejected_token_is_not_stored_but_is_still_deleted(
+        self,
+        db: Database,
+        system_db: Database,
+        said: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        async def refuse(_token: str, **_kw: Any) -> str:
+            return "GitHub rejected that token."
+
+        monkeypatch.setattr(registration, "check_github_token", refuse)
+        bot = FakeBot()
+        row = await self._tenant(system_db)
+
+        await registration.set_key(
+            dm("/gitkey ghp_typo", bot=bot),
+            context(row),
+            voice_settings(),
+            NullState(),
+        )
+
+        assert "GitHub rejected" in said[-1]
+        assert bot.deleted, "a refused token is still a live token in history"
+        after = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
+        assert after is not None and after.github_key_ct is None
+
+    async def test_a_token_sent_to_a_group_is_refused_and_deleted(
+        self,
+        db: Database,
+        system_db: Database,
+        said: list[str],
+    ) -> None:
+        bot = FakeBot()
+        message = SimpleNamespace(
+            text="/gitkey ghp_oops",
+            chat=SimpleNamespace(id=-100999, type="supergroup", title="Team"),
+            message_thread_id=None,
+            message_id=11,
+            from_user=SimpleNamespace(
+                id=OWNER, username=None, first_name="U", last_name=None
+            ),
+            bot=bot,
+        )
+        row = await self._tenant(system_db)
+
+        await registration.set_key(message, context(row), voice_settings(), NullState())
+
+        assert "Never send an API key to a group" in said[-1]
+        assert bot.deleted
+        after = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
+        assert after is not None and after.github_key_ct is None
+
+    async def test_only_owners_may_store_it(
+        self,
+        db: Database,
+        system_db: Database,
+        said: list[str],
+    ) -> None:
+        row = await self._tenant(system_db)
+
+        await registration.set_key(
+            dm("/gitkey ghp_good"),
+            context(row, role="member"),
+            voice_settings(),
+            NullState(),
+        )
+
+        after = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
+        assert after is not None and after.github_key_ct is None
+
+    async def test_revoke_takes_the_github_token_too(
+        self,
+        db: Database,
+        system_db: Database,
+        said: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        async def accept(_token: str, **_kw: Any) -> None:
+            return None
+
+        monkeypatch.setattr(registration, "check_github_token", accept)
+        row = await self._tenant(system_db)
+        await registration.set_key(
+            dm("/gitkey ghp_good"), context(row), voice_settings(), NullState()
+        )
+
+        await registration.revoke(dm("/revoke"), context(row), NullState())
+
+        after = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
+        assert after is not None
+        assert after.github_key_ct is None and after.github_key_fp is None
+
+
 class TestSpeechKeyIntake:
     """`/voicekey` used to accept anything and fail at the first voice note."""
 

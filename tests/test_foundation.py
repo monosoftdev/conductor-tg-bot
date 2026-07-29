@@ -377,6 +377,7 @@ class TestMigrations:
         assert {
             "api_events",
             "chats",
+            "ci_watches",
             "deliveries",
             "enrollment_tokens",
             "outbound_prompts",

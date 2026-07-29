@@ -37,6 +37,7 @@ from __future__ import annotations
 
 from ctb.db.repo import (
     chats,
+    ci,
     deliveries,
     events,
     lease,
@@ -55,6 +56,7 @@ __all__ = [
     "Maybe",
     "Unset",
     "chats",
+    "ci",
     "content_hash",
     "deliveries",
     "events",

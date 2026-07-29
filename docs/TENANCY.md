@@ -113,8 +113,8 @@ remembering to add it.
 | | `ctb_app` | `ctb_worker` |
 |---|---|---|
 | Row-level security | enforced | `BYPASSRLS` |
-| Used by | handlers, routing, FSM storage, pollers (inside a scope) | supervisor reconcile, delivery and voice claim loops, prune, tenancy lookups |
-| Grants | the nine tenant tables, and `SELECT` on `schema_version`. **No grant at all** on `tenants`, `tenant_members`, `tenant_chats` — the tables that decide scope | everything |
+| Used by | handlers, routing, FSM storage, pollers (inside a scope) | supervisor reconcile, delivery, voice and CI claim loops, prune, tenancy lookups |
+| Grants | the ten tenant tables, and `SELECT` on `schema_version`. **No grant at all** on `tenants`, `tenant_members`, `tenant_chats` — the tables that decide scope | everything |
 | Member of the other | **no** | no |
 
 The GUC answers "who is this acting for"; the *role* answers "may this
@@ -144,7 +144,9 @@ reintroduces exactly the bug the tests are written to catch.
 
 The AAD binding is the point. Fernet has none, so copying one row's blob onto
 another row would decrypt cleanly; here it fails authentication. `purpose`
-separates the Conductor key from the speech key on the same row.
+separates the Conductor key, the speech key and the GitHub token on the same
+row — a blob moved between the three columns fails authentication rather than
+opening as the wrong credential.
 
 There is **no plaintext cache**. `ClientPool.get()` decrypts once, hands the key
 to the client's default headers, and drops the reference. The client is the

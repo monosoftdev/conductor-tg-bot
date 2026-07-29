@@ -103,7 +103,7 @@ working bot, only the topic list.
 
 Daily: `/new` `/attach` `/board` `/stop` `/find` `/mode` `/done`
 Power: `/s` `/fork` `/name` `/open` `/desk` `/here` `/log` `/notify` `/defaults` `/sql` `/tidy`
-Team: `/team` `/invite` `/remove` `/leave` `/members` `/health` `/export` `/key` `/voicekey` `/voice` `/revoke`
+Team: `/team` `/invite` `/remove` `/leave` `/members` `/health` `/export` `/key` `/voicekey` `/gitkey` `/voice` `/revoke`
 Several teams: `/use` picks which one your DMs mean · `/forget` drops one
 Anyone: `/start` `/register` `/setup` `/privacy` `/help`
 Operator: `/platform list|suspend|resume`, gated on `PLATFORM_ADMIN_IDS`

@@ -61,7 +61,10 @@ _SIGNALS: Final[tuple[signal.Signals, ...]] = (signal.SIGINT, signal.SIGTERM)
 #: Services whose failure is logged and contained instead of ending the process.
 #: Voice is off by default, costs money, and depends on a third party — it is a
 #: bonus, not a reason to stop delivering agent replies.
-OPTIONAL_SERVICES: Final[frozenset[str]] = frozenset({"voice"})
+#: ``ci`` joins it for the same reasons: it needs a token most teams will not
+#: have stored, it depends on GitHub being up, and a CI verdict nobody hears is
+#: not worth losing an agent reply over.
+OPTIONAL_SERVICES: Final[frozenset[str]] = frozenset({"voice", "ci"})
 
 
 class ServiceStoppedError(RuntimeError):
@@ -91,6 +94,7 @@ class RuntimeFactories:
     make_status_cards: Factory
     make_supervisor: Factory
     make_voice: Factory
+    make_ci: Factory
     make_health_monitor: Factory
     make_health_server: Factory
     make_app: Factory
@@ -112,6 +116,7 @@ class RuntimeServices:
     status_cards: Any | None = None
     supervisor: Any | None = None
     voice: Any | None = None
+    ci: Any | None = None
     health_monitor: Any | None = None
     health_server: Any | None = None
     app: Any | None = None
@@ -129,6 +134,7 @@ class RuntimeServices:
             ("outbox", self.outbox),
             ("status_cards", self.status_cards),
             ("voice", self.voice),
+            ("ci", self.ci),
             ("supervisor", self.supervisor),
             ("health", self.health_server),
         )
@@ -165,6 +171,7 @@ class RuntimeServices:
         # Stop producers before consumers, then close network and storage.
         for name, component, method_name in (
             ("voice", self.voice, "stop"),
+            ("ci", self.ci, "stop"),
             ("supervisor", self.supervisor, "stop"),
             ("status_cards", self.status_cards, "stop"),
             ("outbox", self.outbox, "stop"),
@@ -450,6 +457,22 @@ def _default_make_supervisor(
     )
 
 
+def _default_make_ci(system_db: Any, outbox: Any) -> Any:
+    from ctb.ci.watcher import CiWatcher
+    from ctb.github.pool import GitHubPool
+    from ctb.runtime import secret_box, set_github_pool
+
+    # One client per tenant, from that tenant's own sealed token. No shared
+    # fallback: the token reads a customer's private source, so borrowing
+    # another team's would be exactly the cross-tenant read the schema exists
+    # to prevent.
+    clients = GitHubPool(secret_box())
+    # Published so /revoke can evict a decrypted token rather than leaving it
+    # live in an Authorization header for the life of the process.
+    set_github_pool(clients)
+    return CiWatcher(system_db=system_db, outbox=outbox, clients=clients)
+
+
 def _default_make_health_monitor(system_db: Any, clients: Any, holder: str) -> Any:
     from ctb.health import HealthMonitor
 
@@ -557,6 +580,7 @@ def production_factories() -> RuntimeFactories:
         make_status_cards=_default_make_status_cards,
         make_supervisor=_default_make_supervisor,
         make_voice=_default_make_voice,
+        make_ci=_default_make_ci,
         make_health_monitor=_default_make_health_monitor,
         make_health_server=_default_make_health_server,
         make_app=_default_make_app,
@@ -621,6 +645,7 @@ async def build_runtime(
             runtime.clients,
             runtime.supervisor,
         )
+        runtime.ci = made.make_ci(runtime.system_db, runtime.outbox)
         runtime.health_monitor = made.make_health_monitor(
             runtime.system_db,
             runtime.clients,
