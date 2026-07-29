@@ -67,6 +67,7 @@ __all__ = [
     "enqueue",
     "failure_digest",
     "get",
+    "held_destinations",
     "list_for_session",
     "mark_failed",
     "mark_sent",
@@ -303,6 +304,57 @@ async def pending_destinations(db: Database, *, limit: int = 64) -> list[Destina
         )
         for row in rows
     ]
+
+
+#: A turn is under way in these states, so more of its output is still coming.
+#: Wider than ``sessions._ACTIVE_STATES_SQL`` by ``SUBMIT_PENDING``: the POST is
+#: in flight, which is where the turn starts as far as a reader is concerned.
+_MID_TURN_SQL: Final = (
+    "('SUBMIT_PENDING', 'QUEUED', 'WAKING', 'WORKING', 'DRAINING', 'CANCELLING')"
+)
+
+
+async def held_destinations(
+    db: Database, *, fresh_within_ms: int, at: int | None = None
+) -> set[tuple[int, int]]:
+    """Destinations whose queue should wait for the turn to finish.
+
+    The reason a query about *sessions* lives in the deliveries repo: this is a
+    scheduling question, asked once per outbox pass alongside
+    :func:`pending_destinations`, and answering it in one statement is what
+    keeps it off the per-row path.
+
+    An agent narrates. Sending each narration message as it arrives is eight
+    Telegram notifications for one task even when every one of them is silent,
+    because a silent message still lands in the tray. So under ``/notify`` other
+    than ``loud`` the queue is held while the turn runs — the live surface in
+    that window is the status card, which is an *edit* and never notifies — and
+    released as one batch when the turn ends, followed by the single loud
+    finish line. ``loud`` opts back into per-reply delivery.
+
+    ``fresh_within_ms`` is the safety valve, and the reason this is not a
+    correctness gate. A poller killed mid-turn leaves ``WORKING`` in the table
+    forever; a live one writes ``updated_at`` every tick. Past the window the
+    hold lapses and the output goes out regardless of what the state machine
+    believes — CLAUDE.md rule 1 holds, delivery is never *conditional* on the
+    machine, only briefly *paced* by it, with the outbox's own
+    :data:`ctb.delivery.outbox.MAX_HOLD_MS` capping even a live-but-wrong one.
+    """
+    stamp = now_ms() if at is None else at
+    rows = await db.fetch_all(
+        f"""
+        SELECT DISTINCT s.chat_id, s.thread_id
+          FROM sessions s
+          LEFT JOIN chats c
+            ON c.chat_id = s.chat_id AND c.thread_id = s.thread_id
+         WHERE s.chat_id IS NOT NULL
+           AND s.turn_state IN {_MID_TURN_SQL}
+           AND s.updated_at >= ?
+           AND COALESCE(c.notify, 'quiet') <> 'loud'
+        """,
+        (stamp - max(0, fresh_within_ms),),
+    )
+    return {(as_int(row["chat_id"]), as_int(row["thread_id"])) for row in rows}
 
 
 async def claim(

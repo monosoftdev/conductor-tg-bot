@@ -207,6 +207,12 @@ async def destination_for(db: Database, session_id: str) -> Destination | None:
         # So the three settings are three behaviours, which is the only reason
         # to have three: `loud` pushes every reply *and* the finish, `quiet`
         # pushes only the finish, `off` pushes nothing.
+        #
+        # Muting was not enough on its own — a silent message still occupies a
+        # line in the notification tray — so anything but `loud` also *holds*
+        # the queue until the turn ends (`ctb.delivery.outbox.Outbox._sendable`).
+        # This flag stays what it always was, the push policy for a row that is
+        # being sent; the hold decides when that is.
         silent = chat.notify != "loud"
     return Destination(
         chat_id=row.chat_id,

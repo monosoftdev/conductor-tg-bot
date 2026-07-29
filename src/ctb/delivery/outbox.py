@@ -53,7 +53,7 @@ from aiogram.exceptions import (
 from aiogram.types import BufferedInputFile, InlineKeyboardMarkup, LinkPreviewOptions
 
 from ctb.db import NO_THREAD_ID
-from ctb.db.connection import Database
+from ctb.db.connection import Database, now_ms
 from ctb.db.repo import deliveries as deliveries_repo
 from ctb.db.repo.deliveries import DeliveryRow
 from ctb.db.repo.transcript import DeliveryDraft
@@ -129,6 +129,16 @@ INLINE_RETRY_CEILING_S: Final = 2.0
 RETRY_AFTER_PADDING_S: Final = 0.5
 #: Idle poll interval for :meth:`Outbox.run` when the queue is empty.
 IDLE_INTERVAL_S: Final = 1.0
+#: How stale a mid-turn session's ``updated_at`` may be before the hold lapses.
+#: A live poller touches it every tick, so anything older means nobody is coming
+#: back for that turn and its output must go out now.
+HOLD_FRESH_MS: Final = 300_000
+#: The longest one destination's queue may be held, however healthy the turn
+#: looks. A turn that runs longer than this is real, so the batch goes out —
+#: silently, which is the point: the cap bounds *latency*, never the single
+#: buzz, and a state machine wedged in ``WORKING`` costs half an hour, not a
+#: reply.
+MAX_HOLD_MS: Final = 1_800_000
 
 #: PLAN: link previews are disabled everywhere. Agent output is full of URLs and
 #: a preview card under every reply is noise.
@@ -419,6 +429,8 @@ class Outbox:
         claim_id: str | None = None,
         quick_replies: QuickReplyFactory = _default_quick_replies,
         focus: FocusTracker | None = None,
+        hold_fresh_ms: int = HOLD_FRESH_MS,
+        max_hold_ms: int = MAX_HOLD_MS,
     ) -> None:
         self._bot = bot
         self._db = db
@@ -447,6 +459,10 @@ class Outbox:
         self._rotor = DestinationRotor(clock=clock)
         self._focus = focus if focus is not None else focus_tracker()
         self._orphan_after_ms = orphan_after_ms
+        # Zero disables the hold outright, which is what a test that wants the
+        # old send-as-it-arrives behaviour asks for.
+        self._hold_fresh_ms = max(0, hold_fresh_ms)
+        self._max_hold_ms = max(0, max_hold_ms)
         self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._recovered = False
@@ -460,6 +476,7 @@ class Outbox:
             "recovered": 0,
             "recovery_skipped": 0,
             "rerouted": 0,
+            "held": 0,
             "loop_errors": 0,
         }
 
@@ -751,6 +768,38 @@ class Outbox:
                 self._counters["recovered"] += 1
         return sent
 
+    async def _sendable(
+        self, destinations: Sequence[deliveries_repo.Destination]
+    ) -> list[deliveries_repo.Destination]:
+        """Drop the destinations whose turn is still running.
+
+        One task is one notification. An agent narrates as it works, and every
+        one of those messages lands in the tray even when it is sent silently —
+        so unless the topic is ``/notify loud``, the batch waits for the turn to
+        finish and arrives with the finish line, which is the buzz.
+
+        Nothing here decides *whether* a row sends, only *when*: a destination
+        whose head has waited :data:`MAX_HOLD_MS` is released regardless, and
+        :func:`~ctb.db.repo.deliveries.held_destinations` already ignores a
+        session whose poller has stopped writing. Both valves fail open.
+        """
+        if not destinations or not self._hold_fresh_ms:
+            return list(destinations)
+        held = await deliveries_repo.held_destinations(
+            self._db, fresh_within_ms=self._hold_fresh_ms
+        )
+        if not held:
+            return list(destinations)
+        stamp = now_ms()
+        ready = [
+            destination
+            for destination in destinations
+            if destination.key not in held
+            or stamp - destination.head_at >= self._max_hold_ms
+        ]
+        self._counters["held"] += len(destinations) - len(ready)
+        return ready
+
     async def run_once(self) -> int:
         """Serve each destination in turn. Returns the number of messages sent.
 
@@ -758,12 +807,14 @@ class Outbox:
         within a topic is exact while several topics drain in parallel — and
         one tenant's ten-thousand-row backlog cannot monopolise the sender.
         A destination that has spent its per-chat budget is *skipped*, not
-        waited on.
+        waited on, and one whose turn is still running is held — see
+        :meth:`_sendable`.
         """
         if self.paused_for > 0:
             return 0
+        pending = await deliveries_repo.pending_destinations(self._db, limit=64)
         destinations = self._rotor.order(
-            await deliveries_repo.pending_destinations(self._db, limit=64),
+            await self._sendable(pending),
             key=lambda item: (item.chat_id, item.thread_id),
             urgency=lambda item: (
                 int(Priority.FOCUS)

@@ -651,7 +651,11 @@ async def notify(
             )
         await tell(
             message,
-            f"<b>Topic alerts</b> · {escape(current)}",
+            f"<b>Topic alerts</b> · {escape(current)}\n\n"
+            "🔔 <b>Loud</b> — every reply, the moment it arrives.\n"
+            "🔕 <b>Quiet</b> — the card tracks the work; the replies land "
+            "together when the task is done, with one buzz.\n"
+            "◯ <b>Off</b> — the same, without the buzz.",
             reply_markup=keyboard(choices),
         )
         return

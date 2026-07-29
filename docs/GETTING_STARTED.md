@@ -146,13 +146,19 @@ rules keep that from becoming twenty notifications:
 - **Progress goes on the pinned card, not into the chat.** Tool calls, the file
   it is editing right now, the elapsed clock — one message, edited in place. No
   bubble per changed file.
-- **Nothing pushes until it is finished.** Then one line arrives and your phone
-  buzzes once: `✅ Done · 1m32s · 12 tools · 5 files`. Errors are the exception
-  and always push immediately.
+- **Nothing arrives until it is finished.** The replies are held while the task
+  runs — a silent message is still a line in your notification tray — and then
+  land together, followed by the one line your phone buzzes for:
+  `✅ Done · 1m32s · 12 tools · 5 files`.
 
-`/notify` changes that per topic: `loud` also pushes every reply, `quiet` (the
-default) pushes only the finish, `off` never pushes. `/mode verbose` puts the
-file edits and their patches back into the chat if you want them there.
+`/notify` changes that per topic: `loud` sends every reply the moment it
+arrives, `quiet` (the default) holds them until the task is done and buzzes
+once, `off` does the same without the buzz. `/mode verbose` puts the file edits
+and their patches back into the chat if you want them there.
+
+A held topic is never a stuck one. If a turn runs past half an hour, or the
+poller behind it stops, the backlog goes out anyway — quietly, since the buzz
+belongs to the finish.
 
 ### Reading the topic list
 
