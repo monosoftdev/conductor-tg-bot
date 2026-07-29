@@ -225,7 +225,7 @@ def test_probe_system_and_rate_limit_are_suppressed_below_verbose() -> None:
     assert "claude-sonnet-4-6" in chat_text(init)
     allowed = render(PROBE["probe_verified-3"], Verbosity.VERBOSE)
     assert allowed.adapter == "rate_limit"
-    assert "allowed" in chat_text(allowed)
+    assert "rate limit ok" in chat_text(allowed)
 
 
 def test_probe_messages_are_never_unknown() -> None:
@@ -539,7 +539,7 @@ def test_preamble_span_counts_up_to_the_last_tool_call() -> None:
     [
         ("result_error", "Codex ChatGPT auth not found"),
         ("result_error_traceback", "RuntimeError"),
-        ("rate_limit_blocked", "blocked"),
+        ("rate_limit_blocked", "5-hour limit reached"),
         ("session_error_event", "workspace stopped responding"),
     ],
 )
@@ -563,6 +563,105 @@ def test_multiline_error_body_becomes_a_code_block() -> None:
 
 def test_rate_limit_that_does_not_bite_stays_quiet() -> None:
     assert render(PROBE["probe_verified-3"], Verbosity.NORMAL).chat == ()
+
+
+# ── the three rate-limit tiers ───────────────────────────────────────────────
+
+#: A fixed clock, so "resets in …" is a pure function of the fixture.
+NOW: Final = 1_785_000_000.0
+
+
+def rate_limit(**info: Any) -> TranscriptMessage:
+    return TranscriptMessage.model_validate(
+        {
+            "id": "00000000-0000-4000-8000-000000000001:9:0",
+            "sessionId": "00000000-0000-4000-8000-000000000001",
+            "sessionIndex": 9,
+            "type": "agent",
+            "content": {
+                "type": "agent",
+                "rawPayload": {
+                    "type": "rate_limit_event",
+                    "rate_limit_info": info,
+                },
+            },
+            "receivedAt": "2026-07-26 02:00:00.000+00",
+        }
+    )
+
+
+def render_at(message: TranscriptMessage, verbosity: Verbosity) -> RenderResult:
+    return default_registry().render(
+        message, RenderContext(verbosity=verbosity, now_epoch_s=NOW)
+    )
+
+
+def test_allowed_warning_is_a_card_note_not_an_error_bubble() -> None:
+    """The reported bug: ⚠️ shouted at a limit that was still letting you through."""
+    message = rate_limit(
+        status="allowed_warning",
+        rateLimitType="seven_day",
+        resetsAt=NOW + 2 * 3600 + 15 * 60,
+    )
+    for verbosity in VERBOSITIES:
+        result = render_at(message, verbosity)
+        assert BlockKind.ERROR not in kinds(result), verbosity
+        assert result.activity == (
+            "⏳ approaching your weekly limit · resets in 2h 15m",
+        )
+    # The chat stays a conversation until the user asks for everything.
+    assert render_at(message, Verbosity.QUIET).chat == ()
+    assert render_at(message, Verbosity.NORMAL).chat == ()
+    verbose = chat_text(render_at(message, Verbosity.VERBOSE))
+    assert "⏳" in verbose
+    assert "approaching your weekly limit" in verbose
+
+
+def test_a_limit_that_bites_is_an_error_at_every_verbosity() -> None:
+    message = rate_limit(
+        status="rejected",
+        rateLimitType="seven_day_opus",
+        overageDisabledReason="out_of_credits",
+        resetsAt=NOW + 3 * 86400,
+    )
+    for verbosity in VERBOSITIES:
+        result = render_at(message, verbosity)
+        assert BlockKind.ERROR in kinds(result), verbosity
+        assert chat_text(result) == (
+            "⛔ <b>weekly Opus limit reached · out of credits · resets in 3d</b>"
+        )
+
+
+def test_an_unknown_status_is_treated_as_blocking() -> None:
+    """Fail loud: a status nobody has seen is not evidence that work continues."""
+    result = render_at(rate_limit(status="tarpitted"), Verbosity.NORMAL)
+    assert BlockKind.ERROR in kinds(result)
+    assert "usage limit reached" in chat_text(result)
+
+
+@pytest.mark.parametrize(
+    ("resets_at", "phrase"),
+    [
+        (NOW + 30, "resets shortly"),
+        (NOW - 9_000, "resets shortly"),
+        (NOW + 600, "resets in 10m"),
+        (NOW + 7_200, "resets in 2h"),
+        (NOW + 90_000, "resets in 1d 1h"),
+        (NOW * 1000 + 600_000, "resets in 10m"),
+    ],
+)
+def test_reset_is_a_duration_a_human_can_act_on(resets_at: float, phrase: str) -> None:
+    message = rate_limit(status="allowed_warning", resetsAt=resets_at)
+    assert render_at(message, Verbosity.NORMAL).activity == (
+        f"⏳ approaching your usage limit · {phrase}",
+    )
+
+
+def test_a_missing_reset_is_simply_left_out() -> None:
+    message = rate_limit(status="allowed_warning", rateLimitType="five_hour")
+    assert render_at(message, Verbosity.NORMAL).activity == (
+        "⏳ approaching your 5-hour limit",
+    )
 
 
 def test_server_tool_use_is_still_a_tool_call() -> None:

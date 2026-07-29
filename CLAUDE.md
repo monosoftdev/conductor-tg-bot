@@ -164,3 +164,28 @@ Two things that are not negotiable there:
 - Before claiming a test has teeth, break the code it covers and watch it fail.
   An adversarial review once deleted ten `is_owner` gates at once and eight of
   them killed no test.
+
+## Finishing a task
+
+> **Every task ends in an open pull request, and the report says so with a link.**
+
+Not a commit sitting on a branch, not "ready to push" — an open PR. CI is the
+gate, and a change that never reaches CI has not been verified by the only thing
+that verifies changes here. These branches are also disposable workspaces, so
+work left uncommitted is work thrown away.
+
+So once the change is done and the tests you picked are green:
+
+```bash
+git checkout -b <topic-branch>          # if still on main
+git add -A && git commit                # one commit per coherent change
+git push -u origin HEAD
+gh pr create --fill                     # body: what changed and why, not how
+```
+
+The final report then **names the PR and links it**, on its own last line:
+`PR: https://github.com/reclaimly/conductor-tg-bot/pull/NN`. A report without
+that link is an unfinished task — the reader cannot reach the work.
+
+The exception is being told otherwise: *"don't open a PR"*, *"just show me the
+diff"*, *"commit only"*. A refusal is spoken; silence is not one.
