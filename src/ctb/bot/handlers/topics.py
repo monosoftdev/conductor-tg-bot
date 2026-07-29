@@ -39,7 +39,7 @@ third and is fixed at creation, so it can only ever mean *which workspace*.)
 | turn finished, unread    | ``✅ fix login · api/main``      | ✅ |
 | session error            | ``⚠️ fix login · api/main``      | ❗ |
 | workspace sleeping       | ``💤 fix login · api/main``      | 💤 |
-| archived / deleted       | ``🗄 fix login · api/main``, topic closed | 🏁 |
+| archived / deleted       | topic deleted, else ``🗄 fix login``, closed | 🏁 |
 
 The icons are *requests*: Telegram serves bots a fixed pack and silently keeps
 the current icon for a request it cannot honour, so each state names several
@@ -65,6 +65,7 @@ import asyncio
 import hashlib
 import re
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any, Final
 
 from aiogram import Bot
@@ -98,10 +99,10 @@ __all__ = [
     "Claim",
     "ForumSupport",
     "TopicCreateError",
+    "TopicRetirement",
     "apply_marker",
     "attach_topic",
     "claim_topic",
-    "close_topic",
     "create_topic",
     "discard_topic",
     "dm_topic_support",
@@ -116,6 +117,7 @@ __all__ = [
     "require_topic",
     "resolve_client",
     "resolve_db",
+    "retire_topic",
     "send_html",
     "telegram_reason",
     "topic_label",
@@ -996,18 +998,59 @@ async def apply_marker(
     return True
 
 
-async def close_topic(bot: Bot, db: Database, workspace_id: str) -> bool:
-    """Archive: rename to ``x proj/branch`` and close the topic."""
+class TopicRetirement(StrEnum):
+    """What actually became of the room when its workspace was archived."""
+
+    #: The topic is gone from the chat, and so is the card the tap came from.
+    DELETED = "deleted"
+    #: Telegram would not delete it, so it is renamed ``🗄 …`` and closed.
+    CLOSED = "closed"
+    #: Neither worked. The room is still live and still lying about it.
+    FAILED = "failed"
+    #: There was no topic to retire — a linear DM, or one already unbound.
+    NONE = "none"
+
+
+async def retire_topic(bot: Bot, db: Database, workspace_id: str) -> TopicRetirement:
+    """Archive: take the room away, or close it if Telegram will not.
+
+    Deleting is what archiving *means* on a phone. A closed topic is still a row
+    in the list, at the same size and in the same reach of the thumb as a live
+    one — so ``/done`` on the ten workspaces of a busy week left ten rooms
+    behind, and the list stopped being scannable, which is the one job it has.
+
+    Deletion needs ``can_delete_messages``, which a bot has in its own DM and
+    may not have in somebody's group, so the old rename-and-close stays as the
+    fallback: a room that plainly says it is finished beats one that lies. The
+    binding is dropped only on the delete path — a closed topic still exists,
+    and forgetting where it is would strand every later state change.
+    """
     row = await workspaces_repo.get(db, workspace_id)
     if row is None or row.chat_id is None or row.topic_id is None:
-        return False
+        return TopicRetirement.NONE
+    chat_id, topic_id = row.chat_id, row.topic_id
+    try:
+        await bot.delete_forum_topic(chat_id=chat_id, message_thread_id=topic_id)
+    except TelegramAPIError as exc:
+        # Not a warning: in a group without the right, this is the expected
+        # answer and the fallback below is a perfectly good outcome.
+        log.info(
+            "topics.delete_refused",
+            workspace_id=workspace_id,
+            topic_id=topic_id,
+            error=str(exc),
+        )
+    else:
+        await workspaces_repo.unbind_topic(db, workspace_id)
+        await chats_repo.unbind(db, chat_id, topic_id)
+        return TopicRetirement.DELETED
     await apply_marker(bot, db, workspace_id, TopicMarker.ARCHIVED)
     try:
-        await bot.close_forum_topic(chat_id=row.chat_id, message_thread_id=row.topic_id)
+        await bot.close_forum_topic(chat_id=chat_id, message_thread_id=topic_id)
     except TelegramAPIError as exc:
         log.warning("topics.close_failed", workspace_id=workspace_id, error=str(exc))
-        return False
-    return True
+        return TopicRetirement.FAILED
+    return TopicRetirement.CLOSED
 
 
 async def _newest_session(db: Database, row: WorkspaceRow) -> SessionRow | None:

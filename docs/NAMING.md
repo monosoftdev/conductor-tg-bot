@@ -47,7 +47,7 @@ constants. Nothing about a refused topic changes what a state *means*.
 | error | ⚠️ | the session reported an error, and can sit there indefinitely |
 | cancelled | 🛑 | stopped on request |
 | sleeping | 💤 | the workspace is asleep; a prompt may wake it |
-| archived | 🗄 | archived in Conductor; the topic is closed too |
+| archived | 🗄 | archived in Conductor; the topic is deleted, or closed if Telegram refuses |
 | unreachable | 🚫 | Conductor 404s for this session — gone, not merely quiet |
 
 The topic prefix, `CARD_EMOJI` and `/board`'s `status_icon` all render from

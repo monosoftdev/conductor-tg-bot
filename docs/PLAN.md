@@ -369,7 +369,7 @@ announces once.
 | session working | `⚙️ <task> · proj/branch` |
 | session error | `⚠️ <task> · proj/branch` |
 | workspace sleeping | `💤 <task> · proj/branch` |
-| archived/deleted | `🗄 <task> · proj/branch`, topic closed |
+| archived/deleted | topic deleted; `🗄 <task> · proj/branch` and closed if it cannot be |
 
 Renamed only on state *transitions*, never on a timer (rename is an API call).
 
@@ -565,7 +565,7 @@ raw `<script>`, unbalanced backticks, a 200 KB diff, emoji at the 4096 boundary.
 4. Kill the Conductor key → the 401 path DMs you and stops pollers without crash-looping.
 5. Three concurrent workspaces → roll-up in `General`, no interleaving, no Telegram 429.
 6. `/find` on a phrase you know is in an old transcript.
-7. `/done` → workspace archived, topic closed.
+7. `/done` → workspace archived, topic deleted (closed where the bot may not delete).
 
 **Rollback:** the bot only writes to Conductor via prompts, workspace create, and archive — all
 reversible. Stopping the Railway service stops everything; nothing in Conductor depends on the bot.

@@ -64,7 +64,7 @@ is the escape hatch for continuing a specific result without opening its topic.
 | Long result | Tap the generated `.md`/`.diff` file | Telegram's native searchable preview replaces message floods |
 | Send a screenshot/file | Bot says it was not forwarded | No false claim that Conductor saw unsupported binary content |
 | Error or stall | Tap Check, Retry, Transcript, or Open | Error topic marker and loud alert remain visible |
-| Finish work | Tap Archive, then named confirmation | Topic is marked archived and closed |
+| Finish work | Tap Archive, then named confirmation | The topic is deleted; a bot without `can_delete_messages` marks it archived and closes it instead |
 
 General never accepts an accidental ordinary prompt. `/s` in General is
 navigation, and `/s` inside a topic — group or DM — cannot bind a session from
