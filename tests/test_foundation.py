@@ -26,6 +26,7 @@ from ctb.conductor.errors import (
     PairingError,
     RateLimited,
     api_error_for_status,
+    is_github_connection_required,
 )
 from ctb.conductor.models import (
     Agent,
@@ -263,10 +264,32 @@ class TestScrubber:
 class TestErrors:
     def test_status_mapping(self) -> None:
         assert isinstance(api_error_for_status(401), AuthFatal)
-        assert isinstance(api_error_for_status(403), AuthFatal)
+        assert type(api_error_for_status(403)) is ApiError
         assert isinstance(api_error_for_status(404), NotFound)
         assert isinstance(api_error_for_status(429), RateLimited)
         assert isinstance(api_error_for_status(503), ApiError)
+
+    def test_only_the_workspace_github_capability_refusal_is_recognized(self) -> None:
+        exact = api_error_for_status(
+            403,
+            {
+                "userMessage": (
+                    "GitHub is not connected. Connect GitHub in your Conductor "
+                    "settings to create cloud workspaces in this organization."
+                )
+            },
+            method="POST",
+            path="/workspaces",
+        )
+        unrelated = api_error_for_status(
+            403,
+            {"userMessage": "GitHub is not connected"},
+            method="GET",
+            path="/projects",
+        )
+
+        assert is_github_connection_required(exact)
+        assert not is_github_connection_required(unrelated)
 
     def test_auth_and_not_found_are_never_retryable(self) -> None:
         assert api_error_for_status(401).retryable is False

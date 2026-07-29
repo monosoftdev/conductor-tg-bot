@@ -61,9 +61,7 @@ THINKING_LIMIT: Final = 3000
 UNKNOWN_BLOCK_LIMIT: Final = 1000
 _CONTRACT_MARK: Final = "OUTPUT CONTRACT"
 _CONTRACT_END: Final = "Otherwise never write a Choices block."
-_OUTCOME_RE: Final = re.compile(
-    r"(?m)^(?:fixed|not fixed|blocked|what I found)\b.*"
-)
+_OUTCOME_RE: Final = re.compile(r"(?m)^(?:fixed|not fixed|blocked|what I found)\b.*")
 
 _THINKING_KEYS: Final = (
     "thinking",

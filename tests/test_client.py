@@ -442,42 +442,40 @@ async def test_429_with_a_long_retry_after_is_handed_back(settings: Settings) ->
 # ── auth / not found ─────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("status", [401, 403])
-async def test_auth_failures_are_fatal_and_never_retried(
-    settings: Settings, status: int
-) -> None:
-    recorder = always(status, {"userMessage": "bad key"})
+async def test_auth_failures_are_fatal_and_never_retried(settings: Settings) -> None:
+    recorder = always(401, {"userMessage": "bad key"})
     client, _, sleeper = make_client(recorder, settings)
     async with client:
         with pytest.raises(AuthFatal) as caught:
             await client.get_messages("sess-1")
 
-    assert caught.value.status == status
+    assert caught.value.status == 401
     assert caught.value.retryable is False
     assert recorder.count == 1  # retrying a bad key risks a lockout
     assert sleeper.calls == []
     assert client.auth_failures == 1
 
 
-async def test_a_transient_403_does_not_latch_the_bot_dead(
-    settings: Settings,
-) -> None:
-    """A 2xx clears ``auth_failures``; the supervisor treats it as fatal.
-
-    CLAUDE.md: the API sits behind a proxy that 403s some client signatures. If
-    a hiccup were permanent, ``supervisor.auth_fatal`` would cancel every
-    poller for the life of the process while commands kept answering — the bot
-    would look alive and never deliver another reply.
-    """
+async def test_a_403_never_latches_the_bot_dead(settings: Settings) -> None:
+    """A scoped refusal is not evidence that the API key is invalid."""
     recorder = sequence(
-        httpx.Response(403, json={"userMessage": "proxy said no"}),
+        httpx.Response(
+            403,
+            json={
+                "userMessage": (
+                    "GitHub is not connected. Connect GitHub in your Conductor "
+                    "settings to create cloud workspaces in this organization."
+                )
+            },
+        ),
         httpx.Response(200, json=_ANY_SHAPE),
     )
     client, _, _ = make_client(recorder, settings)
     async with client:
-        with pytest.raises(AuthFatal):
+        with pytest.raises(ApiError) as caught:
             await client.get_messages("sess-1")
-        assert client.auth_failures == 1
+        assert type(caught.value) is ApiError
+        assert client.auth_failures == 0
 
         await client.get_session_status("sess-1")
         assert client.auth_failures == 0

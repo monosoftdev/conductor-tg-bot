@@ -10,10 +10,11 @@ The rules that are not negotiable, and why:
 * **An explicit ``User-Agent`` on every request.** The API sits behind a proxy
   that 403s some default client signatures (the docs call out Python's
   ``urllib``). This is a hard requirement, not politeness.
-* **401/403 is never retried.** Retrying a bad key risks a lockout and the
-  failure will not fix itself. :class:`~ctb.conductor.errors.AuthFatal` reaches
-  the caller on the first response; the caller stops the pollers and DMs the
-  owner once.
+* **401 is never retried.** Retrying a bad key risks a lockout and the failure
+  will not fix itself. :class:`~ctb.conductor.errors.AuthFatal` reaches the
+  caller on the first response; the caller stops the pollers and DMs the owner
+  once. A 403 is a scoped permission or capability refusal and never poisons
+  the key.
 * **A write whose fate is unknown raises
   :class:`~ctb.conductor.errors.Ambiguous`, never a plain error.** For
   ``POST /sessions/{id}/messages`` the caller retries forever with the *same*
@@ -750,12 +751,10 @@ class ConductorClient:
                         )
                     if error is None:
                         self._circuit.record_ok(target)
-                        # A 2xx proves the key works, so a *transient* 403 (the
-                        # proxy in front of the API rejects some client
-                        # signatures) must not latch the bot dead: the
-                        # supervisor treats ``auth_failures > 0`` as fatal and
-                        # cancels every poller for the life of the process. A
-                        # genuinely bad key never reaches this line.
+                        # A 2xx proves the key works, so an earlier 401 raced
+                        # with a successful request rather than proving the key
+                        # is dead. Clear the latch before the supervisor stops
+                        # this tenant's pollers for the life of the process.
                         if self._auth_failures:
                             self._log.info(
                                 "conductor.auth_recovered",

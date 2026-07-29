@@ -45,8 +45,8 @@ now fails the deployment instead of presenting a false-green service.
 | Prompt POST | Workspace is still initializing | Prompt remains durable and submits when ready |
 | Prompt POST | Fast answer arrives before first normal poll | Cursor is seeded before submission; answer is not classified as history |
 | Conductor API | 429/5xx/network interruption | Rate limit, backoff, concurrency cap, and circuit breaker apply |
-| Conductor API | Genuine repeated 401/403 | Pollers stop and owner is alerted once; no retry storm |
-| Conductor API | One transient 403 overlaps a successful 2xx | Client counter and supervisor fatal latch recover; pollers restart |
+| Conductor API | Genuine repeated 401 | Pollers stop and owner is alerted once; no retry storm |
+| Conductor API | Scoped 403 capability or permission refusal | The operation fails or uses its explicit fallback; the valid key and other pollers stay live |
 | Transcript | Status is stale, idle, error, or changes mid-drain | Cursor still drains; status controls cadence, never delivery eligibility |
 | Transcript | Cursor ID becomes unknown/404 | Offset/session-index repair avoids replaying the transcript |
 | Transcript | Same-looking messages or non-gap-free indexes | Envelope ID and ordered cursor rules prevent content-based guessing |

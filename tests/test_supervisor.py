@@ -57,8 +57,8 @@ class AuthCrashPoller(BlockingPoller):
         self.started.set()
         self.client.auth_failures = 1
         raise AuthFatal(
-            403,
-            {"userMessage": "transient proxy rejection"},
+            401,
+            {"userMessage": "transient authentication rejection"},
             method="GET",
             path="/sessions/{id}/status",
         )
@@ -225,7 +225,7 @@ async def test_a_latched_auth_failure_clears_after_an_inflight_success(
     db: Database,
     system_db: Database,
 ) -> None:
-    """One transient 403 must not silence every session until redeploy."""
+    """One raced 401 must not silence every session until redeploy."""
     await seed_bound(db, "s1")
     client = ClientStub()
     made: list[BlockingPoller] = []

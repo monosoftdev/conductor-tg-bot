@@ -727,7 +727,7 @@ async def test_http_degraded_state_is_visible_at_200(
     client = ConductorClient(
         api_key=FAKE_API_KEY,
         api_url=settings.conductor_api_url,
-        transport=transport_returning(403),
+        transport=transport_returning(401),
         sleep=_no_sleep,
         max_attempts=1,
     )

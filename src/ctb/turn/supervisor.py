@@ -139,10 +139,10 @@ class Supervisor:
     def auth_fatal_tenants(self) -> frozenset[uuid.UUID]:
         """Tenants whose key was rejected. Only *their* pollers are stopped.
 
-        A second in-flight request can prove a 403 was a transient proxy
-        rejection after one poller already raised ``AuthFatal``. The client
-        clears its counter on that 2xx; clear the latch too, or that tenant
-        stays dark until the next deployment.
+        A second in-flight request can prove a 401 raced with a successful
+        request after one poller already raised ``AuthFatal``. The client clears
+        its counter on that 2xx; clear the latch too, or that tenant stays dark
+        until the next deployment.
         """
         recovered = {
             tenant_id

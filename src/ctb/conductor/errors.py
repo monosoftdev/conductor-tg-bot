@@ -2,9 +2,10 @@
 
 Design notes that matter to callers:
 
-* ``AuthFatal`` (401/403) is **never** retried. Retrying a bad key risks a
-  lockout, and the failure is not going to fix itself. The client stops all
-  pollers, DMs the owner once, and stays alive for ``/health``.
+* ``AuthFatal`` (401) is **never** retried. Retrying a bad key risks a lockout,
+  and the failure is not going to fix itself. A 403 is an operation-level
+  refusal — for example, an optional integration may be unavailable — and must
+  never poison an otherwise valid key.
 * ``NotFound`` (404) on a session or workspace means the turn machine moves to
   ``DEAD`` — unbind the topic, stop the task, notify.
 * ``Ambiguous`` is the *only* error class that says "the write may or may not
@@ -29,6 +30,7 @@ __all__ = [
     "RateLimited",
     "ServerError",
     "api_error_for_status",
+    "is_github_connection_required",
     "is_retryable_status",
 ]
 
@@ -182,7 +184,7 @@ class RateLimited(ApiError):
 
 
 class AuthFatal(ApiError):
-    """401/403. Never retried — a retry loop on a bad key risks a lockout."""
+    """401. Never retried — a retry loop on a bad key risks a lockout."""
 
     @property
     def retryable(self) -> bool:
@@ -224,7 +226,7 @@ def api_error_for_status(
             path=path,
             request_id=request_id,
         )
-    if status in (401, 403):
+    if status == 401:
         return AuthFatal(status, body, method=method, path=path, request_id=request_id)
     if status == 404:
         return NotFound(status, body, method=method, path=path, request_id=request_id)
@@ -233,6 +235,26 @@ def api_error_for_status(
             status, body, method=method, path=path, request_id=request_id
         )
     return ApiError(status, body, method=method, path=path, request_id=request_id)
+
+
+def is_github_connection_required(error: ApiError) -> bool:
+    """Whether a workspace create was refused only for a GitHub connection.
+
+    This capability denial is safe to route around: a 403 proves the create did
+    not happen, and ``POST /workspaces`` also accepts the project's Git remote
+    directly. Keep the predicate deliberately narrow so an unrelated
+    organization policy is never bypassed by accident.
+    """
+    if error.status != 403 or error.method != "POST":
+        return False
+    if error.path not in ("/workspaces", "/v0/workspaces"):
+        return False
+    detail = " ".join(
+        part for part in (error.code, error.user_message, error.debug_message) if part
+    ).casefold()
+    return "github" in detail and (
+        "not connected" in detail or "connect github" in detail
+    )
 
 
 def _str_or_none(value: Any) -> str | None:

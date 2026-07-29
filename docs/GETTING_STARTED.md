@@ -11,6 +11,10 @@ and comes later, or never.
 - A Conductor account with at least one project.
 - Nothing else. No laptop, no terminal, no credit card for this bot.
 
+GitHub does not have to be connected in Conductor. Without it the bot omits CI
+results and the **Fix CI** button; creating workspaces, sending prompts and
+reading agent replies work the same way.
+
 **What it will cost you.** Conductor bills your own API key for the agents you
 run. This bot adds nothing.
 
