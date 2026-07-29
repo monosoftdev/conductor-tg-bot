@@ -19,6 +19,25 @@ Verified offline, on every commit:
 - The real runtime boots against a real database: all seven services start,
   `/health` returns `ok`, the lease is acquired, shutdown is clean.
 
+## GitHub is optional all the way down (2026-07-29)
+
+The Conductor API can refuse a project-id workspace create with `403 GitHub is
+not connected`, even though the selected project already exposes its Git
+remote. That refusal used to break the bot twice: `/new` stopped there, and the
+client classified every 403 as a bad API key, so the supervisor then stopped
+all of that team's existing pollers too.
+
+`/new` now keeps the selected project's `gitRemote` through the direct, wizard
+and voice paths. Only that exact capability refusal is retried with the API's
+`repositoryUrl` create form; the rejected 403 proves nothing was created, and
+an ambiguous fallback is still reconciled by project and nonce. There is no
+error or setup nudge when the fallback succeeds.
+
+Authentication failure now means 401 only. A 403 remains a scoped API error and
+never increments the fatal-auth latch. GitHub connection and `/gitkey` remain
+optional: without them there is no CI visibility or Fix CI button, while
+workspace/session/prompt workflows continue normally.
+
 ## Ten receipts for one task (2026-07-29)
 
 A phone buzzed ten times for a single turn. The machine had decided the turn

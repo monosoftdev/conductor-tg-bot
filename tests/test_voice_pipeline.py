@@ -955,7 +955,12 @@ async def test_a_voice_note_answers_an_open_wizard_instead_of_searching(
         0,
         user_id=1001,
         state_key=new_workspace.PROMPT_STATE_KEY,
-        data={"projects": {"p1": "api"}, "project_id": "p1", "branch": "dev"},
+        data={
+            "projects": {"p1": "api"},
+            "project_urls": {"p1": "https://github.com/acme/api.git"},
+            "project_id": "p1",
+            "branch": "dev",
+        },
     )
 
     message = voice_message(thread_id=0)
@@ -966,6 +971,7 @@ async def test_a_voice_note_answers_an_open_wizard_instead_of_searching(
     assert len(created) == 1, "the wizard was completed instead"
     assert created[0].branch == "dev", "answers given before the prompt survive"
     assert created[0].prompt == "Fix the flaky test", "the transcript is the prompt"
+    assert created[0].repository_url == "https://github.com/acme/api.git"
     # And the wizard is finished, so the next note routes normally.
     assert await wizard_repo.get(db, -1001, 0, user_id=1001) is None
 

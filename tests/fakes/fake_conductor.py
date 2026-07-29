@@ -332,6 +332,9 @@ class PostFailure:
     status: int | None = None
     exc: BaseException | None = None
     landed: bool = False
+    code: str = "server_error"
+    message: str = "scripted create failure"
+    retryable: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1477,7 +1480,13 @@ class FakeConductor:
                 raise _Injected(failure.exc)
             status = failure.status or 500
             return status, _error(
-                "server_error", "scripted create failure", retryable=True
+                failure.code,
+                failure.message,
+                retryable=(
+                    status in RETRYABLE_STATUSES
+                    if failure.retryable is None
+                    else failure.retryable
+                ),
             )
         workspace, session = self._really_create_workspace(payload, name)
         return 201, {

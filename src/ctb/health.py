@@ -10,7 +10,7 @@ a restart is a plausible fix for exactly one class of failure: the process
 cannot reach its own state. Everything else is reported in the body at HTTP
 200, because a restart loop would make it *worse*:
 
-* **auth fatal (401/403).** The supervisor stops *that tenant's* pollers and
+* **auth fatal (401).** The supervisor stops *that tenant's* pollers and
   keeps the bot alive on purpose — everyone else is unaffected. Cycling the
   process cannot conjure a valid key; it would only lose the in-memory state
   that lets the owner see *why* their workspace went quiet. Reported as the
@@ -495,7 +495,7 @@ class HealthMonitor:
             degradations.append(
                 Degradation(
                     DEGRADATION_AUTH_FATAL,
-                    "Conductor rejected an API key (401/403) for "
+                    "Conductor rejected an API key (401) for "
                     f"{', '.join(sorted(rejected))}; those tenants' pollers are "
                     "stopped. They must set a new key with /key — restarting "
                     "will not fix it, so this does not fail the healthcheck.",

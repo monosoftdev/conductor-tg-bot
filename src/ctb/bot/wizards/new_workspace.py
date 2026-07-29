@@ -144,9 +144,13 @@ def request_from_wizard(
     differently — that divergence is what sent a transcript to ``/find``.
     """
     projects = data.get("projects")
+    project_urls = data.get("project_urls")
     project_id = str(data.get("project_id") or "")
     if not project_id or not isinstance(projects, Mapping):
         return None
+    repository_url = (
+        project_urls.get(project_id) if isinstance(project_urls, Mapping) else None
+    )
     return CreateRequest(
         project_id=project_id,
         project_name=str(projects.get(project_id) or project_id[:8]),
@@ -155,6 +159,9 @@ def request_from_wizard(
         model=str(data.get("model") or settings.default_model),
         effort=str(data.get("effort") or settings.default_effort),
         prompt=text.strip(),
+        repository_url=(
+            str(repository_url) if isinstance(repository_url, str) else None
+        ),
     )
 
 
@@ -339,6 +346,9 @@ async def start_wizard(
         {
             "wid": new_wizard_id(),
             "projects": {item.id: item.name or item.id[:8] for item in projects},
+            "project_urls": {
+                item.id: item.git_remote for item in projects if item.git_remote
+            },
             "project_id": chat.default_project_id,
             "branch": chat.default_branch or defaults.default_branch,
             "agent": chat.default_agent or defaults.default_agent,
@@ -452,6 +462,9 @@ async def task_data(
     return {
         "wid": new_wizard_id(),
         "projects": known,
+        "project_urls": {
+            item.id: item.git_remote for item in projects if item.git_remote
+        },
         "project_id": project_id,
         "step": "confirm",
         "options": [],

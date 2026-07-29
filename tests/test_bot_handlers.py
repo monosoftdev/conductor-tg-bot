@@ -271,7 +271,16 @@ class _CountingClient:
         return WorkspacesPage(data=[], has_more=False)
 
     async def list_projects(self, *_: Any, **__: Any) -> ProjectsPage:
-        return ProjectsPage(data=[Project(id="project-1", name="api")], has_more=False)
+        return ProjectsPage(
+            data=[
+                Project(
+                    id="project-1",
+                    name="api",
+                    git_remote="https://github.com/example/api.git",
+                )
+            ],
+            has_more=False,
+        )
 
     async def list_workspace_sessions(self, *_: Any, **__: Any) -> SessionsPage:
         return SessionsPage(data=[Session(id="session-new")], has_more=False)
@@ -3238,6 +3247,21 @@ def test_the_breadcrumb_names_the_project_not_its_id() -> None:
 def test_the_breadcrumb_skips_what_has_not_been_answered() -> None:
     data = {"projects": {}, "project_id": "p-1", "agent": "codex"}
     assert new_workspace.chosen_line(data, upto="") == "p-1 · codex"
+
+
+def test_the_wizard_keeps_the_selected_projects_non_github_remote() -> None:
+    request = new_workspace.request_from_wizard(
+        {
+            "projects": {"p-1": "acme-api"},
+            "project_urls": {"p-1": "ssh://git@example.com/acme/api.git"},
+            "project_id": "p-1",
+        },
+        "Fix the flaky test",
+        settings=TenantSettings(),
+    )
+
+    assert request is not None
+    assert request.repository_url == "ssh://git@example.com/acme/api.git"
 
 
 # ── the empty thread is a task composer ──────────────────────────────────────

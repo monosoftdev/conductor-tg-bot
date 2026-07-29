@@ -135,6 +135,10 @@ class CreateRequest:
     model: str
     effort: str
     prompt: str
+    #: The API accepts this independently of Conductor's optional GitHub
+    #: connection. Kept beside the project id so `/new` can route around that
+    #: one capability refusal without changing the selected repository.
+    repository_url: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -369,6 +373,7 @@ async def resolve_new_request(
         model=model,
         effort=effort,
         prompt=prompt,
+        repository_url=project.git_remote,
     )
 
 
@@ -607,6 +612,7 @@ async def create_and_bind_input(
             database,
             chat_id=chat_id,
             project_id=request.project_id,
+            repository_url=request.repository_url,
             branch=request.branch,
             session_name=request.prompt[:80],
             agent=request.agent,

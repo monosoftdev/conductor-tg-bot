@@ -30,7 +30,7 @@ from typing import Any
 import pytest
 
 from ctb.conductor.client import ConductorClient
-from ctb.conductor.errors import ApiError, AuthFatal, NotFound, PairingError
+from ctb.conductor.errors import ApiError, NotFound, PairingError
 from ctb.db.connection import Database
 from ctb.db.repo import chats, deliveries, prompts, sessions, transcript, workspaces
 from ctb.delivery.render.types import Verbosity
@@ -1211,13 +1211,78 @@ async def test_a_rejected_create_is_not_reconciled(
     project_id = fake.add_project("example")
     fake.fail_next_workspace_create(PostFailure(status=403))
 
-    with pytest.raises(AuthFatal):
+    with pytest.raises(ApiError) as caught:
         await cursor.create_workspace(
             client, db, chat_id=CHAT_ID, agent="claude", project_id=project_id
         )
 
+    assert caught.value.status == 403
     assert fake.created_workspace_names == []
     assert fake.calls_to("/projects", method="GET") == []
+
+
+async def test_github_connection_refusal_falls_back_to_the_project_remote(
+    db: Database, fake: FakeConductor, client: ConductorClient
+) -> None:
+    """GitHub is a CI enhancement, not a prerequisite for `/new`."""
+    project_id = fake.add_project("example")
+    repository_url = "https://github.com/example/repo.git"
+    fake.fail_next_workspace_create(
+        PostFailure(
+            status=403,
+            code="github_not_connected",
+            message=(
+                "GitHub is not connected. Connect GitHub in your Conductor "
+                "settings to create cloud workspaces in this organization."
+            ),
+        )
+    )
+
+    created = await cursor.create_workspace(
+        client,
+        db,
+        chat_id=CHAT_ID,
+        agent="claude",
+        project_id=project_id,
+        repository_url=repository_url,
+    )
+
+    calls = fake.calls_to("/workspaces", method="POST")
+    assert created.ok and created.created
+    assert len(calls) == 2
+    assert calls[0].body is not None and calls[0].body["projectId"] == project_id
+    assert calls[1].body is not None
+    assert calls[1].body["repositoryUrl"] == repository_url
+    assert "projectId" not in calls[1].body
+    assert client.auth_failures == 0
+
+
+async def test_ambiguous_no_github_fallback_still_reconciles_by_project(
+    db: Database, fake: FakeConductor, client: ConductorClient
+) -> None:
+    """The fallback remains one-shot even though it uses ``repositoryUrl``."""
+    project_id = fake.add_project("example")
+    fake.fail_next_workspace_create(
+        PostFailure(
+            status=403,
+            code="github_not_connected",
+            message="GitHub is not connected",
+        )
+    )
+    fake.fail_next_workspace_create(PostFailure(status=500, landed=True))
+
+    created = await cursor.create_workspace(
+        client,
+        db,
+        chat_id=CHAT_ID,
+        agent="claude",
+        project_id=project_id,
+        repository_url="https://github.com/example/repo.git",
+    )
+
+    assert created.ok and created.reconciled
+    assert len(fake.calls_to("/workspaces", method="POST")) == 2
+    assert len(fake.created_workspace_names) == 1
 
 
 async def test_a_pairing_error_never_reaches_the_api(

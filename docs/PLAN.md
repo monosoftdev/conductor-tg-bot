@@ -227,8 +227,9 @@ the archive that would retire it fails fast behind it.
 
 Retry policy: connect/timeout/502/503/504 → full-jitter backoff base 0.5s cap 30s ×5; `retryable:
 true` → retry regardless of code; `retryable: false` → never; 429 → honor `Retry-After` and open the
-circuit; 401/403 → **fatal**, stop all pollers, DM owner once, keep bot alive for `/health` (never
-retry — avoids key lockout); 404 on session/workspace → `DEAD`.
+circuit; 401 → **fatal**, stop all pollers, DM owner once, keep bot alive for `/health` (never retry
+— avoids key lockout); 403 → scoped capability/permission refusal, never poison the key; 404 on
+session/workspace → `DEAD`.
 
 ### Poller — `src/ctb/turn/{session_poller,supervisor}.py`
 

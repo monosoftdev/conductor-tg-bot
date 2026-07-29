@@ -61,6 +61,7 @@ from ctb.conductor.errors import (
     AuthFatal,
     CircuitOpen,
     NotFound,
+    is_github_connection_required,
 )
 from ctb.conductor.models import (
     Session,
@@ -1261,7 +1262,12 @@ async def create_workspace(
 
     Everything else propagates unchanged, because it is *not* ambiguous: a 4xx
     was rejected outright, and the client only raises ``TransportFailure`` /
-    ``CircuitOpen`` on a write it can prove never left the process.
+    ``CircuitOpen`` on a write it can prove never left the process. One narrow
+    exception is a project-id create refused because GitHub is not connected.
+    When the selected project supplied its Git remote, retry once with the
+    API's ``repositoryUrl`` form. The 403 proves the first create did not land,
+    so this is not a blind retry. ``project_id`` remains available to reconcile
+    an ambiguous response from the fallback.
 
     Pass ``nonce`` (persisted by the caller, e.g. in ``wizard_state``) to make
     the reconciliation survive a process restart too.
@@ -1297,17 +1303,40 @@ async def create_workspace(
                 reason="replayed create intent",
             )
     try:
-        created = await client.create_workspace(
-            agent=agent,
-            project_id=project_id,
-            repository_url=repository_url,
-            branch=branch,
-            name=name,
-            session_name=session_name,
-            model=model,
-            effort=effort,
-            env=env,
-        )
+        try:
+            created = await client.create_workspace(
+                agent=agent,
+                project_id=project_id,
+                repository_url=repository_url if project_id is None else None,
+                branch=branch,
+                name=name,
+                session_name=session_name,
+                model=model,
+                effort=effort,
+                env=env,
+            )
+        except ApiError as exc:
+            if not (
+                project_id is not None
+                and repository_url
+                and is_github_connection_required(exc)
+            ):
+                raise
+            _log.info(
+                "cursor.workspace_create_without_github",
+                nonce=token,
+                project_id=project_id,
+            )
+            created = await client.create_workspace(
+                agent=agent,
+                repository_url=repository_url,
+                branch=branch,
+                name=name,
+                session_name=session_name,
+                model=model,
+                effort=effort,
+                env=env,
+            )
     except Ambiguous as exc:
         reason = f"{type(exc).__name__}: {exc}"
         _log.warning(
