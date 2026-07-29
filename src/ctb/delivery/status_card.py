@@ -19,7 +19,15 @@ apply. Three rules enforce that here rather than trusting every producer:
   and the message id is not, so a deploy landing mid-turn found an empty map,
   posted a second card and left the first frozen with a live Stop — the same
   two Stops by a different road. :meth:`StatusCards._adopt_once` reads the id
-  back off the session row before the first action of a process.
+  back off the session row before the first action of a process;
+* and it only holds while one task at a time touches a topic. The tick loop and
+  the poller's action batch are separate tasks over the same ``_Card``, and
+  ``message_id`` is set only when ``sendMessage`` *returns* — so a tick landing
+  inside that round trip saw ``message_id is None`` and posted the card a second
+  time. Both carried Stop, and the loser was stranded on whatever it was posted
+  saying (``⏳ waking · preparing``) while the winner ticked on to ``⚙️ working``.
+  :meth:`StatusCards._lock_for` gives each topic one, and the tick skips a topic
+  another task is already sending for.
 
 The machine goes straight from ``queued`` to ``working``: only the kinds in
 :data:`_LIVE_KINDS` are re-rendered on every tick, so anything else would leave
@@ -436,6 +444,11 @@ class StatusCards:
         #: Topics whose stored card id has already been looked up. One read per
         #: topic per process; see :meth:`_adopt_once`.
         self._adopted: set[tuple[int, int]] = set()
+        #: One lock per topic, so the tick loop and an action batch cannot both
+        #: be inside a send for the same card. Never removed on retire: a
+        #: waiter would then take a *different* lock and the guard would be no
+        #: guard at all. Bounded by live topics, like ``_pinned`` above.
+        self._locks: dict[tuple[int, int], asyncio.Lock] = {}
         self._task: asyncio.Task[None] | None = None
         self._counters: dict[str, int] = {
             "posted": 0,
@@ -538,35 +551,40 @@ class StatusCards:
         Flushing per batch rather than per action is what makes the card cheap:
         the machine routinely emits an ``EditStatusCard`` and a ``Finalize``
         together, and that must cost one API call, not two.
+
+        Held under the topic's lock from the adoption read to the flush, so the
+        tick loop cannot slip a second ``sendMessage`` into the window where
+        this batch has a dirty card and no message id yet.
         """
-        await self._adopt_once(
-            session_id=session_id,
-            chat_id=chat_id,
-            thread_id=thread_id,
-            deep_link=deep_link,
-        )
-        touched = False
-        finalized = False
-        for action in actions:
-            touched |= await self._apply(
-                action,
+        async with self._lock_for((chat_id, thread_id)):
+            await self._adopt_once(
                 session_id=session_id,
                 chat_id=chat_id,
                 thread_id=thread_id,
                 deep_link=deep_link,
             )
-            finalized |= isinstance(action, Finalize)
-        if not touched:
-            return
-        card = self._cards.get((chat_id, thread_id))
-        if card is None:
-            return
-        # DEAD is terminal for the whole session; an ERROR card is not — the
-        # machine keeps editing it, and retiring would make the next edit post a
-        # duplicate card above it.
-        card.retire_when_clean |= finalized or card.state.kind is CardKind.DEAD
-        await self._flush(card, force=card.state.kind in TERMINAL_KINDS)
-        await self._maybe_retire(card)
+            touched = False
+            finalized = False
+            for action in actions:
+                touched |= await self._apply(
+                    action,
+                    session_id=session_id,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    deep_link=deep_link,
+                )
+                finalized |= isinstance(action, Finalize)
+            if not touched:
+                return
+            card = self._cards.get((chat_id, thread_id))
+            if card is None:
+                return
+            # DEAD is terminal for the whole session; an ERROR card is not — the
+            # machine keeps editing it, and retiring would make the next edit
+            # post a duplicate card above it.
+            card.retire_when_clean |= finalized or card.state.kind is CardKind.DEAD
+            await self._flush(card, force=card.state.kind in TERMINAL_KINDS)
+            await self._maybe_retire(card)
 
     async def apply(
         self,
@@ -777,16 +795,26 @@ class StatusCards:
         now = self._clock()
         for card in list(self._cards.values()):
             try:
-                if card.typing and (now - card.last_typing_at) >= (
-                    self._typing_interval
-                ):
-                    await self._send_typing(card, now)
-                if card.state.kind in _LIVE_KINDS:
-                    # Cheap: _flush suppresses the API call when the rendered
-                    # text is unchanged, and the 3s floor caps it regardless.
-                    card.dirty = True
-                await self._flush(card, force=card.retire_when_clean)
-                await self._maybe_retire(card)
+                lock = self._lock_for(card.key)
+                if lock.locked():
+                    # An action batch is mid-send on this card. Waiting would
+                    # only queue a re-render of text it is already sending, and
+                    # entering would risk posting the card twice. Next second.
+                    continue
+                async with lock:
+                    if self._cards.get(card.key) is not card:
+                        continue  # retired while we took the lock
+                    if card.typing and (now - card.last_typing_at) >= (
+                        self._typing_interval
+                    ):
+                        await self._send_typing(card, now)
+                    if card.state.kind in _LIVE_KINDS:
+                        # Cheap: _flush suppresses the API call when the
+                        # rendered text is unchanged, and the 3s floor caps it
+                        # regardless.
+                        card.dirty = True
+                    await self._flush(card, force=card.retire_when_clean)
+                    await self._maybe_retire(card)
             except Exception as exc:  # a card must never take the task down
                 self._counters["errors"] += 1
                 _log.warning(
@@ -797,6 +825,14 @@ class StatusCards:
                 )
 
     # -- transport --------------------------------------------------------
+
+    def _lock_for(self, key: tuple[int, int]) -> asyncio.Lock:
+        """This topic's send lock. Never acquired twice on one path."""
+        lock = self._locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[key] = lock
+        return lock
 
     def _card(
         self,

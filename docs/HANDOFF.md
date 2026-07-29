@@ -263,6 +263,18 @@ it then cancelled whatever was running by then. `card_buttons` strips Stop from 
 terminal card the moment the turn is over, which is the property that makes a
 control honest.
 
+Two Stops came back anyway, on a road neither `_supersede` nor `_adopt_once`
+could close: **the card was posted twice.** `_post` learns the message id only
+when `sendMessage` *returns*, so for the length of that round trip the `_Card` is
+dirty with `message_id is None` — and `StatusCards.tick()` is a separate task
+reading the same object every second. It saw what the action batch saw and posted
+the card again. The loser kept the text it was posted with (`⏳ waking ·
+preparing`) while the winner ticked on to `⚙️ working 1m2s`, which is exactly the
+two-Stop screen, from one topic's first card. `_lock_for` now gives each topic
+one lock; `handle` holds it from the adoption read through the flush, and the
+tick *skips* a topic another task is already sending for rather than queueing
+behind it.
+
 ## What changed from the single-user design
 
 | | Before | Now |
