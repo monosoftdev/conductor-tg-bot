@@ -62,7 +62,7 @@ No Telegram code. The whole phase is testable offline against `fakes/fake_conduc
 
 - [x] `bot/app.py`, allowlist middleware on **every** update type, DB-backed FSM storage
 - [x] `/setup` — verify supergroup + `can_manage_topics`, else announce degraded DM mode
-- [x] Topic lifecycle: create on workspace create, rename on state transition only, close on archive
+- [x] Topic lifecycle: create on workspace create, rename on state transition only, delete on archive (close as the fallback)
 - [x] Routing on `(chat_id, message_thread_id)`; `General` is search-only, never a prompt target
 - [x] The six menu commands: `/new` `/board` `/stop` `/find` `/mode` `/done`
 - [x] `bot/wizards/new_workspace.py` — edit-in-place, `Go with defaults →` on every step

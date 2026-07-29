@@ -69,6 +69,7 @@ from ctb.bot.keyboards import (
     NonceError,
     NonceStore,
     button,
+    confirm_keyboard,
     read_stateless,
 )
 from ctb.bot.middleware.routing import Route, RoutingMiddleware
@@ -201,6 +202,7 @@ class _ForumBot:
         self.closed: list[int] = []
         self.renamed: list[str] = []
         self.sent: list[dict[str, Any]] = []
+        self.edits: list[str] = []
         self.trace = trace if trace is not None else []
 
     async def get_chat(self, _chat_id: int) -> Any:
@@ -236,6 +238,13 @@ class _ForumBot:
     async def edit_forum_topic(self, **kwargs: Any) -> None:
         self.trace.append("rename_topic")
         self.renamed.append(str(kwargs["name"]))
+
+    async def edit_message_text(self, **kwargs: Any) -> Any:
+        self.edits.append(str(kwargs["text"]))
+        return True
+
+    async def get_forum_topic_icon_stickers(self) -> list[Any]:
+        return []
 
 
 def _refused(reason: str) -> TelegramBadRequest:
@@ -309,10 +318,10 @@ def test_mobile_instruction_binds_narration_format_and_a_numeric_cap() -> None:
     assert "overrides any conflicting" in text
     # The narration between tool calls was 6 of the 9 bubbles in a real turn.
     assert "then one message" in text
-    assert "no progress notes" in text
+    assert "progress notes or plan restatement" in text
     # Outcome first, bad news first, no restatement, no step recap.
     assert "Line 1 is the outcome" in text
-    assert "not at the bottom" in text
+    assert "never at the bottom" in text
     assert "recap your steps" in text
     # A measurable budget, not an adjective.
     assert "6 lines and 80 words" in text
@@ -1094,9 +1103,154 @@ async def test_command_replies_are_silent_by_default() -> None:
 
 
 def test_archive_confirm_states_the_consequence_not_the_name() -> None:
-    """The name is already in the button, the topic title and the title bar."""
-    assert ARCHIVE_CONSEQUENCE == "Closes this topic. Restorable in Conductor."
+    """The name is already in the button, the topic title and the title bar.
+
+    It also has to be *true*: the topic and its messages go, the workspace does
+    not. A confirmation that undersells an irreversible half is not a
+    confirmation.
+    """
+    assert "Deletes this topic" in ARCHIVE_CONSEQUENCE
+    assert "restorable in Conductor" in ARCHIVE_CONSEQUENCE
     assert "<b>" not in ARCHIVE_CONSEQUENCE
+
+
+# =============================================================================
+# /done — archive the workspace, take the room away
+# =============================================================================
+
+
+class _ArchivingClient(_CountingClient):
+    """Records the one call ``/done`` exists to make."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.archived: list[str] = []
+
+    async def archive_workspace(self, workspace_id: str) -> None:
+        self.archived.append(workspace_id)
+
+
+def _card_in(chat_id: int, thread_id: int) -> Message:
+    """The confirm card the Archive button is attached to."""
+    return Message(
+        message_id=4242,
+        date=datetime(2026, 7, 25, tzinfo=UTC),
+        chat=Chat(id=chat_id, type="supergroup"),
+        message_thread_id=thread_id,
+        is_topic_message=True,
+        text="Deletes this topic…",
+    )
+
+
+class _ArchiveTap:
+    """The half of ``CallbackQuery`` :func:`confirm_archive` touches."""
+
+    def __init__(self, bot: Any, data: str, message: Message | None) -> None:
+        self.bot = bot
+        self.data = data
+        self.message = message
+        self.from_user = SimpleNamespace(id=1001)
+        self.answers: list[str] = []
+
+    async def answer(self, text: str = "", **_: Any) -> None:
+        self.answers.append(text)
+
+
+async def _archive_tap(
+    db: Database,
+    bot: Any,
+    *,
+    chat_id: int = -1001,
+    topic_id: int = 99,
+) -> tuple[_ArchivingClient, _ArchiveTap]:
+    """Seed a workspace with a topic, then tap its named Archive button."""
+    await workspaces_repo.upsert(
+        db,
+        "workspace-1",
+        name="tg-1-abc",
+        branch="main",
+        chat_id=chat_id,
+        topic_id=topic_id,
+        topic_name="fix flaky",
+    )
+    await chats_repo.bind(
+        db, chat_id, topic_id, workspace_id="workspace-1", session_id=None
+    )
+    store = NonceStore()
+    markup = confirm_keyboard(
+        Action.ARCHIVE,
+        "workspace-1",
+        "fix flaky",
+        verb="Archive",
+        store=store,
+        user_id=1001,
+    )
+    payload = markup.inline_keyboard[0][0].callback_data
+    assert payload is not None
+    client = _ArchivingClient()
+    query = _ArchiveTap(bot, payload, _card_in(chat_id, topic_id))
+    await core_handlers.confirm_archive(
+        cast(Any, query), store, fake_tenant(client), db=db
+    )
+    return client, query
+
+
+async def test_done_deletes_the_room_it_finished_with(db: Database) -> None:
+    """A closed topic is still a row in the list; archiving must clear it.
+
+    The tap is answered, the workspace is archived in Conductor *and* locally,
+    and the topic is gone — along with the binding, which now points at a
+    thread Telegram no longer has.
+    """
+    bot = _ForumBot()
+
+    client, query = await _archive_tap(db, bot)
+
+    assert client.archived == ["workspace-1"]
+    assert bot.deleted == [99]
+    assert bot.closed == []
+    row = await workspaces_repo.get(db, "workspace-1")
+    assert row is not None and row.archived_at is not None
+    assert row.topic_id is None
+    chat = await chats_repo.get(db, -1001, 99)
+    assert chat is not None and chat.workspace_id is None
+    # The card lived in the deleted topic: no receipt is posted into thin air.
+    assert bot.edits == []
+    assert bot.sent == []
+    assert query.answers == ["Archiving…"]
+
+
+async def test_a_topic_the_bot_may_not_delete_is_marked_and_closed(
+    db: Database,
+) -> None:
+    """No ``can_delete_messages`` in someone's group — degrade, never dead-end."""
+    bot = _ForumBot(delete_error=_refused("Bad Request: not enough rights"))
+
+    client, _ = await _archive_tap(db, bot)
+
+    assert client.archived == ["workspace-1"]
+    assert bot.deleted == [] and bot.closed == [99]
+    assert bot.renamed == ["🗄 fix flaky"]
+    # The topic survives, so the row must keep knowing where it is.
+    row = await workspaces_repo.get(db, "workspace-1")
+    assert row is not None and row.topic_id == 99
+    assert bot.edits == ["✓ Archived <b>fix flaky</b>."]
+
+
+async def test_a_topic_that_will_neither_delete_nor_close_says_so(
+    db: Database,
+) -> None:
+    """Never report a room as retired while it is still open in the list."""
+    bot = _ForumBot(delete_error=_refused("Bad Request: not enough rights"))
+
+    async def refuse(**_: Any) -> None:
+        raise _refused("Bad Request: not enough rights")
+
+    bot.close_forum_topic = refuse  # type: ignore[method-assign]
+
+    _, _ = await _archive_tap(db, bot)
+
+    assert bot.edits == ["✓ Archived <b>fix flaky</b>. Topic left open."]
 
 
 async def test_new_checks_topic_permission_before_paying_for_a_workspace(

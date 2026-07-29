@@ -29,12 +29,13 @@ from ctb.bot.handlers.common import (
     workspace_name,
 )
 from ctb.bot.handlers.topics import (
-    close_topic,
+    TopicRetirement,
     edit_html,
     human_name,
     jump_url,
     resolve_client,
     resolve_db,
+    retire_topic,
     send_html,
 )
 from ctb.bot.keyboards import (
@@ -77,7 +78,10 @@ FIND_VISIBLE: Final = 5
 #: truncates silently.
 ADOPTABLE_SCAN: Final = 20
 #: The confirm button already names the workspace. Say what tapping it does.
-ARCHIVE_CONSEQUENCE: Final = "Closes this topic. Restorable in Conductor."
+ARCHIVE_CONSEQUENCE: Final = (
+    "Deletes this topic and everything said in it. "
+    "The workspace stays restorable in Conductor."
+)
 _ACTIVE_STATES: Final[frozenset[TurnState]] = frozenset(
     {
         TurnState.SUBMIT_PENDING,
@@ -814,6 +818,9 @@ async def confirm_archive(
         return
     await query.answer("Archiving…")
     database = resolve_db(db)
+    # The button's label is ``Archive <name>``; saying it back whole would read
+    # "Archived Archive fix flaky". The row is the name's only honest source.
+    name = ticket.label
     try:
         if query.bot is None:
             raise RuntimeError("Telegram bot is not bound to callback")
@@ -824,9 +831,12 @@ async def confirm_archive(
             if session is None or session.workspace_id is None:
                 raise RuntimeError("Workspace is no longer available.")
             workspace_id = session.workspace_id
+            workspace = await workspaces_repo.get(database, workspace_id)
+        if workspace is not None:
+            name = workspace_name(workspace)
         await resolve_client(client, tenant).archive_workspace(workspace_id)
         await workspaces_repo.mark_archived(database, workspace_id)
-        await close_topic(query.bot, database, workspace_id)
+        retirement = await retire_topic(query.bot, database, workspace_id)
     except Exception as exc:
         if isinstance(query.message, Message) and query.bot is not None:
             changed = await edit_html(
@@ -841,17 +851,24 @@ async def confirm_archive(
                     query.message, f"Archive failed: {escape(short_error(exc))}"
                 )
         return
+    if retirement is TopicRetirement.DELETED:
+        # The card lived in the topic, so it went with it. Editing a message in
+        # a deleted thread fails, and the fallback would post the receipt into
+        # the chat root — a line about a room nobody can look at any more. The
+        # room disappearing off the list *is* the confirmation.
+        return
     if isinstance(query.message, Message) and query.bot is not None:
+        note = " Topic left open." if retirement is TopicRetirement.FAILED else ""
         changed = await edit_html(
             query.bot,
             query.message.chat.id,
             query.message.message_id,
-            f"✓ Archived <b>{escape(ticket.label)}</b>.",
+            f"✓ Archived <b>{escape(name)}</b>.{escape(note)}",
             reply_markup=None,
         )
         if not changed:
             await _reply_beside(
-                query.message, f"Archived <b>{escape(ticket.label)}</b>."
+                query.message, f"Archived <b>{escape(name)}</b>.{escape(note)}"
             )
 
 
