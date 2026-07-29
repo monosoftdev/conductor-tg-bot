@@ -407,9 +407,10 @@ class TestTheLoop:
         after = await ci_repo.get(db, owner="acme", repo="api", pr_number=9)
         assert after is not None and after.state == "done"
 
-    async def test_a_team_with_no_token_is_dropped_not_retried(
+    async def test_a_team_with_no_token_hears_nothing_about_ci_at_all(
         self, db: Database, system_db: Database
     ) -> None:
+        """CI is opt-in. Without a token there is no line and no button."""
         await seed(db, at=now_ms())
         outbox = FakeOutbox()
         watch = CiWatcher(
@@ -420,6 +421,7 @@ class TestTheLoop:
 
         await watch.tick()
 
+        assert outbox.sent == []
         after = await ci_repo.get(db, owner="acme", repo="api", pr_number=9)
         assert after is not None and after.state == "gave_up"
 

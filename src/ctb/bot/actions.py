@@ -16,8 +16,17 @@ from ctb import signals
 from ctb.bot.handlers import topics
 from ctb.db import NO_THREAD_ID
 from ctb.db.connection import Database, current_tenant, tenant_scope
-from ctb.db.repo import chats, ci, prompts, sessions, tenancy, transcript
-from ctb.delivery.outbox import Outbox, Priority
+from ctb.db.repo import (
+    chats,
+    ci,
+    deliveries,
+    prompts,
+    sessions,
+    tenancy,
+    transcript,
+)
+from ctb.db.repo.sessions import SessionRow
+from ctb.delivery.outbox import Outbox, Priority, notice_message_id
 from ctb.delivery.render.adapters.base import one_line
 from ctb.delivery.render.html import escape
 from ctb.delivery.status_card import StatusCards
@@ -33,7 +42,7 @@ from ctb.turn.state import (
     TurnSummary,
 )
 
-__all__ = ["BotActionSink", "finish_line"]
+__all__ = ["BotActionSink", "finish_key", "finish_line"]
 
 log = get_logger(__name__)
 
@@ -67,6 +76,23 @@ def finish_line(summary: TurnSummary) -> str:
         parts.append(one_line(summary.error)[:120])
     tail = "".join(f" · {escape(part)}" for part in parts)
     return f"{marker} <b>{head}</b>{tail}"
+
+
+def finish_key(session_id: str, row: SessionRow | None) -> str:
+    """The delivery id of a session's receipt — one per prompt, not per finalize.
+
+    The prompt is the only identity that survives the machine changing its
+    mind. A turn's own identity does not: ``_finalize`` clears
+    ``turn_started_at`` and ``turn_ids``, so the next premature finish looks
+    like a brand-new turn and would earn a brand-new notification.
+
+    With no prompt of ours behind it — an adopted session driven from a Mac —
+    there is nothing to key on but the cursor, which is the old behaviour and
+    the right one there: those finishes really are separate turns.
+    """
+    if row is not None and row.last_prompt_at:
+        return f"turn-done:{session_id}:p{row.last_prompt_at}"
+    return f"turn-done:{session_id}:{row.cursor_session_index if row else 0}"
 
 
 class BotActionSink:
@@ -255,29 +281,58 @@ class BotActionSink:
         ran and how many files changed. That trade is the point — one line at
         the end instead of twenty while you are trying to read the answer.
 
-        Keyed on the cursor the session finished at, so a ``Finalize``
-        re-derived after a redeploy lands on the same primary key instead of
-        announcing one turn twice. Never raises: a missing receipt must not
-        take down the poller that produced the work it is describing.
+        **Posted once, then edited.** The machine can conclude a turn is over
+        more than once — an ``idle`` in the quiet of a long tool call is
+        byte-for-byte the ``idle`` after the last one — and this used to buzz
+        every time, because the key carried the cursor and the cursor moves.
+        Ten receipts for one task is what that looks like on a phone. The key
+        now carries the *prompt*, so a re-finalize collides with the row that
+        is already there and revises that message instead: one notification,
+        then silent corrections as the real numbers arrive.
+
+        Never raises: a missing receipt must not take down the poller that
+        produced the work it is describing.
         """
         try:
             row = await sessions.get(self._db, session_id)
             chat = await chats.get(self._db, chat_id, thread_id)
             if chat is not None and chat.notify == "off":
                 return
-            await self._outbox.enqueue_notice(
-                finish_line(summary),
+            key = finish_key(session_id, row)
+            text = finish_line(summary)
+            created = await self._outbox.enqueue_notice(
+                text,
                 session_id=session_id,
-                key=f"turn-done:{session_id}:{row.cursor_session_index if row else 0}",
+                key=key,
                 chat_id=chat_id,
                 thread_id=thread_id,
                 priority=Priority.NORMAL,
                 silent=False,
             )
+            if not created:
+                await self._revise_finish(
+                    key, text, session_id=session_id, chat_id=chat_id
+                )
         except Exception as exc:  # noqa: BLE001 - a receipt never stops a turn
             log.warning(
                 "bot.finish_notice_failed", session_id=session_id, error=repr(exc)
             )
+
+    async def _revise_finish(
+        self, key: str, text: str, *, session_id: str, chat_id: int
+    ) -> None:
+        """Update a receipt that has already been sent. Telegram edits are silent.
+
+        A receipt still sitting in the queue is left alone: nobody has seen it,
+        and it will go out carrying whatever the last enqueue wrote. Only a
+        message that has actually landed is worth correcting.
+        """
+        row = await deliveries.get(
+            self._db, (session_id, notice_message_id(key), 0, chat_id)
+        )
+        if row is None or row.tg_message_id is None:
+            return
+        await topics.edit_html(self._bot, chat_id, row.tg_message_id, text)
 
     async def _set_topic_marker(self, session_id: str, action: SetTopicMarker) -> None:
         row = await sessions.get(self._db, session_id)

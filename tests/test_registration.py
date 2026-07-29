@@ -1107,6 +1107,77 @@ class TestVoiceToggle:
         assert said[-1] == "Owners only."
 
 
+class TestKeyGuides:
+    """A bare key command has to be a set-up guide, not a syntax reminder.
+
+    Somebody standing in Telegram with no key does not know where the key
+    lives. Every one of these is followed with a thumb, in another app.
+    """
+
+    async def _tenant(self, system_db: Database) -> TenantRow:
+        row = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
+        assert row is not None
+        return row
+
+    @pytest.mark.parametrize(
+        ("command", "must_mention"),
+        [
+            ("/key", "conductor.build"),
+            ("/voicekey", "elevenlabs.io"),
+            ("/gitkey", "github.com/settings/personal-access-tokens"),
+        ],
+    )
+    async def test_it_says_where_to_go_and_what_to_click(
+        self,
+        db: Database,
+        system_db: Database,
+        said: list[str],
+        command: str,
+        must_mention: str,
+    ) -> None:
+        row = await self._tenant(system_db)
+
+        await registration.set_key(
+            dm(command), context(row), voice_settings(), NullState()
+        )
+
+        guide = said[-1]
+        assert must_mention in guide
+        assert "1 · " in guide and "2 · " in guide, "numbered steps, not prose"
+        assert command in guide, "the command it ends on is the one just typed"
+
+    async def test_only_the_conductor_key_is_presented_as_required(
+        self, db: Database, system_db: Database, said: list[str]
+    ) -> None:
+        """A guide that does not say "optional" reads as a chore."""
+        row = await self._tenant(system_db)
+
+        for command in ("/voicekey", "/gitkey"):
+            await registration.set_key(
+                dm(command), context(row), voice_settings(), NullState()
+            )
+            assert "optional" in said[-1]
+
+        await registration.set_key(
+            dm("/key"), context(row), voice_settings(), NullState()
+        )
+        assert "required" in said[-1]
+
+    async def test_the_github_guide_asks_for_read_only(
+        self, db: Database, system_db: Database, said: list[str]
+    ) -> None:
+        """The bot never writes to a customer's code; the guide must not ask to."""
+        row = await self._tenant(system_db)
+
+        await registration.set_key(
+            dm("/gitkey"), context(row), voice_settings(), NullState()
+        )
+
+        guide = said[-1].casefold()
+        assert "read-only" in guide
+        assert "write" not in guide.replace("never writes", "")
+
+
 class TestGitHubTokenIntake:
     """`/gitkey` is what turns CI watching on for a team."""
 

@@ -149,6 +149,58 @@ _GROUP_STEPS: Final = (
 )
 
 
+#: The three credentials this bot can hold, and how to go and get one.
+CONDUCTOR: Final = "conductor"
+SPEECH: Final = "speech"
+GITHUB: Final = "github"
+
+#: Written to be followed on a phone, with a thumb, in another app: numbered
+#: steps, the exact menu names, and a link that lands on the page rather than
+#: on a home page to navigate from. Only the first one is required — the other
+#: two say so in their own first line, because a guide that does not say
+#: "optional" reads as a chore somebody has to do before anything works.
+_KEY_GUIDES: Final[dict[str, str]] = {
+    CONDUCTOR: (
+        "🔑 <b>Conductor API key</b> · required\n\n"
+        "1 · Open <b>conductor.build</b> and sign in\n"
+        "2 · <b>Settings</b> → <b>API keys</b> → <b>New key</b>\n"
+        "3 · Copy it and send it here:\n"
+        "<code>/key cnd_live_…</code>\n\n"
+        "I check the key works, encrypt it, and delete your message. "
+        "It pays for your own agents, so nobody else can spend on it."
+    ),
+    SPEECH: (
+        "🎙 <b>Speech key</b> · optional, for voice notes\n\n"
+        "1 · Open <b>elevenlabs.io</b> and sign in\n"
+        "2 · Your avatar (top right) → <b>API keys</b> → <b>Create</b>\n"
+        "3 · Copy it and send it here:\n"
+        "<code>/voicekey sk_…</code>\n\n"
+        "Storing it turns voice on — there is no second switch, and "
+        "<code>/voice off</code> pauses it without deleting the key. "
+        "Audio leaves this system under <i>your</i> key, billed to you."
+    ),
+    GITHUB: (
+        "🔎 <b>GitHub token</b> · optional, for CI\n\n"
+        "1 · Open\n"
+        "<code>github.com/settings/personal-access-tokens/new</code>\n"
+        "2 · <b>Repository access</b> → pick the repos your agents work in\n"
+        "3 · <b>Permissions</b> → <b>Repository</b>, set <b>Read-only</b> on:\n"
+        "• Pull requests\n• Checks\n• Commit statuses\n"
+        "4 · <b>Generate token</b>, copy it, send it here:\n"
+        "<code>/gitkey github_pat_…</code>\n\n"
+        "Read-only is all it needs — this bot never writes to your code. "
+        "With it, a turn that opens a pull request gets one line here when "
+        "the checks finish, and a <b>Fix CI</b> button if they fail. "
+        "Without it, nothing about CI appears at all."
+    ),
+}
+
+
+def key_guide(kind: str) -> str:
+    """The step-by-step for one credential. Shown by the bare command."""
+    return _KEY_GUIDES.get(kind, _KEY_GUIDES[CONDUCTOR])
+
+
 #: Anything this long, unbroken and key-shaped is a credential, whatever
 #: command it arrived on. Deliberately loose: the cost of a false positive is
 #: deleting one odd-looking message, and the cost of a false negative is a live
@@ -704,15 +756,7 @@ async def set_key(
 
     if not value:
         await tell(
-            message,
-            (
-                "Send <code>/gitkey &lt;a GitHub token&gt;</code>.\n"
-                "Read-only is enough: it is used to check whether CI passed on "
-                "the pull requests your agents open."
-                if git
-                else "Send <code>/key &lt;your Conductor API key&gt;</code>.\n"
-                "I delete your message straight away and store the key encrypted."
-            ),
+            message, key_guide(GITHUB if git else SPEECH if speech else CONDUCTOR)
         )
         return
 

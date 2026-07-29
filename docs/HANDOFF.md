@@ -14,10 +14,28 @@ create a supergroup, enable Topics or grant admin rights.
 
 Verified offline, on every commit:
 
-- **2,250 tests pass** against a real PostgreSQL 16.
+- **2,254 tests pass** against a real PostgreSQL 16.
 - `ruff format --check`, `ruff check`, `pyright` — all clean.
 - The real runtime boots against a real database: all seven services start,
   `/health` returns `ok`, the lease is acquired, shutdown is clean.
+
+## Ten receipts for one task (2026-07-29)
+
+A phone buzzed ten times for a single turn. The machine had decided the turn
+was over ten times — `idle` in the quiet of a long tool call is byte-for-byte
+the `idle` after the last one — and every one of those was a *new* message,
+because the receipt's delivery key carried the cursor and the cursor moves
+underneath it.
+
+The receipt is now keyed on the **prompt**, which is the only identity that
+survives the machine changing its mind: `_finalize` clears `turn_started_at`
+and `turn_ids`, so a re-finish looks like a brand-new turn to everything
+downstream. A second finalize therefore collides with the row already there and
+*edits* the message it already sent — Telegram never notifies for an edit — so
+the numbers correct themselves in place. One buzz per prompt, still.
+
+An adopted session with no prompt of ours behind it keeps the cursor key: there
+those finishes really are separate turns.
 
 ## CI is watched, and a red run has a button (2026-07-29)
 
@@ -41,7 +59,13 @@ Three decisions worth keeping:
   the reader taps. A refused send leaves the watch owed a message.
 
 `ci` is an optional service, like `voice`: no token, a repository the token
-cannot see, or GitHub being down must never cost a delivered agent reply.
+cannot see, or GitHub being down must never cost a delivered agent reply. With
+no token stored there is no watch, no line and no button — CI is opt-in and
+invisible until it is opted into.
+
+Every key command (`/key`, `/voicekey`, `/gitkey`) sent bare now answers with a
+numbered, click-by-click guide to obtaining that key, rather than a syntax
+reminder aimed at somebody who already has one.
 
 ## The group became optional (2026-07-27)
 

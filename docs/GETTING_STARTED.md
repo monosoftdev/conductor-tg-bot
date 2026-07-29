@@ -59,10 +59,14 @@ pauses it later without throwing the key away.
 And, to be told whether CI passed on the pull requests your agents open:
 
 ```
-/gitkey ghp_xxxxxxxxxxxx
+/gitkey github_pat_xxxxxxxx
 ```
 
 Read-only is enough. See [Watching CI](#watching-ci).
+
+Do not go hunting for any of these. Send the command **bare** — `/key`,
+`/voicekey`, `/gitkey` — and the bot replies with a numbered, click-by-click
+guide to getting that particular key.
 
 > **Never send a key to a group.** If you do, the bot deletes it and tells you
 > to rotate it — but other members may have already seen it. It catches a key
@@ -349,8 +353,14 @@ Store a GitHub token — privately, like every other key — and the bot watches
 what happens after a turn opens a pull request:
 
 ```
-/gitkey ghp_xxxxxxxxxxxx      # read-only scopes are enough
+/gitkey                       # bot replies with the step-by-step
+/gitkey github_pat_xxxxxxxx   # read-only is all it needs
 ```
+
+The token is a **fine-grained** personal access token from
+`github.com/settings/personal-access-tokens/new`, scoped to the repositories
+your agents work in, with *Read-only* on **Pull requests**, **Checks** and
+**Commit statuses**. Nothing else — the bot never writes to your code.
 
 When a turn ends on a `https://github.com/owner/repo/pull/NN` link, the bot
 polls that pull request's checks and posts **one** line in the same topic when

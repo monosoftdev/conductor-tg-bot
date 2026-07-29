@@ -10,9 +10,9 @@ from ctb import signals
 from ctb.bot.actions import BotActionSink, finish_line
 from ctb.bot.handlers import topics
 from ctb.bot.handlers.core import status_icon
-from ctb.db.connection import Database
+from ctb.db.connection import Database, now_ms
 from ctb.db.repo import chats, prompts, sessions, workspaces
-from ctb.delivery.outbox import Priority
+from ctb.delivery.outbox import Outbox, Priority
 from ctb.delivery.status_card import CARD_EMOJI
 from ctb.turn.state import (
     CardKind,
@@ -490,3 +490,128 @@ def test_the_reaction_vocabulary_is_one_telegram_accepts() -> None:
     assert signals.DONE not in signals.REACTION_SAFE
     assert signals.WAITING not in signals.REACTION_SAFE
     assert {"👀", "👍", "😢"} <= signals.REACTION_SAFE, "what the bot uses today"
+
+
+class SendingBot(Bot):
+    """A Bot that answers ``send_message`` with an id, and records edits."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.sent: list[dict[str, Any]] = []
+        self.edits: list[dict[str, Any]] = []
+        self._next_id = 900
+
+    async def send_message(self, **kwargs: Any) -> Any:
+        self.sent.append(kwargs)
+        self._next_id += 1
+        return SimpleNamespace(message_id=self._next_id)
+
+    async def edit_message_text(self, **kwargs: Any) -> Any:
+        self.edits.append(kwargs)
+        return SimpleNamespace(message_id=kwargs.get("message_id", 0))
+
+    async def send_chat_action(self, **kwargs: Any) -> Any:
+        return None
+
+
+async def _prompted(db: Database) -> None:
+    await _bound(db)
+    await sessions.touch_prompt(db, "sess-1")
+
+
+def _finish(summary: TurnSummary) -> tuple[Any, ...]:
+    return (Finalize(summary),)
+
+
+async def test_a_second_finish_edits_the_receipt_instead_of_buzzing_again(
+    db: Database, system_db: Database
+) -> None:
+    """The live bug: ten notifications for one task.
+
+    ``idle`` mid-turn is byte-for-byte the ``idle`` after the last one, so the
+    machine can call a turn finished several times over. Each of those used to
+    be a fresh message, because the delivery key carried the cursor and the
+    cursor moves under it.
+    """
+    await _prompted(db)
+    bot = SendingBot()
+    outbox = Outbox(bot, db)  # type: ignore[arg-type]
+    sink = BotActionSink(bot, db, system_db, outbox, Recorder())  # type: ignore[arg-type]
+
+    async def finish(duration_ms: int, tools: int, cursor: int) -> None:
+        # The cursor moves under every finish — that is what used to mint a new
+        # delivery key, and therefore a new notification, each time.
+        await sessions.update(db, "sess-1", cursor_session_index=cursor)
+        await sink.handle(
+            _finish(TurnSummary(duration_ms=duration_ms, tool_calls=tools)),
+            session_id="sess-1",
+            chat_id=-1001,
+            thread_id=42,
+        )
+        await outbox.flush()
+
+    await finish(60_000, 3, cursor=11)
+    assert len(bot.sent) == 1
+    assert "3 tools" in bot.sent[0]["text"]
+
+    # …and the machine changes its mind, twice, as the turn actually finishes.
+    await finish(300_000, 41, cursor=19)
+    await finish(499_000, 58, cursor=27)
+
+    assert len(bot.sent) == 1, "one buzz for one task"
+    assert bot.edits, "the receipt is corrected in place, and an edit is silent"
+    assert "58 tools" in bot.edits[-1]["text"]
+    # The edit lands on the message that was actually sent, in its topic.
+    assert bot.edits[-1]["message_id"] == 901
+    assert bot.edits[-1]["chat_id"] == -1001
+
+
+async def test_the_next_prompt_earns_its_own_receipt(
+    db: Database, system_db: Database
+) -> None:
+    """Collapsing finishes must not collapse *tasks*."""
+    await _prompted(db)
+    bot = SendingBot()
+    outbox = Outbox(bot, db)  # type: ignore[arg-type]
+    sink = BotActionSink(bot, db, system_db, outbox, Recorder())  # type: ignore[arg-type]
+
+    await sink.handle(
+        _finish(TurnSummary(duration_ms=1_000)),
+        session_id="sess-1",
+        chat_id=-1001,
+        thread_id=42,
+    )
+    await outbox.flush()
+
+    await sessions.touch_prompt(db, "sess-1", at=now_ms() + 1)
+    await sink.handle(
+        _finish(TurnSummary(duration_ms=2_000)),
+        session_id="sess-1",
+        chat_id=-1001,
+        thread_id=42,
+    )
+    await outbox.flush()
+
+    assert len(bot.sent) == 2
+
+
+async def test_a_receipt_still_in_the_queue_is_left_alone(
+    db: Database, system_db: Database
+) -> None:
+    """Nobody has seen it yet, so there is nothing to correct — or to buzz."""
+    await _prompted(db)
+    bot = SendingBot()
+    outbox = Outbox(bot, db)  # type: ignore[arg-type]
+    sink = BotActionSink(bot, db, system_db, outbox, Recorder())  # type: ignore[arg-type]
+
+    for tools in (3, 41):
+        await sink.handle(
+            _finish(TurnSummary(duration_ms=1_000, tool_calls=tools)),
+            session_id="sess-1",
+            chat_id=-1001,
+            thread_id=42,
+        )
+
+    assert bot.edits == []
+    await outbox.flush()
+    assert len(bot.sent) == 1
