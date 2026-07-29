@@ -51,6 +51,7 @@ from ctb.turn.state import (
     QUEUED_SLOW_AFTER_S,
     QUEUED_TIMEOUT_S,
     STATUS_FAILURE_THRESHOLD,
+    TURN_END_AGE_OUT_S,
     WAKE_TIMEOUT_S,
     AbandonPrompt,
     Boot,
@@ -614,6 +615,116 @@ def test_rule_15_will_not_finalize_while_a_prompt_is_unwitnessed() -> None:
     assert all(not has_action(r, Finalize) for r in results)
     assert results[-1].state is TurnState.DRAINING
     assert results[-1].context.consecutive_idle == 6
+
+
+def test_rule_15_will_not_finalize_before_the_agent_reports_the_turn_over() -> None:
+    """The reported bug: ✅ mid-turn, during the quiet of a long tool call.
+
+    `idle` between two tool calls is indistinguishable from `idle` after the
+    last one. The agent's own end-of-turn record is the difference.
+    """
+    context = ctx(
+        TurnState.DRAINING,
+        consecutive_idle=0,
+        marks_turn_end=True,
+        turn_ids=frozenset({MID}),
+        open_turn_ids=frozenset({MID}),
+    )
+    results = drive(context, [(IDLE_STATUS, T0 + 30 + i) for i in range(6)])
+
+    assert all(not has_action(r, Finalize) for r in results)
+    assert results[-1].state is TurnState.DRAINING
+    # …and once the confirmations are in it stops polling every 2s to wait.
+    assert cadence_set(results[DRAIN_CONFIRMS - 1]) == CADENCE_WORKING_MS
+
+
+def test_the_end_of_turn_record_releases_the_finalize() -> None:
+    context = ctx(
+        TurnState.DRAINING,
+        consecutive_idle=0,
+        marks_turn_end=True,
+        turn_ids=frozenset({MID}),
+        open_turn_ids=frozenset({MID}),
+    )
+    held = drive(context, [(IDLE_STATUS, T0 + 30 + i) for i in range(4)])[-1]
+    assert not has_action(held, Finalize)
+
+    closed = step(
+        held.context,
+        Delta(n=1, has_agent_content=True, ended_turn_ids=frozenset({MID})),
+        T0 + 40,
+    )
+    assert closed.context.open_turn_ids == frozenset()
+    finished = drive(
+        closed.context, [(IDLE_STATUS, T0 + 41 + i) for i in range(DRAIN_CONFIRMS)]
+    )[-1]
+
+    assert finished.transition == 15
+    assert finished.state is TurnState.IDLE
+    assert has_action(finished, Finalize)
+
+
+def test_an_agent_that_never_marks_the_turn_end_finalizes_as_before() -> None:
+    """No demonstrated record ⇒ no gate. Otherwise every turn waits it out."""
+    context = ctx(
+        TurnState.DRAINING, consecutive_idle=0, open_turn_ids=frozenset({MID})
+    )
+    results = drive(
+        context, [(IDLE_STATUS, T0 + 30 + i) for i in range(DRAIN_CONFIRMS)]
+    )
+
+    assert results[-1].transition == 15
+    assert has_action(results[-1], Finalize)
+
+
+def test_a_missing_end_of_turn_record_ages_out_rather_than_wedging() -> None:
+    context = ctx(
+        TurnState.DRAINING,
+        consecutive_idle=DRAIN_CONFIRMS,
+        marks_turn_end=True,
+        last_delta_at=T0,
+        open_turn_ids=frozenset({MID}),
+    )
+    at = T0 + TURN_END_AGE_OUT_S + 1
+    result = step(context, Timer(at), at)
+
+    assert result.transition == 15
+    assert result.state is TurnState.IDLE
+    assert has_action(result, Finalize)
+
+
+def test_a_delta_opens_a_turn_and_its_record_closes_it() -> None:
+    opened = step(
+        ctx(TurnState.WORKING),
+        Delta(n=2, has_agent_content=True, turn_ids=frozenset({MID})),
+        T0 + 5,
+    )
+    assert opened.context.open_turn_ids == frozenset({MID})
+    assert opened.context.marks_turn_end is False
+
+    # The same page may carry the last message and the record together.
+    both = step(
+        ctx(TurnState.WORKING),
+        Delta(
+            n=2,
+            has_agent_content=True,
+            turn_ids=frozenset({MID}),
+            ended_turn_ids=frozenset({MID}),
+        ),
+        T0 + 5,
+    )
+    assert both.context.open_turn_ids == frozenset()
+    assert both.context.marks_turn_end is True
+
+
+def test_an_end_of_turn_record_without_a_turn_id_closes_everything() -> None:
+    context = ctx(
+        TurnState.WORKING, marks_turn_end=True, open_turn_ids=frozenset({MID, MID2})
+    )
+    result = step(context, Delta(n=1, has_untagged_turn_end=True), T0 + 5)
+
+    assert result.context.open_turn_ids == frozenset()
+    assert result.context.turn_end_pending(T0 + 5) is False
 
 
 def test_rule_16_draining_status_working_returns_to_working() -> None:

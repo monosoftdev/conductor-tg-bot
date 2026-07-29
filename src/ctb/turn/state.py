@@ -22,6 +22,7 @@ from ctb import signals
 from ctb.conductor.models import SessionStatusValue, WorkspaceStatusValue
 
 __all__ = [
+    "AGENTS_MARKING_TURN_END",
     "AbandonPrompt",
     "Action",
     "Boot",
@@ -63,6 +64,7 @@ __all__ = [
     "RequestStatus",
     "RequestWorkspaceStatus",
     "STATUS_FAILURE_THRESHOLD",
+    "TURN_END_AGE_OUT_S",
     "SetCadence",
     "SetTopicMarker",
     "SetTurnCost",
@@ -122,6 +124,19 @@ NO_OUTPUT_SLOW_S: Final = 3_600.0
 #: A posted prompt never witnessed in the transcript stops blocking finalize
 #: after this long, so one lost echo cannot wedge the session forever.
 PROMPT_AGE_OUT_S: Final = 300.0
+#: A turn whose end-of-turn record never arrived stops blocking finalize after
+#: this long *without a single new message*. Same shape as the prompt age-out
+#: and for the same reason: the gate must not be able to wedge a session. It is
+#: measured from the last delta, so a talkative agent never approaches it, and
+#: it is long because the failure it guards against — declaring a running agent
+#: finished — is the one the user actually reported.
+TURN_END_AGE_OUT_S: Final = 900.0
+#: Agents known to file an end-of-turn record on every turn, so the gate that
+#: waits for one can be trusted from a session's *first* turn rather than only
+#: after it has watched one arrive. Verified against real transcripts
+#: (``tests/fixtures/probe_verified.jsonl``); an agent not listed here teaches
+#: the machine at runtime instead.
+AGENTS_MARKING_TURN_END: Final = frozenset({"claude"})
 #: Consecutive ``/status`` failures before dropping into cursor-only mode.
 STATUS_FAILURE_THRESHOLD: Final = 3
 #: In cursor-only mode WORKING is inferred from recent deltas, and quiet this
@@ -234,6 +249,12 @@ class Delta:
     tool_calls: int = 0
     #: A ``result`` payload flagged ``is_error``.
     has_error_result: bool = False
+    #: Turn ids whose end-of-turn record arrived in this page: the agent's own
+    #: statement that the turn is over. See ``TranscriptMessage.ends_turn``.
+    ended_turn_ids: frozenset[str] = frozenset()
+    #: An end-of-turn record that carried no ``turnId`` — it closes whatever
+    #: was open rather than nothing.
+    has_untagged_turn_end: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -647,6 +668,26 @@ class TurnContext:
     canceled_queued_messages: int = 0
     #: Turn ids seen this turn — used to attribute output to prompts.
     turn_ids: frozenset[str] = field(default_factory=frozenset)
+    #: Turn ids that started and whose end-of-turn record has not arrived.
+    #: Non-empty means the agent has not said it is finished, whatever
+    #: ``/status`` says.
+    open_turn_ids: frozenset[str] = field(default_factory=frozenset)
+    #: True once this session has been seen to emit an end-of-turn record.
+    #: Sticky, because the gate may only be trusted for an agent that has
+    #: demonstrated it: for one that never emits them every turn would look
+    #: permanently open and every finalize would wait out the age-out.
+    marks_turn_end: bool = False
+
+    def turn_end_pending(self, now: float) -> bool:
+        """True while the agent still owes an end-of-turn record for a live turn.
+
+        Measured from the last delta so a lost record ages out instead of
+        wedging the session — the same escape hatch ``PROMPT_AGE_OUT_S`` gives
+        an unwitnessed prompt.
+        """
+        if not self.marks_turn_end or not self.open_turn_ids:
+            return False
+        return self.quiet_for(now) < TURN_END_AGE_OUT_S
 
     @property
     def outstanding(self) -> int:

@@ -839,6 +839,25 @@ async def test_load_turn_context_includes_the_workspace_status(
     assert context.lifecycle_step == "cloning"
 
 
+async def test_load_turn_context_trusts_the_end_of_turn_gate_for_claude(
+    seeded: Database,
+) -> None:
+    """A claude session is gated from its *first* turn, not its second.
+
+    The gate that waits for the agent's end-of-turn record is otherwise
+    learned by watching one arrive, which leaves turn one unprotected — and a
+    workspace's first turn is usually its longest.
+    """
+    context = await sessions.load_turn_context(seeded, SESSION, now=0.0)
+    assert context is not None
+    assert context.marks_turn_end is True
+
+    await sessions.upsert(seeded, SESSION, agent="codex")
+    other = await sessions.load_turn_context(seeded, SESSION, now=0.0)
+    assert other is not None
+    assert other.marks_turn_end is False
+
+
 async def test_load_turn_context_of_an_unknown_session(db: Database) -> None:
     assert await sessions.load_turn_context(db, "nope", now=0.0) is None
 

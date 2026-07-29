@@ -162,7 +162,7 @@ Evidence: `POST_OK`, `POST_AMBIGUOUS`, `STATUS(idle|working|error)`, `DELTA(n, m
 | 12 | WORKING | DELTA(n>0) | WORKING | `last_delta_at=now`; deliver (delivery is state-independent) |
 | 13 | WORKING | STATUS(idle) | DRAINING | **never declare done here** |
 | 14 | DRAINING | DELTA(n>0) | WORKING | trailing content; DRAINING↔WORKING ping-pong is expected |
-| 15 | DRAINING | STATUS(idle) ×3 consecutive, zero delta, `outstanding==0` | IDLE | finalize card "done in 1m32s" |
+| 15 | DRAINING | STATUS(idle) ×3 consecutive, zero delta, `outstanding==0`, no turn still open | IDLE | finalize card "done in 1m32s". A turn is *open* until its own end-of-turn record (`rawPayload.type == "result"`) arrives — `idle` mid tool call is the same observation as `idle` at the end |
 | 16 | DRAINING | STATUS(working) | WORKING | |
 | 17 | any | STATUS(error) | ERROR | **force a full delta drain first** (partial output may exist), then show `errorMessage ?? lastError` + Retry |
 | 18 | any | CANCEL | CANCELLING | POST cancel; report `canceledQueuedMessages` |
