@@ -1620,6 +1620,12 @@ def test_the_phone_menu_never_advertises_a_command_that_does_not_exist() -> None
     assert advertised <= handled, advertised - handled
 
 
+def test_key_setup_commands_are_discoverable_in_the_phone_menu() -> None:
+    """Bare key commands are guides, so hiding them makes setup undiscoverable."""
+    advertised = {c.command for c in bot_app.BOT_COMMANDS}
+    assert {"key", "voicekey", "gitkey"} <= advertised
+
+
 def test_build_app_wires_everything(
     bot: Bot, bot_settings: Settings, db: Database, system_db: Database
 ) -> None:

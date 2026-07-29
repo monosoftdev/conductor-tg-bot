@@ -96,9 +96,10 @@ CONFLICT_BACKOFF_S: Final = 5.0
 
 #: The phone menu, deliberately shorter than the command list. It is the only
 #: discovery surface most people ever read, so it holds the daily loop plus the
-#: three onboarding steps — not everything that exists. Rarely-used commands
-#: (``/forget``, ``/revoke``, ``/tidy``) and operator-only ones (``/platform``)
-#: stay out: advertising them to every customer costs more than it teaches.
+#: setup and credential commands — not everything that exists. Rarely-used
+#: commands (``/forget``, ``/revoke``, ``/tidy``) and operator-only ones
+#: (``/platform``) stay out: advertising them to every customer costs more than
+#: it teaches.
 BOT_COMMANDS: Final[tuple[BotCommand, ...]] = (
     BotCommand(command="new", description="New workspace"),
     BotCommand(command="board", description="Live sessions"),
@@ -117,6 +118,8 @@ BOT_COMMANDS: Final[tuple[BotCommand, ...]] = (
     BotCommand(command="health", description="Team status"),
     BotCommand(command="register", description="Create your team"),
     BotCommand(command="key", description="Store your Conductor API key"),
+    BotCommand(command="voicekey", description="Store your speech API key"),
+    BotCommand(command="gitkey", description="Store your GitHub CI token"),
     BotCommand(command="help", description="Quick control guide"),
 )
 
