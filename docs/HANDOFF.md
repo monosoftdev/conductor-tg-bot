@@ -3,8 +3,7 @@
 ## Current state
 
 The bot is multi-tenant on PostgreSQL. One Telegram bot token serves many
-teams; each brings its own Conductor API key. Ready for a first deployment
-and a live phone pass.
+teams; each brings its own Conductor API key.
 
 **Sign-up is two private messages.** `/start` creates the team, `/key` stores
 the Conductor key, `/new` opens a workspace — and its topic — in that same
@@ -14,7 +13,7 @@ create a supergroup, enable Topics or grant admin rights.
 
 Verified offline, on every commit:
 
-- **2,254 tests pass** against a real PostgreSQL 16.
+- **2,287 tests pass** against a real PostgreSQL 16.
 - `ruff format --check`, `ruff check`, `pyright` — all clean.
 - The real runtime boots against a real database: all seven services start,
   `/health` returns `ok`, the lease is acquired, shutdown is clean.

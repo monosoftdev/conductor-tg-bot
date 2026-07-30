@@ -74,6 +74,31 @@ class TestParsing:
         with pytest.raises(SecretError, match="bytes"):
             MasterKey(kid="v1", key=b"too short")
 
+    @pytest.mark.parametrize(
+        "mangled",
+        [
+            'v1:"{key}"',  # a secret manager that kept the quotes
+            "v1:{key}\n",  # a value pasted with its trailing newline
+            "v1:{key} ",  # or with a trailing space
+        ],
+    )
+    def test_a_key_that_survived_a_paste_still_decodes(self, mangled: str) -> None:
+        """Decoding is deliberately lenient, and must stay that way.
+
+        This is a boot-critical environment variable that reaches the process
+        through a secret manager, a deploy UI and a shell. Every one of those
+        has a way of adding a quote or a newline, and a strict decoder would
+        turn each into a refusal to start.
+
+        Leniency costs nothing here, which is the part worth writing down: a
+        discarded stray character can only ever yield the *correct* key or a
+        length that fails :class:`MasterKey`'s own check. There is no corruption
+        that decodes cleanly to different 32 bytes, so nothing silently seals
+        under the wrong key.
+        """
+        raw = base64.b64encode(b"K" * KEY_BYTES).decode()
+        assert parse_master_keys(mangled.format(key=raw))[0].key == b"K" * KEY_BYTES
+
 
 class TestRoundTrip:
     def test_seal_then_open(self, secret_box: SecretBox) -> None:

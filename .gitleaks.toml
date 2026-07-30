@@ -1,0 +1,59 @@
+# Secret scanning, run over the whole history by `.github/workflows/ci.yml`.
+#
+# The default rule set does the work. Everything here is an allowlist, and each
+# entry is narrow on purpose: a broad `paths` exclusion is how a scanner quietly
+# stops covering the directory a real key eventually lands in.
+#
+# Adding an entry is a decision, not a formality. If a match is a real
+# credential, rotate it — a `git rm` does not remove it from history, and this
+# scanner reads history precisely because that is where they survive.
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = """
+Deliberately fake credentials in tests. `test_health.py` asserts that a bearer
+token appearing in an upstream error message is redacted before it reaches the
+health body — proving that requires a token-shaped string in the fixture.
+"""
+paths = ['''tests/.*\.py''']
+regexes = [
+  '''sk-live-abcdef0123456789''',
+  '''ctb-master-key-self-check''',
+]
+
+[[allowlists]]
+description = """
+Placeholders in the user-facing walkthrough and the onboarding copy. These are
+the literal strings a reader is shown where their own key goes.
+"""
+paths = ['''(docs/.*\.md|README\.md|\.env\.example|src/ctb/bot/handlers/registration\.py)''']
+regexes = [
+  '''github_pat_x+''',
+  '''sk_x+''',
+  '''123456:ABC-DEF\.\.\.''',
+  '''github_pat_…''',
+]
+
+[[allowlists]]
+description = """
+The echo token in the recorded transcript fixture. The probe asks an agent to
+reply with a random marker and nothing else, so that the fixture proves a real
+round trip — which makes the marker look exactly like an API key to a generic
+entropy rule. The `_fixture` field on every line of that file records what was
+scrubbed from it before it was committed.
+"""
+paths = ['''tests/fixtures/.*\.jsonl''']
+regexes = ['''probe-[0-9a-f]{8}''']
+
+[[allowlists]]
+description = """
+The deterministic master keys the suite runs on: base64 of a repeated ASCII
+letter, in a file that says so. Never used anywhere real, and a reader who
+tries them gets a key made of 'T's.
+"""
+paths = ['''tests/(pg|test_rewrap|test_crypto)\.py''']
+regexes = [
+  '''(VFRUVFRU|T09PT09P|S0tLS0tL)[A-Za-z0-9+/=]*''',
+]
