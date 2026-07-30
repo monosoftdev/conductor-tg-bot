@@ -1809,21 +1809,30 @@ async def test_deleting_the_pinned_card_hands_the_pin_to_its_replacement(
     Without handing the pin on, superseding the very first card would leave the
     topic pinless for the rest of the session — the card is pinned exactly so
     it stays reachable under a long transcript.
+
+    Only topics pin at all, so this runs in one: in the main chat there is no
+    pin to hand on. See :func:`test_the_main_chat_is_never_pinned`.
     """
     pinning = StatusCards(bot, db, clock=clock, sleep=sleeper, pin=True)
     await pinning.apply(
-        PostStatusCard(CardKind.WAKING, "waking"), session_id=SESSION, chat_id=CHAT
+        PostStatusCard(CardKind.WAKING, "waking"),
+        session_id=SESSION,
+        chat_id=CHAT,
+        thread_id=5,
     )
     clock.advance(4.0)
 
     await pinning.apply(
-        PostStatusCard(CardKind.QUEUED, "queued"), session_id=SESSION, chat_id=CHAT
+        PostStatusCard(CardKind.QUEUED, "queued"),
+        session_id=SESSION,
+        chat_id=CHAT,
+        thread_id=5,
     )
 
     pins = bot.calls_to("pin_chat_message")
     assert len(pins) == 2, "the replacement claims the pin the delete released"
     assert pins[0]["message_id"] != pins[1]["message_id"]
-    assert pins[1]["message_id"] == pinning.message_id_for(CHAT)
+    assert pins[1]["message_id"] == pinning.message_id_for(CHAT, 5)
 
 
 async def test_unknown_actions_are_left_alone(

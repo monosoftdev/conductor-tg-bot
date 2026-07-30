@@ -25,6 +25,7 @@ from ctb.delivery.render.types import Block, RenderContext
 
 __all__ = ["UserEchoAdapter"]
 
+
 class UserEchoAdapter(Adapter):
     """Matches a user-authored envelope. Renders nothing."""
 
@@ -54,9 +55,10 @@ def _raw_user_prompt_echo(content: Mapping[str, Any]) -> bool:
     payload = raw_payload(content)
     message = payload.get("message")
     wrapped = message if isinstance(message, Mapping) else {}
-    if normalize(payload.get("type")) != "user" and normalize(
-        wrapped.get("role")
-    ) != "user":
+    if (
+        normalize(payload.get("type")) != "user"
+        and normalize(wrapped.get("role")) != "user"
+    ):
         return False
     blocks = payload_blocks(content)
     if not blocks:

@@ -1096,8 +1096,7 @@ class Outbox:
                             thread_id=row.thread_id,
                         )
                         if part.control_buttons
-                        else
-                        self._quick_replies(
+                        else self._quick_replies(
                             part.quick_replies,
                             row.session_id,
                             chat_id=row.chat_id,
