@@ -1,4 +1,7 @@
-FROM python:3.14-slim
+# Pinned to the version CI tests on. `requires-python` allows newer, and the
+# image ran 3.14 for a while — which meant the artifact that reaches production
+# was the one interpreter the 2,200-test suite never executed against.
+FROM python:3.13-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \

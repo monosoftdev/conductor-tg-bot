@@ -1,0 +1,26 @@
+# Review is requested automatically from the owners of the paths a pull request
+# touches. This file is not an access control — branch protection is — it is a
+# statement of who has read a given corner closely enough to be useful on it.
+
+*                           @monosoftdev
+
+# The two files where a mistake is a cross-tenant read rather than a bug, plus
+# the rotation tool a breach runbook depends on. Changes here want a second
+# pair of eyes even when they look mechanical.
+/src/ctb/crypto.py          @monosoftdev
+/src/ctb/rewrap.py          @monosoftdev
+/src/ctb/db/migrations/     @monosoftdev
+/src/ctb/db/repo/tenancy.py @monosoftdev
+/src/ctb/bot/middleware/    @monosoftdev
+
+# Supply chain: a workflow edit runs on the next push, and a dependency bump
+# runs in every job after it.
+/.github/workflows/         @monosoftdev
+/pyproject.toml             @monosoftdev
+/Dockerfile                 @monosoftdev
+
+# The security policy and the walkthrough are read by people deciding whether
+# to trust this with a key.
+/SECURITY.md                @monosoftdev
+/docs/GETTING_STARTED.md    @monosoftdev
+/docs/TENANCY.md            @monosoftdev
