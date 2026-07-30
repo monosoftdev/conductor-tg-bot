@@ -53,7 +53,7 @@ ME_URL = f"{_API.scheme}://{_API.netloc}/me"
 
 # The API sits behind a proxy that 403s some default client signatures (the docs
 # call out Python's urllib). Always send an explicit UA.
-USER_AGENT = "conductor-tg-bot-probe/0.1 (+https://github.com/Monosoft-dev)"
+USER_AGENT = "conductor-tg-bot-probe/0.1 (+https://github.com/monosoftdev)"
 
 OUT = Path(__file__).resolve().parent.parent / "probe-out"
 

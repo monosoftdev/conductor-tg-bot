@@ -88,5 +88,5 @@ First public release, under the MIT licence.
   live account.
 - CI runs with `permissions: contents: read` and a pinned `actionlint` image.
 
-[Unreleased]: https://github.com/Monosoft-dev/conductor-tg-bot/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/Monosoft-dev/conductor-tg-bot/releases/tag/v0.1.0
+[Unreleased]: https://github.com/monosoftdev/conductor-tg-bot/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/monosoftdev/conductor-tg-bot/releases/tag/v0.1.0

@@ -189,7 +189,7 @@ gh pr create --fill                     # body: what changed and why, not how
 ```
 
 The final report then **names the PR and links it**, on its own last line:
-`PR: https://github.com/Monosoft-dev/conductor-tg-bot/pull/NN`. A report without
+`PR: https://github.com/monosoftdev/conductor-tg-bot/pull/NN`. A report without
 that link is an unfinished task — the reader cannot reach the work.
 
 The exception is being told otherwise: *"don't open a PR"*, *"just show me the

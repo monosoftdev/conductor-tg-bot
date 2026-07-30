@@ -89,10 +89,13 @@ jobs:
           # report clean on a repository with a key three commits back.
           fetch-depth: 0
 
-      # The gitleaks CLI, not `gitleaks/gitleaks-action`: the action requires a
-      # paid licence key for organisation-owned repositories, and a security
-      # gate that silently no-ops when a secret is missing is worse than none.
-      # The binary is MIT and needs nothing.
+      # The gitleaks CLI, not `gitleaks/gitleaks-action`. The action wants a
+      # `GITLEAKS_LICENSE` secret once a repository is organisation-owned, and
+      # a security gate that silently no-ops when a secret is missing is worse
+      # than no gate at all. This repository is under a personal account today,
+      # where the action would be free — the CLI is chosen so that moving it to
+      # an organisation later is a transfer and not an outage. The binary is
+      # MIT and needs nothing.
       #
       # This is belt to GitHub's own push protection, which is the braces.
       # Push protection stops a known credential format at `git push`; this

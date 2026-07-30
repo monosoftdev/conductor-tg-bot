@@ -39,12 +39,12 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/Monosoft-dev/conductor-tg-bot"
-Source = "https://github.com/Monosoft-dev/conductor-tg-bot"
-Issues = "https://github.com/Monosoft-dev/conductor-tg-bot/issues"
-Changelog = "https://github.com/Monosoft-dev/conductor-tg-bot/blob/main/CHANGELOG.md"
-Documentation = "https://github.com/Monosoft-dev/conductor-tg-bot/tree/main/docs"
-Security = "https://github.com/Monosoft-dev/conductor-tg-bot/blob/main/SECURITY.md"
+Homepage = "https://github.com/monosoftdev/conductor-tg-bot"
+Source = "https://github.com/monosoftdev/conductor-tg-bot"
+Issues = "https://github.com/monosoftdev/conductor-tg-bot/issues"
+Changelog = "https://github.com/monosoftdev/conductor-tg-bot/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/monosoftdev/conductor-tg-bot/tree/main/docs"
+Security = "https://github.com/monosoftdev/conductor-tg-bot/blob/main/SECURITY.md"
 
 [build-system]
 requires = ["hatchling"]

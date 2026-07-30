@@ -7,7 +7,7 @@ about key handling, tenant isolation or log content as urgent.
 ## Reporting a vulnerability
 
 Email **info@monosoft.dev** with `SECURITY` in the subject, or open a
-[private advisory](https://github.com/Monosoft-dev/conductor-tg-bot/security/advisories/new).
+[private advisory](https://github.com/monosoftdev/conductor-tg-bot/security/advisories/new).
 Please do not open a public issue for anything that could expose a key or one
 tenant's data to another.
 

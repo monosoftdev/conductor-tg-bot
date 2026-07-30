@@ -1,6 +1,12 @@
 # Review is requested automatically from the owners of the paths a pull request
 # touches. This file is not an access control — branch protection is — it is a
 # statement of who has read a given corner closely enough to be useful on it.
+#
+# While this is a one-maintainer repository the entries all resolve to the same
+# person and GitHub requests nothing, because it never asks an author to review
+# their own pull request. The file earns its place the day a second name is
+# added: the paths below are already the ones where a mistake is a cross-tenant
+# read rather than a bug.
 
 *                           @monosoftdev
 
