@@ -203,6 +203,31 @@ def test_raw_user_prompt_echo_with_mobile_contract_is_suppressed() -> None:
     assert result.blocks == ()
 
 
+def test_raw_user_prompt_echo_without_contract_is_suppressed() -> None:
+    message = TranscriptMessage(
+        id="sess:1:1",
+        session_id="sess",
+        session_index=1,
+        type="agent",
+        content={
+            "type": "agent",
+            "rawPayload": {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": "the message I typed in Telegram",
+                },
+            },
+        },
+        received_at="2026-07-26 02:00:37.434+00",
+    )
+
+    result = render(message)
+
+    assert result.adapter == "user_echo"
+    assert result.blocks == ()
+
+
 def test_assistant_echoed_mobile_contract_is_cut_from_chat() -> None:
     message = TranscriptMessage(
         id="sess:2:0",

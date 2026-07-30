@@ -10,7 +10,7 @@ from typing import Final
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
-from aiogram.types import ReactionTypeEmoji
+from aiogram.types import InlineKeyboardMarkup, ReactionTypeEmoji
 
 from ctb import signals
 from ctb.bot.handlers import topics
@@ -35,6 +35,7 @@ from ctb.logging import get_logger
 from ctb.turn.machine import format_duration
 from ctb.turn.state import (
     Action,
+    CardButton,
     Finalize,
     Notify,
     NotifyLevel,
@@ -229,7 +230,7 @@ class BotActionSink:
             message_id = notice_message_id(key)
             row = await deliveries.get(self._db, (session_id, message_id, 0, chat_id))
             if row is not None and row.tg_message_id is not None:
-                await self._pin_message(chat_id, row.tg_message_id)
+                await self._pin_message(chat_id, thread_id, row.tg_message_id)
                 return
             if row is not None:
                 return
@@ -258,7 +259,7 @@ class BotActionSink:
                     (session_id, message_id, 0, chat_id),
                     tg_message_id=sent[0],
                 )
-            await self._pin_message(chat_id, sent[0])
+            await self._pin_message(chat_id, thread_id, sent[0])
         except Exception as exc:  # noqa: BLE001 - review link is a bonus
             log.warning(
                 "bot.pr_review_notice_failed",
@@ -267,7 +268,9 @@ class BotActionSink:
                 error=repr(exc),
             )
 
-    async def _pin_message(self, chat_id: int, message_id: int) -> None:
+    async def _pin_message(self, chat_id: int, thread_id: int, message_id: int) -> None:
+        if thread_id == NO_THREAD_ID:
+            return
         with contextlib.suppress(TelegramAPIError, AttributeError):
             await self._bot.pin_chat_message(
                 chat_id=chat_id,
@@ -383,6 +386,11 @@ class BotActionSink:
                 return
             key = finish_key(session_id, row)
             text = finish_line(summary)
+            controls: tuple[str, ...] = (
+                (CardButton.ARCHIVE.value,)
+                if summary.ok and row is not None and row.workspace_id is not None
+                else ()
+            )
             created = await self._outbox.enqueue_notice(
                 text,
                 session_id=session_id,
@@ -391,10 +399,16 @@ class BotActionSink:
                 thread_id=thread_id,
                 priority=Priority.NORMAL,
                 silent=False,
+                control_buttons=controls,
             )
             if not created:
                 await self._revise_finish(
-                    key, text, session_id=session_id, chat_id=chat_id
+                    key,
+                    text,
+                    session_id=session_id,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    control_buttons=controls,
                 )
         except Exception as exc:  # noqa: BLE001 - a receipt never stops a turn
             log.warning(
@@ -402,7 +416,14 @@ class BotActionSink:
             )
 
     async def _revise_finish(
-        self, key: str, text: str, *, session_id: str, chat_id: int
+        self,
+        key: str,
+        text: str,
+        *,
+        session_id: str,
+        chat_id: int,
+        thread_id: int,
+        control_buttons: tuple[str, ...],
     ) -> None:
         """Update a receipt that has already been sent. Telegram edits are silent.
 
@@ -415,7 +436,41 @@ class BotActionSink:
         )
         if row is None or row.tg_message_id is None:
             return
-        await topics.edit_html(self._bot, chat_id, row.tg_message_id, text)
+        await topics.edit_html(
+            self._bot,
+            chat_id,
+            row.tg_message_id,
+            text,
+            reply_markup=self._control_markup(
+                control_buttons,
+                session_id=session_id,
+                chat_id=chat_id,
+                thread_id=thread_id,
+            ),
+        )
+
+    def _control_markup(
+        self,
+        buttons: tuple[str, ...],
+        *,
+        session_id: str,
+        chat_id: int,
+        thread_id: int,
+    ) -> InlineKeyboardMarkup | None:
+        if not buttons:
+            return None
+        try:
+            from ctb.bot.keyboards import status_card_keyboard
+
+            return status_card_keyboard(
+                [CardButton(value) for value in buttons],
+                session_id,
+                columns=1,
+                chat_id=chat_id,
+                thread_id=thread_id,
+            )
+        except Exception:
+            return None
 
     async def _set_topic_marker(self, session_id: str, action: SetTopicMarker) -> None:
         row = await sessions.get(self._db, session_id)

@@ -82,6 +82,7 @@ __all__ = [
     "MAX_RETRY_AFTER_S",
     "NO_LINK_PREVIEW",
     "FocusTracker",
+    "ControlFactory",
     "Outbox",
     "Priority",
     "notice_message_id",
@@ -320,6 +321,19 @@ class QuickReplyFactory(Protocol):
     ) -> InlineKeyboardMarkup | None: ...
 
 
+class ControlFactory(Protocol):
+    """Build a keyboard for bot-owned durable notice controls."""
+
+    def __call__(
+        self,
+        buttons: Sequence[str],
+        session_id: str,
+        *,
+        chat_id: int,
+        thread_id: int,
+    ) -> InlineKeyboardMarkup | None: ...
+
+
 def _default_quick_replies(
     choices: Sequence[str],
     session_id: str,
@@ -333,6 +347,32 @@ def _default_quick_replies(
     return quick_reply_keyboard(
         choices,
         session_id,
+        chat_id=chat_id,
+        thread_id=thread_id,
+    )
+
+
+def _default_control_buttons(
+    buttons: Sequence[str],
+    session_id: str,
+    *,
+    chat_id: int,
+    thread_id: int,
+) -> InlineKeyboardMarkup | None:
+    # Late import preserves the delivery layer's boot independence.
+    from ctb.bot.keyboards import status_card_keyboard
+    from ctb.turn.state import CardButton
+
+    known: list[CardButton] = []
+    for value in buttons:
+        try:
+            known.append(CardButton(value))
+        except ValueError:
+            continue
+    return status_card_keyboard(
+        known,
+        session_id,
+        columns=1,
         chat_id=chat_id,
         thread_id=thread_id,
     )
@@ -439,6 +479,7 @@ class Outbox:
         max_attempts: int = MAX_ATTEMPTS,
         claim_id: str | None = None,
         quick_replies: QuickReplyFactory = _default_quick_replies,
+        control_buttons: ControlFactory = _default_control_buttons,
         focus: FocusTracker | None = None,
         hold_fresh_ms: int = HOLD_FRESH_MS,
         max_hold_ms: int = MAX_HOLD_MS,
@@ -453,6 +494,7 @@ class Outbox:
         self._max_attempts = max(1, max_attempts)
         self._claim_id = claim_id or deliveries_repo.new_claim_id()
         self._quick_replies = quick_replies
+        self._control_buttons = control_buttons
         # ``pacer`` is the production path: one instance shared with the
         # status cards, so both streams spend the same per-token budget. The
         # rate/burst arguments build a private one, which is what a test that
@@ -591,6 +633,7 @@ class Outbox:
         session_index: int | None = None,
         priority: Priority = Priority.NORMAL,
         silent: bool = False,
+        control_buttons: Sequence[str] = (),
     ) -> int:
         """Queue a durable non-transcript message (a ``Notify`` action).
 
@@ -608,6 +651,7 @@ class Outbox:
             session_index = await deliveries_repo.max_pending_index(
                 self._db, chat_id=chat_id, thread_id=thread_id
             )
+        chunks = chunk_html(html)
         parts = [
             MessagePart(
                 kind=PartKind.TEXT,
@@ -615,8 +659,11 @@ class Outbox:
                 html=chunk,
                 plain=strip_html(chunk),
                 silent=silent,
+                control_buttons=(
+                    tuple(control_buttons) if index == len(chunks) - 1 else ()
+                ),
             )
-            for index, chunk in enumerate(chunk_html(html))
+            for index, chunk in enumerate(chunks)
         ]
         return await self.enqueue_parts(
             parts,
@@ -1042,7 +1089,14 @@ class Outbox:
                     plain=_plain_of(part),
                     silent=part.silent,
                     reply_markup=(
-                        self._quick_replies(
+                        self._control_buttons(
+                            part.control_buttons,
+                            row.session_id,
+                            chat_id=row.chat_id,
+                            thread_id=row.thread_id,
+                        )
+                        if part.control_buttons
+                        else self._quick_replies(
                             part.quick_replies,
                             row.session_id,
                             chat_id=row.chat_id,

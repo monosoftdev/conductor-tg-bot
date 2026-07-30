@@ -110,6 +110,8 @@ class MessagePart:
     #: Agent-provided decision options. The outbox turns these into inline
     #: buttons only on the final text part.
     quick_replies: tuple[str, ...] = ()
+    #: Bot-owned controls attached to durable notices, by CardButton value.
+    control_buttons: tuple[str, ...] = ()
 
     @property
     def utf16_length(self) -> int:
@@ -128,6 +130,9 @@ class MessagePart:
         for reply in self.quick_replies:
             digest.update(b"\x00")
             digest.update(reply.encode("utf-8"))
+        for button in self.control_buttons:
+            digest.update(b"\x00")
+            digest.update(button.encode("utf-8"))
         return digest.hexdigest()
 
     def payload(self) -> dict[str, Any]:
@@ -149,6 +154,8 @@ class MessagePart:
             data["silent"] = True
         if self.quick_replies:
             data["quick_replies"] = list(self.quick_replies)
+        if self.control_buttons:
+            data["control_buttons"] = list(self.control_buttons)
         return data
 
     @classmethod
@@ -170,6 +177,11 @@ class MessagePart:
             quick_replies=tuple(
                 str(value)
                 for value in data.get("quick_replies", ())
+                if isinstance(value, str) and value.strip()
+            )[:4],
+            control_buttons=tuple(
+                str(value)
+                for value in data.get("control_buttons", ())
                 if isinstance(value, str) and value.strip()
             )[:4],
         )

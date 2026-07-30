@@ -13,12 +13,17 @@ from typing import Any, ClassVar
 
 from ctb.conductor.models import TranscriptMessage
 from ctb.delivery.render.adapters.base import SUPPRESS, Adapter
-from ctb.delivery.render.adapters.shapes import first_str, normalize, raw_payload
+from ctb.delivery.render.adapters.shapes import (
+    BlockRole,
+    classify_block,
+    first_str,
+    normalize,
+    payload_blocks,
+    raw_payload,
+)
 from ctb.delivery.render.types import Block, RenderContext
 
 __all__ = ["UserEchoAdapter"]
-
-_CONTRACT_MARK = "OUTPUT CONTRACT"
 
 
 class UserEchoAdapter(Adapter):
@@ -48,19 +53,14 @@ class UserEchoAdapter(Adapter):
 
 def _raw_user_prompt_echo(content: Mapping[str, Any]) -> bool:
     payload = raw_payload(content)
-    if normalize(payload.get("type")) != "user":
-        return False
     message = payload.get("message")
-    if not isinstance(message, Mapping):
+    wrapped = message if isinstance(message, Mapping) else {}
+    if (
+        normalize(payload.get("type")) != "user"
+        and normalize(wrapped.get("role")) != "user"
+    ):
         return False
-    if normalize(message.get("role")) != "user":
+    blocks = payload_blocks(content)
+    if not blocks:
         return False
-    blocks = message.get("content")
-    if not isinstance(blocks, list):
-        return False
-    return any(
-        isinstance(block, Mapping)
-        and normalize(block.get("type")) == "text"
-        and _CONTRACT_MARK in str(block.get("text") or block.get("content") or "")
-        for block in blocks
-    )
+    return all(classify_block(block) is BlockRole.TEXT for block in blocks)

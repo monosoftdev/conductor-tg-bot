@@ -334,6 +334,9 @@ def test_mobile_instruction_binds_narration_format_and_a_numeric_cap() -> None:
     assert "recap your steps" in text
     # A measurable budget, not an adjective.
     assert "6 lines and 80 words" in text
+    # The bot scans the finished transcript for this link and posts a review
+    # handle in the topic.
+    assert "GitHub pull request" in text
     # Formats that wrap badly at ~40 chars are named and banned.
     for banned in ("No tables", "No headings", "bold labels"):
         assert banned in text
