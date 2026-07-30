@@ -19,7 +19,7 @@ import datetime as dt
 import json
 from collections import deque
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from aiogram.dispatcher.middlewares.user_context import (
@@ -289,6 +289,7 @@ def test_delivery_payload_round_trips() -> None:
         plain="x",
         silent=True,
         quick_replies=("Ship now", "Review first"),
+        control_buttons=(CardButton.ARCHIVE.value,),
     )
     data = json.loads(delivery_payload(original, priority=Priority.ERROR))
     assert data["priority"] == int(Priority.ERROR)
@@ -1765,6 +1766,39 @@ async def test_pinning_failure_does_not_lose_the_card(
         PostStatusCard(CardKind.QUEUED, "queued"), session_id=SESSION, chat_id=CHAT
     )
     assert pinning.message_id_for(CHAT) is not None
+
+
+async def test_the_main_chat_is_never_pinned(
+    bot: FakeBot, clock: FakeClock, sleeper: Sleeper
+) -> None:
+    pinning = StatusCards(
+        bot, cast(Database, object()), clock=clock, sleep=sleeper, pin=True
+    )
+
+    await pinning.apply(
+        PostStatusCard(CardKind.QUEUED, "queued"), session_id=SESSION, chat_id=CHAT
+    )
+
+    assert bot.calls_to("pin_chat_message") == []
+
+
+async def test_topic_cards_are_still_pinned(
+    bot: FakeBot, clock: FakeClock, sleeper: Sleeper
+) -> None:
+    pinning = StatusCards(
+        bot, cast(Database, object()), clock=clock, sleep=sleeper, pin=True
+    )
+
+    await pinning.apply(
+        PostStatusCard(CardKind.QUEUED, "queued"),
+        session_id=SESSION,
+        chat_id=CHAT,
+        thread_id=5,
+    )
+
+    pins = bot.calls_to("pin_chat_message")
+    assert len(pins) == 1
+    assert pins[0]["message_id"] == pinning.message_id_for(CHAT, 5)
 
 
 async def test_deleting_the_pinned_card_hands_the_pin_to_its_replacement(

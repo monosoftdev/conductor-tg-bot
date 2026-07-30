@@ -1061,6 +1061,8 @@ class StatusCards:
     async def _pin_card(self, card: _Card) -> None:
         if not self._pin or card.message_id is None:
             return
+        if card.thread_id == NO_THREAD_ID:
+            return
         if card.key in self._pinned:
             return
         # Marked before the call, not after: a chat where we lack the pin

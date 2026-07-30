@@ -208,6 +208,7 @@ async def test_a_finished_turn_is_the_only_thing_that_buzzes(
     html, sent = notices[0]
     assert html == "✅ <b>Done</b> · 1m32s · 12 tools · 5 files"
     assert sent["silent"] is False, "this is the notification"
+    assert sent["control_buttons"] == ("archive",)
     assert sent["chat_id"] == -1001 and sent["thread_id"] == 42
 
 
@@ -252,6 +253,38 @@ async def test_a_finished_turn_with_a_pull_request_posts_and_pins_review_link(
             "disable_notification": True,
         }
     ]
+
+
+async def test_a_pull_request_in_the_main_chat_is_not_pinned(
+    db: Database, system_db: Database
+) -> None:
+    await _bound(db)
+    await sessions.upsert(db, "sess-1", thread_id=0)
+    await db.execute(
+        "INSERT INTO transcript_messages (session_id, message_id, session_index, "
+        "type, content_json, received_at_ms) VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            "sess-1",
+            "m-pr",
+            1,
+            "assistant",
+            json.dumps({"text": "https://github.com/acme/api/pull/31"}),
+            now_ms(),
+        ),
+    )
+    recorder = Recorder()
+    bot = Bot()
+    sink = BotActionSink(bot, db, system_db, recorder, recorder)  # type: ignore[arg-type]
+
+    await sink.handle(
+        (Finalize(TurnSummary(prompts=1)),),
+        session_id="sess-1",
+        chat_id=-1001,
+        thread_id=0,
+    )
+
+    assert [payload for kind, payload in recorder.calls if kind == "send_text"]
+    assert bot.pins == []
 
 
 async def test_the_same_turn_is_never_announced_twice(

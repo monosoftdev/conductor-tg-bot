@@ -94,7 +94,7 @@ MOBILE_REPLY_INSTRUCTION: Final = (
     "the evidence on the same line.\n"
     "6. Decide anything reversible yourself and name the default you took. "
     "Ask only when the repo cannot answer it and the answer changes the "
-    "work.\n"
+    "work. If you opened a GitHub pull request, include its URL.\n"
     "7. To ask: one line of context, then a line that is exactly 'Choices:', "
     "then 2-4 options as '1. ...', '2. ...', recommendation first, each under "
     "40 characters and readable alone (tapping one sends it back as my next "
