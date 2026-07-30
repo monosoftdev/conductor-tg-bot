@@ -59,6 +59,26 @@ UIs). Do this twice, once for `main` and once for `dev`:
 > If `all gates` does not appear in the search box, open any pull request first
 > — GitHub only offers checks it has seen run at least once.
 
+### If the repository is public
+
+Three settings, all under **Settings → Advanced Security** (or *Code security*).
+They are free on public repositories and off until you turn them on.
+
+- ☑ **Secret scanning** — GitHub's own scan of the history, alongside the
+  `secret scan` job in CI. Two scanners with different rule sets is the point;
+  neither one alone has ever been complete.
+- ☑ **Push protection** — blocks a recognised credential at `git push`, before
+  it exists in history at all. This is the only control on the list that
+  prevents rather than reports: once a key is pushed, rotating it is the fix,
+  and `git rm` is not.
+- ☑ **Private vulnerability reporting** — under *Settings → Security*. The link
+  in [`../SECURITY.md`](../SECURITY.md) 404s until this is enabled, which sends
+  a would-be reporter to a public issue instead.
+
+CodeQL (`.github/workflows/codeql.yml`) needs no setting on a public repository
+— it starts working on the next push to `main`. On a private one it requires
+GitHub Advanced Security and will fail until then.
+
 ---
 
 ## 2 · The Telegram bot — you, 5 minutes

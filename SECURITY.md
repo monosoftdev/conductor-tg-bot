@@ -6,8 +6,8 @@ about key handling, tenant isolation or log content as urgent.
 
 ## Reporting a vulnerability
 
-Email **info@reclaimly.com** with `SECURITY` in the subject, or open a
-[private advisory](https://github.com/reclaimly/conductor-tg-bot/security/advisories/new).
+Email **info@monosoft.dev** with `SECURITY` in the subject, or open a
+[private advisory](https://github.com/Monosoft-dev/conductor-tg-bot/security/advisories/new).
 Please do not open a public issue for anything that could expose a key or one
 tenant's data to another.
 
@@ -56,6 +56,27 @@ Read [`docs/TENANCY.md`](docs/TENANCY.md) for the full version. The short one:
   is `false` by default, stored content is capped at 64 KB per message, and
   `transcript_messages` is pruned after 30 days.
 
+## What guards the repository itself
+
+An open codebase that holds keys has a second attack surface: the pipeline that
+builds it.
+
+- **Every GitHub Action is pinned by commit SHA**, and every container by
+  digest. A version tag is mutable, so a tag-pinned third-party action is one
+  force-push away from running somebody else's code with our token.
+- **CI has `permissions: contents: read`** and holds no secrets. A pull request
+  from a fork can therefore run the full suite without being able to write
+  anything, and there is nothing in the environment for it to exfiltrate.
+- **Every pull request is scanned for committed credentials**, over the whole
+  history rather than the diff — and the job fails if the scanner reports having
+  read no commits, because a clean verdict from a scan that read nothing is the
+  one result that would be believed wrongly.
+- **CodeQL** runs on `main` and weekly, so a newly published query reaches code
+  that has not changed.
+- **Dependabot** covers pip, GitHub Actions and Docker weekly.
+
+If you find a way past any of these, it is in scope.
+
 ## If a master key leaks
 
 `CTB_MASTER_KEYS` plus a database dump is every tenant's Conductor key. Back
@@ -72,6 +93,22 @@ the two up separately — together they are one secret.
 
 There is no downtime and no dual-write window: every sealed blob names the key
 that sealed it, so old and new coexist.
+
+Three things worth knowing before you run step 3:
+
+- **It needs `SYSTEM_DATABASE_URL`**, the `ctb_worker` role. That is the default
+  when `--dsn` is not passed. Any other role is refused by name rather than
+  allowed to walk into a permission error partway through.
+- **It re-seals nothing it does not have to.** A row already on the active key
+  is skipped, and a run that fails partway commits nothing, so it is safe to
+  re-run. Re-running it is also how you finish one that was interrupted.
+- **It invalidates in-flight inline buttons.** The callback-signing key is
+  derived from the *active* master key, so a rotation changes it. Buttons expire
+  in minutes anyway, and a tapped stale one reports as expired — which is the
+  safe direction for this to fail in.
+
+Step 3 is covered by `tests/test_rewrap.py`, including the assertion that
+matters most: that every secret still opens once the old key is gone.
 
 ## If the bot token leaks
 

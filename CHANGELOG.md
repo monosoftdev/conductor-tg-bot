@@ -7,9 +7,9 @@ from its first tagged release.
 
 ## [Unreleased]
 
-Nothing is tagged yet. The bot has not been run against a live Conductor
-account and a live Telegram deployment end to end — see
-[What is still unproven](README.md#what-is-still-unproven).
+## [0.1.0] — 2026-07-30
+
+First public release, under the MIT licence.
 
 ### Added
 
@@ -64,6 +64,29 @@ account and a live Telegram deployment end to end — see
 
 ### Security
 
+- `python -m ctb.rewrap` now refuses to run under a role that row-level
+  security applies to. Pointed at the application DSN it failed with
+  `permission denied for table tenants`, three steps into a breach runbook,
+  saying nothing about which of two DSNs to reach for.
+- Rotation now recomputes each stored key fingerprint. `fingerprint_of` is
+  keyed by a subkey of the *active* master key, so every `*_key_fp` was left
+  behind by a rotation — which silently broke the "that is already the stored
+  key" check in `/key` for every tenant.
+- Master-key rotation has tests. It is the module `SECURITY.md` points an
+  operator at after a leak, and it had none: seal under `v1`, load `v2`, re-seal,
+  drop `v1`, and confirm every secret still opens.
+- CI scans the full git history for committed credentials on every pull request,
+  and fails if the scanner reports having read no commits.
+- Every GitHub Action is pinned by commit SHA, and the `actionlint` image by
+  digest. A tag is mutable; on a public repository that is somebody else's push
+  away from being ours.
+- CodeQL runs on `main` and weekly.
+- The published image is pinned to the Python version CI tests on. It ran 3.14
+  while every test job ran 3.13, which made the artifact that reaches production
+  the one interpreter the suite never executed against.
 - `tests/fixtures/probe_verified.jsonl` no longer contains identifiers from a
   live account.
 - CI runs with `permissions: contents: read` and a pinned `actionlint` image.
+
+[Unreleased]: https://github.com/Monosoft-dev/conductor-tg-bot/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/Monosoft-dev/conductor-tg-bot/releases/tag/v0.1.0

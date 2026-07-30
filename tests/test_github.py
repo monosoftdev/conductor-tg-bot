@@ -29,15 +29,15 @@ from tests.pg import BOOTSTRAP_TENANT_ID, OTHER_TENANT_ID
 class TestFindingThePullRequest:
     def test_a_plain_announcement(self) -> None:
         found = find_pull_request(
-            "Fixed the flake.\n\nPR: https://github.com/Reclaimly/conductor-tg-bot/pull/24"
+            "Fixed the flake.\n\nPR: https://github.com/Monosoft-dev/conductor-tg-bot/pull/24"
         )
         assert found is not None
         assert (found.owner, found.repo, found.number) == (
-            "Reclaimly",
+            "Monosoft-dev",
             "conductor-tg-bot",
             24,
         )
-        assert found.slug == "Reclaimly/conductor-tg-bot#24"
+        assert found.slug == "Monosoft-dev/conductor-tg-bot#24"
 
     def test_the_last_one_wins(self) -> None:
         """A turn that cites an older PR before opening its own ends on its own."""

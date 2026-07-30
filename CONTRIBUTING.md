@@ -58,14 +58,23 @@ are the first thing CI checks:
 | Job | What it proves |
 |---|---|
 | `format · lint · types` | style and types, in seconds |
+| `secret scan` | no credential has ever been committed, over the whole history |
 | `tests (no database)` | the pure-logic half really is offline |
 | `tests 1–4/4` | the full suite, sharded, each on its own PostgreSQL |
+| `docker build` | the image builds and can import its own entrypoint |
 | `boot` | `python -m ctb` starts for real against a real database |
 | `all gates` | the single required check — fails if any of the above did |
 
 `CI=true` makes an unreachable database a **failure** rather than a skip. A
 skipped database is not a passing build; it means every isolation, RLS, crypto
 and claim test silently did not run.
+
+The secret scan is allowlisted in [`.gitleaks.toml`](.gitleaks.toml). If it
+flags something of yours, read the entry before adding one next to it: a broad
+`paths` exclusion is how a scanner quietly stops covering the directory a real
+key eventually lands in. And if a match turns out to be genuine, **rotate it** —
+deleting the line does not remove it from history, which is the reason the scan
+reads history at all.
 
 To reproduce a failing shard locally, use the same two flags CI used:
 

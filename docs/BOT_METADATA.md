@@ -32,8 +32,44 @@ Run Conductor cloud coding agents from Telegram. One topic per workspace. Bring 
 
 ## `/setcommands`
 
-Must match `BOT_COMMANDS` in `src/ctb/bot/app.py` — that list is what the code
-registers on boot, and Telegram shows whichever was set last.
+The bot registers this list itself on every boot, so BotFather only needs it if
+you want the menu to be right before the first deploy. Telegram shows whichever
+was set last, which is why the two must agree.
+
+```
+new - New workspace
+board - Live sessions
+attach - Open laptop workspace
+home - Show the launcher buttons
+stop - Stop this turn
+find - Search transcripts
+mode - Current session & controls
+s - Switch session here
+fork - New session here
+notify - Topic alerts
+done - Archive workspace
+setup - Link this group to your team
+invite - Add someone to this team
+use - Pick which team your DMs mean
+health - Team status
+register - Create your team
+key - Store your Conductor API key
+voicekey - Store your speech API key
+gitkey - Store your GitHub CI token
+help - Quick control guide
+```
+
+Regenerate it after any change to `BOT_COMMANDS` in `src/ctb/bot/app.py`:
+
+```bash
+.venv/bin/python -c "from ctb.bot.app import BOT_COMMANDS
+for c in BOT_COMMANDS: print(f'{c.command} - {c.description}')"
+```
+
+Twenty of the forty commands, on purpose. Destructive ones (`/forget`,
+`/revoke`, `/tidy`) and operator-only ones (`/platform`) stay out of the menu:
+advertising them to every customer costs more than it teaches. They all still
+work, and `/help` lists the ones a person needs.
 
 ## Settings that are not copy
 

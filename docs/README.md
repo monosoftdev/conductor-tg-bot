@@ -20,6 +20,7 @@ before you spend time on one that describes a design rather than the system.
 |---|---|
 | [`RELIABILITY_AUDIT.md`](RELIABILITY_AUDIT.md) | The failure modes that were deliberately tested, and how. |
 | [`VOICE_CONTROL_PLAN.md`](VOICE_CONTROL_PLAN.md) | The design of the voice path. |
+| [`BOT_METADATA.md`](BOT_METADATA.md) | The BotFather copy — name, description, about text, and the four settings that are not copy. The store listing is the one piece of user-facing text that does not live in the code, so it drifts unless it is written down. |
 
 ## Historical — kept for the reasoning, not as a description
 
@@ -27,7 +28,7 @@ before you spend time on one that describes a design rather than the system.
 |---|---|
 | [`PLAN.md`](PLAN.md) | The original single-user design. Its reasoning about the Conductor API, the turn state machine and the delivery contract is exactly right and still implemented. Its storage (SQLite), its single owner, and its required supergroup are all superseded. |
 | [`ROADMAP.md`](ROADMAP.md) | What was built in what order. A record, not a plan. |
-| [`HANDOFF.md`](HANDOFF.md) | Working notes: what is done, what is next, what is unproven. Written for whoever picks the work up next, including a future maintainer. |
+| [`HANDOFF.md`](HANDOFF.md) | Working notes, newest first: why a given decision went the way it did. Written for whoever picks the work up next. Where it and `TENANCY.md` disagree, `TENANCY.md` wins. |
 
 ## Not in this directory
 

@@ -1,7 +1,7 @@
 blank_issues_enabled: false
 contact_links:
   - name: Security vulnerability
-    url: https://github.com/reclaimly/conductor-tg-bot/security/advisories/new
+    url: https://github.com/Monosoft-dev/conductor-tg-bot/security/advisories/new
     about: >-
       Never report a key exposure or a cross-tenant leak in a public issue.
       Open a private advisory instead. See SECURITY.md.
