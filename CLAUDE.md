@@ -130,7 +130,7 @@ key.
 > **Run only the tests for what you changed. CI runs the whole suite, in
 > parallel, and nothing merges until it is green.**
 
-The full suite is ~2,000 tests. Running all of it after every edit is the single
+The full suite is ~2,300 tests. Running all of it after every edit is the single
 biggest waste of time in this repo, and it buys nothing a shared runner cannot
 buy more cheaply. So locally:
 
@@ -157,8 +157,9 @@ chain touches everything, and so does anything you are about to tag.
 ```
 
 **CI is the gate, not your laptop.** `.github/workflows/ci.yml` runs format,
-lint, types, the offline subset, four test shards and a real boot smoke — all in
-parallel, each shard against its own PostgreSQL. The `all gates` job is the one
+lint, types, a secret scan over the whole history, the offline subset, four test
+shards, a Docker build and a real boot smoke — all in parallel, each shard
+against its own PostgreSQL. The `all gates` job is the one
 required check; it fails if any job fails, was skipped, or was cancelled.
 
 Two things that are not negotiable there:
@@ -188,7 +189,7 @@ gh pr create --fill                     # body: what changed and why, not how
 ```
 
 The final report then **names the PR and links it**, on its own last line:
-`PR: https://github.com/reclaimly/conductor-tg-bot/pull/NN`. A report without
+`PR: https://github.com/monosoftdev/conductor-tg-bot/pull/NN`. A report without
 that link is an unfinished task — the reader cannot reach the work.
 
 The exception is being told otherwise: *"don't open a PR"*, *"just show me the

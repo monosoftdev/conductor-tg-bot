@@ -3,7 +3,7 @@ name = "conductor-tg-bot"
 version = "0.1.0"
 description = "Drive Conductor cloud coding agents from Telegram."
 readme = "README.md"
-authors = [{ name = "Reclaimly, Inc.", email = "info@reclaimly.com" }]
+authors = [{ name = "Monosoft LLC", email = "info@monosoft.dev" }]
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.13"
@@ -39,9 +39,12 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/reclaimly/conductor-tg-bot"
-Source = "https://github.com/reclaimly/conductor-tg-bot"
-Issues = "https://github.com/reclaimly/conductor-tg-bot/issues"
+Homepage = "https://github.com/monosoftdev/conductor-tg-bot"
+Source = "https://github.com/monosoftdev/conductor-tg-bot"
+Issues = "https://github.com/monosoftdev/conductor-tg-bot/issues"
+Changelog = "https://github.com/monosoftdev/conductor-tg-bot/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/monosoftdev/conductor-tg-bot/tree/main/docs"
+Security = "https://github.com/monosoftdev/conductor-tg-bot/blob/main/SECURITY.md"
 
 [build-system]
 requires = ["hatchling"]

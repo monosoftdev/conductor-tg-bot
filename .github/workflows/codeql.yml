@@ -1,0 +1,47 @@
+# Static analysis, on a schedule and on `main`.
+#
+# Deliberately **not** on `pull_request`. CodeQL takes minutes, finds the class
+# of bug that survives review rather than the class that blocks a merge, and the
+# one required check on a pull request is `all gates` in `ci.yml`. Running it
+# here keeps the merge path fast and still means nothing sits in `main` unread.
+#
+# The weekly run is the one that earns its place: a new query release finds bugs
+# in code that has not changed, and nothing else in this repository would ever
+# notice.
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # Mondays, early. No relation to anyone's working hours; it just needs to
+    # not collide with the Dependabot batch.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: analyze (python)
+    runs-on: ubuntu-latest
+    permissions:
+      # The only reason this workflow needs more than `contents: read`.
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Initialize
+        uses: github/codeql-action/init@f205ea1c3313d32999d8d6a48b4f6530d4437b38 # v4
+        with:
+          languages: python
+          # `security-and-quality` over the default `security-extended`: this is
+          # a codebase with opinions about correctness, and the quality queries
+          # are the ones that catch a comparison that cannot be true.
+          queries: security-and-quality
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@f205ea1c3313d32999d8d6a48b4f6530d4437b38 # v4
+        with:
+          category: "/language:python"
