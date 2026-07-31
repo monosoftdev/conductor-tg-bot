@@ -1,5 +1,7 @@
 # conductor-tg-bot
 
+### 👉 [@Conductor_agent_bot](https://t.me/Conductor_agent_bot) — the live bot on Telegram. Say `/start` to it.
+
 [![CI](https://github.com/monosoftdev/conductor-tg-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/monosoftdev/conductor-tg-bot/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python 3.13](https://img.shields.io/badge/python-3.13-blue.svg)](https://www.python.org/downloads/)
