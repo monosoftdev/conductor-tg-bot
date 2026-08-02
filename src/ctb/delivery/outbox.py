@@ -1048,7 +1048,14 @@ class Outbox:
     async def _reroute_to_general(
         self, row: DeliveryRow, exc: BaseException
     ) -> _Outcome:
-        """Re-home one row from a vanished topic to the group's General."""
+        """Re-home one row from a vanished topic to the group's General.
+
+        And free the room itself. Moving only the *row* left the session still
+        pointing at the dead thread, so the next turn queued there and paid this
+        reroute again, row by row, forever — while ``/board`` kept offering a
+        jump to a topic that does not exist. ``room_gone`` is idempotent, so
+        the rest of this batch discovering the same thing costs nothing.
+        """
         moved = await deliveries_repo.move_to_thread(
             self._db, row.key, thread_id=NO_THREAD_ID
         )
@@ -1060,12 +1067,31 @@ class Outbox:
             thread_id=row.thread_id,
             error=repr(exc)[:200],
         )
+        await self._release_room(row)
         if moved is None:  # pragma: no cover - the row was just claimed
             await self._fail(row, exc=exc, retry=False)
             return _Outcome.DROPPED
         # Deferred, not dropped: the row is pending again at a new destination,
         # and the rest of this batch belongs to the destination that is gone.
         return _Outcome.DEFERRED
+
+    async def _release_room(self, row: DeliveryRow) -> None:
+        """Tell the one seam that a topic is gone. Never fails a delivery.
+
+        Imported here rather than at module scope: ``handlers.topics`` imports
+        ``THREAD_GONE_MARKERS`` from this module, and delivery must not grow a
+        construction-order dependency on the bot layer.
+        """
+        try:
+            from ctb.bot.handlers.topics import room_gone
+
+            await room_gone(self._bot, self._db, row.session_id)  # type: ignore[arg-type]
+        except Exception as exc:  # noqa: BLE001 - cosmetics never fail delivery
+            _log.warning(
+                "outbox.room_release_failed",
+                session_id=row.session_id,
+                error=repr(exc)[:200],
+            )
 
     async def _send_part(self, row: DeliveryRow, part: MessagePart) -> int | None:
         """Dispatch by part kind, absorbing one *short* Telegram 429.

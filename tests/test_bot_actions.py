@@ -58,22 +58,13 @@ class Bot:
         self.pins.append(kwargs)
 
 
-async def _bound(db: Database) -> None:
-    await workspaces.upsert(
-        db,
-        "ws-1",
-        chat_id=-1001,
-        topic_id=42,
-        topic_name="api/main",
+async def _bound(db: Database, session_id: str = "sess-1", thread_id: int = 42) -> None:
+    await workspaces.upsert(db, "ws-1", chat_id=-1001, topic_name="api/main")
+    await sessions.upsert(db, session_id, workspace_id="ws-1")
+    await sessions.bind_topic(
+        db, session_id, chat_id=-1001, topic_id=thread_id, topic_name="api/main"
     )
-    await workspaces.set_topic_marker(db, "ws-1", TopicMarker.IDLE.value)
-    await sessions.upsert(
-        db,
-        "sess-1",
-        workspace_id="ws-1",
-        chat_id=-1001,
-        thread_id=42,
-    )
+    await sessions.set_topic_marker(db, session_id, TopicMarker.IDLE.value)
 
 
 async def test_sink_fans_out_cards_notice_and_topic_marker(
@@ -108,9 +99,9 @@ async def test_sink_fans_out_cards_notice_and_topic_marker(
             "icon_custom_emoji_id": None,
         }
     ]
-    workspace = await workspaces.get(db, "ws-1")
-    assert workspace is not None
-    assert workspace.topic_marker == TopicMarker.ERROR.value
+    session = await sessions.get(db, "sess-1")
+    assert session is not None
+    assert session.topic_marker == TopicMarker.ERROR.value
 
 
 async def test_quiet_notice_is_silent_and_deduped_by_stable_key(
@@ -405,7 +396,7 @@ async def test_a_finished_topic_is_marked_done_not_left_blank(db: Database) -> N
     bot = _IconBot()
     topics._ICON_IDS.clear()
 
-    renamed = await topics.apply_marker(bot, db, "ws-1", TopicMarker.DONE)  # type: ignore[arg-type]
+    renamed = await topics.apply_marker(bot, db, "sess-1", TopicMarker.DONE)  # type: ignore[arg-type]
 
     assert renamed is True
     assert bot.renames[0]["name"].startswith(signals.DONE)
@@ -419,7 +410,7 @@ async def test_an_unfetchable_icon_pack_still_renames(db: Database) -> None:
     bot = _IconBot(pack=False)
     topics._ICON_IDS.clear()
 
-    renamed = await topics.apply_marker(bot, db, "ws-1", TopicMarker.WORKING)  # type: ignore[arg-type]
+    renamed = await topics.apply_marker(bot, db, "sess-1", TopicMarker.WORKING)  # type: ignore[arg-type]
 
     assert renamed is True
     assert bot.renames[0]["name"].startswith(signals.WORKING)
@@ -434,17 +425,17 @@ async def test_renaming_to_the_same_title_costs_no_api_call(db: Database) -> Non
 
     double: Any = bot
     first = await topics.apply_marker(
-        double, db, "ws-1", TopicMarker.IDLE, label="api/main"
+        double, db, "sess-1", TopicMarker.IDLE, label="api/main"
     )
     second = await topics.apply_marker(
-        double, db, "ws-1", TopicMarker.IDLE, label="api/main"
+        double, db, "sess-1", TopicMarker.IDLE, label="api/main"
     )
 
     assert (first, second) == (False, False), "same marker, same name, no call"
     assert bot.renames == []
     # A genuinely different name still renames.
     assert await topics.apply_marker(
-        double, db, "ws-1", TopicMarker.IDLE, label="api/dev"
+        double, db, "sess-1", TopicMarker.IDLE, label="api/dev"
     )
 
 
@@ -461,7 +452,7 @@ async def test_the_icon_moves_with_the_state_not_just_the_name(db: Database) -> 
     double: Any = bot
 
     for marker in (TopicMarker.WORKING, TopicMarker.DONE, TopicMarker.SLEEPING):
-        assert await topics.apply_marker(double, db, "ws-1", marker)
+        assert await topics.apply_marker(double, db, "sess-1", marker)
 
     assert [rename["icon_custom_emoji_id"] for rename in bot.renames] == [
         "id-working",
@@ -485,7 +476,7 @@ async def test_a_pack_that_spells_an_emoji_with_a_selector_still_matches(
     bot = _IconBot(icons=(("⚡️", "id-working"),))
     topics._ICON_IDS.clear()
 
-    assert await topics.apply_marker(bot, db, "ws-1", TopicMarker.WORKING)  # type: ignore[arg-type]
+    assert await topics.apply_marker(bot, db, "sess-1", TopicMarker.WORKING)  # type: ignore[arg-type]
 
     assert bot.renames[0]["icon_custom_emoji_id"] == "id-working"
 
@@ -499,7 +490,7 @@ async def test_a_state_falls_back_to_an_emoji_the_pack_does_carry(
     bot = _IconBot(icons=(("🛠", "id-tools"),))
     topics._ICON_IDS.clear()
 
-    assert await topics.apply_marker(bot, db, "ws-1", TopicMarker.WORKING)  # type: ignore[arg-type]
+    assert await topics.apply_marker(bot, db, "sess-1", TopicMarker.WORKING)  # type: ignore[arg-type]
 
     assert bot.renames[0]["icon_custom_emoji_id"] == "id-tools"
 
@@ -512,7 +503,7 @@ async def test_a_pack_of_an_unexpected_shape_still_renames(db: Database) -> None
     bot.get_forum_topic_icon_stickers = _not_a_list  # type: ignore[method-assign]
     topics._ICON_IDS.clear()
 
-    assert await topics.apply_marker(bot, db, "ws-1", TopicMarker.WORKING)  # type: ignore[arg-type]
+    assert await topics.apply_marker(bot, db, "sess-1", TopicMarker.WORKING)  # type: ignore[arg-type]
 
     assert bot.renames[0]["name"].startswith(signals.WORKING)
     assert bot.renames[0]["icon_custom_emoji_id"] is None
@@ -529,7 +520,7 @@ async def test_a_pack_carrying_none_of_them_still_renames(db: Database) -> None:
     bot = _IconBot(icons=(("🍕", "id-pizza"),))
     topics._ICON_IDS.clear()
 
-    assert await topics.apply_marker(bot, db, "ws-1", TopicMarker.WORKING)  # type: ignore[arg-type]
+    assert await topics.apply_marker(bot, db, "sess-1", TopicMarker.WORKING)  # type: ignore[arg-type]
 
     assert bot.renames[0]["name"].startswith(signals.WORKING)
     assert bot.renames[0]["icon_custom_emoji_id"] is None

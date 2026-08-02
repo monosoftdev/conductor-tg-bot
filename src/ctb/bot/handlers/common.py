@@ -105,7 +105,8 @@ MOBILE_REPLY_INSTRUCTION: Final = (
 #: get one. What Telegram said is for the log — the tenant cannot flip another
 #: account's @BotFather toggle — so the line carries only what changes for them.
 LINEAR_DM_NOTICE: Final = (
-    "Topics unavailable here · one workspace at a time. <code>/s</code> switches."
+    "Topics unavailable here · one task at a time. "
+    "<code>/board</code> moves this chat to another."
 )
 #: Chats already told. In-process on purpose: this is a nudge, not a fact worth
 #: a column, and repeating it once after a redeploy is cheaper than a migration.
@@ -156,8 +157,8 @@ class CreatedBinding:
 
 
 @dataclass(frozen=True, slots=True)
-class _Seat:
-    """Where a new workspace will live, decided before anything is paid for."""
+class Seat:
+    """Where a new session will live, decided before anything is paid for."""
 
     thread_id: int
     #: Set only when *this* call created the topic — the only one we may delete.
@@ -439,6 +440,75 @@ def augment_prompt(text: str) -> str:
     return f"{cleaned}\n\n{MOBILE_REPLY_INSTRUCTION}"
 
 
+async def open_room(
+    *,
+    bot: Bot | None,
+    chat_id: int,
+    chat_type: str,
+    label: str,
+    claimable_thread: int = NO_THREAD_ID,
+    color_key: str | None = None,
+) -> Seat:
+    """Open one room, degrading the way this chat kind degrades. Never pays.
+
+    Factored out of :func:`_seat_for` so ``/new`` and ``/fork`` cannot drift on
+    the one question that has three answers: a group refuses loudly, a DM
+    degrades to its linear seat, and a request that arrived in an empty thread
+    claims that thread instead of opening a sibling beside it.
+    """
+    if chat_type == "private":
+        if bot is None:
+            return Seat(NO_THREAD_ID, refusal="no bot bound")
+        if claimable_thread:
+            # No `dm_topic_support` probe: this update *arrived* in a thread, so
+            # the question it answers ("can this bot have topics here?") is
+            # already answered, and answered by the only thing that counts.
+            claim = await claim_topic(bot, chat_id, claimable_thread, label)
+            if claim.alive:
+                return Seat(
+                    claimable_thread,
+                    claimed_topic=claimable_thread,
+                    claimed_named=claim.named,
+                )
+            # Deleted between the card and the tap. Fall through and open one.
+        support = await dm_topic_support(bot)
+        if support.degraded:
+            return Seat(NO_THREAD_ID, refusal=support.detail or support.reason)
+        try:
+            topic_id = await require_topic(bot, chat_id, label, color_key=color_key)
+        except TopicCreateError as exc:
+            return Seat(NO_THREAD_ID, refusal=exc.reason)
+        return Seat(topic_id, fresh_topic=topic_id)
+    if bot is None:
+        raise RuntimeError("Telegram bot is not bound to the input")
+    support = await forum_support(bot, chat_id)
+    if support.degraded:
+        raise RuntimeError(
+            f"No topic permission ({support.detail or support.reason}). Run /setup."
+        )
+    topic_id = await require_topic(bot, chat_id, label, color_key=color_key)
+    return Seat(topic_id, fresh_topic=topic_id)
+
+
+async def _prior_room(
+    database: Database, nonce: str, chat_id: int
+) -> tuple[int, str | None] | None:
+    """The room a replayed ``/new`` already opened, if this nonce made one.
+
+    ``POST /v0/workspaces`` has no idempotency key, so the nonce embedded in the
+    generated workspace name is how a replayed update is recognised. It resolves
+    to a *workspace*; the room now belongs to a session, so the lookup goes one
+    hop further and takes that workspace's newest session that has a room here.
+    """
+    prior = await workspaces_repo.get_by_nonce(database, nonce)
+    if prior is None:
+        return None
+    for row in await sessions_repo.list_for_workspace(database, prior.id):
+        if row.chat_id == chat_id and row.thread_id:
+            return row.thread_id, row.topic_name
+    return None
+
+
 async def _seat_for(
     *,
     bot: Bot | None,
@@ -448,7 +518,8 @@ async def _seat_for(
     label: str,
     nonce: str,
     claimable_thread: int = NO_THREAD_ID,
-) -> _Seat:
+    color_key: str | None = None,
+) -> Seat:
     """Reserve the room this workspace will live in — **before** it is paid for.
 
     A cloud workspace starts billing the instant it is created, and
@@ -483,43 +554,19 @@ async def _seat_for(
     puts a human-length pause in front of the create, and a thread can be
     deleted in that window.
     """
-    prior = await workspaces_repo.get_by_nonce(database, nonce)
-    if prior is not None and prior.chat_id == chat_id and prior.topic_id:
+    prior = await _prior_room(database, nonce, chat_id)
+    if prior is not None:
         # A replayed update: reuse the topic this nonce already owns rather
         # than opening a sibling next to it.
-        return _Seat(prior.topic_id, prior_label=prior.topic_name)
-    if chat_type == "private":
-        if bot is None:
-            return _Seat(NO_THREAD_ID, refusal="no bot bound")
-        if claimable_thread:
-            # No `dm_topic_support` probe: this update *arrived* in a thread, so
-            # the question it answers ("can this bot have topics here?") is
-            # already answered, and answered by the only thing that counts.
-            claim = await claim_topic(bot, chat_id, claimable_thread, label)
-            if claim.alive:
-                return _Seat(
-                    claimable_thread,
-                    claimed_topic=claimable_thread,
-                    claimed_named=claim.named,
-                )
-            # Deleted between the card and the tap. Fall through and open one.
-        support = await dm_topic_support(bot)
-        if support.degraded:
-            return _Seat(NO_THREAD_ID, refusal=support.detail or support.reason)
-        try:
-            topic_id = await require_topic(bot, chat_id, label)
-        except TopicCreateError as exc:
-            return _Seat(NO_THREAD_ID, refusal=exc.reason)
-        return _Seat(topic_id, fresh_topic=topic_id)
-    if bot is None:
-        raise RuntimeError("Telegram bot is not bound to the input")
-    support = await forum_support(bot, chat_id)
-    if support.degraded:
-        raise RuntimeError(
-            f"No topic permission ({support.detail or support.reason}). Run /setup."
-        )
-    topic_id = await require_topic(bot, chat_id, label)
-    return _Seat(topic_id, fresh_topic=topic_id)
+        return Seat(prior[0], prior_label=prior[1])
+    return await open_room(
+        bot=bot,
+        chat_id=chat_id,
+        chat_type=chat_type,
+        label=label,
+        claimable_thread=claimable_thread,
+        color_key=color_key,
+    )
 
 
 async def note_linear_seat(bot: Bot | None, chat_id: int, reason: str) -> bool:
@@ -587,10 +634,14 @@ async def create_and_bind_input(
     database = resolve_db(db)
     conductor = client
     validate_pairing(request.agent, request.model, request.effort)
-    # The opening prompt names the topic. Taken once, here, and never revisited:
-    # `apply_marker` only ever changes the prefix, so the name a workspace is
-    # born with is the name it keeps.
+    # The opening prompt names the *room*. Taken once, here, and never revisited:
+    # `apply_marker` only ever changes the prefix, so the name a session is born
+    # with is the name it keeps.
     label = topic_label(request.project_name, request.branch, task=request.prompt)
+    # And the workspace keeps the taskless form — it is what `/board` stage 1
+    # calls this workspace, and what every room of it hashes its colour from, so
+    # all of them read as one family in the topic list.
+    family = topic_label(request.project_name, request.branch)
 
     operation_id = action_id or f"{chat_id}:{tg_message_id}"
     nonce = cursor.stable_nonce(operation_id)
@@ -602,6 +653,7 @@ async def create_and_bind_input(
         label=label,
         nonce=nonce,
         claimable_thread=route.claimable_thread,
+        color_key=family,
     )
     thread_id = seat.thread_id
     fresh_topic = seat.fresh_topic
@@ -633,16 +685,18 @@ async def create_and_bind_input(
     workspace_id = creation.workspace_id
     workspace_name = creation.name
     deep_link = creation.deep_link
-    # Persist the mapping immediately: from here on a replay reuses this topic.
-    if seat.owns_topic:
-        await workspaces_repo.upsert(
-            database,
-            workspace_id,
-            create_nonce=nonce,
-            chat_id=chat_id,
-            topic_id=thread_id,
-            topic_name=label,
-        )
+    # Persist the nonce mapping immediately: from here on a replay finds this
+    # workspace rather than paying for a second one. `chat_id` still lives on
+    # the workspace — it answers "which Telegram chat is this in?", which
+    # `/attach` uses to refuse opening it in a second one — but the *room* is
+    # the session's from here on.
+    await workspaces_repo.upsert(
+        database,
+        workspace_id,
+        create_nonce=nonce,
+        chat_id=chat_id,
+        topic_name=family,
+    )
     session_id = creation.session_id or ""
     if not session_id:
         page = await conductor.list_workspace_sessions(workspace_id, limit=1)
@@ -650,17 +704,37 @@ async def create_and_bind_input(
             raise RuntimeError("Workspace created, but no session was returned.")
         session_id = page.data[0].id
 
+    await sessions_repo.upsert(
+        database,
+        session_id,
+        workspace_id=workspace_id,
+        title=request.prompt[:80],
+        agent=request.agent,
+        model=request.model,
+        effort=request.effort,
+    )
+    if thread_id:
+        # The room, on the session, before anything renames it. `prior_label`
+        # is what a replayed nonce's room is already *called*; recording that
+        # rather than `label` is what lets `apply_marker` below see the drift.
+        await sessions_repo.bind_topic(
+            database,
+            session_id,
+            chat_id=chat_id,
+            topic_id=thread_id,
+            topic_name=prior_label or label,
+        )
     # The topic was named before the workspace existed. If what it actually
     # carries is not what the workspace ended up called, correct it through the
     # one rename path there is — never a second mechanism.
     #
-    # **Before** the upsert below, not after. `apply_marker` decides whether a
+    # **Before** the marker below, not after. `apply_marker` decides whether a
     # rename is needed by comparing against the title the row says was last
-    # applied; writing `topic_name=label` first destroys exactly that evidence
-    # and makes the correction skip itself.
+    # applied; writing the marker first destroys exactly that evidence and makes
+    # the correction skip itself.
     if bot is not None and prior_label is not None and prior_label != label:
         await apply_marker(
-            bot, database, workspace_id, TopicMarker.INITIALIZING, label=label
+            bot, database, session_id, TopicMarker.INITIALIZING, label=label
         )
     await workspaces_repo.upsert(
         database,
@@ -675,8 +749,7 @@ async def create_and_bind_input(
         status="initializing",
         create_nonce=nonce,
         chat_id=chat_id,
-        topic_id=thread_id if thread_id else None,
-        topic_name=label,
+        topic_name=family,
     )
     if thread_id and (seat.fresh_topic is not None or seat.claimed_named):
         # The room is wearing ⏳ right now — `require_topic` created it that way,
@@ -688,21 +761,9 @@ async def create_and_bind_input(
         # Deliberately *not* recorded when a claimed thread refused the rename:
         # the row would then assert a title the list has never shown, and the
         # next transition would skip the rename that would have fixed it.
-        await workspaces_repo.set_topic_marker(
-            database, workspace_id, TopicMarker.INITIALIZING.value
+        await sessions_repo.set_topic_marker(
+            database, session_id, TopicMarker.INITIALIZING.value
         )
-    await sessions_repo.upsert(
-        database,
-        session_id,
-        workspace_id=workspace_id,
-        title=request.prompt[:80],
-        agent=request.agent,
-        model=request.model,
-        effort=request.effort,
-        chat_id=chat_id,
-        thread_id=thread_id,
-        is_bound=True,
-    )
     # This session was created by us and is empty before the first POST. Mark
     # that known boundary explicitly. Letting the supervisor "seek to end"
     # later could skip a fast first reply that completed before its first pass.
@@ -712,6 +773,11 @@ async def create_and_bind_input(
         message_id=None,
         session_index=-1,
     )
+    # Bound last, and through `bind` rather than a raw upsert: it releases the
+    # seat's previous occupant in the same transaction, which is the whole of
+    # vector 3. The supervisor starts a poller for anything bound, so nothing
+    # before this line may be left half-written.
+    await sessions_repo.bind(database, session_id, chat_id=chat_id, thread_id=thread_id)
     # A seat with a thread is a topic seat, whatever chat it is in. Only the
     # linear DM root is still ``dm``.
     kind = "dm" if chat_type == "private" and not thread_id else "topic"
@@ -823,7 +889,9 @@ def created_card(
 async def require_session(message: Message, route: Route) -> str | None:
     if route.session_id:
         return route.session_id
-    await tell(message, "No session here. Use <code>/new</code> or <code>/s</code>.")
+    await tell(
+        message, "No session here. Use <code>/new</code> or <code>/board</code>."
+    )
     return None
 
 

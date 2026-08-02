@@ -4,16 +4,27 @@ from __future__ import annotations
 
 import re
 from collections.abc import Collection
-from typing import Final
+from dataclasses import dataclass
+from typing import Any, Final
 
 from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 from ctb import signals
 from ctb.bot.app import register_router
-from ctb.bot.handlers.adopt import adopt_button
+from ctb.bot.handlers.adopt import (
+    SESSION_SCAN,
+    ack_line,
+    adopt_button,
+    adopt_workspace,
+)
 from ctb.bot.handlers.common import (
     abandon_wizard,
     command_text,
@@ -40,6 +51,7 @@ from ctb.bot.handlers.topics import (
 )
 from ctb.bot.keyboards import (
     CONTROL_TTL_S,
+    PLAIN_STYLE,
     Action,
     Cb,
     NonceError,
@@ -62,8 +74,11 @@ from ctb.db.repo import workspaces as workspaces_repo
 from ctb.db.repo.sessions import SessionRow
 from ctb.db.repo.workspaces import WorkspaceRow
 from ctb.delivery.render.html import escape
+from ctb.logging import get_logger
 from ctb.turn.state import TurnState
 from ctb.turn.supervisor import Supervisor
+
+log = get_logger(__name__)
 
 router = Router(name=__name__)
 register_router(router, order=20)
@@ -77,7 +92,11 @@ FIND_VISIBLE: Final = 5
 #: uses. The *caller* caps what it shows and says how many it hid; nothing here
 #: truncates silently.
 ADOPTABLE_SCAN: Final = 20
-#: The confirm button already names the workspace. Say what tapping it does.
+#: Sessions ``/board`` stage 2 lists before it says how many it hid.
+BOARD_SESSIONS_VISIBLE: Final = 10
+#: The confirm button already names the task. Say what tapping it does — and
+#: the two cards must not read alike, because one of them takes the whole
+#: workspace with it.
 ARCHIVE_CONSEQUENCE: Final = (
     "Deletes this topic and everything said in it. "
     "The workspace stays restorable in Conductor."
@@ -235,107 +254,526 @@ async def board(
     db: Database | None = None,
     client: ConductorClient | None = None,
 ) -> None:
+    """Stage 1 of a two-stage picker: which workspace, then which session.
+
+    A session is one Conductor chat, and a topic is now one per session — so
+    "open a workspace" stopped being a single tap and became a question with two
+    halves. The wording carries the whole feature: stage 1 says *see its
+    sessions* and never says "open"; stage 2 says *open it in this chat* and
+    never says "workspace" as the thing being chosen.
+    """
     await abandon_wizard(state)
     database = resolve_db(db)
     rows = await board_rows(database, resolve_client(client, tenant))
+    query = command_text(message)
+    if query:
+        needle = query.casefold()
+        rows = [row for row in rows if needle in row_name(row).casefold()]
     if not rows:
-        await tell(message, "No live workspaces.")
+        await tell(message, "No live workspaces." if not query else "No match.")
         return
-    # Every row is a button. One that already has a topic jumps to it; one made
-    # on the laptop gets "+ Open …", which opens a topic for it here.
+    text, markup = board_stage1(
+        rows,
+        store=nonces,
+        user_id=message.from_user.id if message.from_user else None,
+        chat_id=message.chat.id,
+        thread_id=message.message_thread_id or NO_THREAD_ID,
+    )
+    await tell(message, text, reply_markup=markup)
+
+
+def board_stage1(
+    rows: list[dict[str, object]],
+    *,
+    store: NonceStore,
+    user_id: int | None,
+    chat_id: int,
+    thread_id: int,
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    """The workspace picker. **Every row behaves identically.**
+
+    ``/board`` used to special-case a workspace with no room here into a
+    ``+ Open …`` adopt button, so two rows of the same list did two different
+    things and only one of them told you which. A laptop workspace and a local
+    one both drill down now; the difference shows up in stage 2, as jump versus
+    open, where there is room to say so. ``adopt_button`` stays in ``/attach``.
+    """
     buttons = []
     for row in rows[:BOARD_VISIBLE]:
-        wid = str(row.get("workspace_id") or "")
-        local = await workspaces_repo.get(database, wid) if wid else None
-        name = human_name(str(row.get("workspace_name") or "")) or str(
-            row.get("session_title") or wid[:8]
-        )
+        workspace_id = str(row.get("workspace_id") or "")
+        if not workspace_id:
+            continue
         icon = status_icon(
             str(row.get("display_state") or row.get("workspace_state") or "")
         )
-        model = str(row.get("model") or "")
-        target = (
-            jump_url(local.chat_id, local.topic_id)
-            if local and local.chat_id and local.topic_id
-            else None
+        count = _session_count(row)
+        buttons.append(
+            [
+                button(
+                    f"{icon} {row_name(row)} · {_sessions_suffix(count)}",
+                    Action.BOARD_WS,
+                    workspace_id,
+                    store=store,
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    ttl=CONTROL_TTL_S,
+                )
+            ]
         )
-        if target:
-            suffix = f" · {model}" if model else ""
-            buttons.append([url_button(f"{icon} {name}{suffix}", target)])
-        elif wid:
-            buttons.append(
-                [
-                    adopt_button(
-                        workspace_id=wid,
-                        name=name,
-                        session_id=str(row.get("session_id") or "") or None,
-                        store=nonces,
-                        user_id=message.from_user.id if message.from_user else None,
-                        chat_id=message.chat.id,
-                        thread_id=message.message_thread_id or 0,
-                    )
-                ]
-            )
     # "live" said nothing about what was being counted, which is how a board of
     # two workspaces came to announce "4 live" and look plausible.
-    lines = [f"<b>{len(rows)} workspace{'' if len(rows) == 1 else 's'}</b>"]
+    lines = [f"<b>Workspaces · {len(rows)}</b>", "Tap one to see its sessions."]
     if len(rows) > BOARD_VISIBLE:
-        lines.append(f"<i>+{len(rows) - BOARD_VISIBLE} more · /s</i>")
-    await tell(
-        message, "\n".join(lines), reply_markup=keyboard(buttons) if buttons else None
-    )
+        lines.append(f"<i>+{len(rows) - BOARD_VISIBLE} more · /board name</i>")
+    return "\n".join(lines), keyboard(buttons) if buttons else None
+
+
+def _session_count(row: dict[str, object]) -> int:
+    """``session_count`` off a view row, which is untyped at the wire."""
+    value = row.get("session_count")
+    return value if isinstance(value, int) else 0
+
+
+def _sessions_suffix(count: int) -> str:
+    if count <= 0:
+        return "no sessions yet"
+    return f"{count} session{'' if count == 1 else 's'}"
+
+
+#: Which state a workspace wears in stage 1 when its sessions disagree. The
+#: *most active* one, not the newest: a workspace with one working session reads
+#: ⚙️ even when the session that spoke last has gone quiet.
+_STATE_PRIORITY: Final[tuple[frozenset[TurnState], ...]] = (
+    frozenset({TurnState.ERROR, TurnState.DEAD}),
+    _ACTIVE_STATES,
+)
+
+
+def _busiest(states: list[TurnState]) -> TurnState | None:
+    for tier in _STATE_PRIORITY:
+        for state in states:
+            if state in tier:
+                return state
+    return states[0] if states else None
+
+
+def _local_board_rows(
+    local: Collection[WorkspaceRow],
+    sessions: dict[str, list[SessionRow]],
+    *,
+    exclude: Collection[str],
+) -> list[dict[str, object]]:
+    """Cached workspaces the transcript view has not heard of yet."""
+    skip = frozenset(exclude)
+    out: list[dict[str, object]] = []
+    for row in local:
+        if row.id in skip:
+            continue
+        known = sessions.get(row.id, [])
+        busiest = _busiest([item.state for item in known])
+        out.append(
+            {
+                "workspace_id": row.id,
+                "workspace_name": workspace_name(row),
+                "workspace_state": row.status or "unknown",
+                "display_state": str(busiest)
+                if busiest is not None
+                else row.status or "unknown",
+                "model": row.model or "",
+                "session_count": len(known),
+            }
+        )
+    return out
 
 
 async def board_rows(
     database: Database, client: ConductorClient
 ) -> list[dict[str, object]]:
+    """One row per **workspace**, with the session count stage 1 shows.
+
+    The view has one row per session, and collapsing them used to throw the
+    count away — the same fetch that answers "which workspaces" already answers
+    "how many sessions each", for free.
+
+    The local cache is **unioned in**, not used only as a fallback:
+    ``session_transcripts_view`` has a row only once a session has said
+    something, so a workspace opened a minute ago is missing from it — and
+    ``/board`` is now the only way to reach one, so leaving it out would make it
+    unreachable rather than merely late.
+    """
     local_sessions = await sessions_repo.list_all(database)
     sessions_by_id = {row.id: row for row in local_sessions}
-    sessions_by_workspace: dict[str, SessionRow] = {}
+    local_by_workspace: dict[str, list[SessionRow]] = {}
     for session in local_sessions:
-        if session.workspace_id and session.workspace_id not in sessions_by_workspace:
-            sessions_by_workspace[session.workspace_id] = session
+        if session.workspace_id:
+            local_by_workspace.setdefault(session.workspace_id, []).append(session)
     rows: list[dict[str, object]]
     try:
         result = await client.sql(_BOARD_SQL)
+        raw_rows = [dict(item) for item in result.rows]
+        counts: dict[str, int] = {}
+        states: dict[str, list[TurnState]] = {}
+        for item in raw_rows:
+            workspace_id = str(item.get("workspace_id") or "")
+            if not workspace_id:
+                continue
+            counts[workspace_id] = counts.get(workspace_id, 0) + 1
+            session = sessions_by_id.get(str(item.get("session_id") or ""))
+            if session is not None:
+                states.setdefault(workspace_id, []).append(session.state)
         rows = []
         seen: set[str] = set()
-        for raw in result.rows:
-            item = dict(raw)
-            # The view has one row per *session*. A workspace with three
-            # sessions is still one workspace, one topic and one button — left
-            # alone this counted rows and reported "4 live" over two
-            # workspaces, under three identical buttons that all jumped to the
-            # same topic. Rows arrive newest-first, so the first one seen for a
-            # workspace is the one worth showing. A row with no workspace id
-            # cannot be collapsed and is kept as-is.
+        for item in raw_rows:
+            # A workspace with three sessions is still one workspace and one
+            # button — left alone this counted rows and reported "4 live" over
+            # two workspaces. Rows arrive newest-first, so the first one seen
+            # for a workspace is the one worth showing. A row with no workspace
+            # id cannot be collapsed and is kept as-is.
             workspace_id = str(item.get("workspace_id") or "")
             if workspace_id:
                 if workspace_id in seen:
                     continue
                 seen.add(workspace_id)
-            session = sessions_by_id.get(str(item.get("session_id") or ""))
+            busiest = _busiest(states.get(workspace_id, []))
             item["display_state"] = (
-                str(session.state)
-                if session is not None
+                str(busiest)
+                if busiest is not None
                 else str(item.get("workspace_state") or "")
             )
+            item["session_count"] = max(
+                counts.get(workspace_id, 1),
+                len(local_by_workspace.get(workspace_id, ())),
+            )
             rows.append(item)
+        rows.extend(
+            _local_board_rows(
+                await workspaces_repo.list_all(database),
+                local_by_workspace,
+                exclude=seen,
+            )
+        )
     except Exception:
         local = await workspaces_repo.list_all(database)
-        rows = [
-            {
-                "workspace_id": row.id,
-                "workspace_name": workspace_name(row),
-                "workspace_state": row.status or "unknown",
-                "display_state": str(sessions_by_workspace[row.id].state)
-                if row.id in sessions_by_workspace
-                else row.status or "unknown",
-                "model": row.model or "",
-            }
-            for row in local[:20]
-        ]
+        rows = []
+        for row in local[:20]:
+            known = local_by_workspace.get(row.id, [])
+            busiest = _busiest([item.state for item in known])
+            rows.append(
+                {
+                    "workspace_id": row.id,
+                    "workspace_name": workspace_name(row),
+                    "workspace_state": row.status or "unknown",
+                    "display_state": str(busiest)
+                    if busiest is not None
+                    else row.status or "unknown",
+                    "model": row.model or "",
+                    "session_count": len(known),
+                }
+            )
     return rows
+
+
+@dataclass(frozen=True, slots=True)
+class BoardSession:
+    """One stage-2 row: a Conductor chat, and whether it has a room here."""
+
+    session_id: str
+    title: str
+    model: str
+    state: str
+    #: The thread its transcript is already being read in, in *this* chat.
+    thread_id: int | None = None
+
+
+async def board_sessions(
+    database: Database, client: ConductorClient, workspace_id: str, *, chat_id: int
+) -> list[BoardSession]:
+    """The workspace's sessions, remote ∪ local, newest first.
+
+    A **union**, not one filtered by the other: a session created on the laptop
+    thirty seconds ago is in neither the transcript view nor the local cache
+    reliably, and it is exactly the one somebody opened ``/board`` to reach.
+    Degrades to the local rows alone when the API is unavailable — a stage that
+    cannot list anything is worse than one listing what it already knows.
+    """
+    local = {
+        row.id: row
+        for row in await sessions_repo.list_for_workspace(database, workspace_id)
+    }
+    ordered: list[str] = []
+    titles: dict[str, str] = {}
+    models: dict[str, str] = {}
+    try:
+        page = await client.list_workspace_sessions(workspace_id, limit=SESSION_SCAN)
+        for item in page.data:
+            ordered.append(item.id)
+            titles[item.id] = safe_title(item.title or item.name, item.id[:8])
+            models[item.id] = item.model or ""
+    except Exception:
+        log.info("board.sessions_remote_unavailable", workspace_id=workspace_id)
+    for session_id, row in local.items():
+        if session_id not in titles:
+            ordered.append(session_id)
+        titles.setdefault(session_id, safe_session_title(row))
+        models.setdefault(session_id, row.model or "")
+    out: list[BoardSession] = []
+    seen: set[str] = set()
+    for session_id in ordered:
+        if session_id in seen:
+            continue
+        seen.add(session_id)
+        row = local.get(session_id)
+        if row is not None and row.archived_at is not None:
+            continue
+        out.append(
+            BoardSession(
+                session_id=session_id,
+                title=titles.get(session_id) or session_id[:8],
+                model=models.get(session_id, ""),
+                state=str(row.state) if row is not None else "",
+                thread_id=(
+                    row.thread_id
+                    if row is not None and row.has_room and row.chat_id == chat_id
+                    else None
+                ),
+            )
+        )
+    return out
+
+
+def board_stage2(
+    workspace: WorkspaceRow | None,
+    workspace_id: str,
+    sessions: list[BoardSession],
+    *,
+    store: NonceStore,
+    user_id: int | None,
+    chat_id: int,
+    thread_id: int,
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    """The session picker, and the one card that says *open … in this chat*.
+
+    A session that already has a room here is a plain link — Telegram just
+    jumps, no ticket and no work. One without gets a single-use ticket, minted
+    **here**, at stage-2 render: fanning them out at stage 1 would mint forty
+    tickets for one tap.
+    """
+    name = workspace_name(workspace) if workspace is not None else workspace_id[:8]
+    buttons: list[list[InlineKeyboardButton]] = []
+    for item in sessions[:BOARD_SESSIONS_VISIBLE]:
+        icon = status_icon(item.state or (workspace.status if workspace else None))
+        label = f"{icon} {item.title}" + (f" · {item.model}" if item.model else "")
+        target = jump_url(chat_id, item.thread_id) if item.thread_id else None
+        if target:
+            buttons.append([url_button(label, target)])
+            continue
+        buttons.append(
+            [
+                button(
+                    label,
+                    Action.BOARD_SESSION,
+                    f"{workspace_id}\n{item.session_id}",
+                    store=store,
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    ttl=CONTROL_TTL_S,
+                )
+            ]
+        )
+    # Back is always last and names its destination rather than its direction,
+    # so it is readable alone on a 40-character screen.
+    buttons.append(
+        [
+            button(
+                "« All workspaces",
+                Action.BOARD_BACK,
+                "",
+                store=store,
+                user_id=user_id,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                ttl=CONTROL_TTL_S,
+                style=PLAIN_STYLE,
+            )
+        ]
+    )
+    if not sessions:
+        lines = [f"<b>{escape(name)}</b>", f"No sessions in {escape(name)} yet."]
+        return "\n".join(lines), keyboard(buttons)
+    lines = [
+        f"<b>{escape(name)} · {_sessions_suffix(len(sessions))}</b>",
+        "Tap one to open it in this chat.",
+    ]
+    detail = " · ".join(
+        part
+        for part in (
+            escape(workspace.branch or "") if workspace else "",
+            f"{escape(workspace.agent or '?')}/{escape(workspace.model or '?')}"
+            if workspace and (workspace.agent or workspace.model)
+            else "",
+        )
+        if part
+    )
+    if detail:
+        lines.append(detail)
+    if len(sessions) > BOARD_SESSIONS_VISIBLE:
+        hidden = len(sessions) - BOARD_SESSIONS_VISIBLE
+        lines.append(f"<i>+{hidden} more · open one in Conductor</i>")
+    return "\n".join(lines), keyboard(buttons)
+
+
+async def _redraw(query: CallbackQuery, text: str, markup: Any) -> None:
+    """Edit the card in place, or post a fresh one if it is gone.
+
+    Never drop the tap: an edit fails when the card was deleted, and answering
+    a tap with nothing at all is the one outcome a picker may not have.
+    """
+    if not isinstance(query.message, Message) or query.bot is None:
+        return
+    changed = await edit_html(
+        query.bot,
+        query.message.chat.id,
+        query.message.message_id,
+        text,
+        reply_markup=markup,
+    )
+    if not changed:
+        await _reply_beside(query.message, text, reply_markup=markup)
+
+
+@router.callback_query(Cb.filter(F.action == Action.BOARD_WS.value))
+async def board_workspace_callback(
+    query: CallbackQuery,
+    nonces: NonceStore,
+    tenant: TenantContext,
+    db: Database | None = None,
+    client: ConductorClient | None = None,
+) -> None:
+    try:
+        ticket = resolve(query, expect=Action.BOARD_WS, store=nonces)
+    except NonceError as exc:
+        await query.answer(exc.user_message, show_alert=True)
+        return
+    await query.answer()
+    database = resolve_db(db)
+    conductor = resolve_client(client, tenant)
+    chat_id = ticket.chat_id or query.from_user.id
+    workspace = await workspaces_repo.get(database, ticket.target)
+    sessions = await board_sessions(database, conductor, ticket.target, chat_id=chat_id)
+    text, markup = board_stage2(
+        workspace,
+        ticket.target,
+        sessions,
+        store=nonces,
+        user_id=query.from_user.id,
+        chat_id=chat_id,
+        thread_id=ticket.thread_id,
+    )
+    await _redraw(query, text, markup)
+
+
+@router.callback_query(Cb.filter(F.action == Action.BOARD_BACK.value))
+async def board_back_callback(
+    query: CallbackQuery,
+    nonces: NonceStore,
+    tenant: TenantContext,
+    db: Database | None = None,
+    client: ConductorClient | None = None,
+) -> None:
+    try:
+        ticket = resolve(query, expect=Action.BOARD_BACK, store=nonces)
+    except NonceError as exc:
+        await query.answer(exc.user_message, show_alert=True)
+        return
+    await query.answer()
+    database = resolve_db(db)
+    rows = await board_rows(database, resolve_client(client, tenant))
+    text, markup = board_stage1(
+        rows,
+        store=nonces,
+        user_id=query.from_user.id,
+        chat_id=ticket.chat_id or query.from_user.id,
+        thread_id=ticket.thread_id,
+    )
+    await _redraw(query, text, markup)
+
+
+@router.callback_query(Cb.filter(F.action == Action.BOARD_SESSION.value))
+async def board_session_callback(
+    query: CallbackQuery,
+    route: Route,
+    nonces: NonceStore,
+    tenant: TenantContext,
+    db: Database | None = None,
+    client: ConductorClient | None = None,
+) -> None:
+    """Connect one session: open its room, or bind this seat if there is none.
+
+    Both branches are :func:`adopt_workspace` scoped by ``session_hint``. With
+    per-session rooms the hint stopped meaning "which session gets the
+    workspace's room" and started meaning "which session to open", so tapping
+    two sessions of one workspace opens two rooms. In a seat that cannot host
+    topics it degrades to binding *that* seat — which is the one job ``/s``
+    used to have and the reason it could be retired.
+    """
+    try:
+        ticket = resolve(query, expect=Action.BOARD_SESSION, store=nonces)
+    except NonceError as exc:
+        await query.answer(exc.user_message, show_alert=True)
+        return
+    workspace_id, _, session_id = ticket.target.partition("\n")
+    if query.bot is None or not workspace_id:
+        await query.answer("Expired. Run /board again.", show_alert=True)
+        return
+    chat_id = ticket.chat_id or query.from_user.id
+    await query.answer("Opening…")
+    try:
+        result = await adopt_workspace(
+            bot=query.bot,
+            db=resolve_db(db),
+            client=resolve_client(client, tenant),
+            chat_id=chat_id,
+            chat_type=_callback_chat_type(query, chat_id),
+            workspace_id=workspace_id,
+            session_hint=session_id or None,
+            claim_thread=route.claimable_thread,
+        )
+    except Exception as exc:
+        await send_html(
+            query.bot,
+            chat_id,
+            f"Open failed · {escape(short_error(exc))}",
+            thread_id=ticket.thread_id,
+            silent=False,
+        )
+        return
+    if result.carded and result.thread_id == ticket.thread_id:
+        # Opened into the very thread the button was tapped in, and the snapshot
+        # card is on screen there. A button pointing at this room would not be.
+        return
+    target = jump_url(chat_id, result.thread_id)
+    link = target or result.deep_link
+    await send_html(
+        query.bot,
+        chat_id,
+        ack_line(result, linkable=target is not None),
+        thread_id=ticket.thread_id,
+        reply_markup=keyboard(
+            [[url_button("Open topic" if target else "Open in Conductor", link)]]
+        )
+        if link
+        else None,
+        silent=True,
+    )
+
+
+def _callback_chat_type(query: CallbackQuery, chat_id: int) -> str:
+    message = query.message
+    if isinstance(message, Message):
+        return message.chat.type
+    return "private" if chat_id > 0 else "supergroup"
 
 
 def row_name(row: dict[str, object]) -> str:
@@ -349,22 +787,27 @@ def adoptable(
     board: list[dict[str, object]],
     local: Collection[WorkspaceRow],
     *,
+    homed: Collection[str] = (),
     query: str = "",
     exclude: Collection[str] = (),
     limit: int = ADOPTABLE_SCAN,
 ) -> list[dict[str, object]]:
     """Workspaces with no room in this chat yet, from data already fetched.
 
-    Pure, and given both sources on purpose. It used to re-read every candidate
-    with ``workspaces_repo.get`` inside the loop — one query per row to answer a
-    question one query answers for all of them.
+    Pure, and given all three sources on purpose. It used to re-read every
+    candidate with ``workspaces_repo.get`` inside the loop — one query per row
+    to answer a question one query answers for all of them.
 
-    The two sources are a **union**, not a filter of one by the other.
-    ``session_transcripts_view`` has a row only once a session has said
+    The board and the local cache are a **union**, not a filter of one by the
+    other. ``session_transcripts_view`` has a row only once a session has said
     something, so a workspace opened on the laptop a minute ago is missing from
     it — and it is exactly the one somebody reaches for ``/attach`` to find.
+
+    ``homed`` is the workspace ids that have a *room* here. It is passed in
+    rather than derived, because a room now belongs to a session and this
+    function is given workspaces (:func:`homed_workspaces` computes it).
     """
-    homed = {row.id for row in local if row.chat_id is not None and row.topic_id}
+    homed = frozenset(homed)
     listed = {str(row.get("workspace_id") or "") for row in board}
     candidates = [*board]
     candidates.extend(
@@ -399,6 +842,19 @@ def adoptable(
     return out
 
 
+async def homed_workspaces(database: Database, chat_id: int | None = None) -> set[str]:
+    """Workspace ids that already have at least one room, optionally in one chat.
+
+    One query for the whole census. It used to be a column on ``workspaces``;
+    with a room per session it is a fact about the session rows.
+    """
+    return {
+        row.workspace_id
+        for row in await sessions_repo.list_with_room(database)
+        if row.workspace_id and (chat_id is None or row.chat_id == chat_id)
+    }
+
+
 async def adoptable_rows(
     database: Database,
     client: ConductorClient,
@@ -409,16 +865,19 @@ async def adoptable_rows(
 ) -> list[dict[str, object]]:
     """:func:`adoptable`, fetching its own inputs. Never raises.
 
-    ``/s`` still lists the topics it knows when ``POST /v0/sql`` is unavailable
-    — :func:`board_rows` already falls back to the local cache, and anything
-    past that degrades to "no suggestions".
+    Still lists the topics it knows when ``POST /v0/sql`` is unavailable —
+    :func:`board_rows` already falls back to the local cache, and anything past
+    that degrades to "no suggestions".
     """
     try:
         board = await board_rows(database, client)
         local = await workspaces_repo.list_all(database)
+        homed = await homed_workspaces(database)
     except Exception:
         return []
-    return adoptable(board, local, query=query, exclude=exclude, limit=limit)
+    return adoptable(
+        board, local, homed=homed, query=query, exclude=exclude, limit=limit
+    )
 
 
 @router.message(Command("attach"))
@@ -455,9 +914,10 @@ async def attach_workspace(
     # and a second full scan, on the path that already found nothing.
     board = await board_rows(database, client)
     local = await workspaces_repo.list_all(database)
-    rows = adoptable(board, local, query=query, limit=BOARD_VISIBLE)
+    homed = await homed_workspaces(database, message.chat.id)
+    rows = adoptable(board, local, homed=homed, query=query, limit=BOARD_VISIBLE)
     if not rows:
-        await tell(message, nothing_to_attach(local, query))
+        await tell(message, nothing_to_attach(homed, query))
         return
     buttons = []
     for row in rows:
@@ -483,7 +943,7 @@ async def attach_workspace(
     )
 
 
-def nothing_to_attach(local: Collection[WorkspaceRow], query: str) -> str:
+def nothing_to_attach(homed: Collection[str], query: str) -> str:
     """Why ``/attach`` has nothing to offer — there are three reasons.
 
     "No unattached cloud workspace matches" was every one of them at once, and
@@ -498,7 +958,7 @@ def nothing_to_attach(local: Collection[WorkspaceRow], query: str) -> str:
     """
     if query:
         return f"Nothing unattached matches <b>{escape(query)}</b>."
-    total = sum(1 for row in local if row.chat_id is not None and row.topic_id)
+    total = len(set(homed))
     if not total:
         return "No workspaces in Conductor yet · describe a task here to start one."
     plural = "" if total == 1 else "s"
@@ -509,21 +969,22 @@ def nothing_to_attach(local: Collection[WorkspaceRow], query: str) -> str:
 
 
 def board_lines(rows: list[dict[str, object]]) -> list[str]:
-    """Text-only board. ``/board`` uses buttons; this is the voice path's copy."""
-    lines = [f"<b>Board · {len(rows)} workspace{'' if len(rows) == 1 else 's'}</b>"]
+    """Text-only board. ``/board`` uses buttons; this is the voice path's copy.
+
+    It says nothing about tapping, because voice cannot tap: the way on from
+    here is to name the workspace out loud.
+    """
+    lines = [f"<b>Workspaces · {len(rows)}</b>"]
     for row in rows[:BOARD_VISIBLE]:
-        wid = str(row.get("workspace_id") or "")
-        name = human_name(str(row.get("workspace_name") or "")) or str(
-            row.get("session_title") or wid[:8]
-        )
         status = str(row.get("display_state") or row.get("workspace_state") or "?")
-        model = str(row.get("model") or "")
+        count = _session_count(row)
         lines.append(
-            f"{status_icon(status)} <b>{escape(name)}</b>"
-            + (f" · {escape(model)}" if model else "")
+            f"{status_icon(status)} <b>{escape(row_name(row))}</b>"
+            f" · {_sessions_suffix(count)}"
         )
     if len(rows) > BOARD_VISIBLE:
-        lines.append(f"<i>+{len(rows) - BOARD_VISIBLE} more · use /s to switch</i>")
+        hidden = len(rows) - BOARD_VISIBLE
+        lines.append(f'<i>+{hidden} more · say "open &lt;name&gt;"</i>')
     return lines
 
 
@@ -760,7 +1221,9 @@ async def mode(
             button(
                 "🗄 Archive…",
                 Action.ARCHIVE_REQUEST,
-                workspace.id,
+                # The session, not the workspace: `/done` archives *this task*
+                # and takes the workspace only when it was the last one.
+                session.id,
                 store=nonces,
                 user_id=message.from_user.id if message.from_user else None,
                 chat_id=message.chat.id,
@@ -777,24 +1240,101 @@ async def mode(
     )
 
 
+async def live_siblings(
+    database: Database,
+    client: ConductorClient,
+    session: SessionRow,
+) -> int | None:
+    """How many *other* live sessions this workspace has. ``None`` = unknown.
+
+    Counted against the API, not the local cache: a chat somebody opened on the
+    laptop is invisible to it, and the whole point of the number is deciding
+    whether archiving the workspace throws away work nobody in this chat can
+    see. When the count cannot be established the caller archives the session
+    and leaves the workspace alone — leaving a container running is recoverable,
+    archiving somebody's live laptop session from a phone is not.
+    """
+    if not session.workspace_id:
+        return None
+    try:
+        page = await client.list_workspace_sessions(
+            session.workspace_id, limit=SESSION_SCAN
+        )
+    except Exception:
+        log.info("done.session_count_unavailable", session_id=session.id)
+        return None
+    archived_locally = {
+        row.id
+        for row in await sessions_repo.list_for_workspace(
+            database, session.workspace_id
+        )
+        if row.archived_at is not None
+    }
+    return sum(
+        1
+        for item in page.data
+        if item.id != session.id and item.id not in archived_locally
+    )
+
+
+def archive_consequence(name: str, others: int | None) -> str:
+    """The two cards, and they must not read alike.
+
+    The count is fetched *before* the card is drawn, so the second sentence is a
+    fact rather than a guess — and the tap that follows re-reads it, because
+    "last one" can stop being true while a phone is in a pocket.
+    """
+    if others is None:
+        return (
+            "Deletes this topic and everything said in it. "
+            "The workspace stays — I could not check its other tasks."
+        )
+    if others <= 0:
+        return (
+            f"Last task in <b>{escape(name)}</b> — this archives the whole "
+            "workspace too. Both stay restorable in Conductor."
+        )
+    plural = "" if others == 1 else "s"
+    return (
+        "Deletes this topic and everything said in it. "
+        f"The workspace and its {others} other task{plural} stay."
+    )
+
+
 @router.message(Command("done"))
 async def done(
     message: Message,
     route: Route,
+    tenant: TenantContext,
     state: FSMContext,
     nonces: NonceStore,
     db: Database | None = None,
+    client: ConductorClient | None = None,
 ) -> None:
+    """Archive *this task*, and the workspace only when it is the last one.
+
+    It used to archive the workspace from inside a room, which under one room
+    per session would throw away every sibling task to finish one.
+    """
     await abandon_wizard(state)
-    if not route.workspace_id:
-        await tell(message, "No workspace here.")
+    session = route.session
+    if session is None:
+        await tell(
+            message,
+            "Run this inside a task, or <code>/board</code> to pick one.",
+        )
         return
-    row = await workspaces_repo.get(resolve_db(db), route.workspace_id)
-    name = workspace_name(row) if row else route.workspace_id[:8]
+    database = resolve_db(db)
+    workspace = (
+        await workspaces_repo.get(database, session.workspace_id)
+        if session.workspace_id
+        else None
+    )
+    others = await live_siblings(database, resolve_client(client, tenant), session)
     markup = confirm_keyboard(
         Action.ARCHIVE,
-        route.workspace_id,
-        name,
+        session.id,
+        safe_session_title(session),
         verb="Archive",
         store=nonces,
         user_id=message.from_user.id if message.from_user else None,
@@ -803,7 +1343,13 @@ async def done(
     )
     # The button below already reads "Archive <name>", and the topic title bar
     # reads it a third time. Spend the line on the consequence instead.
-    await tell(message, ARCHIVE_CONSEQUENCE, reply_markup=markup)
+    await tell(
+        message,
+        archive_consequence(
+            workspace_name(workspace) if workspace else session.id[:8], others
+        ),
+        reply_markup=markup,
+    )
 
 
 async def _reply_beside(
@@ -847,22 +1393,29 @@ async def confirm_archive(
     # The button's label is ``Archive <name>``; saying it back whole would read
     # "Archived Archive fix flaky". The row is the name's only honest source.
     name = ticket.label
+    took_workspace = False
     try:
         if query.bot is None:
             raise RuntimeError("Telegram bot is not bound to callback")
-        workspace_id = ticket.target
-        workspace = await workspaces_repo.get(database, workspace_id)
-        if workspace is None:
-            session = await sessions_repo.get(database, ticket.target)
-            if session is None or session.workspace_id is None:
-                raise RuntimeError("Workspace is no longer available.")
-            workspace_id = session.workspace_id
-            workspace = await workspaces_repo.get(database, workspace_id)
-        if workspace is not None:
-            name = workspace_name(workspace)
-        await resolve_client(client, tenant).archive_workspace(workspace_id)
-        await workspaces_repo.mark_archived(database, workspace_id)
-        retirement = await retire_topic(query.bot, database, workspace_id)
+        session = await _archive_target(database, ticket.target)
+        if session is None:
+            raise RuntimeError("Task is no longer available.")
+        name = safe_session_title(session)
+        conductor = resolve_client(client, tenant)
+        # Remote archive first, room deletion last. A deleted room with a live
+        # session behind it is a task you can no longer reach; a live room with
+        # an archived session behind it says so on its next tick.
+        await conductor.archive_session(session.id)
+        others = await live_siblings(database, conductor, session)
+        if others is not None and others <= 0 and session.workspace_id:
+            await conductor.archive_workspace(session.workspace_id)
+            await workspaces_repo.mark_archived(database, session.workspace_id)
+            took_workspace = True
+        retirement = await retire_topic(query.bot, database, session.id)
+        await sessions_repo.mark_archived(database, session.id)
+        await chats_repo.unbind(
+            database, ticket.chat_id or query.from_user.id, ticket.thread_id
+        )
     except Exception as exc:
         if isinstance(query.message, Message) and query.bot is not None:
             changed = await edit_html(
@@ -882,9 +1435,22 @@ async def confirm_archive(
         # a deleted thread fails, and the fallback would post the receipt into
         # the chat root — a line about a room nobody can look at any more. The
         # room disappearing off the list *is* the confirmation.
+        #
+        # Unless the *workspace* went too: that is news beyond this room, and
+        # there is no room left that could carry it.
+        if took_workspace and query.bot is not None:
+            await send_html(
+                query.bot,
+                ticket.chat_id or query.from_user.id,
+                f"🗄 Archived <b>{escape(name)}</b> · the workspace was its last task.",
+                thread_id=NO_THREAD_ID,
+                silent=True,
+            )
         return
     if isinstance(query.message, Message) and query.bot is not None:
         note = " Topic left open." if retirement is TopicRetirement.FAILED else ""
+        if took_workspace:
+            note += " Workspace archived too."
         changed = await edit_html(
             query.bot,
             query.message.chat.id,
@@ -898,11 +1464,29 @@ async def confirm_archive(
             )
 
 
+async def _archive_target(database: Database, target: str) -> SessionRow | None:
+    """The session an Archive ticket means.
+
+    Tickets minted before this release carry a *workspace* id — the status card
+    and ``/mode`` both targeted one — so a button that outlived the deploy
+    resolves to that workspace's bound session rather than answering "gone".
+    """
+    session = await sessions_repo.get(database, target)
+    if session is not None:
+        return session
+    candidates = await sessions_repo.list_for_workspace(database, target)
+    bound = [row for row in candidates if row.is_bound]
+    pool = bound or candidates
+    return max(pool, key=lambda row: row.updated_at) if pool else None
+
+
 @router.callback_query(Cb.filter(F.action == Action.ARCHIVE_REQUEST.value))
 async def request_archive(
     query: CallbackQuery,
     nonces: NonceStore,
+    tenant: TenantContext,
     db: Database | None = None,
+    client: ConductorClient | None = None,
 ) -> None:
     """Turn status-card Archive into the same named two-tap flow as /done."""
     try:
@@ -911,19 +1495,20 @@ async def request_archive(
         await query.answer(exc.user_message, show_alert=True)
         return
     database = resolve_db(db)
-    workspace = await workspaces_repo.get(database, ticket.target)
-    if workspace is None:
-        session = await sessions_repo.get(database, ticket.target)
-        if session is not None and session.workspace_id is not None:
-            workspace = await workspaces_repo.get(database, session.workspace_id)
-    if workspace is None:
-        await query.answer("Workspace is gone.", show_alert=True)
+    session = await _archive_target(database, ticket.target)
+    if session is None:
+        await query.answer("Task is gone.", show_alert=True)
         return
-    name = workspace_name(workspace)
+    workspace = (
+        await workspaces_repo.get(database, session.workspace_id)
+        if session.workspace_id
+        else None
+    )
+    others = await live_siblings(database, resolve_client(client, tenant), session)
     markup = confirm_keyboard(
         Action.ARCHIVE,
-        workspace.id,
-        name,
+        session.id,
+        safe_session_title(session),
         verb="Archive",
         store=nonces,
         user_id=query.from_user.id,
@@ -932,7 +1517,13 @@ async def request_archive(
     )
     await query.answer()
     if isinstance(query.message, Message):
-        await _reply_beside(query.message, ARCHIVE_CONSEQUENCE, reply_markup=markup)
+        await _reply_beside(
+            query.message,
+            archive_consequence(
+                workspace_name(workspace) if workspace else session.id[:8], others
+            ),
+            reply_markup=markup,
+        )
 
 
 @router.callback_query(Cb.filter(F.action == Action.CANCEL.value))

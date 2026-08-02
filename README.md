@@ -39,8 +39,10 @@ almost nothing else about a development environment is.
 
 So this is not a terminal in a chat window. It is a bot with opinions:
 
-- **One topic per workspace.** Not one channel, not a thread you have to find.
-  Each topic is named after its task, and its title carries the state.
+- **One topic per session.** Not one channel, not a thread you have to find.
+  Each topic is named after its task, and its title carries the state. A
+  workspace is a *group* of them: `/fork` adds another task to the same
+  container, branch and checkout, in a room of its own.
 - **One pinned status card per turn**, edited in place. It never notifies, so
   the live surface while an agent works costs nothing in your notification tray.
 - **One notification per task, not per message.** Replies are held and land as a
@@ -73,11 +75,11 @@ Then `/new fix the flaky checkout test`. That is the whole setup.
 | Continue | Just type in that topic — or send a voice note |
 | Answer a question | Tap a numbered choice; `✓` marks the recommendation |
 | See where you are | `/mode` — session, branch, model, queue, safe actions |
-| See everything | `/board`, then `/s` to switch |
+| See everything | `/board` — workspaces, then their sessions |
 | Pick up laptop work | `/attach [name]`, then tap **+ Open** |
 | Stop a runaway turn | The pinned card's ⏹, or `/stop` |
 | Search | `/find text` — every transcript you can reach |
-| Finish | `/done`, then confirm by name |
+| Finish | `/done` — archives this task; the workspace too when it is the last |
 
 ### Working as a team
 
@@ -96,8 +98,9 @@ their own private chat if they prefer. `/members` lists who is in.
 
 **Daily** — `/new` `/board` `/attach` `/mode` `/stop` `/find` `/done` `/home`
 
-**In a topic** — `/s` switch session · `/fork` a second one here · `/name` rename
-(`-w` renames the topic too) · `/open` deep-link into Conductor · `/desk` the
+**In a topic** — `/fork` a second task, in its own topic · `/name` rename
+(`-w` renames the workspace and every room of it) · `/open` deep-link into
+Conductor · `/desk` the
 workspace card · `/log [1-200]` dump the raw transcript · `/notify`
 loud·quiet·off
 

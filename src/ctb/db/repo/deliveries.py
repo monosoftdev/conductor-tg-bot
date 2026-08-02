@@ -652,9 +652,14 @@ async def release(db: Database, claim_id: str, *, at: int | None = None) -> int:
                       WHERE peer.chat_id = d.chat_id
                         AND peer.thread_id = d.thread_id
                         AND peer.content_hash = d.content_hash
+                        -- Scoped to the *session*. Two sessions whose rooms
+                        -- were both deleted reroute to the same chat root, and
+                        -- two forks of one task both answering "Done." are two
+                        -- answers, not one duplicate.
+                        AND peer.session_id = d.session_id
                         AND peer.state = 'sent'
-                        AND (peer.session_id, peer.message_id, peer.part_index)
-                            <> (d.session_id, d.message_id, d.part_index)
+                        AND (peer.message_id, peer.part_index)
+                            <> (d.message_id, d.part_index)
                    )
             """,
             (stamp, claim_id),
@@ -739,10 +744,17 @@ async def recover_orphaned(
                         """
                         SELECT 1 FROM deliveries
                          WHERE chat_id = ? AND thread_id = ? AND content_hash = ?
+                           AND session_id = ?
                            AND state = 'sent' AND COALESCE(sent_at, 0) >= ?
                          LIMIT 1
                         """,
-                        (row.chat_id, row.thread_id, row.content_hash, dedupe_cutoff),
+                        (
+                            row.chat_id,
+                            row.thread_id,
+                            row.content_hash,
+                            row.session_id,
+                            dedupe_cutoff,
+                        ),
                         default=0,
                     )
                     == 1

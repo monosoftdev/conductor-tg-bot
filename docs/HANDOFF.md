@@ -13,10 +13,73 @@ create a supergroup, enable Topics or grant admin rights.
 
 Verified offline, on every commit:
 
-- **2,287 tests pass** against a real PostgreSQL 16.
+- **2,343 tests pass** against a real PostgreSQL 16.
 - `ruff format --check`, `ruff check`, `pyright` — all clean.
 - The real runtime boots against a real database: all seven services start,
   `/health` returns `ok`, the lease is acquired, shutdown is clean.
+
+## One topic per session (2026-08-02)
+
+`workspaces` used to own the room, so every session of a workspace was bound to
+one topic. `/fork` created a second session and bound it to that same room, and
+`/s` existed to move the pointer back by hand. Inside a workspace the room was a
+mutable pointer, and the only way to see the other conversation was to move it.
+
+The room is the **session's** now (migration 003: `sessions.topic_name`,
+`topic_marker`, `archived_at`; `sessions.chat_id`/`thread_id` already carried
+the address). A workspace is a *group of rooms* over one container, one branch
+and one checkout.
+
+**The bug that made it worth doing.** Nothing anywhere unbound the session a
+seat already held — `grep -rn unbind src/ctb/bot/` returned three hits and none
+in `power.py` — so every `/s` and `/fork` since day one left *two* bound
+sessions on one thread. `list_bound` returned both, the supervisor polled both,
+both delivered into the same room with nothing saying which was which, and which
+one a prompt reached was decided by `get_bound_for`'s `ORDER BY created_at DESC`.
+So the model is enforced by two partial unique indexes rather than by discipline
+(`uq_sessions_one_per_room`, `uq_chats_one_room_per_session`), thread 0 carved
+out because the linear seat is a seat and not a room. Migration 003 resolves the
+existing duplicates first, keeping the newest — the same tiebreak the lookup
+already applied, so nothing moves; it only stops the losers polling.
+
+What changed at the surface:
+
+- **`/fork`** opens its own room before `POST /v0/sessions`, binds that thread to
+  the new session immediately, and discards the room if the create fails. It adds
+  no workspace. The parent's `chats` row and marker are untouched.
+- **`/board`** is a two-stage picker in one message, edited in place: stage 1
+  says *tap one to see its sessions* and never says "open"; stage 2 names the
+  workspace, lists its sessions and says *tap one to open it in this chat*. A
+  session with a room here is a plain link — Telegram just jumps. One without
+  gets a room on that tap. In a seat that cannot hold topics, stage 2 moves that
+  seat, which is the one job only `/s` could do.
+- **`/s` is retired** — out of `BOT_COMMANDS` and `/help`, kept as a silent alias
+  to `/board` for the muscle memory. `switch_callback`, `switchable_sessions`
+  and `homed_elsewhere` are gone: a dead callback that can still rebind a room is
+  the vector this change exists to close.
+- **`/done`** archives *this task* and deletes its room, and archives the
+  workspace only when no live session is left — counted against the API, because
+  a chat somebody opened on the laptop is invisible to the local cache. If the
+  count cannot be established the workspace is left alone.
+- **A deleted topic stops being silent.** Telegram sends no update for one
+  (`prompts._SERVICE_CONTENT` has no deleted member), and three places discovered
+  it independently. `topics.room_gone` is the one seam: it unbinds the room,
+  clears the `chats` row, and says so once in the chat root. A detach, not an
+  archive — the gesture is one accidental tap and the thing behind it costs money.
+- **Per-session markers.** Two sessions of one workspace used to fight over a
+  single `topic_marker`; whichever ticked last won, so a room could read
+  `⚙️ working` for a session nobody was looking at.
+
+`workspaces.topic_id`/`topic_marker` are kept and no longer written — the only
+evidence a rollback would have. `workspaces.topic_name` stays and changed
+meaning: it is the *family* label (`acme-api/main`), what `/board` stage 1 calls
+the workspace and what every one of its rooms hashes its icon colour from, so
+they read as one group in the topic list.
+
+**Still open:** a follow-up migration should drop `workspaces.topic_id` and
+`topic_marker` once a rollback is no longer wanted. `docs/TOPIC_PER_SESSION_TESTS.md`
+catalogues 120 faults; the ones covered here are the model, the indexes, `/fork`,
+`/board`'s two stages, `/done`'s two cards, `room_gone` and the marker split.
 
 ## GitHub is optional all the way down (2026-07-29)
 
@@ -91,8 +154,9 @@ Telegram now supports topics **inside a private chat with a bot** (@BotFather �
 *Threaded Mode*). A bot may create, rename and delete them there with no admin
 rights and no Premium; the sibling toggle *"Disallow users to create new
 threads"* governs the **user**, and `BOT_FORUM_CREATE_FORBIDDEN` is never about
-the bot. So the chat model is unchanged — one topic per workspace, routed on
-`(chat_id, message_thread_id)` — and only its host is now free.
+the bot. So the chat model is unchanged — one topic per room, routed on
+`(chat_id, message_thread_id)` — and only its host is now free. (What a room
+*is* changed later: see "One topic per session" below.)
 
 **This is the one thing in the repo built on an unverified Telegram feature.**
 Bot API 10.0 (2026-05-08) carries an open regression: `sendMessage` with
@@ -111,7 +175,7 @@ path, not the hoped-for one:
 - A DM refusal returns the linear `thread_id = 0` seat instead of raising, so
   the workspace is still created, the prompt still queued, the chat still
   works. One line says so, once per chat: *Topics unavailable here · one
-  workspace at a time.*
+  task at a time.*
 - `send_html` retries once without `message_thread_id` when Telegram says the
   thread is gone, sharing `THREAD_GONE_MARKERS` with the delivery path.
 - The group path is byte-identical to what it was, `/setup` probe included.
@@ -134,11 +198,10 @@ session"*. Each has its own cause and its own test; all three are fixed.
    up. With nothing ever run there is no cockpit to be, and the old nudge stands.
 2. **`/s` moved a session instead of reaching it.** Binding re-addresses the
    transcript, so `/s` from the root pointed a topic-bound session at thread 0
-   and its topic went quiet — the recovery broke what it was recovering.
-   `power.homed_elsewhere` now decides: a workspace with a room of its own is
-   *opened* (a jump button where Telegram gives a link, its name where it does
-   not, as in a DM), never switched to. The callback re-checks, so a button
-   minted before the topic existed is refused rather than obeyed.
+   and its topic went quiet — the recovery broke what it was recovering. Fixed
+   at the time by `power.homed_elsewhere`; *superseded* on 2026-08-02, when
+   `/s` was retired outright and `/board` stage 2 took over reaching a session
+   — see "One topic per session" below.
 3. **One wizard served every seat in a chat.** aiogram keyed FSM state on
    `(chat, user)`, so a half-finished `/new` swallowed the next line typed in
    *any* topic and spent it on a second workspace. Fixed in two halves that only

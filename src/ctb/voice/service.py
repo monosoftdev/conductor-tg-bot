@@ -474,6 +474,10 @@ class VoiceService:
                         session.agent,
                         session.model,
                         session.effort,
+                        # The room's own name is the session's now, and it
+                        # carries the opening prompt — the closest thing to
+                        # this task's vocabulary that we hold.
+                        session.topic_name,
                     )
                     if item
                 )
@@ -575,7 +579,7 @@ class VoiceService:
                         reply_markup=markup,
                     )
                     return True
-            await self._send(row, "No session here. Use /new or /s.")
+            await self._send(row, "No session here. Use /new or /board.")
             return True
         _message_id, state = await submit_prompt(
             db=self.db,

@@ -64,8 +64,16 @@ class WorkspaceRow:
     status: str | None = None
     lifecycle_step: str | None = None
     last_status_at: int | None = None
+    #: Which Telegram chat this workspace lives in. Still written, and still
+    #: what refuses opening the same workspace in a second chat.
     chat_id: int | None = None
+    #: **Rollback evidence only.** The room moved onto the session in migration
+    #: 003 (``sessions.thread_id`` / ``topic_name`` / ``topic_marker``); nothing
+    #: writes these two any more and a later migration drops them.
     topic_id: int | None = None
+    #: Still written, and no longer a room's name: this is the workspace's
+    #: *family* label, ``acme-api/main`` — what ``/board`` stage 1 calls it, and
+    #: the key every one of its rooms hashes its icon colour from.
     topic_name: str | None = None
     topic_marker: str | None = None
     create_nonce: str | None = None
@@ -114,6 +122,11 @@ class WorkspaceRow:
 
     @property
     def has_topic(self) -> bool:
+        """**Rollback evidence only** — see :attr:`topic_id`.
+
+        "Does this workspace have a room here?" is now "does any of its sessions
+        have one", which :func:`ctb.db.repo.sessions.list_with_room` answers.
+        """
         return self.chat_id is not None and self.topic_id is not None
 
 
@@ -272,6 +285,11 @@ async def bind_topic(
     topic_name: str | None = None,
     at: int | None = None,
 ) -> WorkspaceRow | None:
+    """**Rollback path only.** The room belongs to the session (migration 003).
+
+    Kept beside the columns it writes so a revert is one deploy rather than one
+    migration. :func:`ctb.db.repo.sessions.bind_topic` is the live one.
+    """
     return await update(
         db,
         workspace_id,

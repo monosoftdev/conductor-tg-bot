@@ -48,6 +48,7 @@ __all__ = [
     "get",
     "list_all",
     "list_bound",
+    "release_session",
     "set_defaults",
     "set_notify",
     "set_verbosity",
@@ -217,19 +218,73 @@ async def bind(
     kind: ChatKind = "topic",
     at: int | None = None,
 ) -> ChatRow:
-    """Point a chat/topic at a workspace + session."""
-    await ensure(db, chat_id, thread_id, kind=kind, at=at)
-    row = await update(
-        db,
-        chat_id,
-        thread_id,
-        workspace_id=workspace_id,
-        session_id=session_id,
-        at=at,
-    )
+    """Point a chat/topic at a workspace + session.
+
+    **A room is not a pointer.** With one topic per session, repointing a room
+    at a *different* session re-addresses a transcript somebody is reading and
+    silences the room they are reading it in, so it raises instead. Thread 0 is
+    exempt: the linear DM seat and a group's General are seats, and moving that
+    binding is the one legitimate switch left.
+
+    ``uq_chats_one_room_per_session`` is the same rule at the database, from the
+    other direction — one session is never in two rooms.
+    """
+    if thread_id != NO_THREAD_ID and session_id is not None:
+        current = await get(db, chat_id, thread_id)
+        if (
+            current is not None
+            and current.session_id is not None
+            and current.session_id != session_id
+        ):
+            raise ValueError(
+                f"topic {chat_id}/{thread_id} already belongs to session "
+                f"{current.session_id}"
+            )
+    async with db.transaction():
+        if session_id is not None:
+            # One session is never in two rooms. A room this session used to be
+            # read in — a topic that was deleted and reopened, most often — must
+            # stop routing to it, or ``uq_chats_one_room_per_session`` rejects
+            # the write and the reopen fails outright.
+            await release_session(db, session_id, keep=(chat_id, thread_id), at=at)
+        await ensure(db, chat_id, thread_id, kind=kind, at=at)
+        row = await update(
+            db,
+            chat_id,
+            thread_id,
+            workspace_id=workspace_id,
+            session_id=session_id,
+            at=at,
+        )
     if row is None:  # pragma: no cover - ensure() guarantees the row
         raise RuntimeError(f"chats row vanished for ({chat_id}, {thread_id})")
     return row
+
+
+async def release_session(
+    db: Database,
+    session_id: str,
+    *,
+    keep: tuple[int, int] | None = None,
+    at: int | None = None,
+) -> int:
+    """Stop every *other* room routing to this session. Returns how many.
+
+    The counterpart of ``sessions.release_room``, from the other direction, and
+    the reason a reopened topic does not collide with the room it replaced.
+    """
+    stamp = now_ms() if at is None else at
+    keep_chat, keep_thread = keep if keep is not None else (None, None)
+    return await db.execute(
+        """
+        UPDATE chats
+           SET session_id = NULL, updated_at = ?
+         WHERE session_id = ?
+           AND NOT (chat_id IS NOT DISTINCT FROM ?
+                    AND thread_id IS NOT DISTINCT FROM ?)
+        """,
+        (stamp, session_id, keep_chat, keep_thread),
+    )
 
 
 async def unbind(

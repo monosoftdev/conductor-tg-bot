@@ -48,35 +48,42 @@ from ctb.turn.state import (
 __all__ = [
     "SessionRow",
     "bind",
+    "bind_topic",
     "clear_cursor_only",
     "delete",
     "get",
     "get_bound_for",
+    "get_by_topic",
     "list_all",
     "list_bound",
     "list_for_workspace",
+    "list_with_room",
     "load_turn_context",
+    "mark_archived",
     "mark_dead",
     "record_status",
+    "release_room",
     "save_turn_context",
     "seek_to_end",
     "set_poll_interval",
     "set_status_card",
+    "set_topic_marker",
     "touch_prompt",
     "unbind",
+    "unbind_topic",
     "update",
     "upsert",
 ]
 
 _COLUMNS = """
     tenant_id, id, workspace_id, title, agent, model, effort, fast_mode,
-    chat_id, thread_id,
+    chat_id, thread_id, topic_name, topic_marker,
     is_bound, cursor_message_id, cursor_session_index, seeded, turn_state,
     start_witnessed, index_at_post, last_delta_at, entered_state_at,
     turn_started_at, consecutive_idle, consecutive_status_failures, cursor_only,
     idle_decay_step, poll_interval_ms, status_card_msg_id, waking_notified,
     warned_no_output_at, tool_calls, last_status, error_message, last_error,
-    last_error_at, last_prompt_at, dead_at, created_at, updated_at
+    last_error_at, last_prompt_at, dead_at, archived_at, created_at, updated_at
 """
 
 #: Sessions in these states are polled first after a restart. A literal, not a
@@ -97,6 +104,11 @@ class SessionRow:
     fast_mode: bool = False
     chat_id: int | None = None
     thread_id: int = NO_THREAD_ID
+    #: The room's label, marker excluded — what ``apply_marker`` renames around.
+    topic_name: str | None = None
+    #: The last applied :class:`~ctb.turn.state.TopicMarker`, so renames stay
+    #: idempotent. NULL until the first one lands.
+    topic_marker: str | None = None
     is_bound: bool = True
     cursor_message_id: str | None = None
     cursor_session_index: int = -1
@@ -122,6 +134,9 @@ class SessionRow:
     last_error_at: int | None = None
     last_prompt_at: int | None = None
     dead_at: int | None = None
+    #: Archived by the *user*, as distinct from :attr:`dead_at` (the session
+    #: 404ed). "Is this the last live task?" must not be fooled by either.
+    archived_at: int | None = None
     created_at: int = 0
     updated_at: int = 0
 
@@ -138,6 +153,8 @@ class SessionRow:
             fast_mode=as_bool(row["fast_mode"]),
             chat_id=as_opt_int(row["chat_id"]),
             thread_id=as_int(row["thread_id"]),
+            topic_name=as_opt_str(row["topic_name"]),
+            topic_marker=as_opt_str(row["topic_marker"]),
             is_bound=as_bool(row["is_bound"]),
             cursor_message_id=as_opt_str(row["cursor_message_id"]),
             cursor_session_index=as_int(row["cursor_session_index"], -1),
@@ -163,6 +180,7 @@ class SessionRow:
             last_error_at=as_opt_int(row["last_error_at"]),
             last_prompt_at=as_opt_int(row["last_prompt_at"]),
             dead_at=as_opt_int(row["dead_at"]),
+            archived_at=as_opt_int(row["archived_at"]),
             created_at=as_int(row["created_at"]),
             updated_at=as_int(row["updated_at"]),
         )
@@ -187,6 +205,20 @@ class SessionRow:
     def error_text(self) -> str | None:
         """``errorMessage ?? lastError`` — what the ERROR card shows."""
         return self.error_message or self.last_error
+
+    @property
+    def has_room(self) -> bool:
+        """This session owns a Telegram *topic*, not just a seat.
+
+        ``thread_id = 0`` is the linear DM and a group's General: a seat that
+        legitimately holds one mutable binding, and never a room.
+        """
+        return self.chat_id is not None and self.thread_id != NO_THREAD_ID
+
+    @property
+    def live(self) -> bool:
+        """Neither archived by its owner nor 404ed by Conductor."""
+        return self.archived_at is None and self.state is not TurnState.DEAD
 
 
 # ── clock conversion ─────────────────────────────────────────────────────────
@@ -230,6 +262,37 @@ async def get_bound_for(
         (chat_id, thread_id),
     )
     return None if row is None else SessionRow.from_row(row)
+
+
+async def get_by_topic(db: Database, chat_id: int, thread_id: int) -> SessionRow | None:
+    """Whose room is this thread? The per-session twin of the old workspace one.
+
+    Addressed, not *bound*: a session whose poller has stopped still owns the
+    room its transcript is in, and the rename-notice sweeper still has to
+    recognise the title it wrote there.
+    """
+    row = await db.fetch_one(
+        f"""
+        SELECT {_COLUMNS} FROM sessions
+         WHERE chat_id = ? AND thread_id = ?
+         ORDER BY is_bound DESC, updated_at DESC
+         LIMIT 1
+        """,
+        (chat_id, thread_id),
+    )
+    return None if row is None else SessionRow.from_row(row)
+
+
+async def list_with_room(db: Database) -> list[SessionRow]:
+    """Every session that owns a topic. The room census ``/attach`` counts."""
+    rows = await db.fetch_all(
+        f"""
+        SELECT {_COLUMNS} FROM sessions
+         WHERE chat_id IS NOT NULL AND thread_id <> 0
+         ORDER BY updated_at DESC
+        """
+    )
+    return [SessionRow.from_row(row) for row in rows]
 
 
 async def list_bound(db: Database) -> list[SessionRow]:
@@ -351,6 +414,42 @@ async def update(
         return await get(db, session_id)
 
 
+async def release_room(
+    db: Database,
+    chat_id: int,
+    thread_id: int,
+    *,
+    keep: str,
+    at: int | None = None,
+) -> int:
+    """Unbind every *other* session sitting on this seat. Returns how many.
+
+    Nothing used to do this, and it is the bug that made topic-per-session worth
+    doing: ``/fork`` and ``/s`` both bound a new session to a seat and left the
+    previous one bound to it as well. ``list_bound`` then returned both, the
+    supervisor polled both, and both delivered into the same room with nothing
+    saying which was which — the old session did not go quiet, it went
+    *anonymous*.
+
+    A no-op at ``thread_id = 0``: the linear DM seat and a group's General are
+    seats, not rooms, and this is the only path that legitimately moves a
+    binding, so the same call still has to clear the seat's previous occupant.
+    (It does — ``keep`` is the only exclusion.)
+
+    ``uq_sessions_one_per_room`` enforces the same rule at the database, so
+    forgetting this call raises rather than silently re-addressing a transcript.
+    """
+    stamp = now_ms() if at is None else at
+    return await db.execute(
+        """
+        UPDATE sessions
+           SET is_bound = false, updated_at = ?
+         WHERE chat_id = ? AND thread_id = ? AND is_bound AND id <> ?
+        """,
+        (stamp, chat_id, thread_id, keep),
+    )
+
+
 async def bind(
     db: Database,
     session_id: str,
@@ -359,15 +458,79 @@ async def bind(
     thread_id: int = NO_THREAD_ID,
     at: int | None = None,
 ) -> SessionRow | None:
-    """Route this session's transcript into a chat/topic and start polling it."""
+    """Route this session's transcript into a chat/topic and start polling it.
+
+    Releases the seat first, so one room never has two pollers writing into it.
+    """
+    stamp = now_ms() if at is None else at
+    async with db.transaction():
+        await release_room(db, chat_id, thread_id, keep=session_id, at=stamp)
+        return await update(
+            db,
+            session_id,
+            at=stamp,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            is_bound=True,
+        )
+
+
+async def bind_topic(
+    db: Database,
+    session_id: str,
+    *,
+    chat_id: int,
+    topic_id: int,
+    topic_name: str | None = None,
+    at: int | None = None,
+) -> SessionRow | None:
+    """Give this session a room. The address half; :func:`bind` starts polling.
+
+    Separate on purpose: ``/new`` and ``/fork`` open the room *before* the
+    session is bound, because the supervisor starts a poller for anything bound
+    and a poller that wins that race would seed the cursor itself.
+    """
     return await update(
         db,
         session_id,
         at=at,
         chat_id=chat_id,
-        thread_id=thread_id,
-        is_bound=True,
+        thread_id=topic_id,
+        topic_name=topic_name,
     )
+
+
+async def unbind_topic(
+    db: Database, session_id: str, *, at: int | None = None
+) -> SessionRow | None:
+    """The room is gone. Keep the session, drop where it was being read.
+
+    ``thread_id`` falls back to the chat root rather than NULL — it is
+    ``NOT NULL`` and the root is where a delivery reroutes to anyway.
+    """
+    return await update(
+        db,
+        session_id,
+        at=at,
+        thread_id=NO_THREAD_ID,
+        topic_name=None,
+        topic_marker=None,
+    )
+
+
+async def set_topic_marker(
+    db: Database, session_id: str, marker: str, *, at: int | None = None
+) -> SessionRow | None:
+    """Remember the last applied topic-name prefix so renames stay idempotent."""
+    return await update(db, session_id, at=at, topic_marker=marker)
+
+
+async def mark_archived(
+    db: Database, session_id: str, *, at: int | None = None
+) -> SessionRow | None:
+    """``/done`` on one task: stop polling it and remember the user meant to."""
+    stamp = now_ms() if at is None else at
+    return await update(db, session_id, at=stamp, archived_at=stamp, is_bound=False)
 
 
 async def unbind(

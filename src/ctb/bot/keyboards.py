@@ -169,6 +169,14 @@ class Action(StrEnum):
     JUMP = "jump"
     #: Open a workspace that already exists in Conductor as a topic here.
     ADOPT = "adopt"
+    #: ``/board`` stage 1 → 2: show this workspace's sessions. Target is the
+    #: workspace id; the card is edited in place.
+    BOARD_WS = "bws"
+    #: ``/board`` stage 2: connect one session — jump to its room, or open one.
+    #: Target is ``workspace_id\nsession_id``.
+    BOARD_SESSION = "bsess"
+    #: ``/board`` stage 2 → 1. Target is empty; the card is edited in place.
+    BOARD_BACK = "bback"
     #: Delete an entire *workspace* — the tenant row and everything that
     #: cascades from it. Distinct from ARCHIVE, which retires one Conductor
     #: workspace: sharing that value would put two handlers on one payload.

@@ -27,7 +27,7 @@ Tap Start, then send /key.
 ## `/setabouttext` — the profile blurb, 120 characters
 
 ```
-Run Conductor cloud coding agents from Telegram. One topic per workspace. Bring your own API key.
+Run Conductor cloud coding agents from Telegram. One topic per session. Bring your own API key.
 ```
 
 ## `/setcommands`

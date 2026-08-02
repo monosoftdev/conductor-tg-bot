@@ -31,7 +31,6 @@ from ctb.bot.app import PostgresStorage
 from ctb.bot.handlers import adopt as adopt_handlers
 from ctb.bot.handlers import common
 from ctb.bot.handlers import core as core_handlers
-from ctb.bot.handlers import power as power_handlers
 from ctb.bot.handlers import prompts as prompt_handlers
 from ctb.bot.handlers.adopt import (
     EXCHANGE_CHARS,
@@ -274,13 +273,16 @@ async def test_adopting_a_remote_workspace_opens_one_topic_and_binds_it(
     outcome = await _adopt(bot, db, client, session)
 
     assert bot.topics == [FIRST_TOPIC]
-    assert bot.renamed == ["checkout/main"]
+    # The room is the *session's*, so it is named after the session, with the
+    # workspace still behind the "·" so its rooms read as one family.
+    assert bot.renamed == ["fake session · checkout/main"]
     assert outcome.thread_id == FIRST_TOPIC
     assert not outcome.already
 
     workspace = await workspaces_repo.get(db, session.workspace_id)
     assert workspace is not None
-    assert (workspace.chat_id, workspace.topic_id) == (CHAT_ID, FIRST_TOPIC)
+    assert workspace.chat_id == CHAT_ID
+    assert workspace.topic_name == "checkout/main", "the family label"
     assert workspace.deep_link == session.workspace.deep_link
 
     row = await sessions_repo.get(db, session.session_id)
@@ -370,16 +372,16 @@ async def test_a_second_adoption_keeps_the_visible_and_stored_prefix_in_sync(
     session = _seeded(fake)
     bot = _Bot()
     await _adopt(bot, db, client, session)
-    await workspaces_repo.set_topic_marker(
-        db, session.workspace_id, TopicMarker.WORKING.value
+    await sessions_repo.set_topic_marker(
+        db, session.session_id, TopicMarker.WORKING.value
     )
 
     await _adopt(bot, db, client, session)
 
-    workspace = await workspaces_repo.get(db, session.workspace_id)
-    assert workspace is not None
-    assert workspace.topic_marker == TopicMarker.IDLE.value
-    assert bot.renamed[-1] == "checkout/main"
+    row = await sessions_repo.get(db, session.session_id)
+    assert row is not None
+    assert row.topic_marker == TopicMarker.IDLE.value
+    assert bot.renamed[-1] == "fake session · checkout/main"
 
 
 async def test_a_topic_deleted_out_from_under_us_is_reopened(
@@ -395,9 +397,9 @@ async def test_a_topic_deleted_out_from_under_us_is_reopened(
 
     assert outcome.thread_id == FIRST_TOPIC + 1
     assert not outcome.already
-    workspace = await workspaces_repo.get(db, session.workspace_id)
-    assert workspace is not None
-    assert workspace.topic_id == FIRST_TOPIC + 1
+    row = await sessions_repo.get(db, session.session_id)
+    assert row is not None
+    assert row.thread_id == FIRST_TOPIC + 1
     assert bot.cards_in(FIRST_TOPIC + 1)
 
 
@@ -405,17 +407,20 @@ async def test_a_workspace_bound_to_another_chat_is_not_silently_moved(
     db: Database, client: ConductorClient, fake: FakeConductor
 ) -> None:
     session = _seeded(fake)
-    await workspaces_repo.upsert(
-        db, session.workspace_id, chat_id=-1009999, topic_id=7, topic_name="elsewhere"
+    await workspaces_repo.upsert(db, session.workspace_id, chat_id=-1009999)
+    await sessions_repo.upsert(
+        db, session.session_id, workspace_id=session.workspace_id
+    )
+    await sessions_repo.bind_topic(
+        db, session.session_id, chat_id=-1009999, topic_id=7, topic_name="elsewhere"
     )
     bot = _Bot()
 
     with pytest.raises(AdoptError, match="another Telegram chat"):
         await _adopt(bot, db, client, session)
 
-    workspace = await workspaces_repo.get(db, session.workspace_id)
-    assert workspace is not None
-    assert (workspace.chat_id, workspace.topic_id) == (-1009999, 7)
+    row = await sessions_repo.get(db, session.session_id)
+    assert row is not None and (row.chat_id, row.thread_id) == (-1009999, 7)
     assert bot.topics == []
 
 
@@ -441,9 +446,13 @@ async def test_a_partial_binding_repairs_the_remembered_topic_in_place(
 ) -> None:
     """A crash between workspace and route writes must not clone the topic."""
     session = _seeded(fake)
-    await workspaces_repo.upsert(
+    await workspaces_repo.upsert(db, session.workspace_id, chat_id=CHAT_ID)
+    await sessions_repo.upsert(
+        db, session.session_id, workspace_id=session.workspace_id
+    )
+    await sessions_repo.bind_topic(
         db,
-        session.workspace_id,
+        session.session_id,
         chat_id=CHAT_ID,
         topic_id=77,
         topic_name="checkout/main",
@@ -452,12 +461,13 @@ async def test_a_partial_binding_repairs_the_remembered_topic_in_place(
 
     outcome = await _adopt(bot, db, client, session)
 
+    # The room is remembered, so this is a jump — and the lost `chats` row is
+    # repaired on the way past, to the one session that room can belong to.
     assert outcome.thread_id == 77
-    assert not outcome.already
+    assert outcome.already
     assert bot.topics == []
     route = await chats_repo.get(db, CHAT_ID, 77)
     assert route is not None and route.session_id == session.session_id
-    assert bot.cards_in(77)
 
 
 async def test_a_dm_that_can_host_topics_gets_one_like_any_other_chat(
@@ -531,7 +541,9 @@ async def test_adopting_into_the_thread_it_was_asked_from_opens_nothing_new(
     chat = await chats_repo.get(db, CHAT_ID, 555)
     assert chat is not None and chat.session_id == session.session_id
     workspace = await workspaces_repo.get(db, session.workspace_id)
-    assert workspace is not None and workspace.topic_id == 555
+    assert workspace is not None and workspace.chat_id == CHAT_ID
+    room = await sessions_repo.get(db, session.session_id)
+    assert room is not None and room.thread_id == 555
 
 
 async def test_a_second_attach_in_a_dm_jumps_instead_of_opening_a_sibling(
@@ -673,7 +685,7 @@ async def test_a_sleeping_workspace_is_adopted_and_the_card_is_honest(
     card = bot.cards_in(FIRST_TOPIC)[0]
     assert "💤 Sleeping. A prompt may wake it — unverified." in card
     # The sleeping marker is on the topic, not just in the bubble.
-    assert bot.renamed == ["💤 checkout/main"]
+    assert bot.renamed == ["💤 fake session · checkout/main"]
 
 
 async def test_an_empty_transcript_says_nothing_yet_rather_than_faking_one(
@@ -890,28 +902,28 @@ async def test_attach_command_lists_only_matching_unattached_workspaces(
     assert [row[0].text for row in markup.inline_keyboard] == ["+ Open billing"]
 
 
-async def test_general_switch_offers_adoption_and_says_what_it_capped(
+async def test_board_caps_the_workspace_list_and_says_what_it_hid(
     db: Database, client: ConductorClient, fake: FakeConductor, monkeypatch: Any
 ) -> None:
+    """Stage 1 shows ten and names the rest — it never truncates in silence."""
     sent: list[tuple[str, Any]] = []
 
     async def fake_tell(_message: Any, text: str, **kwargs: Any) -> None:
         sent.append((text, kwargs.get("reply_markup")))
 
-    monkeypatch.setattr(power_handlers, "tell", fake_tell)
+    monkeypatch.setattr(core_handlers, "tell", fake_tell)
     for index in range(15):
         _seeded(fake, name=f"checkout-{index:02d}")
     message = SimpleNamespace(
-        text="/s checkout",
+        text="/board checkout",
         chat=SimpleNamespace(id=CHAT_ID, type="supergroup"),
         message_thread_id=None,
         message_id=3,
         from_user=SimpleNamespace(id=1001),
     )
 
-    await power_handlers.switch_session(
+    await core_handlers.board(
         message,  # type: ignore[arg-type]
-        Route(chat_id=CHAT_ID, kind="general"),
         fake_tenant(client),
         _NullState(),  # type: ignore[arg-type]
         NonceStore(),
@@ -920,15 +932,19 @@ async def test_general_switch_offers_adoption_and_says_what_it_capped(
 
     text, markup = sent[0]
     assert text == (
-        "<b>Open workspace</b> · + opens a laptop one here\n<i>+3 more · /s name</i>"
+        "<b>Workspaces · 15</b>\nTap one to see its sessions."
+        "\n<i>+5 more · /board name</i>"
     )
     assert markup is not None
     labels = [row[0].text for row in markup.inline_keyboard]
-    assert len(labels) == power_handlers.GENERAL_VISIBLE
-    assert labels[0] == "+ Open checkout-00"
+    assert len(labels) == core_handlers.BOARD_VISIBLE
+    assert "checkout-00" in labels[0]
+    # Stage 1 never says "open": nothing in this card opens anything, and the
+    # `+ Open …` adopt special case is gone — every row drills down alike.
+    assert not any(label.startswith("+ Open") for label in labels)
 
 
-async def test_general_switch_filters_adoptable_workspaces_by_name(
+async def test_board_filters_workspaces_by_name(
     db: Database, client: ConductorClient, fake: FakeConductor, monkeypatch: Any
 ) -> None:
     sent: list[tuple[str, Any]] = []
@@ -936,20 +952,19 @@ async def test_general_switch_filters_adoptable_workspaces_by_name(
     async def fake_tell(_message: Any, text: str, **kwargs: Any) -> None:
         sent.append((text, kwargs.get("reply_markup")))
 
-    monkeypatch.setattr(power_handlers, "tell", fake_tell)
+    monkeypatch.setattr(core_handlers, "tell", fake_tell)
     _seeded(fake, name="checkout")
     _seeded(fake, name="billing")
     message = SimpleNamespace(
-        text="/s billing",
+        text="/board billing",
         chat=SimpleNamespace(id=CHAT_ID, type="supergroup"),
         message_thread_id=None,
         message_id=3,
         from_user=SimpleNamespace(id=1001),
     )
 
-    await power_handlers.switch_session(
+    await core_handlers.board(
         message,  # type: ignore[arg-type]
-        Route(chat_id=CHAT_ID, kind="general"),
         fake_tenant(client),
         _NullState(),  # type: ignore[arg-type]
         NonceStore(),
@@ -958,25 +973,30 @@ async def test_general_switch_filters_adoptable_workspaces_by_name(
 
     _, markup = sent[0]
     assert markup is not None
-    assert [row[0].text for row in markup.inline_keyboard] == ["+ Open billing"]
+    labels = [row[0].text for row in markup.inline_keyboard]
+    assert len(labels) == 1
+    assert "billing" in labels[0]
 
 
-async def test_general_switch_finds_an_attached_topic_by_workspace_name(
+async def test_board_finds_a_cached_workspace_the_view_has_not_seen(
     db: Database, client: ConductorClient, monkeypatch: Any
 ) -> None:
-    """The session title often differs from the workspace name typed on phone."""
+    """A workspace made a minute ago has no transcript row and must still list.
+
+    ``/board`` is the only way to reach one now that ``/s`` is gone, so the
+    local cache is unioned in rather than used only when the view is down.
+    """
     sent: list[tuple[str, Any]] = []
 
     async def fake_tell(_message: Any, text: str, **kwargs: Any) -> None:
         sent.append((text, kwargs.get("reply_markup")))
 
-    monkeypatch.setattr(power_handlers, "tell", fake_tell)
+    monkeypatch.setattr(core_handlers, "tell", fake_tell)
     await workspaces_repo.upsert(
         db,
         "workspace-checkout",
         name="checkout",
         chat_id=CHAT_ID,
-        topic_id=44,
         topic_name="checkout/main",
     )
     await sessions_repo.upsert(
@@ -987,16 +1007,15 @@ async def test_general_switch_finds_an_attached_topic_by_workspace_name(
         is_bound=True,
     )
     message = SimpleNamespace(
-        text="/s checkout",
+        text="/board checkout",
         chat=SimpleNamespace(id=CHAT_ID, type="supergroup"),
         message_thread_id=None,
         message_id=3,
         from_user=SimpleNamespace(id=1001),
     )
 
-    await power_handlers.switch_session(
+    await core_handlers.board(
         message,  # type: ignore[arg-type]
-        Route(chat_id=CHAT_ID, kind="general"),
         fake_tenant(client),
         _NullState(),  # type: ignore[arg-type]
         NonceStore(),
@@ -1005,7 +1024,9 @@ async def test_general_switch_finds_an_attached_topic_by_workspace_name(
 
     _, markup = sent[0]
     assert markup is not None
-    assert [row[0].text for row in markup.inline_keyboard] == ["✅ checkout/main"]
+    assert [row[0].text for row in markup.inline_keyboard] == [
+        "✅ checkout/main · 1 session"
+    ]
 
 
 async def test_the_view_being_down_leaves_general_switch_working(
@@ -1047,7 +1068,7 @@ async def test_the_callback_opens_the_topic_and_answers_with_a_jump(
     assert query.answers == ["Opening…"]
     assert bot.topics == [FIRST_TOPIC]
     ack = [item for item in bot.sent if not item.get("message_thread_id")][0]
-    assert ack["text"] == "→ <b>checkout/main</b>"
+    assert ack["text"] == "→ <b>fake session · checkout/main</b>"
     assert ack["reply_markup"].inline_keyboard[0][0].text == "Open topic"
 
 
@@ -1156,7 +1177,8 @@ async def test_a_claimed_thread_that_refuses_its_new_name_is_still_used(
     assert outcome.thread_id == 555
     workspace = await workspaces_repo.get(db, session.workspace_id)
     assert workspace is not None
-    assert workspace.topic_id == 555
+    room = await sessions_repo.get(db, session.session_id)
+    assert room is not None and room.thread_id == 555
     assert workspace.topic_marker is None, "nothing to skip on the next transition"
 
 
@@ -1168,3 +1190,122 @@ def test_an_already_open_workspace_names_its_room_when_it_cannot_link_to_one() -
 
     assert "thread list" in ack_line(result, linkable=False)
     assert "thread list" not in ack_line(result, linkable=True)
+
+
+# ── /board stage 2 connects one session, and only that one ───────────────────
+
+
+async def test_two_stage_two_taps_open_two_rooms(
+    db: Database, client: ConductorClient, fake: FakeConductor
+) -> None:
+    """**The whole point of the picker.**
+
+    ``session_hint`` used to mean "which session gets the *workspace's* room";
+    it means "which session to open" now, so tapping two sessions of one
+    workspace opens two rooms rather than one room twice.
+    """
+    workspace = fake.add_workspace("checkout")
+    first = fake.add_session(workspace=workspace, seed=[user_message("one")])
+    second = fake.add_session(workspace=workspace, seed=[user_message("two")])
+    bot = _Bot()
+    store = NonceStore()
+
+    for session in (first, second):
+        ticket = store.issue(
+            "bsess",
+            f"{workspace.id}\n{session.session_id}",
+            user_id=1001,
+            chat_id=CHAT_ID,
+            thread_id=0,
+        )
+        await core_handlers.board_session_callback(
+            _Query(bot, ticket.callback_data),  # type: ignore[arg-type]
+            Route(chat_id=CHAT_ID, kind="supergroup"),
+            store,
+            fake_tenant(client),
+            db=db,
+        )
+
+    assert bot.topics == [FIRST_TOPIC, FIRST_TOPIC + 1], "one room each"
+    rows = {
+        row.id: row.thread_id
+        for row in await sessions_repo.list_for_workspace(db, workspace.id)
+    }
+    assert rows[first.session_id] != rows[second.session_id]
+    # And each thread routes to its own session — never the other's.
+    for session, thread in ((first, FIRST_TOPIC), (second, FIRST_TOPIC + 1)):
+        route = await chats_repo.get(db, CHAT_ID, thread)
+        assert route is not None and route.session_id == session.session_id
+
+
+async def test_a_stage_two_tap_on_a_session_that_is_open_jumps_to_it(
+    db: Database, client: ConductorClient, fake: FakeConductor
+) -> None:
+    """A room is jumped to, never rebound — rebinding silences what you read."""
+    session = _seeded(fake)
+    bot = _Bot()
+    store = NonceStore()
+    ticket = store.issue(
+        "bsess",
+        f"{session.workspace_id}\n{session.session_id}",
+        user_id=1001,
+        chat_id=CHAT_ID,
+        thread_id=0,
+    )
+    await core_handlers.board_session_callback(
+        _Query(bot, ticket.callback_data),  # type: ignore[arg-type]
+        Route(chat_id=CHAT_ID, kind="supergroup"),
+        store,
+        fake_tenant(client),
+        db=db,
+    )
+
+    second = store.issue(
+        "bsess",
+        f"{session.workspace_id}\n{session.session_id}",
+        user_id=1001,
+        chat_id=CHAT_ID,
+        thread_id=0,
+    )
+    await core_handlers.board_session_callback(
+        _Query(bot, second.callback_data),  # type: ignore[arg-type]
+        Route(chat_id=CHAT_ID, kind="supergroup"),
+        store,
+        fake_tenant(client),
+        db=db,
+    )
+
+    assert bot.topics == [FIRST_TOPIC], "no sibling room beside the one it has"
+    row = await sessions_repo.get(db, session.session_id)
+    assert row is not None and row.thread_id == FIRST_TOPIC
+
+
+async def test_a_spent_stage_two_ticket_leaves_the_card_alone(
+    db: Database, client: ConductorClient, fake: FakeConductor
+) -> None:
+    session = _seeded(fake)
+    bot = _Bot()
+    store = NonceStore()
+    ticket = store.issue(
+        "bsess",
+        f"{session.workspace_id}\n{session.session_id}",
+        user_id=1001,
+        chat_id=CHAT_ID,
+        thread_id=0,
+    )
+    query = _Query(bot, ticket.callback_data)
+    store.consume(ticket.nonce, user_id=1001)  # a first tap already spent it
+
+    await core_handlers.board_session_callback(
+        query,  # type: ignore[arg-type]
+        Route(chat_id=CHAT_ID, kind="supergroup"),
+        store,
+        fake_tenant(client),
+        db=db,
+    )
+
+    # Single-use, so going back and forth works by re-minting at every render
+    # rather than by reusing a ticket. A spent one opens nothing and says so.
+    assert bot.topics == []
+    assert query.answers == ["Already done — that button was single-use."]
+    assert bot.sent == [], "the card is left exactly as it was"

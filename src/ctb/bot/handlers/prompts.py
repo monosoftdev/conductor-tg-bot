@@ -40,7 +40,6 @@ from ctb.db.connection import Database
 from ctb.db.repo import prompts as prompts_repo
 from ctb.db.repo import sessions as sessions_repo
 from ctb.db.repo import transcript as transcript_repo
-from ctb.db.repo import workspaces as workspaces_repo
 from ctb.delivery.render.html import escape
 from ctb.logging import get_logger
 from ctb.turn.state import TopicMarker
@@ -181,7 +180,7 @@ async def plain_text(
 
     if not route.session_id:
         await tell(
-            message, "No session here. Use <code>/new</code> or <code>/s</code>."
+            message, "No session here. Use <code>/new</code> or <code>/board</code>."
         )
         return
     try:
@@ -487,7 +486,7 @@ async def tidy_rename_notice(message: Message, db: Database | None = None) -> No
     *list*, where you read it at a glance, not in the transcript you scroll.
 
     Only our own. The title Telegram reports is compared against the one this
-    workspace's row says we last applied, so a person renaming their own topic
+    room's session says we last applied, so a person renaming their own topic
     by hand keeps their receipt. Best effort throughout: the delete needs a
     permission the group grants and a DM does not, and a topic with one extra
     line in it is still a working topic.
@@ -496,7 +495,7 @@ async def tidy_rename_notice(message: Message, db: Database | None = None) -> No
     if edited is None or edited.name is None:
         return
     database = resolve_db(db)
-    row = await workspaces_repo.get_by_topic(
+    row = await sessions_repo.get_by_topic(
         database, message.chat.id, message.message_thread_id or NO_THREAD_ID
     )
     if row is None or row.topic_name is None:

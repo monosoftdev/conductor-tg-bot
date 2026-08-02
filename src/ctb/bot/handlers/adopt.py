@@ -48,6 +48,7 @@ from ctb.bot.handlers.topics import (
     require_topic,
     resolve_client,
     resolve_db,
+    room_label,
     send_html,
     topic_label,
     topic_title,
@@ -72,7 +73,7 @@ from ctb.db.connection import Database
 from ctb.db.repo import chats as chats_repo
 from ctb.db.repo import sessions as sessions_repo
 from ctb.db.repo import workspaces as workspaces_repo
-from ctb.db.repo.workspaces import WorkspaceRow
+from ctb.db.repo.sessions import SessionRow
 from ctb.delivery.render.html import escape
 from ctb.logging import get_logger
 from ctb.turn import cursor
@@ -308,12 +309,12 @@ async def _adopt_workspace(
     claim_thread: int = NO_THREAD_ID,
 ) -> AdoptResult:
     local = await workspaces_repo.get(db, workspace_id)
-    if (
-        local is not None
-        and local.topic_id
-        and local.chat_id is not None
-        and local.chat_id != chat_id
-    ):
+    known_rooms = [
+        row
+        for row in await sessions_repo.list_for_workspace(db, workspace_id)
+        if row.has_room
+    ]
+    if known_rooms and all(row.chat_id != chat_id for row in known_rooms):
         raise AdoptError("Already connected in another Telegram chat.")
     workspace = await _describe(client, workspace_id)
     if workspace.status.value == "unknown":
@@ -325,70 +326,85 @@ async def _adopt_workspace(
         workspace.lifecycle_step = status.lifecycle_step
     if workspace.status.is_gone:
         raise AdoptError("Archived in Conductor. Restore it there first.")
-    # `workspace.name` is `tg-<chat>-<nonce>` for anything this bot created, and
-    # this label is written to the topic title *and* persisted as `topic_name`.
-    label = topic_label(
+    # `workspace.name` is `tg-<chat>-<nonce>` for anything this bot created.
+    # The *family* label names the workspace and keys every one of its rooms'
+    # colours, so they read as one group in the topic list.
+    family = topic_label(
         human_name(workspace.name) or workspace_id[:8], workspace.branch
     )
     marker = marker_for(workspace_status=workspace.status)
+
+    # Which session, first: the room belongs to one now, so "does this already
+    # have a room here?" cannot be asked before "which one are we opening?".
+    remote_sessions = await _all_sessions(client, workspace_id)
+    if not remote_sessions:
+        raise AdoptError("No sessions in this workspace yet.")
+    chosen = _pick_session(remote_sessions, session_hint)
+    label = room_label(family, _session_title(chosen))
 
     # A private chat used to be excluded here, back when a DM had exactly one
     # linear seat and no topic to remember. It can have both now, and skipping
     # the check meant a second `/attach` of the same workspace opened a second
     # room beside the first instead of jumping to it.
-    remembered = _remembered_topic(local, chat_id)
+    remembered = _remembered_topic(
+        next((row for row in known_rooms if row.id == chosen.id), None), chat_id
+    )
     existing_thread: int | None = None
     if remembered is not None and await _topic_exists(
         bot, chat_id, remembered, label, marker
     ):
-        route = await chats_repo.get(db, chat_id, remembered)
-        known = await sessions_repo.list_for_workspace(db, workspace_id)
-        session_id = (
-            route.session_id
-            if route is not None and route.session_id
-            else (known[0].id if known else "")
-        )
-        if session_id:
-            # The existence probe also reconciled the visible title to the
-            # current remote status. Persist the same marker, otherwise a
-            # later transition can incorrectly skip the rename.
-            async with db.transaction():
-                await workspaces_repo.upsert(
-                    db,
-                    workspace.id,
-                    project_id=workspace.project_id,
-                    name=workspace.name,
-                    repo_url=workspace.repository_url,
-                    branch=workspace.branch,
-                    agent=workspace.agent,
-                    model=workspace.model,
-                    effort=workspace.effort,
-                    deep_link=workspace.deep_link,
-                    status=workspace.status.value,
-                    lifecycle_step=workspace.lifecycle_step,
-                    chat_id=chat_id,
-                    topic_id=remembered,
-                    topic_name=label,
-                )
-                await workspaces_repo.set_topic_marker(db, workspace.id, marker.value)
-            return AdoptResult(
-                workspace_id=workspace_id,
-                session_id=session_id,
-                thread_id=remembered,
-                name=label,
-                deep_link=workspace.deep_link or (local.deep_link if local else None),
-                already=True,
-                sessions=max(1, len(known)),
-                sleeping=workspace.status.is_waking,
+        # The existence probe also reconciled the visible title to the current
+        # remote status. Persist the same marker, otherwise a later transition
+        # can incorrectly skip the rename.
+        async with db.transaction():
+            await workspaces_repo.upsert(
+                db,
+                workspace.id,
+                project_id=workspace.project_id,
+                name=workspace.name,
+                repo_url=workspace.repository_url,
+                branch=workspace.branch,
+                agent=workspace.agent,
+                model=workspace.model,
+                effort=workspace.effort,
+                deep_link=workspace.deep_link,
+                status=workspace.status.value,
+                lifecycle_step=workspace.lifecycle_step,
+                chat_id=chat_id,
+                topic_name=family,
             )
-        # A workspace row can survive a partial write even when its chat/session
-        # route did not. Repair that exact topic instead of creating a sibling.
-        existing_thread = remembered
-
-    remote_sessions = await _all_sessions(client, workspace_id)
-    if not remote_sessions:
-        raise AdoptError("No sessions in this workspace yet.")
-    chosen = _pick_session(remote_sessions, session_hint)
+            await sessions_repo.bind_topic(
+                db,
+                chosen.id,
+                chat_id=chat_id,
+                topic_id=remembered,
+                topic_name=label,
+            )
+            await sessions_repo.set_topic_marker(db, chosen.id, marker.value)
+            # Repair a route that a partial write lost. The room is this
+            # session's, so the only thing the `chats` row can be repaired *to*
+            # is this session — which is what keying the memory on the session
+            # rather than the workspace bought.
+            route = await chats_repo.get(db, chat_id, remembered)
+            if route is None or route.session_id != chosen.id:
+                await chats_repo.bind(
+                    db,
+                    chat_id,
+                    remembered,
+                    workspace_id=workspace.id,
+                    session_id=chosen.id,
+                    kind="topic",
+                )
+        return AdoptResult(
+            workspace_id=workspace_id,
+            session_id=chosen.id,
+            thread_id=remembered,
+            name=label,
+            deep_link=workspace.deep_link or (local.deep_link if local else None),
+            already=True,
+            sessions=len(remote_sessions),
+            sleeping=workspace.status.is_waking,
+        )
 
     # The topic is created before any state is written, for the same reason
     # ``common.create_and_bind_input`` does it: a half-written binding pointing
@@ -415,7 +431,9 @@ async def _adopt_workspace(
         claimed = True
         named = claim.named
     elif chat_type != "private":
-        thread_id = await require_topic(bot, chat_id, label, marker=marker)
+        thread_id = await require_topic(
+            bot, chat_id, label, marker=marker, color_key=family
+        )
         fresh = True
     else:
         # A DM with no thread to claim: open one if this bot may, and fall back
@@ -424,7 +442,9 @@ async def _adopt_workspace(
         refusal = support.detail or support.reason if support.degraded else None
         if refusal is None:
             try:
-                thread_id = await require_topic(bot, chat_id, label, marker=marker)
+                thread_id = await require_topic(
+                    bot, chat_id, label, marker=marker, color_key=family
+                )
                 fresh = True
             except TopicCreateError as exc:
                 refusal = exc.reason
@@ -445,6 +465,7 @@ async def _adopt_workspace(
             chat_id=chat_id,
             thread_id=thread_id,
             label=label,
+            family=family,
             marker=marker,
             fresh=fresh,
             record_marker=fresh or named or not claimed,
@@ -550,11 +571,16 @@ def _pick_session(sessions: Sequence[Session], hint: str | None) -> Session:
     return sessions[0]
 
 
-def _remembered_topic(row: WorkspaceRow | None, chat_id: int) -> int | None:
-    """The topic this chat already owns for the workspace, if any."""
-    if row is None or row.chat_id != chat_id or not row.topic_id:
+def _remembered_topic(row: SessionRow | None, chat_id: int) -> int | None:
+    """The topic this chat already owns for *this session*, if any.
+
+    Keyed on the session rather than the workspace, so the repair path can only
+    ever restore a room to the session that room belongs to — a different
+    session in the same room is exactly what this change exists to prevent.
+    """
+    if row is None or row.chat_id != chat_id or not row.has_room:
         return None
-    return row.topic_id
+    return row.thread_id
 
 
 def _session_title(session: Session) -> str:
@@ -573,6 +599,7 @@ async def _bind(
     chat_id: int,
     thread_id: int,
     label: str,
+    family: str,
     marker: TopicMarker,
     fresh: bool,
     record_marker: bool = True,
@@ -595,6 +622,10 @@ async def _bind(
         effort=workspace.effort,
         deep_link=workspace.deep_link,
         status=workspace.status.value,
+        # Still the workspace's: which Telegram chat it lives in, which is what
+        # refuses opening it in a second one. The *room* is the session's.
+        chat_id=chat_id,
+        topic_name=family,
     )
     await sessions_repo.upsert(
         db,
@@ -626,16 +657,16 @@ async def _bind(
         if thread_id and fresh:
             await attach_topic(
                 db,
-                workspace_id=workspace.id,
+                session_id=session.id,
                 chat_id=chat_id,
                 topic_id=thread_id,
                 label=label,
                 marker=marker,
             )
         elif thread_id:
-            await workspaces_repo.bind_topic(
+            await sessions_repo.bind_topic(
                 db,
-                workspace.id,
+                session.id,
                 chat_id=chat_id,
                 topic_id=thread_id,
                 topic_name=label,
@@ -644,18 +675,15 @@ async def _bind(
                 # ``False`` only when a claimed thread refused the rename, so
                 # the topic list is not showing this marker and recording it
                 # would make the next transition skip the rename that fixes it.
-                await workspaces_repo.set_topic_marker(db, workspace.id, marker.value)
+                await sessions_repo.set_topic_marker(db, session.id, marker.value)
             await chats_repo.ensure(db, chat_id, thread_id, kind="topic")
         else:
             await workspaces_repo.upsert(db, workspace.id, chat_id=chat_id)
             await chats_repo.ensure(db, chat_id, NO_THREAD_ID, kind="dm")
-        await sessions_repo.upsert(
-            db,
-            session.id,
-            chat_id=chat_id,
-            thread_id=thread_id,
-            is_bound=True,
-        )
+        # Bound last, and through `bind`, which releases whatever session was on
+        # this seat before. Nothing else unbinds it, and two bound sessions on
+        # one seat means two pollers writing into one room.
+        await sessions_repo.bind(db, session.id, chat_id=chat_id, thread_id=thread_id)
         await chats_repo.bind(
             db,
             chat_id,
