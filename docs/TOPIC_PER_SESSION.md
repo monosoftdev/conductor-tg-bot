@@ -50,6 +50,149 @@ its room lazily, on the first `/s`-style *Open*. Without this rule, `/attach` on
 a laptop workspace with nine sessions opens nine rooms nobody asked for, and the
 backfill has to create a room for every historical session in one migration.
 
+## Audit: every way a room's session can change today
+
+The point of this change is that **a topic is one session, for its whole life**.
+That is only true if every path that writes `chats.session_id` or
+`sessions.chat_id`/`thread_id` is accounted for. Sixteen were found; four are
+real switch vectors, and two of them are worse than they look.
+
+Grep basis: `chats_repo.bind|update|unbind`, `sessions_repo.bind|upsert|unbind`
+across `src/`, plus every reader of `Route.session_id`.
+
+### Real switch vectors — must go
+
+**1. `/s` and its callback** (`power.py:190`, `power.py:339`). The explicit
+switch. `switch_callback` writes `sessions_repo.bind` + `chats_repo.bind` on the
+seat the button was minted in. Deleted (see §`/s` is deprecated).
+
+**2. `/fork`** (`power.py:402`). Rebinds the current seat to the new session
+(`power.py:446-465`). Fixed by giving the fork its own room.
+
+**3. Nothing ever unbinds the session that was there.** `grep -rn "unbind"
+src/ctb/bot/` returns three hits and none of them is in `power.py` — so both
+`/s` and `/fork` leave the **previous** session with `is_bound = true` and the
+same `(chat_id, thread_id)`. Two bound sessions then share one seat, and:
+
+- `sessions.list_bound` (`repo/sessions.py:235`) returns both, so the supervisor
+  polls both;
+- both enqueue deliveries addressed to that same thread
+  (`session_poller.py:574-586`), so the old session's output keeps landing in
+  the room — interleaved with the new session's, with nothing saying which is
+  which. The old session does not go quiet; it goes *anonymous*;
+- `sessions.get_bound_for` (`repo/sessions.py:219`) resolves the seat with
+  `ORDER BY created_at DESC LIMIT 1`, so which session a *prompt* reaches is
+  decided by a tiebreak, not by anything the user did.
+
+This is the bug that makes the whole feature worth doing, and it is why the fix
+cannot be "stop calling switch" — it has to be a constraint (below).
+
+**4. `/attach` of a workspace whose remembered topic lost its `chats` pointer**
+(`adopt.py:388-395`). When `_remembered_topic` finds the topic but no session
+id, the flow falls through to `_pick_session(remote_sessions, session_hint)` and
+`_bind`s *that* session into the remembered room — a different session in the
+same room, by design, as a repair. Under the new model `_remembered_topic` is
+keyed on the **session**, so the repair can only ever restore the room's own
+session.
+
+### Legitimate, and staying
+
+**5. The linear seat** (`thread_id = 0`: a DM without threaded mode, a group's
+General). It genuinely holds one mutable binding and always will — it is not a
+room, it is a seat. This is the *only* place switching survives, and after `/s`
+goes the switcher is `/board` stage 2. It must be carved out of the constraint
+below explicitly, not by accident.
+
+**6. Reply-to override** (`routing.py:322`, `Route.via_reply`). Routes one
+prompt to the session that produced the message being replied to, without
+touching any binding. Keep — it is a PLAN safety rail — but state the new rule:
+the prompt's echo and receipt stay in the room it was typed in while the reply
+lands in the target session's room. In practice Telegram only offers Reply
+inside the current thread, so after this change the override is reachable almost
+only from the root, which is exactly where it is useful.
+
+**7. Cockpit "Send to «task»"** (`core.cockpit_markup`, `Action.SEND` at
+`prompts.py:436`). Sends a line typed in the root to the most recently prompted
+session. Nothing is rebound; the reply lands in that session's room. Keep.
+
+**8. `/new`, direct and wizard** (`common.py:718`, `wizards/new_workspace.py:910,
+1033`) — always a brand-new room for a brand-new session. Safe, and the model
+`/fork` copies.
+
+**9. `cursor.create_session` / `create_workspace`** (`cursor.py:1389`, `:1519`)
+write `is_bound=False` and no `chat_id`/`thread_id`. Safe by construction.
+
+**10. `/setup`, `tenancy.bind_chat`/`rebind_chat`** (`registration.py:525,636,
+1158`) bind a *chat to a tenant*, never a session to a seat. Not a vector.
+
+**11. Voice.** `VoiceCommand` (`voice/intent.py:32`) has no switch verb —
+`new · board · stop · find · mode · done`. The voice path reaches sessions only
+through the route and the cockpit. Safe; `board` stays text-only because voice
+cannot tap a drill-down.
+
+**12. `/mode`** (`core.py:682`) offers Stop, Transcript, Open, Archive. No
+session picker. Safe.
+
+### Loose ends this change should close
+
+**13. `chats_repo.bind` is unguarded** (`repo/chats.py:210`). It will happily
+repoint any seat at any session. After this change it should refuse to overwrite
+a *different* non-null `session_id` when `thread_id <> 0`, and say so — a room
+is not a pointer. Cheap, and it turns every future regression into an exception
+instead of a silently re-addressed transcript.
+
+**14. `UnbindTopic` leaves a zombie room** (`session_poller.py:530-540`). It
+unbinds the session and clears the workspace topic, but never clears
+`chats.session_id`, so the room still routes prompts to a session that is dead.
+Clear the `chats` row in the same block.
+
+**15. Outbox reroute does not free the room** (`outbox.py:1047`). A deleted
+topic moves the *delivery row* to the root; the session keeps pointing at the
+dead thread, so the next turn queues there and pays the reroute again, row by
+row. Recommended: on reroute, also clear that session's room
+(`sessions.unbind_topic`, `thread_id = 0`) so `/board` offers to open a new one.
+Flagged rather than assumed — it changes routing, so it wants its own test.
+
+**16. `retire_topic`'s delete path** (`topics.py:1044-1045`) already unbinds
+both sides. It just becomes per-session.
+
+### The database guarantee
+
+Per CLAUDE.md's second rule — isolation and invariants are database facts, not
+code-review facts — the model is enforced by an index, not by discipline:
+
+```sql
+-- One bound session per room. Thread 0 is excluded: the linear seat and a
+-- group's General are seats, not rooms, and legitimately switch.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_sessions_one_per_room
+    ON sessions (tenant_id, chat_id, thread_id)
+ WHERE is_bound AND chat_id IS NOT NULL AND thread_id <> 0;
+
+-- And the inverse: one session is never in two rooms.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_chats_one_room_per_session
+    ON chats (tenant_id, session_id)
+ WHERE session_id IS NOT NULL AND thread_id <> 0;
+```
+
+**Migration 003 will fail on live data unless vector 3 is cleaned up first**,
+because every `/fork` and every `/s` ever run has left duplicate bound sessions
+on a seat. The migration must, before creating the index, keep the newest bound
+session per `(tenant_id, chat_id, thread_id)` and set `is_bound = false` on the
+rest — the same tiebreak `get_bound_for` already applies, so nothing changes
+where prompts go; it only stops the losers from polling and delivering. Log the
+count.
+
+### Tests for the audit
+
+- `tests/test_repo.py` — the two indexes reject a second bound session in a room
+  and a session in a second room; both **allow** it at `thread_id = 0`; the
+  pre-index cleanup keeps exactly the newest and unbinds the rest.
+- `tests/test_bot_handlers.py` — `chats_repo.bind` raises when repointing a room
+  at a different session, and does not raise for `thread_id = 0`.
+- `tests/test_session_poller.py` — `UnbindTopic` clears the `chats` row.
+- `tests/test_outbox.py` — a thread-gone reroute leaves the session roomless
+  (if 15 is taken).
+
 ## Schema
 
 New migration `003_topic_per_session.sql`. `bootstrap`/`migrate` apply it; the
@@ -305,6 +448,10 @@ that stays correct.
 
 ## Migration and rollout
 
+0. Clean up the duplicate bound sessions vector 3 has been leaving on seats
+   since the first `/fork`, and add the two uniqueness indexes. This is the step
+   that makes "one session per room" true rather than intended, and it is also
+   the one that can fail on live data — run its `SELECT` count first.
 1. Migration 003 + `sessions` repo helpers + backfill. No behaviour change.
 2. Move the writers (`common.py`, `adopt.py`, `actions.py`, `session_poller.py`)
    to the session columns; keep every reader dual-reading
