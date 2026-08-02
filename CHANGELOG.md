@@ -29,6 +29,14 @@ from its first tagged release.
 
 ### Fixed
 
+- **A database one migration behind now fails the boot, by name.** The gate
+  only asked whether *any* schema was present, but the repo layer names its
+  columns — so a deploy that skipped `ctb.db.bootstrap` came up, `/health`
+  asked for the bound sessions, PostgreSQL answered `UndefinedColumn`, and
+  Railway reported *"Network › Healthcheck · Healthcheck failure"* with nothing
+  in the log naming the cause. Boot compares against
+  `REQUIRED_SCHEMA_VERSION` and prints the command to run; a test refuses to
+  let a new migration leave that constant behind.
 - **`DEFAULT_BRANCH` (and `DEFAULT_AGENT` / `DEFAULT_MODEL` / `DEFAULT_EFFORT`)
   reached no tenant at all.** The four `tenants.default_*` columns were NOT NULL
   with the shipped literal as their column default, `TenantSettings` read the
