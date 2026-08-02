@@ -700,3 +700,48 @@ async def test_a_receipt_still_in_the_queue_is_left_alone(
     assert bot.edits == []
     await outbox.flush()
     assert len(bot.sent) == 1
+
+
+def test_a_receipt_names_the_files_it_changed() -> None:
+    """ "5 files" is the question. The paths are the answer.
+
+    They are also the one thing the chat no longer prints per edit: `DIFF`
+    blocks are `VERBOSE`-only and a room defaults to `normal`, so without this
+    line a phone never learns where the agent went.
+    """
+    line = finish_line(
+        TurnSummary(files_changed=2, files=("src/a.py", "src/b.py"), tool_calls=3)
+    )
+
+    assert line == (
+        "✅ <b>Done</b> · 3 tools · 2 files\n"
+        "<code>src/a.py</code> · <code>src/b.py</code>"
+    )
+
+
+def test_a_receipt_counts_the_files_it_does_not_name() -> None:
+    files = tuple(f"src/f{index}.py" for index in range(9))
+
+    line = finish_line(TurnSummary(files_changed=9, files=files))
+
+    assert line.splitlines()[-1].endswith("· +4 more")
+    assert "src/f4.py" in line
+    assert "src/f5.py" not in line
+
+
+def test_a_stopped_turn_never_lists_files() -> None:
+    """A half-finished edit list under a failure reads as "the work landed"."""
+    line = finish_line(
+        TurnSummary(ok=False, error="cancelled", files_changed=2, files=("a.py",))
+    )
+
+    assert "\n" not in line
+    assert line.startswith("⚠️ <b>Stopped</b>")
+
+
+def test_a_receipt_escapes_a_hostile_path() -> None:
+    """Paths come from agent output, which is not trusted markup."""
+    line = finish_line(TurnSummary(files_changed=1, files=("<script>x</script>.py",)))
+
+    assert "<script>" not in line
+    assert "&lt;script&gt;" in line

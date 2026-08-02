@@ -43,7 +43,7 @@ from ctb.turn.state import (
     TurnSummary,
 )
 
-__all__ = ["BotActionSink", "finish_key", "finish_line"]
+__all__ = ["BotActionSink", "changed_files_line", "finish_key", "finish_line"]
 
 log = get_logger(__name__)
 
@@ -54,6 +54,12 @@ log = get_logger(__name__)
 CI_SCAN_MESSAGES: Final = 40
 
 
+#: Changed files named on the receipt before it stops naming them. Five is what
+#: fits a phone line-wrapped to two lines; past that the count is the answer and
+#: the list is scrolling.
+FINISH_FILES_SHOWN: Final = 5
+
+
 def finish_line(summary: TurnSummary) -> str:
     """``✅ <b>Done</b> · 1m32s · 12 tools · 5 files`` — the completion receipt.
 
@@ -61,6 +67,11 @@ def finish_line(summary: TurnSummary) -> str:
     ``format_duration``): two surfaces describing one event must not word it
     differently. Failure leads with the marker and the reason, because that is
     the whole message when a turn did not work.
+
+    A successful turn that changed files names them on a second line. "5 files"
+    alone is the question, not the answer — the paths are what tells you whether
+    the agent went where you expected, and they are the one thing the chat no
+    longer prints per edit under the default verbosity.
     """
     marker = signals.DONE if summary.ok else signals.ERROR
     head = "Done" if summary.ok else "Stopped"
@@ -76,7 +87,24 @@ def finish_line(summary: TurnSummary) -> str:
     if not summary.ok and summary.error:
         parts.append(one_line(summary.error)[:120])
     tail = "".join(f" · {escape(part)}" for part in parts)
-    return f"{marker} <b>{head}</b>{tail}"
+    line = f"{marker} <b>{head}</b>{tail}"
+    files = changed_files_line(summary)
+    return f"{line}\n{files}" if files else line
+
+
+def changed_files_line(summary: TurnSummary) -> str:
+    """``<code>src/a.py</code> · <code>src/b.py</code> · +3 more``, or ``""``.
+
+    Empty for a turn that changed nothing, and for a failed one: a stopped turn
+    already leads with why it stopped, and a half-finished edit list underneath
+    reads like a claim that the work landed.
+    """
+    if not summary.ok or not summary.files:
+        return ""
+    shown = summary.files[:FINISH_FILES_SHOWN]
+    rendered = " · ".join(f"<code>{escape(path)}</code>" for path in shown)
+    hidden = max(0, summary.files_changed - len(shown))
+    return f"{rendered} · +{hidden} more" if hidden else rendered
 
 
 def finish_key(session_id: str, row: SessionRow | None) -> str:

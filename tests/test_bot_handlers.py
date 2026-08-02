@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -95,6 +96,7 @@ from ctb.db.repo import workspaces as workspaces_repo
 from ctb.db.repo.chats import ChatRow
 from ctb.db.repo.sessions import SessionRow
 from ctb.db.repo.tenancy import TenantRow
+from ctb.db.repo.transcript import StoredMessage
 from ctb.db.repo.workspaces import WorkspaceRow
 from ctb.delivery.status_card import CardState, card_buttons
 from ctb.settings import Settings
@@ -3591,3 +3593,179 @@ async def test_a_line_typed_mid_wizard_never_starts_a_rival_task(
     )
 
     assert started == []
+
+
+async def test_the_cockpit_offers_the_three_most_recent_tasks(
+    db: Database, monkeypatch: Any
+) -> None:
+    """One button was a guess dressed as a decision.
+
+    "Send it there" used to mean "send it to whatever I touched last", which is
+    right with two tasks open and a coin flip with ten — and being wrong costs a
+    prompt delivered to an agent doing something else.
+    """
+    for index, title in enumerate(("Oldest", "Middle", "Newest")):
+        thread = 100 + index
+        await workspaces_repo.upsert(db, f"ws-c{index}", chat_id=1030, topic_id=thread)
+        await sessions_repo.upsert(
+            db,
+            f"sess-c{index}",
+            workspace_id=f"ws-c{index}",
+            chat_id=1030,
+            thread_id=thread,
+            title=title,
+        )
+        await chats_repo.bind(
+            db,
+            1030,
+            thread,
+            workspace_id=f"ws-c{index}",
+            session_id=f"sess-c{index}",
+            kind="topic",
+        )
+        await chats_repo.touch_prompt(db, 1030, thread, at=1_000 + index)
+
+    bubbles, _ = await _dm_root_text(db, monkeypatch, chat_id=1030)
+
+    _, markup = bubbles[0]
+    assert markup is not None
+    assert [row[0].text for row in markup.inline_keyboard] == [
+        "Send to Newest",
+        "Send to Middle",
+        "Send to Oldest",
+    ]
+
+
+async def test_the_cockpit_never_offers_more_than_it_can_fit(
+    db: Database, monkeypatch: Any
+) -> None:
+    """Past three the answer is /board, not a fourth guess."""
+    for index in range(6):
+        thread = 200 + index
+        await workspaces_repo.upsert(db, f"ws-m{index}", chat_id=1031, topic_id=thread)
+        await sessions_repo.upsert(
+            db,
+            f"sess-m{index}",
+            workspace_id=f"ws-m{index}",
+            chat_id=1031,
+            thread_id=thread,
+            title=f"Task {index}",
+        )
+        await chats_repo.bind(
+            db,
+            1031,
+            thread,
+            workspace_id=f"ws-m{index}",
+            session_id=f"sess-m{index}",
+            kind="topic",
+        )
+        await chats_repo.touch_prompt(db, 1031, thread, at=2_000 + index)
+
+    bubbles, _ = await _dm_root_text(db, monkeypatch, chat_id=1031)
+
+    _, markup = bubbles[0]
+    assert markup is not None
+    assert len(markup.inline_keyboard) == core_handlers.COCKPIT_TARGETS
+    assert markup.inline_keyboard[0][0].text == "Send to Task 5"
+
+
+# ── /log is read on a phone ──────────────────────────────────────────────────
+
+
+def _stored(index: int, kind: str, content: dict[str, Any]) -> StoredMessage:
+    return StoredMessage(
+        session_id="s-1",
+        message_id=f"m{index}",
+        session_index=index,
+        type=kind,
+        content_json=json.dumps(content),
+    )
+
+
+def _said(text: str) -> dict[str, Any]:
+    return {
+        "type": "agentMessage",
+        "rawPayload": {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": text}]},
+        },
+    }
+
+
+def test_the_log_reads_like_the_room_it_describes() -> None:
+    """It used to be a ``.md`` file of raw JSON, which a phone cannot read.
+
+    That is the right artefact for debugging a shape and the wrong one for the
+    question people actually ask ``/log``: what has this agent been doing?
+    """
+    rows = [
+        _stored(
+            1, "userMessage", {"type": "userMessage", "text": "fix the flaky test"}
+        ),
+        _stored(2, "agentMessage", _said("Rewrote the seed.")),
+        _stored(
+            3,
+            "agentMessage",
+            {
+                "type": "agentMessage",
+                "rawPayload": {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "name": "Bash",
+                                "input": {"command": "pytest -q"},
+                            }
+                        ]
+                    },
+                },
+            },
+        ),
+    ]
+
+    assert power_handlers.log_lines(rows) == [
+        "› fix the flaky test",
+        "· Rewrote the seed.",
+        "· Bash · pytest -q",
+    ]
+
+
+def test_an_unreadable_row_is_dropped_rather_than_printed() -> None:
+    """The 64 KB cap can cut a huge tool result mid-object.
+
+    A log with blank rows in it reads as a bug in the agent, and one unparseable
+    envelope is not a reason to fail the command.
+    """
+    rows = [
+        StoredMessage(
+            session_id="s-1", message_id="m1", session_index=1, content_json="{not json"
+        ),
+        _stored(2, "agentMessage", _said("still here")),
+    ]
+
+    assert power_handlers.log_lines(rows) == ["· still here"]
+
+
+def test_the_log_escapes_what_the_agent_said() -> None:
+    """Transcript text is the customer's source code, not trusted markup."""
+    lines = power_handlers.log_lines([_stored(1, "agentMessage", _said("<b>x</b>"))])
+
+    assert lines == ["· &lt;b&gt;x&lt;/b&gt;"]
+
+
+def test_a_stored_row_restores_into_the_envelope_renderers_expect() -> None:
+    message = power_handlers.restore_message(
+        _stored(7, "userMessage", {"type": "userMessage", "text": "go"})
+    )
+
+    assert message.session_index == 7
+    assert message.is_user_echo is True
+
+
+def test_a_restored_row_with_broken_json_is_empty_and_never_raises() -> None:
+    message = power_handlers.restore_message(
+        StoredMessage(session_id="s", message_id="m", session_index=1, content_json="[")
+    )
+
+    assert message.content == {}

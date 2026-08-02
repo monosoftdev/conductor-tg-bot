@@ -36,7 +36,7 @@ from ctb.db.repo import chats, deliveries, prompts, sessions, transcript, worksp
 from ctb.delivery.render.types import Verbosity
 from ctb.settings import Settings
 from ctb.turn import cursor
-from ctb.turn.state import PostOk
+from ctb.turn.state import EDITED_PATHS_CAP, PostOk
 from tests.conftest import FAKE_API_KEY
 from tests.fakes.fake_conductor import (
     SCENARIOS,
@@ -1445,3 +1445,66 @@ async def test_error_mid_turn_still_delivers_the_partial_output(
     assert "trailing after the error" in html
     await assert_each_answer_delivered_once(db, session)
     assert await transcript.count(db, session.session_id) == len(session.transcript)
+
+
+async def test_build_delta_names_the_files_a_page_edited(
+    fake: FakeConductor,
+) -> None:
+    """``files_changed`` was hardcoded to 0, so both readers printed nothing.
+
+    The count and the paths come from the renderer's own reducer, so the receipt
+    cannot disagree with the transcript above it about what an edit is.
+    """
+    session = fake.add_session(
+        seed=(
+            user_message("go"),
+            tool_use("Bash", tool_input={"command": "pytest -q"}),
+            tool_use("Edit", tool_input={"file_path": "src/a.py", "patch": "x"}),
+            tool_use("Write", tool_input={"file_path": "src/b.py", "content": "y"}),
+            # The same file twice is one file.
+            tool_use("Edit", tool_input={"file_path": "src/a.py", "patch": "z"}),
+            assistant("done"),
+        )
+    )
+
+    delta = cursor.build_delta(session.messages_model())
+
+    assert delta is not None
+    # First-seen order, deduped — the order the agent touched them in.
+    assert delta.edited_paths == ("src/a.py", "src/b.py")
+    # A shell command is a tool call and not a file edit.
+    assert delta.tool_calls == 4
+
+
+async def test_build_delta_counts_no_files_when_nothing_was_edited(
+    fake: FakeConductor,
+) -> None:
+    session = fake.add_session(
+        seed=(user_message("go"), tool_use("Bash"), assistant("nothing to change"))
+    )
+
+    delta = cursor.build_delta(session.messages_model())
+
+    assert delta is not None
+    assert delta.edited_paths == ()
+
+
+def test_edited_paths_stops_at_the_cap() -> None:
+    """A repository-wide refactor is not held in memory as strings."""
+
+    class _Fake:
+        def __init__(self, blocks: list[dict[str, Any]]) -> None:
+            self.blocks = blocks
+
+    blocks = [
+        {
+            "type": "tool_use",
+            "name": "Edit",
+            "input": {"file_path": f"src/f{index}.py", "patch": "x"},
+        }
+        for index in range(EDITED_PATHS_CAP + 25)
+    ]
+    paths = cursor._edited_paths([_Fake(blocks)])  # type: ignore[list-item]
+
+    assert len(paths) == EDITED_PATHS_CAP
+    assert paths[0] == "src/f0.py"

@@ -81,6 +81,7 @@ from ctb.turn.state import (
     CURSOR_ONLY_QUIET_FINALIZE_S,
     DRAIN_CONFIRMS,
     E404,
+    EDITED_PATHS_CAP,
     NO_OUTPUT_SLOW_S,
     NO_OUTPUT_WARN_S,
     QUEUED_SLOW_AFTER_S,
@@ -142,6 +143,25 @@ def format_duration(ms: int) -> str:
         return f"{minutes}m{seconds:02d}s"
     hours, minutes = divmod(minutes, 60)
     return f"{hours}h{minutes:02d}m"
+
+
+def _merge_paths(
+    current: tuple[str, ...], incoming: tuple[str, ...]
+) -> tuple[str, ...]:
+    """Union of two edited-path lists, first-seen order kept, capped.
+
+    Order is the point: the receipt prints these, and the order an agent edited
+    files in is the order it explained them in. A ``set`` here would make the
+    same turn render its files differently on two runs.
+    """
+    if not incoming:
+        return current
+    merged = dict.fromkeys(current)
+    for path in incoming:
+        if len(merged) >= EDITED_PATHS_CAP:
+            break
+        merged.setdefault(path, None)
+    return tuple(merged)
 
 
 _ACTIVE_BUTTONS: Final[tuple[CardButton, ...]] = (CardButton.STOP,)
@@ -397,6 +417,7 @@ def _start_turn(tick: _Tick, now: float, index_at_post: int | None) -> None:
         consecutive_idle=0,
         idle_decay_step=0,
         tool_calls=0,
+        edited_paths=(),
         delivered=0,
         turn_ids=frozenset(),
         open_turn_ids=frozenset(),
@@ -457,7 +478,10 @@ def _finalize(
     summary = TurnSummary(
         duration_ms=context.turn_duration_ms(now),
         tool_calls=context.tool_calls,
-        files_changed=0,
+        # Was hardcoded to 0, which made both readers — the finish line and the
+        # done card — print nothing while looking like they printed something.
+        files_changed=len(context.edited_paths),
+        files=context.edited_paths,
         prompts=max(1, len(context.turn_ids)),
         ok=ok,
         error=error,
@@ -480,6 +504,7 @@ def _finalize(
         consecutive_idle=0,
         idle_decay_step=0,
         tool_calls=0,
+        edited_paths=(),
         turn_ids=frozenset(),
         # `marks_turn_end` deliberately survives: it is a fact about the agent,
         # not about this turn.
@@ -954,7 +979,12 @@ def _delta_in_draining(tick: _Tick, evidence: Delta, now: float) -> TransitionRe
 def _delta_in_idle(tick: _Tick, evidence: Delta, now: float) -> TransitionResult:
     # RULE 2 — out-of-band activity: you drove the session from the Mac.
     if evidence.has_agent_content:
-        tick.evolve(turn_started_at=now, tool_calls=0, status_card_msg_id=None)
+        tick.evolve(
+            turn_started_at=now,
+            tool_calls=0,
+            edited_paths=(),
+            status_card_msg_id=None,
+        )
         _witness_start(tick, now, "working")
         return tick.result(2, "out-of-band agent output")
     # Something happened but it is not agent output (a user echo posted from the
@@ -1017,6 +1047,7 @@ def _on_delta(tick: _Tick, evidence: Delta, now: float) -> TransitionResult:
         consecutive_idle=0,
         delivered=context.delivered + evidence.n,
         tool_calls=context.tool_calls + evidence.tool_calls,
+        edited_paths=_merge_paths(context.edited_paths, evidence.edited_paths),
         turn_ids=context.turn_ids | evidence.turn_ids,
         open_turn_ids=_open_turns(context, evidence),
         marks_turn_end=(

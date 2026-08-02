@@ -566,26 +566,48 @@ DM_COCKPIT_HINT: Final = (
     "Send it to a task below, or <code>/new</code> to start one."
 )
 
+#: How many recent tasks the cockpit offers to send a stray line to. Three fits
+#: under the message without pushing it off screen, and the fourth answer is
+#: ``/board``.
+COCKPIT_TARGETS: Final = 3
 
-async def cockpit_target(db: Database) -> tuple[str, str] | None:
-    """``(session_id, label)`` for the seat a cockpit's one button points at.
 
-    The most recently prompted bound seat — the thing "send it there" means
-    when the person did not say where. ``None`` when nothing has ever run, in
-    which case there is no cockpit to be and the caller says so plainly.
+async def cockpit_targets(
+    db: Database, *, limit: int = COCKPIT_TARGETS
+) -> list[tuple[str, str]]:
+    """``[(session_id, label), …]`` — the seats a cockpit can send to.
+
+    The most recently prompted bound seats, newest first. It used to return
+    exactly one, which was right when a chat held one or two tasks and a coin
+    flip once it held ten: "send it there" meant "send it to whatever I touched
+    last", and being wrong costs a prompt delivered to the wrong agent.
+
+    Empty when nothing has ever run, in which case there is no cockpit to be and
+    the caller says so plainly.
     """
     rows = sorted(
         (row for row in await chats_repo.list_bound(db) if row.last_prompt_at),
         key=lambda row: row.last_prompt_at or 0,
         reverse=True,
     )
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
     for row in rows:
-        if not row.session_id:
+        if not row.session_id or row.session_id in seen:
             continue
+        seen.add(row.session_id)
         session = await sessions_repo.get(db, row.session_id)
         label = safe_title(session.title if session else None, row.session_id[:8])
-        return row.session_id, label
-    return None
+        out.append((row.session_id, label))
+        if len(out) >= max(1, limit):
+            break
+    return out
+
+
+async def cockpit_target(db: Database) -> tuple[str, str] | None:
+    """The single newest target. Kept for callers that only want the head."""
+    targets = await cockpit_targets(db, limit=1)
+    return targets[0] if targets else None
 
 
 async def cockpit_markup(
@@ -597,20 +619,23 @@ async def cockpit_markup(
     chat_id: int,
     thread_id: int,
 ) -> InlineKeyboardMarkup | None:
-    """The single-use "Send to …" button a cockpit offers instead of prompting.
+    """The single-use "Send to …" buttons a cockpit offers instead of prompting.
 
     Shared by the typed and the spoken path on purpose: the two surfaces
     resolving "where would this have gone?" differently is the divergence that
     once sent a dictated prompt to ``/find``.
 
+    Up to :data:`COCKPIT_TARGETS` rows, newest first. One button was a guess
+    dressed as a decision; three is the shortlist a person can actually
+    recognise, and the first is still the one that used to be offered alone.
+
     :data:`CONTROL_TTL_S`, not the 60-second default — this is a phone control
     on a line the owner may well come back to after reading the reply, not a
     destructive confirm.
     """
-    target = await cockpit_target(db)
-    if target is None:
+    targets = await cockpit_targets(db)
+    if not targets:
         return None
-    session_id, label = target
     return keyboard(
         [
             [
@@ -625,6 +650,7 @@ async def cockpit_markup(
                     ttl=CONTROL_TTL_S,
                 )
             ]
+            for session_id, label in targets
         ]
     )
 

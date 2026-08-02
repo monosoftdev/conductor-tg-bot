@@ -1496,3 +1496,63 @@ def test_the_stopping_card_always_offers_a_way_to_ask() -> None:
     card = actions_of(result, EditStatusCard)[0]
     assert card.kind is CardKind.CANCELLING
     assert CardButton.CHECK in card.buttons, "a spinner with no controls is a dead end"
+
+
+# ══ the edited-file list a receipt is made of ════════════════════════════════
+
+
+def test_a_delta_accumulates_the_files_a_turn_edits() -> None:
+    """``TurnSummary.files_changed`` was a hardcoded zero until now.
+
+    Both readers of it — the finish line and the done card — rendered a segment
+    that could never appear, so a turn that rewrote nine files said "9 tools"
+    and nothing about the nine files.
+    """
+    context = ctx(TurnState.WORKING)
+    results = drive(
+        context,
+        [
+            (Delta(n=1, has_agent_content=True, edited_paths=("a.py", "b.py")), T0 + 1),
+            # A path already seen does not appear twice; a new one appends.
+            (Delta(n=1, has_agent_content=True, edited_paths=("b.py", "c.py")), T0 + 2),
+        ],
+    )
+
+    assert results[-1].context.edited_paths == ("a.py", "b.py", "c.py")
+
+
+def test_a_finalized_turn_reports_the_files_it_changed() -> None:
+    context = ctx(
+        TurnState.DRAINING,
+        consecutive_idle=0,
+        tool_calls=4,
+        edited_paths=("src/a.py", "src/b.py"),
+        turn_ids=frozenset({MID}),
+    )
+
+    results = drive(
+        context, [(IDLE_STATUS, T0 + 30 + i) for i in range(DRAIN_CONFIRMS)]
+    )
+
+    summary = actions_of(results[-1], Finalize)[0].summary
+    assert summary.files_changed == 2
+    assert summary.files == ("src/a.py", "src/b.py")
+
+
+def test_the_next_turn_does_not_inherit_the_last_turn_s_files() -> None:
+    """A receipt naming files the *previous* prompt changed is a lie."""
+    context = ctx(TurnState.IDLE, edited_paths=("stale.py",))
+
+    result = step(context, PostOk(MID, index_at_post=4), T0 + 1)
+
+    assert result.context.edited_paths == ()
+
+
+def test_out_of_band_work_starts_its_own_file_list() -> None:
+    """Rule 2 — the turn began on the Mac, so nothing here is ours to keep."""
+    context = ctx(TurnState.IDLE, edited_paths=("stale.py",))
+
+    result = step(context, Delta(n=1, has_agent_content=True), T0 + 1)
+
+    assert result.state is TurnState.WORKING
+    assert result.context.edited_paths == ()
