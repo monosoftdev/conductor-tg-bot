@@ -75,6 +75,7 @@ from ctb.db.repo import chats, events, prompts, sessions, transcript, workspaces
 from ctb.db.repo.prompts import PromptRow
 from ctb.db.repo.transcript import AdvanceItem, DeliveryDraft
 from ctb.delivery.render.adapters import activity_text, best_effort_text
+from ctb.delivery.render.adapters.diff import describe_file_edit
 from ctb.delivery.render.adapters.result import turn_cost
 from ctb.delivery.render.adapters.shapes import BlockRole, classify_block, first_str
 from ctb.delivery.render.chunk import PartKind, chunk_blocks, chunk_html
@@ -89,7 +90,7 @@ from ctb.delivery.render.types import (
     chat_blocks,
 )
 from ctb.logging import get_logger
-from ctb.turn.state import Delta, PostAmbiguous, PostOk
+from ctb.turn.state import EDITED_PATHS_CAP, Delta, PostAmbiguous, PostOk
 
 __all__ = [
     "MAX_PAGES_PER_TICK",
@@ -471,6 +472,30 @@ def _preview_source(message: TranscriptMessage) -> str:
 # ── evidence ─────────────────────────────────────────────────────────────────
 
 
+def _edited_paths(messages: Sequence[TranscriptMessage]) -> tuple[str, ...]:
+    """Which files this page's tool calls edited, first-seen order, unique.
+
+    Uses the renderer's own reducer rather than a second rule for "is this an
+    edit": :func:`~ctb.delivery.render.adapters.diff.describe_file_edit` is the
+    thing that decides what the chat calls a file edit, it is tested against
+    real probe fixtures, and it never raises. Two answers to that question would
+    mean a receipt that disagrees with the transcript above it.
+
+    Bounded by :data:`~ctb.turn.state.EDITED_PATHS_CAP` — a page from a
+    repository-wide refactor is not worth holding in memory as strings.
+    """
+    seen: dict[str, None] = {}
+    for message in messages:
+        for block in message.blocks:
+            edit = describe_file_edit(block)
+            if edit is None or not edit.path:
+                continue
+            seen.setdefault(edit.path, None)
+            if len(seen) >= EDITED_PATHS_CAP:
+                return tuple(seen)
+    return tuple(seen)
+
+
 def build_delta(messages: Sequence[TranscriptMessage]) -> Delta | None:
     """The :class:`~ctb.turn.state.Delta` evidence for a page of new messages.
 
@@ -487,6 +512,7 @@ def build_delta(messages: Sequence[TranscriptMessage]) -> Delta | None:
     tool_calls = sum(
         1 for m in messages for block in m.blocks if block.get("type") == "tool_use"
     )
+    edited_paths = _edited_paths(messages)
     has_agent_content = any(
         m.is_agent and m.raw_payload_type in ("assistant", "result", "user")
         for m in messages
@@ -499,6 +525,7 @@ def build_delta(messages: Sequence[TranscriptMessage]) -> Delta | None:
         turn_ids=frozenset(turn_ids),
         witnessed_prompt_ids=frozenset(witnessed),
         tool_calls=tool_calls,
+        edited_paths=edited_paths,
         has_error_result=any(m.is_result and m.is_error for m in messages),
         ended_turn_ids=frozenset(ended),
         has_untagged_turn_end=any(m.ends_turn and not m.turn_id for m in messages),

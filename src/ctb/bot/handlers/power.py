@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Sequence
 from typing import Final
 
 from aiogram import F, Router
@@ -54,13 +55,14 @@ from ctb.bot.keyboards import (
 from ctb.bot.middleware.routing import Route
 from ctb.bot.middleware.tenancy import TenantContext
 from ctb.conductor.client import ConductorClient
-from ctb.conductor.models import validate_pairing
+from ctb.conductor.models import TranscriptMessage, validate_pairing
 from ctb.db.connection import Database
 from ctb.db.repo import chats as chats_repo
 from ctb.db.repo import sessions as sessions_repo
 from ctb.db.repo import transcript as transcript_repo
 from ctb.db.repo import workspaces as workspaces_repo
 from ctb.db.repo.sessions import SessionRow
+from ctb.db.repo.transcript import StoredMessage
 from ctb.db.repo.workspaces import WorkspaceRow
 from ctb.delivery.render.html import escape
 from ctb.turn import cursor as turn_cursor
@@ -77,16 +79,16 @@ _HELP = """<b>Phone loop</b>
 New thread · type a task; it becomes a workspace
 In a workspace · send text, voice, or audio
 Result · tap a numbered choice; ✓ is recommended
-<code>/attach</code> a laptop one · <code>/board</code> · <code>/home</code> for buttons
+<code>/attach</code> a laptop one · <code>/board</code> · <code>/home</code> buttons
 
+<code>/digest</code> what needs you · errors and stalls first
 <code>/stop</code> cancels this turn · also on the pinned card
-<code>/find text</code> searches every transcript you can reach
+<code>/find text</code> searches transcripts · <code>/log</code> this one
 <code>/name text</code> renames this session · <code>-w</code> renames the topic
 <code>/s</code> switch · <code>/fork</code> another here · <code>/mode</code> settings
 <code>/notify</code> loud·quiet·off · <code>/done</code> archives, always confirms
 
-<b>Your team</b>
-<code>/team</code> adds a group for several people · optional
+<b>Your team</b> · <code>/team</code> adds a group, optional
 <code>/invite id</code> adds someone · <code>/members</code> lists them
 Privately · <code>/key</code> Conductor · <code>/voicekey</code> voice ·
 <code>/gitkey</code> CI · send one bare and I walk you through getting it
@@ -105,6 +107,18 @@ _DEFAULTS_USAGE: Final = (
 #: Name of the throwaway topic ``/setup`` creates to prove it can. Deleted
 #: immediately; only ever visible if the delete itself is refused.
 _SETUP_PROBE_LABEL: Final = "setup check"
+
+#: ``/log`` bounds. The readable form is a phone screen of one-liners; the raw
+#: form is a debugging artefact and keeps the old, wider window.
+LOG_LINES_MAX: Final = 60
+LOG_RAW_DEFAULT: Final = "40"
+LOG_RAW_MAX: Final = 200
+#: Per line, before the ellipsis. Two phone lines at most.
+LOG_LINE_CHARS: Final = 140
+#: Room for the body under Telegram's 4096, leaving the header and slack for
+#: HTML escaping expanding a character into six.
+LOG_BODY_CHARS: Final = 3_400
+LOG_USAGE: Final = "Usage: <code>/log [1-60]</code> · <code>/log raw [1-200]</code>"
 
 _SWITCH_ACTIVE = frozenset(
     {
@@ -580,6 +594,48 @@ async def desk(
     await tell(message, "\n".join(lines), reply_markup=markup)
 
 
+def restore_message(row: StoredMessage) -> TranscriptMessage:
+    """A stored row back into the envelope the renderers understand.
+
+    ``content_json`` is the verbatim ``content`` object, so this is a parse and
+    not a reconstruction. Malformed or truncated JSON — the 64 KB cap can cut a
+    huge tool result mid-object — yields an empty content rather than raising:
+    one unreadable line in a log is not a reason to fail the command.
+    """
+    try:
+        content = json.loads(row.content_json or "{}")
+    except (ValueError, TypeError):
+        content = {}
+    if not isinstance(content, dict):
+        content = {"_raw": content}
+    return TranscriptMessage(
+        id=row.message_id,
+        session_id=row.session_id,
+        session_index=row.session_index,
+        type=row.type,
+        content=content,
+    )
+
+
+def log_lines(rows: Sequence[StoredMessage]) -> list[str]:
+    """Oldest-first, one HTML line per message: who spoke and the gist.
+
+    ``›`` for a prompt of yours, ``·`` for anything the agent said or did — the
+    same shape as reading the room, which is the point. Messages the renderers
+    can make nothing of are dropped rather than printed as an id: a log with
+    three blank rows in it reads as a bug in the agent.
+    """
+    lines: list[str] = []
+    for row in rows:
+        message = restore_message(row)
+        gist = turn_cursor.preview_text(message, limit=LOG_LINE_CHARS).strip()
+        if not gist:
+            continue
+        mark = "›" if message.is_user_echo else "·"
+        lines.append(f"{mark} {escape(gist)}")
+    return lines
+
+
 @router.message(Command("log"))
 async def log_command(
     message: Message,
@@ -587,18 +643,49 @@ async def log_command(
     state: FSMContext,
     db: Database | None = None,
 ) -> None:
+    """The last few exchanges, readable — or the raw envelopes on request.
+
+    It used to be only the second thing: a ``.md`` file of JSON blocks, which is
+    the right artefact for debugging a shape and the wrong one for the question
+    people actually ask it ("what has this agent been doing?"). A phone cannot
+    read JSON, and it was the only command that answered that question at all.
+    """
     await abandon_wizard(state)
     session_id = await require_session(message, route)
     if not session_id:
         return
+    argument = command_text(message).strip()
+    raw = argument.split()[:1] == ["raw"]
+    if raw:
+        argument = argument[3:].strip()
     try:
-        limit = min(200, max(1, int(command_text(message) or "40")))
+        cap = LOG_RAW_MAX if raw else LOG_LINES_MAX
+        limit = min(cap, max(1, int(argument or (LOG_RAW_DEFAULT if raw else "20"))))
     except ValueError:
-        await tell(message, "Usage: <code>/log [1-200]</code>")
+        await tell(message, LOG_USAGE)
         return
-    rows = reversed(
-        await transcript_repo.recent(resolve_db(db), session_id, limit=limit)
+    rows = list(
+        reversed(await transcript_repo.recent(resolve_db(db), session_id, limit=limit))
     )
+    if raw:
+        await _send_raw_log(message, session_id, rows)
+        return
+    lines = log_lines(rows)
+    if not lines:
+        await tell(message, "Nothing cached for this task yet.")
+        return
+    # Trim from the *front*: the newest exchange is the one being asked about,
+    # and a message Telegram refuses is worse than a short one.
+    body = "\n".join(lines)
+    while len(body) > LOG_BODY_CHARS and len(lines) > 1:
+        lines.pop(0)
+        body = "\n".join(lines)
+    await tell(message, f"<b>Last {len(lines)}</b> · <code>/log raw</code>\n{body}")
+
+
+async def _send_raw_log(
+    message: Message, session_id: str, rows: Sequence[StoredMessage]
+) -> None:
     parts = [
         (
             f"## {row.session_index} · {row.type}\n\n"

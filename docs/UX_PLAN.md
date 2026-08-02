@@ -5,7 +5,13 @@ Companion to [`TOPIC_PER_SESSION.md`](TOPIC_PER_SESSION.md). That document says
 person holding the phone, and what else is worth building once it lands.
 
 Everything here is grounded in code that exists today; each item names the file
-it touches and what it costs. Nothing is implemented.
+it touches and what it costs.
+
+> **Shipped so far** (see the section for each): **A4** `/digest`, **B1** the
+> receipt names the files it changed, **B2** `/log` is readable, **B4** the
+> cockpit offers three destinations. **A1 turned out to be impossible as
+> written** — Telegram gives a bot no read event — and the correction is
+> recorded in place rather than deleted.
 
 ---
 
@@ -56,26 +62,27 @@ screen (§G).
 
 ## P0 — ships with topic-per-session, because that change creates the need
 
-### A1 · `✅` must mean *unread*, not *finished*
+### A1 · `✅` must mean *unread*, not *finished* — **and it cannot, quite**
 
 **Friction.** `TopicMarker.DONE` is applied on finalize (`machine.py:471`) and
 cleared only by the *next* state transition. So a room you have already read
 keeps its `✅` until you prompt it again, and after a busy afternoon every room
-in the list is `✅`. A signal that is always on is not a signal, and it is the
-one the eye actually uses.
+in the list is `✅`. A signal that is always on is not a signal.
 
-**Change.** Reading a room clears it. `RoutingMiddleware` already knows which
-room every update came from and marks it as the send queue's focus
-(`routing.py:248`); in the same place, if the room's session marker is `DONE`,
-apply `IDLE`. One extra call on an update that is already doing DB work, and
-only on the transition.
+> **Correction to the first draft of this plan, which said "reading a room
+> clears it".** Telegram gives a bot **no read event** — no "chat opened", no
+> read receipt. The only evidence a room was looked at is an update *from* it,
+> which means a message or a button tap. Opening a room and reading it is, to
+> the bot, indistinguishable from never opening it. So this item cannot be
+> built as written.
 
-**Where.** `bot/middleware/routing.py`, `bot/handlers/topics.apply_marker`.
-**Size.** Half a day. **Test.** Prompting or even opening a `✅` room clears the
-prefix; a room nobody touched keeps it; clearing does not fire on every update.
+**What is left, and it is worth less.** Any interaction in a room can clear a
+stale `DONE`, but prompting already does (the marker follows the session to
+`WORKING`), which leaves only "ran a command in the room" — a rare event.
 
-**Why it is P0.** It is what turns the topic list into an inbox, and an inbox is
-the only structure that survives thirty rooms.
+**So the value moved to A4.** `/digest` answers the question the prefix was
+being asked to answer, ranks by what actually wants attention, and needs no read
+event to be correct. **Shipped there instead.**
 
 ### A2 · Finished rooms retire themselves
 
@@ -107,65 +114,74 @@ tenant at `0` is never touched; closing is idempotent.
 **Size.** Half a day. **Test.** A fork's room starts at the tenant default, not
 at its parent's setting (this is already **F-88** in the fault catalogue).
 
-### A4 · `/digest` — the answer to "what happened while I was away"
+### A4 · `/digest` — the answer to "what happened while I was away" · **shipped**
 
 **Friction.** `/board` lists workspaces; nothing anywhere answers "three
 finished, one wants an answer, two are still going". After this change that
 question is asked against thirty rooms instead of ten.
 
-**Change.** One card, computed entirely from local rows — no API call, so it
-works when Conductor is down:
+**Shipped**, and it ranks rather than lists — worst first, because the card's
+job is "what needs me?" and not "what happened?":
 
 ```
-Since 18:20 · 3 done · 1 needs you · 2 running
+Last 1d · 1 errored · 1 stalled · 2 running · 3 finished
 
-✅ fix flaky login · acme-api · 4m ago      [open]
-✅ port billing to v2 · acme-api · 22m      [open]
-⚠️ rename CLI flags · web · error 1h        [open]
-⚙️ upgrade deps · infra · 12m in            [open]
+⚠️ rename CLI flags · web/main · model overloaded · 1h04m
+⏳ upgrade deps · infra/main · no output · 41m00s
+⚙️ port billing · acme-api/main · WORKING · 12m03s
+✅ fix flaky login · acme-api/main · 4m12s
 ```
 
-Grouped by state, newest first, jump buttons, capped with a `+N more` line —
-the same conventions `/board` already uses. Optional daily push at a
-tenant-configured hour, silent, off by default.
+Three decisions worth keeping:
 
-**Where.** New `handlers/digest.py`, reusing `signals`, `status_icon`,
-`jump_url`. **Size.** Two days for the command, one more for the scheduled push.
-**Test.** Counts match the rows; a room with no topic renders an *Open here*
-button rather than a dead link; the push never fires twice for one window.
+- **Stalled is its own bucket.** Working-but-silent past `NO_OUTPUT_WARN_S` is
+  the state nothing else in the UI can show: the topic list wears `⚙️` for both,
+  and it is the most common reason somebody picks the phone up.
+- **The window never hides something broken.** A session that errored two days
+  ago is precisely what this card is for; filtering it out under "nothing
+  happened recently" is how it stays broken. Only *finished* work ages out.
+- **Local rows only** — no Conductor call, so it is the one command that still
+  answers during an API outage.
+
+A daily push at a tenant-set hour is still worth building and is not here.
 
 ---
 
 ## P1 — the result is the product, and it is the weakest surface
 
-### B1 · The finish line should say *what changed*
+### B1 · The finish line should say *what changed* · **shipped**
 
 **Friction.** `finish_line` reads `✅ Done · 1m32s · 12 tools · 5 files`
 (`bot/actions.py:57`). Five files — which? The answer is in the transcript that
 just went past, above a wall of tool narration.
 
-**Change.** Append the changed paths (up to five, then `+N`) and the pull
-request URL when there is one. The CI watcher already extracts a
-`github.com/owner/repo/pull/NN` from the transcript tail
-(`ci/watcher.py`, and `HANDOFF.md` calls the link "the announcement"), so the
-same extraction feeds this. No new state, no new API call.
+**And it was worse than that.** `files_changed` was **hardcoded to `0`** in
+`machine._finalize`, so both readers of it — the finish line and the done card —
+rendered a segment that could never appear. Every turn since the machine was
+written has said "12 tools" and nothing at all about files.
 
-**Where.** `bot/actions.finish_line`, `turn/state.TurnSummary`.
-**Size.** One to two days. **Test.** A turn touching 20 files shows 5 + `+15`; a
-turn with no PR link renders exactly as today.
+**Shipped.** `Delta` now carries `edited_paths`, collected in
+`cursor.build_delta` with the renderer's own `describe_file_edit` so the receipt
+cannot disagree with the transcript about what an edit is; `TurnContext`
+accumulates them per turn, first-seen order, capped at `EDITED_PATHS_CAP`; the
+finish line names up to five and counts the rest. Not persisted — a redeploy
+mid-turn degrades it to what every turn showed before, which is nothing.
 
-### B2 · `/log` should be readable
+The PR half needed no work: `_share_review_pr` already finds and pins the link
+(`bot/actions.py:210`).
+
+### B2 · `/log` should be readable · **shipped**
 
 **Friction.** `/log` sends a `.md` file of raw JSON blocks
 (`power.py:599-609`). On a phone that is unreadable, and it is the only
 "show me what happened" command there is.
 
-**Change.** `/log` renders the last N *exchanges* — prompt, reply, tool count —
-as text in the room. `/log raw` keeps today's JSON dump for debugging.
-
-**Where.** `handlers/power.log_command`, reusing the render adapters.
-**Size.** One day. **Test.** `/log` never exceeds the 4096 UTF-16 chunk; `/log
-raw` is byte-identical to today.
+**Shipped.** `/log` renders the last N exchanges as one line each — `›` for
+your prompt, `·` for anything the agent said or did — through
+`cursor.preview_text`, which is the same reducer the first-bind preview uses, so
+the log phrases a tool call exactly as the status card does. `/log raw` keeps
+the JSON document, unchanged. An envelope the renderers cannot parse (the 64 KB
+cap can cut one mid-object) is dropped rather than printed as a blank row.
 
 ### B3 · One tap for the three things everyone types
 
@@ -182,17 +198,16 @@ button-shaped canned text; this is a stored set rather than a per-turn one.
 **Size.** Two days. **Test.** A snippet is sent as a prompt to *this* room's
 session; snippets are tenant-scoped by RLS like everything else.
 
-### B4 · The cockpit should offer more than one destination
+### B4 · The cockpit should offer more than one destination · **shipped**
 
 **Friction.** `cockpit_target` returns exactly one session — the most recently
 prompted (`core.py:570`) — so a line typed in the DM root can only go to the
 last thing you touched. With thirty rooms that is a coin flip.
 
-**Change.** Offer the three most recent, and let the fourth be `/board`.
-
-**Where.** `handlers/core.cockpit_target`/`cockpit_markup`.
-**Size.** Half a day. **Test.** Three buttons, newest first, each addressing its
-own session; unchanged when only one exists.
+**Shipped.** `cockpit_targets` returns up to `COCKPIT_TARGETS` (3), newest
+first, deduplicated by session; `cockpit_target` stays as the single-head
+helper. Both the typed and the spoken path get it, because both already go
+through `cockpit_markup`.
 
 ### B5 · `/spend`
 
@@ -261,15 +276,19 @@ content — the same perimeter rule the rest of voice follows.
 
 ## Sequence
 
-1. **With the topic-per-session change:** A1, A3 — both are small and both
-   become wrong to skip the moment rooms multiply.
-2. **Immediately after:** A2, A4. This is the pair that keeps a thirty-room list
-   usable; ship them before anyone accumulates thirty rooms.
-3. **Then:** B1, C1, B4, B2 — in that order. B1 is the largest single
-   improvement to "easier to see reports" and touches one function; C1 is the
-   second largest and is mostly a button, because the renderer is already
-   written and merely switched off.
-4. **Then:** B3, B5, and the P2 items as they earn their place.
+**Done:** A4, B1, B2, B4 — the four that stand alone, need no migration and are
+worth having whether or not topic-per-session ever lands. A1 was dropped for the
+reason recorded above.
+
+**Next, in order:**
+
+1. **A2 and A3**, with the topic-per-session change: they are what keeps a
+   thirty-room list usable, and both become wrong to skip the moment rooms
+   multiply. Both want a `tenant_settings` column, which is the migration this
+   first batch deliberately avoided.
+2. **C1** — the diff is already rendered and merely switched off, so "Show
+   changes" is a button rather than a feature.
+3. **B3, B5**, then the rest of P2 as they earn their place.
 
 One rule for all of it: **every one of these reads from rows the bot already
 writes.** Nothing here needs a new Conductor endpoint, a webhook, or a second

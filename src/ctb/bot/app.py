@@ -103,6 +103,7 @@ CONFLICT_BACKOFF_S: Final = 5.0
 BOT_COMMANDS: Final[tuple[BotCommand, ...]] = (
     BotCommand(command="new", description="New workspace"),
     BotCommand(command="board", description="Live sessions"),
+    BotCommand(command="digest", description="What needs me"),
     BotCommand(command="attach", description="Open laptop workspace"),
     BotCommand(command="home", description="Show the launcher buttons"),
     BotCommand(command="stop", description="Stop this turn"),

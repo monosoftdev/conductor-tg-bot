@@ -7,6 +7,33 @@ from its first tagged release.
 
 ## [Unreleased]
 
+### Added
+
+- `/digest` — one card ranking every live task by how much it wants you:
+  errored, then stalled, then running, then finished, then asleep. Read from
+  local rows only, so it is the one command that still answers during a
+  Conductor outage. **Stalled** (working but silent past the machine's
+  no-output threshold) is a state nothing else in the UI could show: the topic
+  list wears the same ⚙️ for a healthy turn and a wedged one.
+- The completion receipt names the files a turn changed, up to five and then a
+  count.
+
+### Fixed
+
+- `TurnSummary.files_changed` was hardcoded to `0`, so both of its readers —
+  the finish line and the done card — rendered a "N files" segment that could
+  never appear. The count and the paths now come from the transcript, via the
+  renderer's own file-edit reducer so the receipt cannot disagree with the
+  chat above it about what an edit is.
+
+### Changed
+
+- `/log` renders the last exchanges as readable lines instead of a `.md` file
+  of raw JSON; `/log raw` keeps the old document for debugging a shape.
+- The DM cockpit's "Send to …" offers the three most recently prompted tasks
+  rather than only the newest, which was a coin flip once a chat held more
+  than a couple.
+
 ## [0.1.0] — 2026-07-30
 
 First public release, under the MIT licence.

@@ -42,6 +42,7 @@ __all__ = [
     "DRAIN_CONFIRMS",
     "Delta",
     "E404",
+    "EDITED_PATHS_CAP",
     "EditStatusCard",
     "Evidence",
     "Finalize",
@@ -131,6 +132,11 @@ PROMPT_AGE_OUT_S: Final = 300.0
 #: it is long because the failure it guards against — declaring a running agent
 #: finished — is the one the user actually reported.
 TURN_END_AGE_OUT_S: Final = 900.0
+#: How many distinct edited paths one turn remembers. A refactor can touch
+#: hundreds of files and the receipt shows five of them, so the rest are counted
+#: and never carried — an unbounded tuple on a long turn is memory spent on
+#: strings nobody will read.
+EDITED_PATHS_CAP: Final = 64
 #: Agents known to file an end-of-turn record on every turn, so the gate that
 #: waits for one can be trusted from a session's *first* turn rather than only
 #: after it has watched one arrive. Verified against real transcripts
@@ -247,6 +253,10 @@ class Delta:
     witnessed_prompt_ids: frozenset[str] = frozenset()
     #: Tool-use blocks seen, for the completed-turn header line.
     tool_calls: int = 0
+    #: Paths of files this page's tool calls edited, first-seen order, unique.
+    #: A tuple rather than a set because the finish line prints them and the
+    #: order an agent touched files in is the order it explains them in.
+    edited_paths: tuple[str, ...] = ()
     #: A ``result`` payload flagged ``is_error``.
     has_error_result: bool = False
     #: Turn ids whose end-of-turn record arrived in this page: the agent's own
@@ -439,6 +449,10 @@ class TurnSummary:
     duration_ms: int = 0
     tool_calls: int = 0
     files_changed: int = 0
+    #: The paths behind :attr:`files_changed`, in the order the agent touched
+    #: them, capped at :data:`EDITED_PATHS_CAP`. ``files_changed`` may exceed
+    #: ``len(files)`` only if the cap bit — the count is the honest one.
+    files: tuple[str, ...] = ()
     prompts: int = 1
     ok: bool = True
     error: str | None = None
@@ -663,6 +677,13 @@ class TurnContext:
 
     status_card_msg_id: int | None = None
     tool_calls: int = 0
+    #: Files this turn has edited, first-seen order, capped at
+    #: :data:`EDITED_PATHS_CAP`. Deliberately **not** persisted: it is receipt
+    #: decoration, and a redeploy mid-turn degrades it to the empty tuple —
+    #: which is exactly what every turn showed before it existed. ``tool_calls``
+    #: has a column and survives; this does not, and must not be read as if it
+    #: were authoritative.
+    edited_paths: tuple[str, ...] = ()
     delivered: int = 0
     cancel_requested_at: float | None = None
     canceled_queued_messages: int = 0
