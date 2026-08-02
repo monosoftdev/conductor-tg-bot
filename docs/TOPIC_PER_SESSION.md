@@ -135,9 +135,10 @@ session that never ran" (`power.py:472-475`) disappears — the new room is born
 session owning a room, `homed_elsewhere` (`power.py:133`) is true of almost
 everything, so:
 
-- in a **topic**: `/s` lists the sibling sessions of this workspace as *jump*
-  buttons (`jump_url`), plus an *Open* button for a sibling that has no room
-  yet — which mints one lazily and binds it. No `switch` action is offered.
+- in a **topic**: `/s` renders **stage 2 of `/board`** for this workspace, with
+  no Back button — the same renderer, so the two cannot drift. Sibling sessions
+  with a room are jump buttons; a sibling with no room gets an *Open here*
+  button that mints one lazily. No `switch` action is offered.
 - in the **linear DM root / General**: unchanged. That seat genuinely has one
   mutable binding and `/s` is the only way to move it, and the whole degraded
   path depends on it.
@@ -153,13 +154,10 @@ them. Loop over `sessions_repo.list_for_workspace`.
 sessions with a room, keeping the same 7-day staleness test on the session's
 `updated_at`.
 
-### `bot/handlers/core.py` — `/board`, `/done`
+### `bot/handlers/core.py` — `/board` becomes a two-stage picker
 
-`/board` (`core.py:229`) is the workspace list and should stay one row per
-workspace. Its jump target becomes "the workspace's most recently active session
-with a room" — a `sessions` lookup instead of `local.topic_id` (`:257-261`).
-Worth adding `· N tasks` to a row with more than one session, since the list can
-no longer show them.
+See [§`/board`, stage by stage](#board-stage-by-stage) below; it is the largest
+single piece of UI work in this change.
 
 `/done` archives a workspace, so `confirm_archive` (`core.py:807`) must retire
 **every** room of that workspace, not one: loop `retire_topic` over
@@ -254,14 +252,19 @@ that stays correct.
    to the session columns; keep every reader dual-reading
    `session.topic_id ?? workspace.topic_id` for one deploy.
 3. Move `/fork` to open its own room. This is the user-visible flip.
-4. Move `/s`, `/board`, `/done`, `/tidy`, `/name -w`, `prompts.tidy_rename_notice`.
-5. Delete the dual reads; migration 004 drops the workspace columns.
-6. Docs: `PLAN.md` §Chat model, `HANDOFF.md`, `CLAUDE.md`, `README.md`,
+4. Move `/done`, `/tidy`, `/name -w`, `prompts.tidy_rename_notice`.
+5. The `/board` two-stage picker, and `/s` re-pointed at its stage-2 renderer.
+   This is the second user-visible flip and the only one with new callbacks.
+6. Delete the dual reads; migration 004 drops the workspace columns.
+7. Docs: `PLAN.md` §Chat model, `HANDOFF.md`, `CLAUDE.md`, `README.md`,
    `GETTING_STARTED.md:255`, `SETUP.md:101`, and the `/help` card
-   (`power.py:76-95`) — `/fork` now reads "new session, new topic".
+   (`power.py:76-95`) — `/fork` now reads "new session, new topic" and `/board`
+   "workspaces, then their sessions".
 
 Steps 1–2 are safely deployable on their own; step 3 is the one that changes
-what a person sees.
+what a person sees; step 5 can ship separately from it, in either order —
+the picker's stage 2 is correct under the old model too, it just lists sessions
+that all share one room.
 
 ## Tests
 
@@ -286,11 +289,150 @@ Named by what the change can break, per CLAUDE.md:
 Before claiming any of these have teeth, break the code they cover and watch
 them fail (CLAUDE.md).
 
-## Open question worth deciding before step 3
+<a id="board-stage-by-stage"></a>
 
-`/board` currently shows workspaces. With rooms per session, is the primary list
-still *workspaces* (one row, jumps to the newest room) or *sessions* (one row
-per room, matching the topic list one-for-one)? This proposal assumes
-workspaces, because `/board` is the cross-org view and the topic list is already
-the per-room switcher — but it is a one-function change either way
-(`core.board_rows`).
+## `/board`, stage by stage
+
+`/board` becomes a two-stage picker in **one message**, edited in place. Stage 1
+picks a workspace; stage 2 picks a session inside it; picking a session connects
+it — opens or jumps to its Telegram topic. A session is one Conductor chat, and
+that is what a topic is now per.
+
+The wording is the feature. At every moment the card must say which of the two
+things is being chosen, so the two stages share no noun, no verb and no button
+shape.
+
+### Stage 1 — choose a workspace
+
+```
+Workspaces · 4
+Tap one to see its sessions.
+
+[ ✅ acme-api · 3 sessions ]
+[ ⚙️ billing-svc · 1 session ]
+[ 💤 web · 2 sessions ]
+[ 💭 infra · no sessions yet ]
+```
+
+- Header names the thing being chosen (`Workspaces`) and the next step
+  (`see its sessions`). It never says "open" — in this card nothing opens.
+- One button per workspace, from `board_rows` (`core.py:289`), which already
+  collapses the per-session view rows to one row per workspace. The session
+  count comes from that same fetch: count the view's rows per `workspace_id`
+  *before* collapsing, which is free and is currently thrown away.
+- The icon is the workspace's **most active** session state, not the first row's
+  — `status_icon` over the max of `_ACTIVE_STATES`, so a workspace with one
+  working session reads `⚙️` even if its newest session is idle.
+- **Every row behaves identically**, whether or not this chat already has rooms
+  for it. `/board` loses its `adopt_button` / `+ Open …` special case
+  (`core.py:262-278`): a laptop workspace and a local one both drill down, and
+  the difference only shows up in stage 2 (jump vs. open). `adopt_button` stays
+  in `/attach` and `/s`.
+- Cap `BOARD_VISIBLE` (10) with the existing `+N more · /board name` line.
+
+### Stage 2 — choose a session
+
+```
+acme-api · 3 sessions
+Tap one to open it in this chat.
+main · claude/opus-5
+
+[ ✅ fix flaky login test · opus-5 ]
+[ ⚙️ port billing to v2 · opus-5 ]
+[ 💭 rename the CLI flags · sonnet-5 ]
+[ « All workspaces ]
+```
+
+- Header names the **workspace** as context and `sessions` as the thing being
+  chosen. The verb changes to `open … in this chat`, which is the thing stage 1
+  deliberately never says.
+- Back is always last and always reads `« All workspaces` — it names the
+  destination, not the direction, so it is readable alone.
+- Session rows come from `GET /v0/workspaces/{id}/sessions` (adopt's
+  `_all_sessions`, `SESSION_SCAN` = 20) unioned with
+  `sessions_repo.list_for_workspace`, because a session created on the laptop
+  seconds ago is in neither the view nor the local cache reliably. Label:
+  `{icon} {session title} · {model}`.
+- A session that **already has a room in this chat** is a `url_button`
+  (`jump_url`) — no ticket, no work, Telegram just jumps. In a DM topic
+  `jump_url` returns `None` (Telegram publishes no link syntax for one), so it
+  falls back to a connect ticket whose handler answers "already open here" and
+  does nothing else.
+- A session with **no room** gets a connect ticket.
+- Zero sessions: `No sessions in acme-api yet.` plus Back. Not an error.
+
+### Connecting
+
+Tapping a session runs the adopt path scoped to that one session:
+`adopt.adopt_workspace(..., session_hint=<session_id>)` already picks by hint
+(`adopt.py:_pick_session`) — with per-session rooms it stops meaning "which
+session gets the workspace's room" and starts meaning "which session to open",
+so repeated calls for different sessions of one workspace open different rooms.
+The per-workspace `_locks` (`adopt.py:122`) still serialise them.
+
+Order, unchanged from `/new`: create the topic first, then write the binding,
+then `seek_to_end`, then post the snapshot card into the new room. A DM that
+cannot host topics degrades to the linear seat and the existing one-line notice.
+
+### Callbacks and nonces
+
+Three new `Action` members in `keyboards.py:151`:
+
+- `BOARD_WS = "bws"` — target `workspace_id`. Renders stage 2 in place.
+- `BOARD_SESSION = "bsess"` — target `workspace_id\nsession_id` (the `\n`
+  packing `adopt_callback` already uses at `adopt.py:697`). Connects.
+- `BOARD_BACK = "bback"` — target `""`. Re-renders stage 1 in place.
+
+Tickets are **single-use** (`NonceStore.consume`), so each render mints a fresh
+keyboard and the outgoing stage's tickets simply expire — going back and forth
+works because every transition re-mints, not because a ticket is reused. Stage-2
+tickets are minted when stage 2 is *rendered*, never fanned out at stage 1: one
+tap must not mint forty tickets.
+
+Both stages redraw with `edit_html` (`topics.py:577`), which already treats
+"message is not modified" as success and falls back to plain text on an
+entity-parse 400. If the edit fails — the card was deleted — send a fresh card
+rather than dropping the tap.
+
+`CONTROL_TTL_S` (15 min) is the right TTL: a board left open on a lock screen
+should expire into "run /board again", which is the existing message.
+
+### Where else the wording has to move
+
+- `board_lines` (`core.py:511`) is the **voice** path's text-only board. It gets
+  the stage-1 wording and says nothing about tapping, because voice cannot tap.
+  Its `+N more · use /s to switch` tail becomes `· say "open <name>"`.
+- `/help` (`power.py:76`): `/board` becomes "workspaces, then their sessions".
+- `nothing_to_attach` (`core.py:486`) counts rooms from `workspaces.topic_id`
+  and moves to counting sessions with a room.
+- `/attach` is now nearly a subset of `/board` stage 1. Keep it — it filters to
+  *unattached* workspaces and takes a text query — but the two must use the same
+  noun for a workspace and the same noun for a session.
+
+### Tests for the picker
+
+In `tests/test_bot_handlers.py`:
+
+- stage 1 renders one button per workspace with a session count, and **no**
+  `+ Open` adopt buttons;
+- tapping a workspace edits the same message (same `message_id`) and the new
+  text names that workspace and the word `sessions`;
+- Back returns to stage 1 and the stage-1 text is byte-identical to the first
+  render except for its nonces;
+- a session with a room renders a `url_button`; one without renders a callback
+  button;
+- tapping a session opens exactly one room and binds that session, and a second
+  tap on a *different* session of the same workspace opens a second room;
+- an expired stage-2 ticket answers "run /board again" and leaves the card
+  alone.
+
+### Deliberately not in v1
+
+- Pagination inside stage 2 (`Action.PAGE` exists; a 20-session workspace shows
+  10 and a `+N more` line).
+- A `+ New session` button in stage 2. It is one `/fork` away and adds a third
+  verb to a card whose whole point is having exactly two.
+- Renaming the noun. The bot says **session** everywhere today (`/s Switch
+  session`, `/fork New session here`, `sessions_repo`, `POST /v0/sessions`), so
+  this spec says session; if Conductor's own UI calls them chats, it is one
+  constant and one pass over the copy above.
