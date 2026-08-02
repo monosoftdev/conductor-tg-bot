@@ -29,6 +29,18 @@ from its first tagged release.
 
 ### Fixed
 
+- **`DEFAULT_BRANCH` (and `DEFAULT_AGENT` / `DEFAULT_MODEL` / `DEFAULT_EFFORT`)
+  reached no tenant at all.** The four `tenants.default_*` columns were NOT NULL
+  with the shipped literal as their column default, `TenantSettings` read the
+  row, and nothing in the bot ever wrote it — so every team answered `main` /
+  `claude` / `opus-5-1m` / `high` forever, whatever the environment said. The
+  columns are an *override* now, and NULL means "follow the platform"
+  (migration `004_platform_defaults`).
+- **A create pinned its seat's branch.** `create_and_bind` wrote every request's
+  branch back onto the chat, and the chat outranks both the tenant and the
+  platform, so one workspace made on `main` fixed that chat to `main` for good.
+  The project, agent, model and effort are still remembered; the branch is not,
+  and `/defaults branch <name>` is now the only thing that sets it.
 - **Every `/fork` and `/s` left two bound sessions on one seat.** Nothing
   unbound the session a room already held, so the supervisor polled both and
   both delivered into the same topic with nothing saying which was which; which
@@ -56,6 +68,9 @@ from its first tagged release.
   workspace's other sessions, stage 1 reaches a workspace, and stage 2's
   bind-the-seat branch moves the one binding a chat without topics has. It stays
   registered as a silent alias to `/board` for the muscle memory.
+- The wizard's branch step always offers `main` as well as the configured
+  default, so it stops being a one-button formality you have to type your way
+  out of. With `DEFAULT_BRANCH=dev` that is `dev` then `main`, `dev` first.
 - `chats.bind` refuses to repoint a *topic* at a different session. A room is not
   a pointer; thread 0 — the linear seat and a group's General — is exempt.
 - `/log` renders the last exchanges as readable lines instead of a `.md` file

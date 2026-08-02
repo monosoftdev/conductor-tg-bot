@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import uuid
 from collections.abc import AsyncGenerator, Callable
 from types import SimpleNamespace
 from typing import Any, Final, cast
@@ -102,6 +103,7 @@ from ctb.bot.middleware import (
     TenantMiddleware,
 )
 from ctb.bot.middleware.context import new_request_id
+from ctb.bot.middleware.tenancy import TenantSettings
 from ctb.bot.wizards import new_workspace
 from ctb.conductor.pool import ClientPool, MissingKeyError
 from ctb.db.connection import Database, tenant_scope
@@ -110,6 +112,7 @@ from ctb.db.repo import chats as chats_repo
 from ctb.db.repo import sessions as sessions_repo
 from ctb.db.repo import tenancy as tenancy_repo
 from ctb.db.repo import workspaces as workspaces_repo
+from ctb.db.repo.tenancy import TenantRow
 from ctb.settings import Settings
 from ctb.turn.state import CardButton
 from tests.conftest import FAKE_BOT_TOKEN, FakeClock
@@ -1946,3 +1949,37 @@ async def test_a_real_stranger_is_still_reported(
     await dispatcher.feed_update(bot, build_update("message", STRANGER_ID))
 
     assert notifier.sent == 1
+
+
+# ── the platform's DEFAULT_* actually reach a tenant ──────────────────────────
+
+
+def test_a_tenant_with_no_override_follows_the_platform(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    """**`DEFAULT_BRANCH=dev` did nothing for the whole multi-tenant build.**
+
+    The four columns were NOT NULL with the shipped literal as their default and
+    nothing in the bot ever wrote them — `tenancy.update_defaults` has three
+    callers and all three set voice fields — so every tenant answered `main`,
+    `claude`, `opus-5-1m`, `high`, forever, whatever Railway said.
+    """
+    platform = settings_factory(
+        default_branch="dev", default_agent="codex", default_model="gpt-5-codex"
+    )
+    tenant = TenantRow(id=uuid.uuid4(), slug="t", name="T")
+
+    resolved = TenantSettings.of(tenant, platform)
+
+    assert (resolved.default_branch, resolved.default_agent) == ("dev", "codex")
+    assert resolved.default_model == "gpt-5-codex"
+
+
+def test_a_tenant_override_still_beats_the_platform(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    """NULL means "follow the platform"; a value is a deliberate pin."""
+    platform = settings_factory(default_branch="dev")
+    tenant = TenantRow(id=uuid.uuid4(), slug="t", name="T", default_branch="release")
+
+    assert TenantSettings.of(tenant, platform).default_branch == "release"

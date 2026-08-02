@@ -135,10 +135,13 @@ class TenantRow:
     github_key_kid: str | None = None
     github_key_fp: str | None = None
     github_key_at: int | None = None
-    default_agent: str = "claude"
-    default_model: str = "opus-5-1m"
-    default_effort: str = "high"
-    default_branch: str = "main"
+    #: An **override** of the platform's ``DEFAULT_*`` env vars, or ``None`` to
+    #: follow them. Nothing in the bot sets these; they exist so an operator can
+    #: pin one tenant against the deployment-wide default (migration 004).
+    default_agent: str | None = None
+    default_model: str | None = None
+    default_effort: str | None = None
+    default_branch: str | None = None
     voice_enabled: bool = False
     voice_mode: str = "prompts"
     max_pollers: int = 20
@@ -172,10 +175,10 @@ class TenantRow:
             github_key_kid=as_opt_str(row["github_key_kid"]),
             github_key_fp=as_opt_str(row["github_key_fp"]),
             github_key_at=as_opt_int(row["github_key_at"]),
-            default_agent=as_str(row["default_agent"], "claude"),
-            default_model=as_str(row["default_model"], "opus-5-1m"),
-            default_effort=as_str(row["default_effort"], "high"),
-            default_branch=as_str(row["default_branch"], "main"),
+            default_agent=as_opt_str(row["default_agent"]),
+            default_model=as_opt_str(row["default_model"]),
+            default_effort=as_opt_str(row["default_effort"]),
+            default_branch=as_opt_str(row["default_branch"]),
             voice_enabled=as_bool(row["voice_enabled"]),
             voice_mode=as_str(row["voice_mode"], "prompts"),
             max_pollers=as_int(row["max_pollers"], 20),
@@ -370,10 +373,10 @@ async def update_defaults(
     tenant_id: uuid.UUID,
     *,
     name: Maybe[str] = UNSET,
-    default_agent: Maybe[str] = UNSET,
-    default_model: Maybe[str] = UNSET,
-    default_effort: Maybe[str] = UNSET,
-    default_branch: Maybe[str] = UNSET,
+    default_agent: Maybe[str | None] = UNSET,
+    default_model: Maybe[str | None] = UNSET,
+    default_effort: Maybe[str | None] = UNSET,
+    default_branch: Maybe[str | None] = UNSET,
     voice_enabled: Maybe[bool] = UNSET,
     voice_mode: Maybe[str] = UNSET,
     conductor_api_url: Maybe[str] = UNSET,

@@ -636,11 +636,18 @@ async def _ask_branch(
     nonces: NonceStore,
     defaults: TenantSettings,
 ) -> None:
-    """Offer the configured default first, then the last-used branch.
+    """The configured default first, then ``main``, then the pinned one.
 
-    ``DEFAULT_BRANCH=dev`` is the whole point: the branch you almost always
-    want is the first button, and the remembered one only earns a second button
-    when it is genuinely different.
+    ``DEFAULT_BRANCH=dev`` is the whole point: the branch you almost always want
+    is the first button and the one "go with defaults" takes. **``main`` is
+    always the second**, because it is the branch every repository has and the
+    other answer whatever the default is — offering only the default made the
+    step a one-button formality you had to type your way out of.
+
+    :func:`_unique` collapses them when they are the same string, so
+    ``DEFAULT_BRANCH=main`` renders one button rather than two identical ones,
+    and a chat pinned to something else with ``/defaults branch`` earns a third.
+    Anything else is still typed.
     """
     data = await state.get_data()
     configured = defaults.default_branch or DEFAULT_BRANCH
@@ -651,7 +658,12 @@ async def _ask_branch(
         nonces,
         step="branch",
         fsm_state=NewWorkspace.branch,
-        options=[(configured, configured), (current, current)],
+        options=[
+            (configured, configured),
+            (DEFAULT_BRANCH, DEFAULT_BRANCH),
+            (current, current),
+        ],
+        columns=3,
     )
     await _edit(message, _ask(data, "branch", "Branch? Type it or tap."), markup)
 

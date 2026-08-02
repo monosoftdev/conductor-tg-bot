@@ -42,6 +42,7 @@ from ctb.bot.handlers.common import (
     created_card,
     react_received,
     request_cancel,
+    resolve_new_request,
     submit_prompt,
     tell,
 )
@@ -2498,19 +2499,32 @@ async def test_branch_step_still_offers_both_when_they_differ(
 async def test_branch_step_offers_the_configured_default_first(
     monkeypatch: Any, settings_factory: Callable[..., Settings]
 ) -> None:
-    """``DEFAULT_BRANCH=dev`` is how the owner stops being shown ``main``."""
+    """``DEFAULT_BRANCH=dev`` is how the owner stops being shown ``main`` first.
+
+    And `main` keeps the second slot whatever the default is: it is the branch
+    every repository has, and offering only the default made the step a
+    one-button formality you had to type your way out of.
+    """
     assert await _branch_buttons(
         "dev", monkeypatch, settings_factory, configured="dev"
-    ) == ["dev"]
+    ) == ["dev", "main"]
     assert await _branch_buttons(
         "release", monkeypatch, settings_factory, configured="dev"
-    ) == ["dev", "release"]
+    ) == ["dev", "main", "release"]
 
 
-async def test_a_created_workspace_makes_its_branch_the_next_offer(
+async def test_a_create_no_longer_pins_the_seats_branch(
     db: Database, monkeypatch: Any, settings_factory: Callable[..., Settings]
 ) -> None:
-    """Type ``dev`` once and it is the button from then on."""
+    """**The bug behind "DEFAULT_BRANCH is dev but it goes with main".**
+
+    Every create wrote its branch back onto the seat, and `chats.default_branch`
+    outranks both the tenant and the platform — so one workspace made on `main`
+    pinned that chat to `main` for good, whatever Railway said afterwards. The
+    project, agent, model and effort are still remembered: those are answers to
+    "what did I pick", while the branch had an operator-level default fighting
+    it. `/defaults branch <name>` is now the only thing that writes it.
+    """
     await create_and_bind_input(
         bot=None,
         chat_id=1001,
@@ -2523,11 +2537,44 @@ async def test_a_created_workspace_makes_its_branch_the_next_offer(
     )
 
     chat = await chats_repo.get(db, 1001, 0)
-    assert chat is not None and chat.default_branch == "dev"
-    # Seeded exactly as ``start_wizard`` seeds it: chat default beats settings.
-    assert await _branch_buttons(
-        chat.default_branch or "", monkeypatch, settings_factory
-    ) == ["main", "dev"]
+    assert chat is not None
+    assert chat.default_branch is None, "the seat is not pinned by a side effect"
+    assert chat.default_project_id == _REQUEST.project_id
+    assert (chat.default_agent, chat.default_model) == (
+        _REQUEST.agent,
+        _REQUEST.model,
+    )
+
+
+async def test_an_explicit_defaults_branch_still_wins(db: Database) -> None:
+    """`/defaults branch` is a choice, so it outranks the platform default."""
+    pinned = await chats_repo.ensure(db, 1001, 0, kind="dm")
+    pinned = await chats_repo.set_defaults(db, 1001, 0, branch="release") or pinned
+
+    request = await resolve_new_request(
+        text="fix it",
+        route=Route(chat_id=1001, kind="dm", chat=pinned),
+        defaults=TenantSettings(default_branch="dev"),
+        db=db,
+        client=_CountingClient(),  # type: ignore[arg-type]
+    )
+
+    assert request.branch == "release"
+
+
+async def test_the_platform_default_reaches_a_chat_that_pinned_nothing(
+    db: Database,
+) -> None:
+    """What `DEFAULT_BRANCH=dev` was supposed to do all along."""
+    request = await resolve_new_request(
+        text="fix it",
+        route=Route(chat_id=1002, kind="dm"),
+        defaults=TenantSettings(default_branch="dev"),
+        db=db,
+        client=_CountingClient(),  # type: ignore[arg-type]
+    )
+
+    assert request.branch == "dev"
 
 
 # ── the wizard's buttons have to outlive the process ─────────────────────────
