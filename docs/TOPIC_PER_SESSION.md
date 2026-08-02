@@ -201,6 +201,9 @@ application never applies DDL (CLAUDE.md).
 ```sql
 ALTER TABLE sessions ADD COLUMN topic_name   text;
 ALTER TABLE sessions ADD COLUMN topic_marker text;
+-- Terminal by the user's choice, as distinct from `dead_at` (the session 404ed).
+-- "Is this the last one?" must not be fooled by either.
+ALTER TABLE sessions ADD COLUMN archived_at  bigint;
 -- sessions.chat_id / thread_id already exist and already carry the address.
 
 -- Backfill: the workspace's room becomes the room of the session already
@@ -360,12 +363,8 @@ sessions with a room, keeping the same 7-day staleness test on the session's
 See [§`/board`, stage by stage](#board-stage-by-stage) below; it is the largest
 single piece of UI work in this change.
 
-`/done` archives a workspace, so `confirm_archive` (`core.py:807`) must retire
-**every** room of that workspace, not one: loop `retire_topic` over
-`sessions_repo.list_for_workspace`. `TopicRetirement` becomes a per-room result
-and the card reports the aggregate ("3 rooms closed", "1 left open"). The
-"the card lived in the topic, so it went with it" early return (`:855`) has to
-check whether the *card's own* room was among the deleted ones.
+`/done` stops meaning "archive the workspace" and starts meaning "archive this
+task" — see [§Archiving, and a deleted topic](#archiving) below.
 
 `adoptable` / `board_lines` / `nothing_to_attach` (`:348`, `:501`) count
 "workspaces that have a room here" from `workspaces.topic_id`; they move to
@@ -457,7 +456,11 @@ that stays correct.
    to the session columns; keep every reader dual-reading
    `session.topic_id ?? workspace.topic_id` for one deploy.
 3. Move `/fork` to open its own room. This is the user-visible flip.
-4. Move `/done`, `/tidy`, `/name -w`, `prompts.tidy_rename_notice`.
+4. Move `/tidy`, `/name -w`, `prompts.tidy_rename_notice`, and add
+   `topics.room_gone` with its three callers — a deleted topic stops being
+   silent before rooms start multiplying.
+4b. `/done` becomes archive-this-session-then-the-workspace-if-last, with the
+   two confirm cards. First caller of `client.archive_session`.
 5. The `/board` two-stage picker — including its bind-the-seat branch for a chat
    with no topics — then, in the *same* release, retire `/s`: out of
    `BOT_COMMANDS` and `_HELP`, kept as a silent alias to `/board`. The second
@@ -497,6 +500,123 @@ Named by what the change can break, per CLAUDE.md:
 
 Before claiming any of these have teeth, break the code they cover and watch
 them fail (CLAUDE.md).
+
+<a id="archiving"></a>
+
+## Archiving, and a deleted topic
+
+### `/done` archives the session, and the workspace only when it is the last
+
+Today `/done` archives the **workspace** from inside a room (`core.py:754`,
+`confirm_archive` at `:807`), which under one-room-per-session would throw away
+every sibling task to finish one. New behaviour, in a room:
+
+1. Two-tap confirm, as now (`confirm_keyboard`, `NONCE_TTL_S`, no `CONTROL_TTL_S`
+   — this one is destructive).
+2. `POST /v0/sessions/{id}/archive` — `client.archive_session` already exists
+   (`conductor/client.py:1181`, `idempotent=True`) and **has no caller anywhere
+   in `src/`**; this is its first one.
+3. Count what is left. Not from the local cache alone:
+   `sessions_repo.list_for_workspace` cannot see a chat somebody opened on the
+   laptop, so the count is `client.list_workspace_sessions(workspace_id)` minus
+   the one just archived, with the local rows as the fallback when the API call
+   fails. **If the count cannot be established, do not archive the workspace** —
+   leaving a container running is recoverable, archiving somebody's live laptop
+   session from a phone is not.
+4. If nothing live remains: `archive_workspace` + `workspaces_repo.mark_archived`,
+   exactly as `/done` does today.
+5. Delete this room (`retire_topic`, per session; rename-and-close fallback when
+   Telegram refuses the delete, unchanged).
+6. Locally: `sessions.archived_at`, `is_bound = false`, and the poller stops on
+   its next reconcile because `list_bound` already skips unbound rows.
+
+Order matters: remote archive first, room deletion last. A deleted room with a
+live session behind it is a task you can no longer reach; a live room with an
+archived session behind it says so on its next tick.
+
+**Two confirm cards, and they must not read alike** — same rule as `/board`'s
+two stages:
+
+- not the last: `Archive «fix flaky login»` / *Deletes this topic and everything
+  in it. The workspace and its 2 other tasks stay.*
+- the last: `Archive «fix flaky login»` / *Last task in acme-api — this archives
+  the whole workspace too. Both stay restorable in Conductor.*
+
+The count is fetched **before** the card is drawn, so the second sentence is a
+fact rather than a guess. `ARCHIVE_CONSEQUENCE` (`core.py:81`) becomes those two
+strings.
+
+Where the receipt goes: the room is gone, so the card went with it (the early
+return at `core.py:855` stays). When the *workspace* was archived too, that is
+news beyond the room — post one line into the chat root, because there is no
+room left that could carry it.
+
+Same path for `Action.ARCHIVE_REQUEST` (`core.py:876`) and `/mode`'s `🗄
+Archive…` button (`core.py:735`), both of which target `workspace.id` today and
+move to the session. `/done` typed in the root or General has no session in
+scope and answers "run this inside a task, or `/board` to pick one".
+
+**A workspace archived elsewhere** (the laptop, or `/done` on the last session)
+must retire *all* of its rooms, not one. That is `machine._die` →
+`SetTopicMarker(ARCHIVED)` + `UnbindTopic` (`turn/machine.py:1140-1160`), which
+fires per session, so each room retires itself as its own poller notices — no
+fan-out needed, and it degrades correctly if one poller is behind.
+
+### Deleting a topic from Telegram is silent
+
+**Telegram sends no service message for a deleted topic.** The repo's own
+enumeration is the evidence: `_SERVICE_CONTENT` (`prompts.py:55-82`) lists
+`FORUM_TOPIC_CREATED`, `FORUM_TOPIC_EDITED`, `FORUM_TOPIC_CLOSED`,
+`FORUM_TOPIC_REOPENED`, `GENERAL_FORUM_TOPIC_HIDDEN/UNHIDDEN` — there is no
+deleted member to handle. The bot finds out only by trying to use the room.
+
+Three places already discover it, independently, and none of them tells the
+others:
+
+- `topics.send_html` → `thread_is_gone` → resends to the chat root
+  (`topics.py:503-517`);
+- the outbox → `_reroute_to_general` → moves *that one delivery row* to thread 0
+  (`outbox.py:1047`);
+- `apply_marker` → `edit_forum_topic` raises → a warning and `False`
+  (`topics.py:987-994`).
+
+So today, deleting a room leaves the session bound to a dead thread, the poller
+running, the workspace still holding `topic_id`, the `chats` row still routing,
+`/board` still offering a jump button to a room that does not exist — and every
+future delivery paying the reroute again, one row at a time, forever.
+
+**Fix: one seam, three callers.** `topics.room_gone(db, session_id)` clears the
+session's room (`unbind_topic`, `thread_id = 0`), clears the `chats` row, and
+posts one line into the chat root: *«fix flaky login» lost its topic · /board to
+open it again, /done to archive it.* All three discovery points call it; it is
+idempotent, so three of them racing costs one line, not three (guard on the
+session already being roomless).
+
+**A deleted topic is a detach, not an archive.** Deliberate: the gesture is
+reachable by accident from a phone, it has no confirm of its own, and the thing
+on the other side costs money and holds uncommitted work. Unbinding is free to
+undo — `/board` re-opens a room and `seek_to_end` picks the transcript up where
+it left off. Archiving on a Telegram gesture is not. If that turns out to be
+wrong in use, it is one function.
+
+Consequence worth stating: **deleting a topic does not archive anything**, so a
+workspace whose rooms were all deleted stays live and billable, and shows up in
+`/board` stage 1 with sessions that have no room — which is exactly the state
+stage 2's *Open here* button exists for.
+
+### Tests
+
+- `tests/test_bot_handlers.py` — `/done` in a room with siblings archives the
+  session and deletes only that room, and does **not** call `archive_workspace`;
+  `/done` on the last live session archives both; the two confirm cards differ;
+  a failed session-count lookup archives the session and leaves the workspace
+  alone.
+- `tests/test_bot_handlers.py` — `room_gone` unbinds, clears `chats`, posts one
+  line, and is a no-op the second time.
+- `tests/test_outbox.py` — a thread-gone reroute calls `room_gone` once, and the
+  next turn's deliveries are queued to the root rather than to the dead thread.
+- `tests/test_machine.py` — a workspace archived remotely retires each session's
+  own room through its own `UnbindTopic`.
 
 <a id="board-stage-by-stage"></a>
 
