@@ -51,8 +51,11 @@ from ctb.turn.state import Cancel, Evidence, TopicMarker, TurnState
 log = get_logger(__name__)
 
 FOCUS_MS: Final = 30 * 60 * 1000
-#: Last resort only. Precedence is chat default → ``DEFAULT_BRANCH`` env →
-#: this, so the owner changes the offered branch from Railway, not from code.
+#: Last resort only, and the branch every repository has. Precedence is the
+#: chat's pinned branch (``/defaults branch``) → the tenant override → the
+#: platform's ``DEFAULT_BRANCH`` → this, so the owner changes the offered branch
+#: from Railway, not from code. It is also the permanent second button on the
+#: wizard's branch step: whatever the default is, `main` is the other answer.
 DEFAULT_BRANCH: Final = "main"
 #: Appended to every Telegram prompt. The delimiter matters: without it a long
 #: task that carries its own style guidance averages this away instead of
@@ -789,26 +792,22 @@ async def create_and_bind_input(
         session_id=session_id,
         kind=kind,
     )
-    await chats_repo.set_defaults(
-        database,
-        chat_id,
-        route.thread_id,
-        project_id=request.project_id,
-        branch=request.branch,
-        agent=request.agent,
-        model=request.model,
-        effort=request.effort,
-    )
-    await chats_repo.set_defaults(
-        database,
-        chat_id,
-        thread_id,
-        project_id=request.project_id,
-        branch=request.branch,
-        agent=request.agent,
-        model=request.model,
-        effort=request.effort,
-    )
+    # Remembered for the next zero-tap `/new`. **Not the branch**: writing it
+    # back made one create pin the seat forever, outranking both the tenant and
+    # the platform, so a chat that once ran on `main` kept answering `main`
+    # however `DEFAULT_BRANCH` was set. `/defaults branch <name>` is now the only
+    # thing that writes that column, which is the difference between a choice
+    # and a side effect.
+    for remembered_seat in {route.thread_id, thread_id}:
+        await chats_repo.set_defaults(
+            database,
+            chat_id,
+            remembered_seat,
+            project_id=request.project_id,
+            agent=request.agent,
+            model=request.model,
+            effort=request.effort,
+        )
     # New workspaces start in `initializing`. Capture the prompt durably now,
     # but do not POST it until the poller observes `ready`; rule 10 then emits a
     # RePost with this exact id.
