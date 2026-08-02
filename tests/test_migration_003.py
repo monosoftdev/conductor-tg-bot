@@ -27,7 +27,7 @@ pytestmark = pytest.mark.db
 
 #: The versions a database deployed before this change has already recorded.
 _BEFORE = ("001_init.sql", "002_ci_watch.sql")
-_SCRATCH = "ctb_migration_003"
+_SCRATCH = "ctb_migration_upgrade"
 
 
 @pytest.fixture
@@ -102,7 +102,7 @@ def test_003_resolves_the_duplicates_it_would_otherwise_fail_on(
         applied = apply_migrations_sync(conn, MIGRATIONS_DIR)
         conn.commit()
 
-        assert [m.version for m in applied] == [3], "only the new one runs"
+        assert [m.version for m in applied][0] == 3, "003 is the next one up"
         conn.execute("SELECT set_config('ctb.tenant_id', %s, false)", (tenant,))
         sessions = {
             str(row[0]): (bool(row[1]), row[2])

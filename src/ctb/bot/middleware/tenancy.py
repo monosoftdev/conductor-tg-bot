@@ -160,12 +160,18 @@ class TenantSettings:
 
         A tenant can turn voice off for itself; it can never turn it on when the
         platform has no speech vendor configured.
+
+        The four ``default_*`` columns are **overrides**, and NULL means "follow
+        the platform" (migration 004). They were NOT NULL with the shipped
+        literal as their column default and nothing in the bot ever wrote them,
+        so `DEFAULT_BRANCH=dev` in Railway reached no tenant at all: every one of
+        them answered `main`, forever.
         """
         return cls(
-            default_agent=tenant.default_agent,
-            default_model=tenant.default_model,
-            default_effort=tenant.default_effort,
-            default_branch=tenant.default_branch,
+            default_agent=tenant.default_agent or platform.default_agent,
+            default_model=tenant.default_model or platform.default_model,
+            default_effort=tenant.default_effort or platform.default_effort,
+            default_branch=tenant.default_branch or platform.default_branch,
             voice_enabled=tenant.voice_enabled and platform.voice_enabled,
             voice_mode=tenant.voice_mode,
             max_pollers=tenant.max_pollers,
