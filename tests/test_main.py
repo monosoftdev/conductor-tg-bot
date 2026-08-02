@@ -11,9 +11,12 @@ import pytest
 from aiogram.exceptions import TelegramUnauthorizedError
 
 from ctb.__main__ import (
+    OPTIONAL_SCHEMA_VERSIONS,
+    REQUIRED_SCHEMA_VERSION,
     RuntimeFactories,
     ServiceStoppedError,
     _assert_app_role_is_confined,
+    _default_verify_schema,
     build_runtime,
     run,
 )
@@ -589,3 +592,71 @@ class TestConfigurationErrorsAreLegible:
 
         assert exit_info.value.code == 1
         assert "CTB_MASTER_KEYS" in capsys.readouterr().err
+
+
+# ── a database behind the code must fail by name, not by timeout ─────────────
+
+
+class _SchemaAt:
+    """Only what ``current_schema_version`` reads: one scalar."""
+
+    def __init__(self, version: int) -> None:
+        self._version = version
+
+    async def fetch_val(self, _sql: str, *_args: Any, **_kwargs: Any) -> int:
+        return self._version
+
+
+async def test_a_database_behind_this_build_refuses_to_boot() -> None:
+    """**The deploy this check exists for.**
+
+    Every repo module SELECTs an explicit column list, so a database one
+    migration behind does not degrade — it raises ``UndefinedColumn`` on the
+    first query. The gate only asked for "some schema", so the process came up,
+    ``/health`` asked for the bound sessions, that failed on a column that did
+    not exist, and Railway reported *"Healthcheck failure"* with nothing in the
+    log naming the cause.
+    """
+    with pytest.raises(SettingsError) as refused:
+        await _default_verify_schema(_SchemaAt(REQUIRED_SCHEMA_VERSION - 1))
+
+    message = str(refused.value)
+    assert f"at schema {REQUIRED_SCHEMA_VERSION - 1}" in message
+    assert f"needs {REQUIRED_SCHEMA_VERSION}" in message
+    # The only thing a reader of a deploy log can act on.
+    assert "python -m ctb.db.bootstrap" in message
+    assert "migrate first, then deploy" in message
+
+
+async def test_an_empty_database_says_so_differently() -> None:
+    """ "Nothing here" and "one behind" are different mistakes."""
+    with pytest.raises(SettingsError, match="no schema"):
+        await _default_verify_schema(_SchemaAt(0))
+
+    assert await _default_verify_schema(_SchemaAt(REQUIRED_SCHEMA_VERSION)) == (
+        REQUIRED_SCHEMA_VERSION
+    )
+    # Ahead is fine: the old image keeps running while the new schema lands.
+    assert await _default_verify_schema(_SchemaAt(REQUIRED_SCHEMA_VERSION + 1)) == (
+        REQUIRED_SCHEMA_VERSION + 1
+    )
+
+
+def test_a_new_migration_forces_a_decision_about_booting_on_it() -> None:
+    """The constant cannot be silently left behind.
+
+    A migration is either something the core reads — in which case this build
+    must refuse to run without it — or something a runtime gate degrades, like
+    002's CI ledger. Adding one makes this fail until that is written down,
+    which is the moment the author knows the answer.
+    """
+    from ctb.db.migrate import discover_migrations
+
+    versions = {m.version for m in discover_migrations()}
+    required = versions - OPTIONAL_SCHEMA_VERSIONS
+
+    assert max(required) == REQUIRED_SCHEMA_VERSION, (
+        "a migration was added: raise REQUIRED_SCHEMA_VERSION, or record it in "
+        "OPTIONAL_SCHEMA_VERSIONS with the runtime gate that degrades it"
+    )
+    assert versions >= OPTIONAL_SCHEMA_VERSIONS, "an optional version was deleted"

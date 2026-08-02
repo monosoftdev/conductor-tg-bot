@@ -61,6 +61,31 @@ _SIGNALS: Final[tuple[signal.Signals, ...]] = (signal.SIGINT, signal.SIGTERM)
 # Core Telegram/Conductor behavior remains available on schema 001.
 _CI_SCHEMA_VERSION: Final = 2
 
+#: Migrations the core can run *without*, because a runtime gate degrades the
+#: feature instead. Only 002 so far — see :data:`_CI_SCHEMA_VERSION`.
+OPTIONAL_SCHEMA_VERSIONS: Final[frozenset[int]] = frozenset({2})
+
+#: The lowest schema this build's **core** reads can survive.
+#:
+#: Every repo module SELECTs an explicit column list, so a database behind the
+#: code does not degrade — it raises ``UndefinedColumn`` on the first query.
+#: Booting anyway is how a missed migration presented as *"1/1 replicas never
+#: became healthy"*: the boot gate only asked for "some schema", ``/health``
+#: called ``sessions.list_bound``, that failed on a column that did not exist,
+#: and the platform timed out with nothing in the log naming the cause.
+#:
+#: Bumped by whoever adds a migration. ``tests/test_main.py`` refuses to let
+#: that be forgotten: a new file must either raise this or be recorded as
+#: optional above, and the choice is made where the migration is written.
+REQUIRED_SCHEMA_VERSION: Final = 4
+
+#: Spelled out once, because this string is the whole value of the check: it is
+#: read in a deploy log by somebody who cannot see the database.
+_BOOTSTRAP_COMMAND: Final = (
+    "python -m ctb.db.bootstrap --admin-dsn ... "
+    "--app-password ... --worker-password ..."
+)
+
 #: Services whose failure is logged and contained instead of ending the process.
 #: Voice is off by default, costs money, and depends on a third party — it is a
 #: bonus, not a reason to stop delivering agent replies.
@@ -354,21 +379,33 @@ async def _assert_app_role_is_confined(app: Any) -> None:
 
 
 async def _default_verify_schema(db: Any) -> int:
-    """Check the schema is present. The application never applies migrations.
+    """Check the schema is present **and current**. The app never migrates.
 
     Neither database role may create anything: DDL belongs to
     ``python -m ctb.db.bootstrap``, run once by an operator with the rights to
     do it. Booting against an unmigrated database must therefore fail here,
     loudly, rather than crash-loop on the first query.
+
+    "Present" was not enough. A database one migration behind passes every
+    connection check and then fails every *query*, because the repo layer names
+    its columns — so the process came up, ``/health`` asked for the bound
+    sessions, PostgreSQL said the column did not exist, and the deploy timed
+    out under a healthcheck failure that named nothing. The version is a fact
+    the database already records; refusing on it is one comparison, and it puts
+    the missing command in the deploy log.
     """
     from ctb.db.migrate import current_schema_version
 
     version = await current_schema_version(db)
     if version < 1:
+        raise SettingsError(f"The database has no schema. Run:\n  {_BOOTSTRAP_COMMAND}")
+    if version < REQUIRED_SCHEMA_VERSION:
         raise SettingsError(
-            "The database has no schema. Run:\n"
-            "  python -m ctb.db.bootstrap --admin-dsn ... "
-            "--app-password ... --worker-password ..."
+            f"The database is at schema {version}; this build needs "
+            f"{REQUIRED_SCHEMA_VERSION}. Run, from somewhere that can reach it:\n"
+            f"  {_BOOTSTRAP_COMMAND}\n"
+            "It is idempotent, and the image already running tolerates the new "
+            "schema — so migrate first, then deploy."
         )
     return version
 

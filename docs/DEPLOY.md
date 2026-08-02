@@ -47,8 +47,16 @@ Keep both passwords; you need them in the next step. This creates `ctb_app`
 migration, and grants each role only what it needs. It is safe to re-run.
 
 The bot itself never applies DDL. At boot it *verifies* the schema and refuses
-to start if it is missing, so a half-migrated database fails loudly at deploy
-time rather than at the first prompt.
+to start unless the version is at least the one this build reads
+(`ctb.__main__.REQUIRED_SCHEMA_VERSION`), so a database that is missing — or
+merely one release behind — fails loudly at deploy time, naming this command,
+rather than at the first prompt.
+
+That check earns its keep because the repo layer names its columns: a database
+behind the code does not degrade, it raises `UndefinedColumn` on the first
+query. Without the version comparison the process came up, `/health` asked for
+the bound sessions, and the deploy died under *"Network › Healthcheck ·
+Healthcheck failure"* with nothing in the log saying why.
 
 ## 3. Generate the master key
 
@@ -145,7 +153,13 @@ in `wizard_state` rather than in memory.
 
 If a release adds a migration, run it before deploying the new image — the same
 `ctb.db.bootstrap` command, which is idempotent. The old image keeps running
-against the new schema in the window between.
+against the new schema in the window between: every migration so far only adds
+columns and relaxes constraints, and the old code names the columns it reads,
+so it neither sees nor misses the new ones.
+
+Deploying first is the order that fails, and it fails as a healthcheck timeout
+rather than an error — which is why boot now refuses on the version instead of
+letting the first query find out.
 
 ## Key rotation
 
