@@ -114,36 +114,94 @@ instead of `workspaces_repo.upsert(chat_id=…, topic_id=…, topic_name=…)`
 `workspaces.get_by_nonce` for a *chat/topic* pair; it moves to reading the
 nonce's workspace and then that workspace's newest session's topic.
 
-### `bot/handlers/power.py` — `/fork`, `/s`, `/name`, `/tidy`
+### `bot/handlers/power.py` — `/fork`, `/name`, `/tidy` (and `/s` is retired)
 
-**`/fork` is the centre of this change.** It becomes a small `/new`:
+#### `/fork`, exactly
 
-1. build `label = topic_label(project, branch, task=<fork title>)`;
-2. `require_topic` / `claim_topic` / degrade-to-linear, through the same
-   `_seat_for` logic — factor the DM-vs-group half of `_seat_for` out of
-   `common.py` so `/fork` and `/new` cannot drift;
-3. `POST /sessions` with a caller-supplied `sessionId` (already idempotent —
-   `turn_cursor.create_session`);
-4. bind the session to the *new* thread, `chats_repo.bind` that thread;
-5. on failure, `discard_topic` the room it just opened.
+**No new workspace.** `/fork` reuses `route.workspace_id` — the guard at
+`power.py:412` already refuses a seat that has none — and adds a session *to
+that existing workspace*, in a room of its own. So one workspace ends up with
+several Conductor chats, each with its own Telegram topic, all sharing one
+container, one branch and one checkout.
 
-The current "reset the topic marker to IDLE because the room now points at a
-session that never ran" (`power.py:472-475`) disappears — the new room is born
-`⏳`/`💭` and the old room keeps its own true marker.
+Order, and the order matters:
 
-**`/s` loses its switching job in a room and keeps it in a seat.** With every
-session owning a room, `homed_elsewhere` (`power.py:133`) is true of almost
-everything, so:
+1. `label = topic_label(project, branch, task=<fork title>)` — the same builder
+   `/new` uses, fed the same `project`/`branch` the parent room carries, so the
+   new row joins the family in the list (`topic_icon_color` hashes the
+   **workspace** label, so the colour matches too).
+2. Open the room: `require_topic` in a group, `claim_topic` if the `/fork` was
+   itself typed into an empty *New Chat* thread, `dm_topic_support` →
+   `require_topic` → degrade-to-linear in a DM. Factor the DM-vs-group half of
+   `_seat_for` (`common.py:442`) out so `/fork` and `/new` cannot drift.
+   **Before** the session exists, exactly as `/new` does it.
+3. `POST /v0/sessions` with a caller-supplied `sessionId`
+   (`turn_cursor.create_session`) — idempotent, so an ambiguous failure is
+   retried with the same id rather than leaving an orphan chat.
+4. `sessions_repo.upsert(chat_id, thread_id=<new topic>, is_bound=True)` +
+   `bind_topic` + `set_topic_marker(INITIALIZING)`, then
+   `sessions_repo.seek_to_end(message_id=None, session_index=-1)` — a session
+   we just created is empty, and saying so beats letting the supervisor guess.
+5. `chats_repo.bind(chat_id, <new thread>, workspace_id, session_id,
+   kind="topic")` — this is the "immediately linked" step: from here the router
+   resolves that thread to that session and a prompt typed in it goes to the new
+   chat, nowhere else.
+6. On any failure after step 2, `discard_topic` the room just opened, so a retry
+   finds no empty siblings.
 
-- in a **topic**: `/s` renders **stage 2 of `/board`** for this workspace, with
-  no Back button — the same renderer, so the two cannot drift. Sibling sessions
-  with a room are jump buttons; a sibling with no room gets an *Open here*
-  button that mints one lazily. No `switch` action is offered.
-- in the **linear DM root / General**: unchanged. That seat genuinely has one
-  mutable binding and `/s` is the only way to move it, and the whole degraded
-  path depends on it.
-- `switch_callback` (`power.py:339`) keeps its refusal (`"That task has its own
-  topic"`) and gains an `open` sibling that creates-and-binds.
+The parent room is **not touched**: its `chats` row still points at the parent
+session, its marker still describes the parent's own turn. The current "reset
+the marker to IDLE because the room now points at a session that never ran"
+(`power.py:472-475`) is deleted — it only existed because the fork stole the
+room.
+
+In a **linear DM** (topics refused) there is no second room to open, so `/fork`
+keeps today's behaviour: the one seat is rebound to the new session, and the
+one-line notice already says the chat holds one thing at a time.
+
+Naming a bare `/fork`: today it titles the session `"Telegram fork"`
+(`power.py:433`), which would become a topic reading `Telegram fork ·
+acme-api/main` — useless in a list. `/fork <title>` is the good path and should
+be what `/help` shows. For the bare form the default here is to label the room
+`fork 2 · acme-api/main` (ordinal from `list_for_workspace`) and mark the label
+*provisional* while `sessions.last_prompt_at IS NULL`; the first prompt sent
+into the room upgrades it once through `apply_marker(label=…)` and never again.
+That keeps "the opening prompt names the room" true without making `/fork` a
+two-step command.
+
+#### `/s` is deprecated
+
+Every job `/s` had now belongs to something else:
+
+- *switch session inside a workspace* — gone as a concept. Each session has its
+  own room; you tap the room.
+- *see the workspace's other sessions* — `/board` stage 2.
+- *reach a workspace from General or the DM root* — `/board` stage 1 → 2.
+- *move the binding in a linear DM* — `/board` stage 2, which in a seat with no
+  topics binds that seat instead of opening a room. **This is the one piece of
+  `/s` that must be reimplemented before `/s` is removed, not after**: the
+  degraded DM has exactly one mutable binding and no other way to move it.
+
+So:
+
+- delete `BotCommand(command="s", …)` from `BOT_COMMANDS` (`app.py:111`);
+- drop the `/s` line from `_HELP` (`power.py:85`); `/board` gains "workspaces,
+  then their sessions";
+- keep `switch_session` registered for one release as a **silent alias** that
+  renders `/board` — a command people have in muscle memory should land
+  somewhere useful, not on "Unknown command · use /help" from the catch-all at
+  `prompts.py`. Remove the handler, `switchable_sessions`, `homed_elsewhere`,
+  `switch_callback`, `Action`'s `switch` and `GENERAL_VISIBLE` in the
+  follow-up that drops the workspace topic columns.
+- fix every string that tells someone to run it: `common.py:108`
+  (`LINEAR_DM_NOTICE`), `common.py:826`, `prompts.py:184`, `voice/service.py:578`
+  ("No session here. Use /new or /s"), `core.py:283`, `core.py:526`,
+  `power.py:280`, plus `README.md:76,99`, `GETTING_STARTED.md:116,132,152`,
+  `SYSTEM_OVERVIEW.md:41,58,60,61,69-72,205`, `RELIABILITY_AUDIT.md:89` and the
+  module docstrings at `routing.py:13-16` and `adopt.py:543`.
+- `tests/test_bot_adopt.py:893-1014` and `tests/test_bot_handlers.py:650,1793`
+  test `/s` directly; they become `/board` stage-1/stage-2 tests, keeping the
+  same assertions about capping, filtering and never crossing a workspace.
 
 `/name` (`power.py:481`): `/name text` renames the session **and** its room
 (that is now the same object), `/name -w text` renames the workspace and must
@@ -253,8 +311,10 @@ that stays correct.
    `session.topic_id ?? workspace.topic_id` for one deploy.
 3. Move `/fork` to open its own room. This is the user-visible flip.
 4. Move `/done`, `/tidy`, `/name -w`, `prompts.tidy_rename_notice`.
-5. The `/board` two-stage picker, and `/s` re-pointed at its stage-2 renderer.
-   This is the second user-visible flip and the only one with new callbacks.
+5. The `/board` two-stage picker — including its bind-the-seat branch for a chat
+   with no topics — then, in the *same* release, retire `/s`: out of
+   `BOT_COMMANDS` and `_HELP`, kept as a silent alias to `/board`. The second
+   user-visible flip and the only one with new callbacks.
 6. Delete the dual reads; migration 004 drops the workspace columns.
 7. Docs: `PLAN.md` §Chat model, `HANDOFF.md`, `CLAUDE.md`, `README.md`,
    `GETTING_STARTED.md:255`, `SETUP.md:101`, and the `/help` card
@@ -273,10 +333,12 @@ Named by what the change can break, per CLAUDE.md:
 - `tests/test_repo.py` — the new session topic columns, RLS still forced on
   them, the backfill's exact `WHERE` (a session bound to a *different* thread of
   the same workspace must not inherit the room).
-- `tests/test_bot_handlers.py` — `/fork` opens a room and leaves the old one
-  bound to the old session; `/fork` in a linear DM still rebinds the one seat;
-  `/done` retires every room of the workspace; `/s` in a room offers jump/open
-  and never `switch`; `/name -w` re-labels every room.
+- `tests/test_bot_handlers.py` — `/fork` adds a session to the **existing**
+  workspace (no `POST /workspaces`), opens a new room, binds `chats` for that
+  thread to the new session, and leaves the parent room's `chats` row and marker
+  untouched; a failed `POST /sessions` discards the room it opened; `/fork` in a
+  linear DM still rebinds the one seat; `/done` retires every room of the
+  workspace; `/name -w` re-labels every room.
 - `tests/test_bot_adopt.py` — `/attach` opens exactly one room for N remote
   sessions; a second `/attach` jumps rather than opening a sibling.
 - `tests/test_bot_actions.py` — `SetTopicMarker` renames the *session's* room;
@@ -371,8 +433,16 @@ so repeated calls for different sessions of one workspace open different rooms.
 The per-workspace `_locks` (`adopt.py:122`) still serialise them.
 
 Order, unchanged from `/new`: create the topic first, then write the binding,
-then `seek_to_end`, then post the snapshot card into the new room. A DM that
-cannot host topics degrades to the linear seat and the existing one-line notice.
+then `seek_to_end`, then post the snapshot card into the new room.
+
+**In a seat that cannot host topics** — a DM with threaded mode off, or a group
+General — connecting binds *that seat* to the chosen session instead of opening
+a room, which is precisely what `/s`'s `switch_callback` (`power.py:339`) does
+today. This is the piece that lets `/s` be retired; it must land in the same
+release, or the degraded DM loses its only switcher. The refusal `/s` carries
+("That task has its own topic") stays, keyed on the session now rather than the
+workspace: a session with a room is jumped to, never rebound, because rebinding
+re-addresses its transcript and silences the room somebody is reading.
 
 ### Callbacks and nonces
 
@@ -424,7 +494,12 @@ In `tests/test_bot_handlers.py`:
 - tapping a session opens exactly one room and binds that session, and a second
   tap on a *different* session of the same workspace opens a second room;
 - an expired stage-2 ticket answers "run /board again" and leaves the card
-  alone.
+  alone;
+- in a chat with no topics, tapping a session rebinds that seat instead of
+  opening a room — the assertion `tests/test_bot_handlers.py:1793` makes about
+  `/s` today, moved;
+- `/s` is absent from `BOT_COMMANDS` and from `_HELP`, and still routes to the
+  `/board` renderer while the alias lasts.
 
 ### Deliberately not in v1
 
