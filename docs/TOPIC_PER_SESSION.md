@@ -156,6 +156,17 @@ Flagged rather than assumed — it changes routing, so it wants its own test.
 **16. `retire_topic`'s delete path** (`topics.py:1044-1045`) already unbinds
 both sides. It just becomes per-session.
 
+**17. The delivery dedup guard matches across sessions.** Both the release path
+(`deliveries.py:651-657`) and the boot recovery (`:741-745`) compare
+`(chat_id, thread_id, content_hash)` and the release guard *requires* a
+different `(session_id, message_id, part_index)` — so one session's payload can
+mark another's identical payload as already sent. Harmless today, because
+sessions of one workspace share a room and an identical payload there really is
+a duplicate. After this change it becomes newly reachable: two sessions whose
+rooms were both deleted reroute to the **same** root destination, and two forks
+of one task both answering "Done." lose one of them. Either scope the guard to
+the session or accept it and pin the behaviour — F-78 either way.
+
 ### The database guarantee
 
 Per CLAUDE.md's second rule — isolation and invariants are database facts, not
@@ -477,6 +488,12 @@ the picker's stage 2 is correct under the old model too, it just lists sessions
 that all share one room.
 
 ## Tests
+
+> The full enumeration — 120 faults, each with the test that pins it and the
+> file it belongs in — is [`TOPIC_PER_SESSION_TESTS.md`](TOPIC_PER_SESSION_TESTS.md).
+> The three worth writing first are F-63 (a phone archives a colleague's live
+> workspace), F-78 (a reply silently swallowed by the cross-session dedup guard)
+> and F-04 (a migration that cannot run on real data).
 
 Named by what the change can break, per CLAUDE.md:
 
