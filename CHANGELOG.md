@@ -9,6 +9,15 @@ from its first tagged release.
 
 ### Added
 
+- **One topic per session.** A workspace is now a *group* of rooms sharing one
+  container, branch and checkout, rather than one room its sessions took turns
+  owning. `/fork` opens its own topic and leaves the parent's alone; `/board`
+  became a two-stage picker (workspaces, then that workspace's sessions) in one
+  card edited in place; `/done` archives *this task* and takes the workspace
+  only when it was the last live one. Migration `003_topic_per_session`.
+- `topics.room_gone` — the one seam for a deleted topic, which Telegram reports
+  through no update at all. It unbinds the room, clears the routing row and says
+  so once in the chat root. A detach, not an archive.
 - `/digest` — one card ranking every live task by how much it wants you:
   errored, then stalled, then running, then finished, then asleep. Read from
   local rows only, so it is the one command that still answers during a
@@ -20,6 +29,20 @@ from its first tagged release.
 
 ### Fixed
 
+- **Every `/fork` and `/s` left two bound sessions on one seat.** Nothing
+  unbound the session a room already held, so the supervisor polled both and
+  both delivered into the same topic with nothing saying which was which; which
+  one a prompt reached was a `created_at` tiebreak. Now a constraint
+  (`uq_sessions_one_per_room`, `uq_chats_one_room_per_session`) rather than
+  discipline, with the existing duplicates resolved by the migration.
+- Two sessions of one workspace no longer fight over a single topic marker, so a
+  room can no longer read `⚙️ working` for a session nobody is looking at.
+- A thread-gone delivery reroute now frees the room instead of moving one row at
+  a time and paying the reroute again on the next turn.
+- The delivery dedup guard compared `(chat_id, thread_id, content_hash)` across
+  *sessions*. Harmless while a workspace's sessions shared a room; with two
+  rooms deleted and both rerouted to the chat root, two forks answering "Done."
+  would have lost one. Scoped to the session.
 - `TurnSummary.files_changed` was hardcoded to `0`, so both of its readers —
   the finish line and the done card — rendered a "N files" segment that could
   never appear. The count and the paths now come from the transcript, via the
@@ -28,6 +51,13 @@ from its first tagged release.
 
 ### Changed
 
+- **`/s` is retired.** Every job it had moved: per-session rooms removed
+  "switch session inside a workspace" as a concept, `/board` stage 2 lists a
+  workspace's other sessions, stage 1 reaches a workspace, and stage 2's
+  bind-the-seat branch moves the one binding a chat without topics has. It stays
+  registered as a silent alias to `/board` for the muscle memory.
+- `chats.bind` refuses to repoint a *topic* at a different session. A room is not
+  a pointer; thread 0 — the linear seat and a group's General — is exempt.
 - `/log` renders the last exchanges as readable lines instead of a `.md` file
   of raw JSON; `/log raw` keeps the old document for debugging a shape.
 - The DM cockpit's "Send to …" offers the three most recently prompted tasks

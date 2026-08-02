@@ -125,7 +125,8 @@ Recorded so they don't get re-litigated:
 - [x] `/register <name>` and `/team` are additive; neither is on the path to a first prompt
 - [x] `dm_topic_support` — @BotFather Threaded Mode via `getMe.has_topics_enabled`, no rights, no
       Premium; only an explicit `false` refuses
-- [x] One topic per workspace **in a private chat**, created before the paid workspace
+- [x] One topic per session **in a private chat**, created before the paid workspace
+      (per *workspace* until 2026-08-02; see `docs/TOPIC_PER_SESSION.md`)
 - [x] Every DM-topic refusal degrades to the linear one-seat DM and says so once
 - [x] `send_html` retries once without `message_thread_id` when Telegram loses the thread
 - [ ] Live: `scripts/probe_dm_topics.py` against a real token — create, send, rename, icon

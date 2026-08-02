@@ -30,7 +30,7 @@ from ctb.conductor.errors import (
 )
 from ctb.db import NO_THREAD_ID
 from ctb.db.connection import Database, now_ms
-from ctb.db.repo import prompts, sessions, workspaces
+from ctb.db.repo import chats, prompts, sessions, workspaces
 from ctb.logging import get_logger
 from ctb.turn import cursor
 from ctb.turn.machine import step
@@ -534,10 +534,14 @@ class SessionPoller:
                     # routing to rename/detach Telegram first.
                     external.append(action)
                     await flush_external()
-                    await sessions.unbind(self.db, self.session_id)
                     row = await sessions.get(self.db, self.session_id)
-                    if row is not None and row.workspace_id is not None:
-                        await workspaces.unbind_topic(self.db, row.workspace_id)
+                    await sessions.unbind(self.db, self.session_id)
+                    await sessions.unbind_topic(self.db, self.session_id)
+                    # The `chats` row too. Clearing only the session left the
+                    # room still routing prompts to a session that is dead —
+                    # a zombie room, answering nothing.
+                    if row is not None and row.chat_id is not None and row.has_room:
+                        await chats.unbind(self.db, row.chat_id, row.thread_id)
                 case StopPolling():
                     self._stop_requested = True
                 case SetCadence():

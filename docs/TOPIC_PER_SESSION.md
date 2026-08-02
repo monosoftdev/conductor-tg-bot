@@ -1,10 +1,22 @@
 # One topic per session
 
-> **Status: proposal.** Nothing below is implemented. It supersedes PLAN §Chat
-> model ("one topic per workspace") if adopted, and `docs/PLAN.md`,
-> `docs/HANDOFF.md`, `CLAUDE.md`, `README.md`, `docs/GETTING_STARTED.md` and
-> `docs/SETUP.md` all say "one topic per workspace" today and would need the
-> same edit.
+> **Status: shipped, 2026-08-02.** Steps 0–5 and 7 of the rollout below are in
+> `main`; see `docs/HANDOFF.md` §"One topic per session" for what landed and
+> what it is worth. It supersedes PLAN §Chat model ("one topic per workspace"),
+> and `docs/PLAN.md`, `docs/HANDOFF.md`, `CLAUDE.md`, `README.md`,
+> `docs/GETTING_STARTED.md` and `docs/SYSTEM_OVERVIEW.md` have had the same
+> edit.
+>
+> **Not done:** step 6 — `workspaces.topic_id` and `topic_marker` are kept and
+> no longer written, as the only evidence a rollback would have, and a follow-up
+> migration should drop them. `workspaces.topic_name` stays deliberately and
+> changed meaning: it is the *family* label (`acme-api/main`), what `/board`
+> stage 1 calls the workspace and what every one of its rooms hashes its icon
+> colour from. Two deviations from the text below, both deliberate: `/s`'s dead
+> `switch_callback`, `switchable_sessions` and `homed_elsewhere` were deleted in
+> the same release rather than the follow-up (a callback that can still rebind a
+> room is the vector this closes), and `/tidy`'s per-session sweep landed with
+> the rest rather than as its own step.
 
 ## The problem, stated in the current code
 

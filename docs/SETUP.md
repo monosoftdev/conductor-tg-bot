@@ -99,7 +99,7 @@ Then, still in BotFather, three settings. The first two are not optional:
   with privacy on it appears to ignore you.
 - `/setjoingroups` → **Enable**. It has to be addable to groups.
 - **Threaded Mode** → **Enable**. This is what lets the bot open one topic per
-  workspace *inside a private chat*, which is the default install. The bot
+  session *inside a private chat*, which is the default install. The bot
   needs no admin rights and no Premium there. Leave the sibling toggle
   "Disallow users to create new threads" alone unless you want your users
   making threads of their own — it governs the **user**, never the bot.

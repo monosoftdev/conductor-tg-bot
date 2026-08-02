@@ -72,7 +72,7 @@ finish between polls, so if `idle` persists, check the transcript for the reply 
 | Repo | A standalone repository, since made public under the MIT licence |
 | Stack | Python 3.13, aiogram 3.30, httpx 0.28, aiosqlite, pydantic-settings, structlog |
 | Hosting | One Railway service, Dockerfile builder, `numReplicas = 1`, volume at `/data`, Telegram **long polling** (no public webhook URL to manage) |
-| Chat layout | Private Telegram **supergroup with Forum Topics**. One topic per workspace. `General` = cockpit. DM = degraded fallback mode |
+| Chat layout | Telegram **Forum Topics**, in a private chat or a supergroup. One topic per **session** (a workspace is a group of them — see `docs/TOPIC_PER_SESSION.md`). `General` = cockpit. Linear DM = degraded fallback mode |
 | Storage | SQLite (WAL) on the Railway volume |
 | Defaults | `claude` + `opus-5-1m` + `high` |
 | Step 0 | Read-only probe of a real transcript, using a `CONDUCTOR_API_KEY` you add to Conductor's Environment settings |
@@ -323,7 +323,14 @@ but those characters and one miss is a `400` and a lost reply. HTML needs only `
 
 ## Phase 3 — Telegram UX
 
-### Chat model: Forum Topics on, one topic per workspace
+### Chat model: Forum Topics on, one topic per session
+
+> **Superseded in part, 2026-08-02.** This section was written "one topic per
+> workspace" and shipped that way; `docs/TOPIC_PER_SESSION.md` moved the room
+> onto the **session**, so a workspace is a group of rooms sharing one
+> container, branch and checkout. Everything below about *addressing* — the
+> topic your thumb is in, `(chat_id, message_thread_id)`, renames only on
+> transitions — is unchanged and is why the move was small.
 
 The address of a prompt is the topic your thumb is in — there is no "bound session" variable to lose
 track of. This is why it beats a pinned card in a flat chat (which labels the mess but doesn't stop
@@ -332,8 +339,8 @@ and a per-message header line (solves recognition, not navigation).
 
 Free from Telegram: the topic list *is* the switcher, with native unread badges, native search,
 per-topic mute, and per-topic push. Routing key is `(chat_id, message_thread_id)`, so DM mode falls
-out as `thread_id = NULL` — a degraded single-bound-session mode with `/s` to switch, which the bot
-announces once.
+out as `thread_id = NULL` — a degraded single-bound-session mode, moved by `/board` stage 2, which
+the bot announces once.
 
 > **What shipped, 2026-07-27: the supergroup became optional.** This section was written
 > "private supergroup, Forum Topics on", and for the whole of the single-user design and the
@@ -348,7 +355,7 @@ announces once.
 > `BOT_FORUM_CREATE_FORBIDDEN` is never about the bot. Non-Premium accounts get the default icon
 > pack, which is the only pack this repo has ever used.
 >
-> So the chat model above is unchanged — one topic per workspace, addressed by
+> So the chat model above is unchanged — one topic per room, addressed by
 > `(chat_id, message_thread_id)` — and only its *host* is now free. The default is a private chat:
 > `/start` → `/key` → `/new`, and the topic opens in the DM. A group is the optional `/team` flow,
 > for several people who want one shared topic list.
@@ -382,21 +389,23 @@ Renamed only on state *transitions*, never on a timer (rename is an API call).
 
 ### Commands
 
-BotFather menu — the daily loop. *(Shipped with seventeen: this six plus
-`/attach`, `/s`, `/fork`, `/notify`, `/setup`, `/invite`, `/use`, `/health`,
-`/register`, `/key` and `/help` — see `src/ctb/bot/app.py`.)*
+BotFather menu — the daily loop. *(Shipped with sixteen: this six plus
+`/attach`, `/fork`, `/notify`, `/setup`, `/invite`, `/use`, `/health`,
+`/register`, `/key` and `/help` — see `src/ctb/bot/app.py`. `/s` was retired
+when `/board` became a two-stage picker.)*
 
 | Command | Syntax | Help | Driven by |
 |---|---|---|---|
 | `/new` | `/new [<project>:] <prompt>` or bare | New workspace and first prompt. Bare = wizard. | hybrid |
-| `/board` | `/board` | All live sessions with status. Tap to jump. | keyboard, edits in place |
+| `/board` | `/board [name]` | Workspaces, then their sessions. Two stages, one card. | keyboard, edits in place |
 | `/stop` | `/stop` | Cancel this session's turn and queue. | no confirm |
 | `/find` | `/find <text>` | Search every transcript in the org. | argument |
 | `/mode` | `/mode` | Change agent / model / effort for this session. | keyboard |
-| `/done` | `/done` | Archive this workspace. Closes the topic. | 2-tap confirm |
+| `/done` | `/done` | Archive this task and delete its topic; the workspace too when it was the last live one. | 2-tap confirm |
 
-Power (via `/help`, not in the menu): `/s [query]` switch bound session · `/fork [name]` new session
-in this workspace · `/name <text>` rename (`-w` for workspace) · `/open` deep link · `/desk` handoff
+Power (via `/help`, not in the menu): `/fork [name]` new session in this workspace, in its own
+topic · `/name <text>` rename (`-w` for workspace, which re-labels every room of it) · `/open` deep
+link · `/desk` handoff
 card · `/log [n]` raw messages as `.md` · `/notify loud|quiet|off` · `/defaults` · `/sql <SELECT>` ·
 `/tidy` close archived + 7-day-idle topics.
 Admin: `/allow <id>` · `/deny <id>` *(shipped as `/invite` and `/remove`)* · `/health` (poll lag, circuit state, last 20 `api_events`,

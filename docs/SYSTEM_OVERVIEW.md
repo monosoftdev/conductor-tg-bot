@@ -37,11 +37,11 @@ in [`HANDOFF.md`](HANDOFF.md); everything below is the same either way.
 | Resume laptop work | Chat root: `/attach [name]`, then tap `+ Open` |
 | Continue work | Open its topic and send text, voice, or audio |
 | See current state | `/mode` — status, workspace, branch, model, queue, actions |
-| See all work | `/board` — ten compact recent rows with topic jump buttons |
-| Change session | `/s [search]` — active/recent sessions first |
+| See all work | `/board [name]` — workspaces, then a workspace's sessions |
+| Change task | `/board`, tap the workspace, tap the task |
 | Stop | Tap **Stop** on the card or run `/stop` |
 | Search history | `/find text`, or plain text in a group's General |
-| Finish | `/done`, then tap the named archive confirmation |
+| Finish | `/done` — archives this task, and the workspace when it was the last |
 
 Replying to a bot message uses that message's session, even from General. This
 is the escape hatch for continuing a specific result without opening its topic.
@@ -55,10 +55,10 @@ is the escape hatch for continuing a specific result without opening its topic.
 | Send a prompt | Type in its topic | The bot reacts 👀 instead of adding a receipt bubble |
 | Prompt finishes | Read the answer; reaction becomes 👍 | Pinned card also becomes Done |
 | Agent needs a decision | Tap one of 2–4 buttons | Recommended option is first, green, and checked |
-| Open another workspace | `/board` or `/s` from the chat root | Deep-link button opens its topic; no binding is changed |
+| Open another workspace | `/board` from the chat root | Stage 1 picks the workspace, stage 2 the session; a session with a room is jumped to, never rebound |
 | Resume a laptop cloud workspace | `/attach name`, tap `+ Open`, then type in its new topic | Starts at the current transcript tail; history is not replayed |
-| Change session | Topic `/s` | Only sessions from that workspace are offered |
-| Run parallel approaches | `/fork name`, then `/s` | Sessions share the workspace topic without cross-workspace routing |
+| Change session | `/board`, then that workspace | Stage 2 is scoped to one workspace by construction |
+| Run parallel approaches | `/fork name` | The fork opens its own topic; the parent room keeps its session and its marker |
 | Phone was locked | Tap the pinned-card control | Safe controls live for 15 minutes; destructive confirmation stays 60 seconds |
 | Too many queued prompts | Tap Clear queue on the card | Goes through the turn machine; no direct row deletion |
 | Long result | Tap the generated `.md`/`.diff` file | Telegram's native searchable preview replaces message floods |
@@ -66,11 +66,11 @@ is the escape hatch for continuing a specific result without opening its topic.
 | Error or stall | Tap Check, Retry, Transcript, or Open | Error topic marker and loud alert remain visible |
 | Finish work | Tap Archive, then named confirmation | The topic is deleted; a bot without `can_delete_messages` marks it archived and closes it instead |
 
-General never accepts an accidental ordinary prompt. `/s` in General is
-navigation, and `/s` inside a topic — group or DM — cannot bind a session from
-another workspace. A private chat's root is the exception by design: it is a
-seat, not a cockpit, so `/s` there switches across workspaces and plain text
-prompts the one it is bound to.
+General never accepts an accidental ordinary prompt. `/board` in General is
+navigation, and connecting a session opens *its* room rather than rebinding the
+one you ran it from. A chat that cannot hold topics is the exception by design:
+it has one seat, so stage 2 moves that seat and plain text prompts whatever it
+is bound to.
 
 A workspace started in the Conductor app can be resumed from Telegram when it
 is a **Conductor cloud workspace visible to the configured API account**.
@@ -202,7 +202,7 @@ delivery layer; ElevenLabs is only the provisional speech-to-text model.
   messages.
 - Normal topics default to quiet notifications. The last-prompted topic gets a
   temporary focus window; errors remain loud.
-- `/board`, `/s`, `/mode`, and `/help` are optimized for narrow phone screens
+- `/board`, `/mode`, and `/help` are optimized for narrow phone screens
   and put active/current work first.
 - `/attach name` directly finds cloud work started from the laptop; an
   idempotent one-tap control opens exactly one topic and preserves its current

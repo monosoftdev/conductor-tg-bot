@@ -80,6 +80,13 @@ key.
   so a batch inserted by one `advance_cursor` call would share a `created_at` and flip every
   `ORDER BY created_at` tiebreak.
 - Every id and epoch-ms column is `bigint`. Telegram ids exceed int32.
+- **One topic per session, and it is an index, not a convention.** A room belongs to one session for
+  its whole life: `uq_sessions_one_per_room` refuses a second bound session on a thread, and
+  `uq_chats_one_room_per_session` refuses one session in two rooms. Both carve out `thread_id = 0` —
+  the linear DM seat and a group's General are *seats*, not rooms, and legitimately hold a mutable
+  binding. So `sessions.bind` releases the seat's previous occupant and `chats.bind` refuses to
+  repoint a topic; forgetting either raises rather than silently re-addressing somebody's transcript.
+  `workspaces.topic_id`/`topic_marker` are kept, unwritten, as rollback evidence only.
 - `deliveries.claim` uses `FOR UPDATE SKIP LOCKED`, so concurrent workers take disjoint sets.
   `recover_orphaned` only reclaims rows whose `claimed_at` is older than `ORPHAN_AFTER_MS`, because
   a fresher one may still be in flight on an overlapping deployment.

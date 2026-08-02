@@ -501,14 +501,15 @@ class BotActionSink:
             return None
 
     async def _set_topic_marker(self, session_id: str, action: SetTopicMarker) -> None:
-        row = await sessions.get(self._db, session_id)
-        if row is None or row.workspace_id is None:
-            return
+        # Straight to the session: the marker is the *session's* now, not its
+        # workspace's. Two sessions of one workspace used to fight over a single
+        # `topic_marker` — whichever ticked last won, so a room could read
+        # "⚙️ working" for a session you were not looking at.
         try:
             await topics.apply_marker(
                 self._bot,
                 self._db,
-                row.workspace_id,
+                session_id,
                 action.marker,
             )
         except Exception as exc:

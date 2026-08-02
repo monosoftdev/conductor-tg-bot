@@ -56,7 +56,6 @@ from ctb.bot.handlers.core import (
     session_overview_lines,
     status_icon,
 )
-from ctb.bot.handlers.power import homed_elsewhere, switchable_sessions
 from ctb.bot.handlers.topics import (
     TOPIC_ICON_COLORS,
     TopicCreateError,
@@ -564,10 +563,10 @@ def test_mobile_board_is_compact_and_scannable() -> None:
         for index in range(BOARD_VISIBLE + 3)
     ]
     lines = board_lines(rows)
-    assert lines[0] == f"<b>Board · {BOARD_VISIBLE + 3} workspaces</b>"
+    assert lines[0] == f"<b>Workspaces · {BOARD_VISIBLE + 3}</b>"
     assert lines[1].startswith("⚙️")
     assert len(lines) == BOARD_VISIBLE + 2
-    assert lines[-1] == "<i>+3 more · use /s to switch</i>"
+    assert lines[-1] == '<i>+3 more · say "open &lt;name&gt;"</i>'
 
 
 def test_session_overview_is_a_concise_control_summary() -> None:
@@ -649,19 +648,26 @@ def test_topic_color_is_stable_and_uses_telegrams_palette() -> None:
     assert first in TOPIC_ICON_COLORS
 
 
-def test_topic_session_switch_cannot_cross_workspaces() -> None:
-    sessions = [
-        SessionRow(id="a", workspace_id="workspace-a"),
-        SessionRow(id="b", workspace_id="workspace-b"),
-    ]
-    topic = Route(
-        kind="topic",
-        chat=ChatRow(chat_id=-1001, thread_id=7, workspace_id="workspace-a"),
-    )
-    dm = Route(kind="dm")
+async def test_board_stage_two_never_crosses_a_workspace(db: Database) -> None:
+    """Stage 2 is scoped to one workspace, wherever it is opened from.
 
-    assert [row.id for row in switchable_sessions(sessions, topic)] == ["a"]
-    assert [row.id for row in switchable_sessions(sessions, dm)] == ["a", "b"]
+    ``/s`` enforced this with ``switchable_sessions``; the picker enforces it by
+    construction — the query is per workspace id, so there is nothing to filter.
+    """
+    await workspaces_repo.upsert(db, "workspace-a", name="a")
+    await workspaces_repo.upsert(db, "workspace-b", name="b")
+    await sessions_repo.upsert(db, "a", workspace_id="workspace-a", title="mine")
+    await sessions_repo.upsert(db, "b", workspace_id="workspace-b", title="theirs")
+
+    class _NoSql:
+        async def list_workspace_sessions(self, *_: Any, **__: Any) -> Any:
+            raise RuntimeError("offline")
+
+    rows = await core_handlers.board_sessions(
+        db, cast(Any, _NoSql()), "workspace-a", chat_id=-1001
+    )
+
+    assert [row.session_id for row in rows] == ["a"]
 
 
 async def test_general_plain_text_searches_and_never_posts(
@@ -940,6 +946,7 @@ async def test_board_sends_one_line_and_buttons_never_both_lists(
 
     monkeypatch.setattr(core_handlers, "board_rows", fake_rows)
     message = SimpleNamespace(
+        text="/board",
         chat=SimpleNamespace(id=-1001),
         message_thread_id=None,
         message_id=3,
@@ -956,10 +963,10 @@ async def test_board_sends_one_line_and_buttons_never_both_lists(
 
     text, markup = sent[0]
     # The ten names used to be printed and then rendered as ten buttons.
-    assert text == "<b>3 workspaces</b>"
+    assert text == "<b>Workspaces · 3</b>\nTap one to see its sessions."
     assert markup is not None
     labels = [row[0].text for row in markup.inline_keyboard]
-    assert labels == [f"⚙️ api/fix-{index} · sonnet" for index in range(3)]
+    assert labels == [f"⚙️ api/fix-{index} · no sessions yet" for index in range(3)]
 
 
 async def test_board_counts_workspaces_not_sessions(db: Database) -> None:
@@ -1006,13 +1013,23 @@ async def test_board_counts_workspaces_not_sessions(db: Database) -> None:
     ]
     # Newest first, so the survivor is the freshest session of its workspace.
     assert rows[0]["session_id"] == "session-0"
-    assert core_handlers.board_lines(rows)[0] == "<b>Board · 2 workspaces</b>"
+    # The count stage 1 shows, taken from the same fetch and previously thrown
+    # away when the per-session rows were collapsed.
+    assert rows[0]["session_count"] == 3
+    assert rows[1]["session_count"] == 1
+    assert core_handlers.board_lines(rows)[0] == "<b>Workspaces · 2</b>"
 
 
-async def test_board_offers_one_tap_adoption_for_a_topicless_workspace(
+async def test_board_treats_a_laptop_workspace_like_every_other_row(
     db: Database, monkeypatch: Any
 ) -> None:
-    """A laptop-made workspace used to render as dead text. Now it opens."""
+    """Stage 1 lost its `+ Open …` special case, deliberately.
+
+    Two rows of one list doing two different things, with only one of them
+    saying which, is the ambiguity the two stages exist to remove: a laptop
+    workspace and a local one both drill down, and jump-versus-open shows up in
+    stage 2, where there is room to say so.
+    """
     sent: list[tuple[str, Any]] = []
 
     async def fake_tell(_message: Any, text: str, **kwargs: Any) -> None:
@@ -1033,6 +1050,7 @@ async def test_board_offers_one_tap_adoption_for_a_topicless_workspace(
     monkeypatch.setattr(core_handlers, "board_rows", fake_rows)
     store = NonceStore()
     message = SimpleNamespace(
+        text="/board",
         chat=SimpleNamespace(id=-1001),
         message_thread_id=None,
         message_id=3,
@@ -1048,16 +1066,18 @@ async def test_board_offers_one_tap_adoption_for_a_topicless_workspace(
     )
 
     text, markup = sent[0]
-    assert text == "<b>1 workspace</b>"
+    assert text == "<b>Workspaces · 1</b>\nTap one to see its sessions."
     assert markup is not None
     tap = markup.inline_keyboard[0][0]
-    assert tap.text == "+ Open api/orphan"
-    # Nonce-backed, and it carries the newest session so adoption does not
-    # have to guess which one the board was talking about.
+    assert tap.text == "⚙️ api/orphan · no sessions yet"
+    assert not tap.text.startswith("+ Open")
+    assert tap.callback_data is not None
+    # Nonce-backed, and it targets the workspace: picking the session is
+    # stage 2's job, so stage 1 never mints a ticket per session.
     ticket = store.peek(tap.callback_data.rsplit(":", 1)[-1])
     assert ticket is not None
-    assert ticket.action == "adopt"
-    assert ticket.target == "workspace-orphan\nsession-orphan"
+    assert ticket.action == "bws"
+    assert ticket.target == "workspace-orphan"
 
 
 async def test_stop_acknowledges_with_a_reaction_not_a_bubble(
@@ -1197,14 +1217,33 @@ def test_archive_confirm_states_the_consequence_not_the_name() -> None:
 
 
 class _ArchivingClient(_CountingClient):
-    """Records the one call ``/done`` exists to make."""
+    """Records the two calls ``/done`` exists to make, and the count between.
 
-    def __init__(self, **kwargs: Any) -> None:
+    ``siblings`` is what ``list_workspace_sessions`` reports *besides* the one
+    being archived — the number that decides whether the workspace goes too.
+    """
+
+    def __init__(self, *, siblings: int = 0, countable: bool = True, **kwargs: Any):
         super().__init__(**kwargs)
         self.archived: list[str] = []
+        self.archived_sessions: list[str] = []
+        self._siblings = siblings
+        self._countable = countable
 
     async def archive_workspace(self, workspace_id: str) -> None:
         self.archived.append(workspace_id)
+
+    async def archive_session(self, session_id: str) -> None:
+        self.archived_sessions.append(session_id)
+
+    async def list_workspace_sessions(self, *_: Any, **__: Any) -> Any:
+        if not self._countable:
+            raise RuntimeError("Conductor is unreachable")
+        data = [SimpleNamespace(id="session-1")]
+        data.extend(
+            SimpleNamespace(id=f"sibling-{index}") for index in range(self._siblings)
+        )
+        return SimpleNamespace(data=data, has_more=False)
 
 
 def _card_in(chat_id: int, thread_id: int) -> Message:
@@ -1239,24 +1278,35 @@ async def _archive_tap(
     *,
     chat_id: int = -1001,
     topic_id: int = 99,
+    siblings: int = 0,
+    countable: bool = True,
 ) -> tuple[_ArchivingClient, _ArchiveTap]:
-    """Seed a workspace with a topic, then tap its named Archive button."""
+    """Seed a session with a room, then tap its named Archive button."""
     await workspaces_repo.upsert(
         db,
         "workspace-1",
         name="tg-1-abc",
         branch="main",
         chat_id=chat_id,
+        topic_name="api/main",
+    )
+    await sessions_repo.upsert(
+        db, "session-1", workspace_id="workspace-1", title="fix flaky"
+    )
+    await sessions_repo.bind_topic(
+        db,
+        "session-1",
+        chat_id=chat_id,
         topic_id=topic_id,
         topic_name="fix flaky",
     )
     await chats_repo.bind(
-        db, chat_id, topic_id, workspace_id="workspace-1", session_id=None
+        db, chat_id, topic_id, workspace_id="workspace-1", session_id="session-1"
     )
     store = NonceStore()
     markup = confirm_keyboard(
         Action.ARCHIVE,
-        "workspace-1",
+        "session-1",
         "fix flaky",
         verb="Archive",
         store=store,
@@ -1264,7 +1314,7 @@ async def _archive_tap(
     )
     payload = markup.inline_keyboard[0][0].callback_data
     assert payload is not None
-    client = _ArchivingClient()
+    client = _ArchivingClient(siblings=siblings, countable=countable)
     query = _ArchiveTap(bot, payload, _card_in(chat_id, topic_id))
     await core_handlers.confirm_archive(
         cast(Any, query), store, fake_tenant(client), db=db
@@ -1283,17 +1333,25 @@ async def test_done_deletes_the_room_it_finished_with(db: Database) -> None:
 
     client, query = await _archive_tap(db, bot)
 
+    assert client.archived_sessions == ["session-1"]
+    # The last live task, so the workspace goes with it.
     assert client.archived == ["workspace-1"]
     assert bot.deleted == [99]
     assert bot.closed == []
     row = await workspaces_repo.get(db, "workspace-1")
     assert row is not None and row.archived_at is not None
-    assert row.topic_id is None
+    session = await sessions_repo.get(db, "session-1")
+    assert session is not None and session.archived_at is not None
+    assert not session.has_room and not session.is_bound
     chat = await chats_repo.get(db, -1001, 99)
     assert chat is not None and chat.workspace_id is None
-    # The card lived in the deleted topic: no receipt is posted into thin air.
+    # The card lived in the deleted topic, so no receipt is edited into thin
+    # air — but the *workspace* going too is news beyond that room, and there
+    # is no room left that could carry it.
     assert bot.edits == []
-    assert bot.sent == []
+    assert len(bot.sent) == 1
+    assert bot.sent[0]["message_thread_id"] is None
+    assert "its last task" in bot.sent[0]["text"]
     assert query.answers == ["Archiving…"]
 
 
@@ -1303,14 +1361,16 @@ async def test_a_topic_the_bot_may_not_delete_is_marked_and_closed(
     """No ``can_delete_messages`` in someone's group — degrade, never dead-end."""
     bot = _ForumBot(delete_error=_refused("Bad Request: not enough rights"))
 
-    client, _ = await _archive_tap(db, bot)
+    client, _ = await _archive_tap(db, bot, siblings=1)
 
-    assert client.archived == ["workspace-1"]
+    assert client.archived_sessions == ["session-1"]
+    # A sibling task is still live, so the workspace stays.
+    assert client.archived == []
     assert bot.deleted == [] and bot.closed == [99]
     assert bot.renamed == ["🗄 fix flaky"]
     # The topic survives, so the row must keep knowing where it is.
-    row = await workspaces_repo.get(db, "workspace-1")
-    assert row is not None and row.topic_id == 99
+    session = await sessions_repo.get(db, "session-1")
+    assert session is not None and session.thread_id == 99
     assert bot.edits == ["✓ Archived <b>fix flaky</b>."]
 
 
@@ -1325,9 +1385,41 @@ async def test_a_topic_that_will_neither_delete_nor_close_says_so(
 
     bot.close_forum_topic = refuse  # type: ignore[method-assign]
 
-    _, _ = await _archive_tap(db, bot)
+    _, _ = await _archive_tap(db, bot, siblings=1)
 
     assert bot.edits == ["✓ Archived <b>fix flaky</b>. Topic left open."]
+
+
+async def test_done_never_archives_a_workspace_it_could_not_count(
+    db: Database,
+) -> None:
+    """F-63: a phone must not archive a colleague's live laptop session.
+
+    The count is the API's, because a chat somebody opened on the laptop is
+    invisible to the local cache. When it cannot be established the task is
+    archived and the workspace is left alone — leaving a container running is
+    recoverable; archiving somebody's live session from a phone is not.
+    """
+    bot = _ForumBot()
+
+    client, _ = await _archive_tap(db, bot, countable=False)
+
+    assert client.archived_sessions == ["session-1"]
+    assert client.archived == []
+    row = await workspaces_repo.get(db, "workspace-1")
+    assert row is not None and row.archived_at is None
+
+
+def test_the_two_archive_cards_do_not_read_alike() -> None:
+    """One of them takes the whole workspace with it. It has to say so."""
+    last = core_handlers.archive_consequence("acme-api", 0)
+    not_last = core_handlers.archive_consequence("acme-api", 2)
+    unknown = core_handlers.archive_consequence("acme-api", None)
+
+    assert "the whole workspace too" in last
+    assert "2 other tasks stay" in not_last
+    assert "workspace" in unknown and "whole workspace" not in unknown
+    assert len({last, not_last, unknown}) == 3
 
 
 async def test_new_checks_topic_permission_before_paying_for_a_workspace(
@@ -1520,7 +1612,7 @@ async def test_a_replay_renames_a_topic_whose_title_drifted(
         db=db,
         client=client,  # type: ignore[arg-type]
     )
-    await workspaces_repo.update(db, "workspace-1", topic_name="stale/name")
+    await sessions_repo.update(db, "session-new", topic_name="stale/name")
 
     await create_and_bind_input(
         bot=bot,  # type: ignore[arg-type]
@@ -1581,8 +1673,11 @@ async def test_a_dm_gets_one_topic_per_workspace_just_like_a_group(
     assert seat.session_id == "session-new"
     session = await sessions_repo.get(db, "session-new")
     assert session is not None and session.thread_id == 99
+    assert session.topic_name == "Fix it · api/main"
     workspace = await workspaces_repo.get(db, "workspace-1")
-    assert workspace is not None and workspace.topic_id == 99
+    # The workspace keeps the *family* name — what `/board` stage 1 calls it,
+    # and the key every one of its rooms hashes its colour from.
+    assert workspace is not None and workspace.topic_name == "api/main"
 
 
 async def test_a_new_typed_into_an_empty_thread_lives_in_that_thread(
@@ -1619,8 +1714,9 @@ async def test_a_new_typed_into_an_empty_thread_lives_in_that_thread(
     seat = await chats_repo.get(db, 1007, 4242)
     assert seat is not None and seat.kind == "topic"
     assert seat.session_id == "session-new"
-    workspace = await workspaces_repo.get(db, "workspace-1")
-    assert workspace is not None and workspace.topic_id == 4242
+    session = await sessions_repo.get(db, "session-new")
+    assert session is not None and session.thread_id == 4242
+    assert session.topic_name == "Fix it · api/main"
 
 
 async def test_a_new_from_a_thread_that_already_has_work_opens_a_new_room(
@@ -1784,7 +1880,7 @@ async def test_a_dm_topic_is_renamed_through_the_one_rename_path(
     bot = _ForumBot(topics_enabled=True)
     client = _CountingClient()
     await _new_in_dm(db, bot, client, chat_id=1006)
-    await workspaces_repo.update(db, "workspace-1", topic_name="stale/name")
+    await sessions_repo.update(db, "session-new", topic_name="stale/name")
 
     await _new_in_dm(db, bot, client, chat_id=1006)
 
@@ -1814,8 +1910,7 @@ async def test_a_dm_topic_switch_stays_inside_its_workspace(db: Database) -> Non
     assert root.is_dm and not root.is_topic
     assert topic.is_topic and not topic.is_dm
     assert topic.is_private, "still a private chat, whatever the seat"
-    assert [row.id for row in switchable_sessions(sessions, root)] == ["a", "b"]
-    assert [row.id for row in switchable_sessions(sessions, topic)] == ["a"]
+    assert sessions[0].workspace_id != sessions[1].workspace_id
 
 
 async def test_a_dm_topic_addresses_its_own_seat_without_is_topic_message(
@@ -1993,7 +2088,7 @@ async def test_a_dm_with_nothing_running_still_gets_the_honest_nudge(
 
     assert searches == []
     assert bubbles == [
-        ("No session here. Use <code>/new</code> or <code>/s</code>.", None)
+        ("No session here. Use <code>/new</code> or <code>/board</code>.", None)
     ]
 
 
@@ -2128,129 +2223,106 @@ def test_a_dm_topic_has_no_link_so_the_card_says_where_it_went() -> None:
     assert "its own topic" not in group_text
 
 
-# ── /s may reach a room, never re-address it ─────────────────────────────────
+# ── /board stage 2 may reach a room, never re-address it ─────────────────────
 
 
-def test_a_workspace_with_a_room_is_opened_not_switched_to() -> None:
-    """``/s`` binds the session to the seat it was run from. That is a *move*."""
-    homed = WorkspaceRow(id="w", chat_id=1040, topic_id=99)
-
-    assert homed_elsewhere(homed, Route(chat_id=1040, kind="dm")) == (1040, 99)
-    # Standing in the room already: nothing to open, so switching is fine.
-    assert homed_elsewhere(homed, Route(chat_id=1040, thread_id=99, kind="dm")) is None
-    # A linear workspace has no room of its own and stays switchable.
-    assert homed_elsewhere(WorkspaceRow(id="w"), Route(chat_id=1040, kind="dm")) is None
-    assert homed_elsewhere(None, (1040, 0)) is None
-
-
-async def test_s_from_the_dm_root_names_a_topics_task_instead_of_stealing_it(
-    db: Database, monkeypatch: Any
-) -> None:
-    """The recovery that used to break the thing it was recovering from.
-
-    Binding here would set ``sessions.thread_id = 0``, so every later reply
-    landed in the root and the topic the owner was reading went silent.
-    """
-    sent: list[tuple[str, Any]] = []
-
-    async def fake_tell(_message: Any, text: str, **kwargs: Any) -> None:
-        sent.append((text, kwargs.get("reply_markup")))
-
-    monkeypatch.setattr(power_handlers, "tell", fake_tell)
-    await workspaces_repo.upsert(db, "ws-room", chat_id=1041, topic_id=99)
-    await sessions_repo.upsert(
-        db, "sess-room", workspace_id="ws-room", chat_id=1041, thread_id=99, title="Log"
-    )
-    message = SimpleNamespace(
-        text="/s",
-        chat=SimpleNamespace(id=1041, type="private"),
-        message_thread_id=None,
-        message_id=14,
-        from_user=SimpleNamespace(id=1001),
-    )
-
-    await power_handlers.switch_session(
-        message,  # type: ignore[arg-type]
-        Route(chat_id=1041, kind="dm"),
-        fake_tenant(_CountingClient()),
-        _NullFsm(),  # type: ignore[arg-type]
-        NonceStore(),
-        db=db,
-    )
-
-    text, markup = sent[0]
-    assert markup is None, "no button may re-address a session that has a room"
-    assert "their own topic" in text
-    assert "Log" in text
-
-
-async def test_s_still_switches_a_linear_dms_sessions(
-    db: Database, monkeypatch: Any
-) -> None:
-    """A workspace with no room is what `/s` was written for. Unchanged."""
-    sent: list[tuple[str, Any]] = []
-
-    async def fake_tell(_message: Any, text: str, **kwargs: Any) -> None:
-        sent.append((text, kwargs.get("reply_markup")))
-
-    monkeypatch.setattr(power_handlers, "tell", fake_tell)
-    await workspaces_repo.upsert(db, "ws-linear", chat_id=1042)
-    await sessions_repo.upsert(
-        db, "sess-a", workspace_id="ws-linear", chat_id=1042, thread_id=0, title="A"
-    )
-    message = SimpleNamespace(
-        text="/s",
-        chat=SimpleNamespace(id=1042, type="private"),
-        message_thread_id=None,
-        message_id=15,
-        from_user=SimpleNamespace(id=1001),
-    )
-
-    await power_handlers.switch_session(
-        message,  # type: ignore[arg-type]
-        Route(chat_id=1042, kind="dm"),
-        fake_tenant(_CountingClient()),
-        _NullFsm(),  # type: ignore[arg-type]
-        NonceStore(),
-        db=db,
-    )
-
-    _text, markup = sent[0]
-    assert markup is not None
-    assert markup.inline_keyboard[0][0].text.endswith("A · ?")
-
-
-async def test_a_stale_switch_button_cannot_move_a_room_bound_session(
+async def test_stage_two_links_a_session_that_already_has_a_room(
     db: Database,
 ) -> None:
-    """Minted before the workspace had a topic; tapped after. Refuse, don't move."""
-    await workspaces_repo.upsert(db, "ws-late", chat_id=1043, topic_id=99)
+    """A room is jumped to, never rebound: rebinding silences what you read.
+
+    This is the refusal `/s` used to carry ("That task has its own topic"),
+    keyed on the session now — and expressed as a plain link, which cannot
+    rebind anything at all.
+    """
+    await workspaces_repo.upsert(db, "ws-room", name="api", chat_id=-1001040)
     await sessions_repo.upsert(
-        db, "sess-late", workspace_id="ws-late", chat_id=1043, thread_id=99
-    )
-    nonces = NonceStore()
-    tapped = button(
-        "switch", "switch", "sess-late", store=nonces, user_id=1001, chat_id=1043
-    )
-    answers: list[str] = []
-
-    async def answer(text: str | None = None, **_: Any) -> bool:
-        answers.append(text or "")
-        return True
-
-    query = SimpleNamespace(
-        data=tapped.callback_data,
-        from_user=SimpleNamespace(id=1001),
-        message=None,
-        bot=None,
-        answer=answer,
+        db,
+        "sess-room",
+        workspace_id="ws-room",
+        title="Log",
+        chat_id=-1001040,
+        thread_id=99,
     )
 
-    await power_handlers.switch_callback(query, nonces, db=db)  # type: ignore[arg-type]
+    class _NoSql:
+        async def list_workspace_sessions(self, *_: Any, **__: Any) -> Any:
+            raise RuntimeError("offline")
 
-    assert answers == ["That task has its own topic. Open it there."]
-    session = await sessions_repo.get(db, "sess-late")
-    assert session is not None and session.thread_id == 99, "still addressed there"
+    rows = await core_handlers.board_sessions(
+        db, cast(Any, _NoSql()), "ws-room", chat_id=-1001040
+    )
+    _text, markup = core_handlers.board_stage2(
+        await workspaces_repo.get(db, "ws-room"),
+        "ws-room",
+        rows,
+        store=NonceStore(),
+        user_id=1001,
+        chat_id=-1001040,
+        thread_id=0,
+    )
+
+    assert markup is not None
+    first = markup.inline_keyboard[0][0]
+    assert first.url == "https://t.me/c/1040/99"
+    assert first.callback_data is None, "a link cannot re-address a transcript"
+
+
+async def test_stage_two_offers_a_ticket_for_a_session_with_no_room(
+    db: Database,
+) -> None:
+    """The lazy rule: a session materialises its room the first time it opens."""
+    await workspaces_repo.upsert(db, "ws-lazy", name="api", chat_id=-1001040)
+    await sessions_repo.upsert(db, "sess-lazy", workspace_id="ws-lazy", title="A")
+
+    class _NoSql:
+        async def list_workspace_sessions(self, *_: Any, **__: Any) -> Any:
+            raise RuntimeError("offline")
+
+    rows = await core_handlers.board_sessions(
+        db, cast(Any, _NoSql()), "ws-lazy", chat_id=-1001040
+    )
+    _text, markup = core_handlers.board_stage2(
+        await workspaces_repo.get(db, "ws-lazy"),
+        "ws-lazy",
+        rows,
+        store=NonceStore(),
+        user_id=1001,
+        chat_id=-1001040,
+        thread_id=0,
+    )
+
+    assert markup is not None
+    first = markup.inline_keyboard[0][0]
+    assert first.url is None
+    assert first.callback_data is not None
+    assert markup.inline_keyboard[-1][0].text == "« All workspaces"
+
+
+def test_the_two_board_stages_share_no_verb() -> None:
+    """The wording is the feature: stage 1 never opens, stage 2 never picks a
+    workspace. Two cards that read alike are one card you cannot navigate."""
+    stage1, _ = core_handlers.board_stage1(
+        [{"workspace_id": "w", "workspace_name": "api", "session_count": 2}],
+        store=NonceStore(),
+        user_id=1001,
+        chat_id=-1001040,
+        thread_id=0,
+    )
+    stage2, _ = core_handlers.board_stage2(
+        None,
+        "w",
+        [core_handlers.BoardSession("s", "fix login", "opus-5", "IDLE")],
+        store=NonceStore(),
+        user_id=1001,
+        chat_id=-1001040,
+        thread_id=0,
+    )
+
+    assert "Tap one to see its sessions." in stage1
+    assert "open" not in stage1.casefold()
+    assert "Tap one to open it in this chat." in stage2
+    assert "workspaces" not in stage2.casefold()
 
 
 async def test_a_reply_telegram_will_not_thread_still_arrives() -> None:
@@ -3190,10 +3262,11 @@ async def test_our_own_rename_notice_is_cleaned_up(db: Database) -> None:
     State belongs in the topic *list*, where it is read at a glance — not in
     the scroll, as permanent bookkeeping about itself.
     """
-    await workspaces_repo.upsert(
-        db, "ws-1", chat_id=-500, topic_id=9, topic_name="fix login · api/main"
+    await sessions_repo.upsert(db, "sess-1", workspace_id=None)
+    await sessions_repo.bind_topic(
+        db, "sess-1", chat_id=-500, topic_id=9, topic_name="fix login · api/main"
     )
-    await workspaces_repo.set_topic_marker(db, "ws-1", TopicMarker.WORKING.value)
+    await sessions_repo.set_topic_marker(db, "sess-1", TopicMarker.WORKING.value)
     service = _ServiceMessage(name="⚙️ fix login · api/main", chat_id=-500, thread_id=9)
 
     await prompt_handlers.tidy_rename_notice(service, db=db)  # type: ignore[arg-type]
@@ -3203,10 +3276,11 @@ async def test_our_own_rename_notice_is_cleaned_up(db: Database) -> None:
 
 async def test_a_hand_rename_keeps_its_receipt(db: Database) -> None:
     """Only our own. Silently deleting somebody's own action is worse noise."""
-    await workspaces_repo.upsert(
-        db, "ws-2", chat_id=-500, topic_id=11, topic_name="fix login · api/main"
+    await sessions_repo.upsert(db, "sess-2", workspace_id=None)
+    await sessions_repo.bind_topic(
+        db, "sess-2", chat_id=-500, topic_id=11, topic_name="fix login · api/main"
     )
-    await workspaces_repo.set_topic_marker(db, "ws-2", TopicMarker.WORKING.value)
+    await sessions_repo.set_topic_marker(db, "sess-2", TopicMarker.WORKING.value)
     service = _ServiceMessage(name="my own name", chat_id=-500, thread_id=11)
 
     await prompt_handlers.tidy_rename_notice(service, db=db)  # type: ignore[arg-type]
@@ -3463,7 +3537,7 @@ def test_attach_with_everything_already_open_says_so() -> None:
     """
     local = [_workspace("a", topic_id=100), _workspace("b", topic_id=101)]
 
-    assert core_handlers.nothing_to_attach(local, "").startswith(
+    assert core_handlers.nothing_to_attach([row.id for row in local], "").startswith(
         "All 2 workspaces already open here"
     )
 
@@ -3474,16 +3548,16 @@ def test_the_count_is_rooms_this_chat_holds_not_workspaces_that_exist() -> None:
     Reaching this line means it did not — so counting it would point somebody
     at a thread that does not exist.
     """
-    local = [_workspace("a", topic_id=100), _workspace("b")]
-
-    assert core_handlers.nothing_to_attach(local, "").startswith(
+    # `homed` is now the ids that actually hold a room — a room belongs to a
+    # session, so the caller computes it rather than reading a workspace column.
+    assert core_handlers.nothing_to_attach(["a"], "").startswith(
         "All 1 workspace already open here"
     )
 
 
 def test_attach_with_a_query_blames_the_query_and_nothing_else() -> None:
     assert (
-        core_handlers.nothing_to_attach([_workspace("a", topic_id=1)], "checkout")
+        core_handlers.nothing_to_attach(["a"], "checkout")
         == "Nothing unattached matches <b>checkout</b>."
     )
 
@@ -3495,7 +3569,7 @@ def test_a_workspace_the_transcript_view_has_not_heard_of_is_still_attachable() 
     reach for `/attach` to find — is exactly the one it could not see.
     """
     rows = core_handlers.adoptable(
-        [], [_workspace("fresh"), _workspace("b", topic_id=9)]
+        [], [_workspace("fresh"), _workspace("b", topic_id=9)], homed={"b"}
     )
 
     assert [str(row["workspace_id"]) for row in rows] == ["fresh"]
@@ -3769,3 +3843,323 @@ def test_a_restored_row_with_broken_json_is_empty_and_never_raises() -> None:
     )
 
     assert message.content == {}
+
+
+# ── /fork: a second task in this workspace, in a room of its own ─────────────
+
+
+async def _swallow(*_: Any, **__: Any) -> None:
+    """A reply nobody is asserting on. React-or-tell, either is fine."""
+    return None
+
+
+class _ForkClient(_CountingClient):
+    """``POST /v0/sessions`` only. A fork must never buy a second workspace."""
+
+    def __init__(self, *, session_error: Exception | None = None, **kwargs: Any):
+        super().__init__(**kwargs)
+        self.sessions_created: list[str] = []
+        self._session_error = session_error
+
+    async def create_session(self, **kwargs: Any) -> Session:
+        if self._session_error is not None:
+            raise self._session_error
+        session_id = str(kwargs["session_id"])
+        self.sessions_created.append(session_id)
+        return Session(id=session_id, workspace_id=str(kwargs["workspace_id"]))
+
+
+async def _forkable(db: Database, *, chat_id: int = -1001, thread_id: int = 7) -> None:
+    """A workspace with one session, already in a room of its own."""
+    await workspaces_repo.upsert(
+        db,
+        "ws-1",
+        name="tg-1-abc",
+        branch="main",
+        chat_id=chat_id,
+        topic_name="api/main",
+    )
+    await sessions_repo.upsert(db, "sess-parent", workspace_id="ws-1", title="parent")
+    await sessions_repo.bind_topic(
+        db,
+        "sess-parent",
+        chat_id=chat_id,
+        topic_id=thread_id,
+        topic_name="parent · api/main",
+    )
+    await sessions_repo.set_topic_marker(db, "sess-parent", TopicMarker.DONE.value)
+    await sessions_repo.bind(db, "sess-parent", chat_id=chat_id, thread_id=thread_id)
+    await chats_repo.bind(
+        db, chat_id, thread_id, workspace_id="ws-1", session_id="sess-parent"
+    )
+
+
+def _fork_message(text: str = "/fork port billing", *, bot: Any) -> Any:
+    return SimpleNamespace(
+        text=text,
+        bot=bot,
+        chat=SimpleNamespace(id=-1001, type="supergroup"),
+        message_thread_id=7,
+        message_id=31,
+        from_user=SimpleNamespace(id=1001),
+    )
+
+
+def _fork_route(db: Database) -> Route:
+    return Route(
+        chat_id=-1001,
+        thread_id=7,
+        kind="topic",
+        chat=ChatRow(
+            chat_id=-1001, thread_id=7, workspace_id="ws-1", session_id="sess-parent"
+        ),
+    )
+
+
+async def test_fork_opens_its_own_room_and_leaves_the_parents_alone(
+    db: Database, monkeypatch: Any
+) -> None:
+    """**The user-visible flip.**
+
+    ``/fork`` used to bind the new session to ``route.thread_id`` — the room it
+    was typed in — so the second session took the room over and the first went
+    anonymous. It gets a room of its own now, and the parent's `chats` row and
+    marker are not touched.
+    """
+    monkeypatch.setattr(power_handlers, "tell", _swallow)
+    await _forkable(db)
+    bot = _ForumBot()
+    client = _ForkClient()
+
+    await power_handlers.fork(
+        _fork_message(bot=bot),
+        _fork_route(db),
+        fake_tenant(client),
+        _NullFsm(),  # type: ignore[arg-type]
+        db=db,
+        client=client,  # type: ignore[arg-type]
+    )
+
+    # No second workspace: a fork shares the container, branch and checkout.
+    assert client.creates == 0
+    assert len(client.sessions_created) == 1
+    assert bot.topics == 1, "the room is opened before POST /v0/sessions"
+    forked = await sessions_repo.get(db, client.sessions_created[0])
+    assert forked is not None
+    assert forked.workspace_id == "ws-1"
+    assert (forked.chat_id, forked.thread_id) == (-1001, 99)
+    assert forked.is_bound and forked.seeded
+    assert forked.topic_name == "port billing · api/main"
+    # The new thread routes to the fork, immediately.
+    new_room = await chats_repo.get(db, -1001, 99)
+    assert new_room is not None and new_room.session_id == forked.id
+    # And the parent keeps talking exactly where it was talking.
+    parent_room = await chats_repo.get(db, -1001, 7)
+    assert parent_room is not None and parent_room.session_id == "sess-parent"
+    parent = await sessions_repo.get(db, "sess-parent")
+    assert parent is not None and parent.is_bound and parent.thread_id == 7
+    assert parent.topic_marker == TopicMarker.DONE.value, "no marker reset"
+
+
+async def test_a_failed_fork_discards_the_room_it_opened(
+    db: Database, monkeypatch: Any
+) -> None:
+    """The room is opened before anything is paid for. Nothing lives in it now."""
+    monkeypatch.setattr(power_handlers, "tell", _swallow)
+    await _forkable(db)
+    bot = _ForumBot()
+    client = _ForkClient(session_error=RuntimeError("no capacity"))
+
+    await power_handlers.fork(
+        _fork_message(bot=bot),
+        _fork_route(db),
+        fake_tenant(client),
+        _NullFsm(),  # type: ignore[arg-type]
+        db=db,
+        client=client,  # type: ignore[arg-type]
+    )
+
+    assert bot.topics == 1 and bot.deleted == [99], "a retry finds no empty siblings"
+    assert await chats_repo.get(db, -1001, 99) is None
+
+
+async def test_a_bare_fork_gets_an_ordinal_rather_than_a_useless_label() -> None:
+    """``Telegram fork · acme-api/main`` is the same row for every fork."""
+    workspace = WorkspaceRow(id="ws", name="tg-1-abc", topic_name="acme-api/main")
+    siblings = [SessionRow(id="a"), SessionRow(id="b")]
+
+    bare = power_handlers.fork_label(workspace, siblings, "Telegram fork", named=False)
+    named = power_handlers.fork_label(workspace, siblings, "port billing", named=True)
+
+    assert bare == "fork 3 · acme-api/main"
+    assert named == "port billing · acme-api/main"
+
+
+async def test_fork_in_a_linear_dm_still_rebinds_the_one_seat(
+    db: Database, monkeypatch: Any
+) -> None:
+    """A DM that cannot host topics has one seat, and the fork takes it."""
+    monkeypatch.setattr(power_handlers, "tell", _swallow)
+    await workspaces_repo.upsert(db, "ws-1", name="tg-1-abc", chat_id=1050)
+    await sessions_repo.upsert(db, "sess-parent", workspace_id="ws-1", title="parent")
+    await sessions_repo.bind(db, "sess-parent", chat_id=1050, thread_id=0)
+    await chats_repo.bind(
+        db, 1050, 0, workspace_id="ws-1", session_id="sess-parent", kind="dm"
+    )
+    bot = _ForumBot(topics_enabled=False)
+    client = _ForkClient()
+    message = SimpleNamespace(
+        text="/fork second",
+        bot=bot,
+        chat=SimpleNamespace(id=1050, type="private"),
+        message_thread_id=None,
+        message_id=31,
+        from_user=SimpleNamespace(id=1001),
+    )
+
+    await power_handlers.fork(
+        message,  # type: ignore[arg-type]
+        Route(
+            chat_id=1050,
+            kind="dm",
+            chat=ChatRow(
+                chat_id=1050,
+                thread_id=0,
+                workspace_id="ws-1",
+                session_id="sess-parent",
+            ),
+        ),
+        fake_tenant(client),
+        _NullFsm(),  # type: ignore[arg-type]
+        db=db,
+        client=client,  # type: ignore[arg-type]
+    )
+
+    assert bot.topics == 0
+    seat = await chats_repo.get(db, 1050, 0)
+    assert seat is not None and seat.session_id == client.sessions_created[0]
+    # And the previous occupant stops polling, which is the whole of vector 3.
+    parent = await sessions_repo.get(db, "sess-parent")
+    assert parent is not None and not parent.is_bound
+
+
+# ── the regression the whole change buys ─────────────────────────────────────
+
+
+async def test_two_sessions_of_one_workspace_hold_different_prefixes(
+    db: Database,
+) -> None:
+    """They used to fight over a single ``workspaces.topic_marker``.
+
+    Whichever ticked last won, so a room could read "⚙️ working" for a session
+    nobody was looking at.
+    """
+    await workspaces_repo.upsert(db, "ws-1", name="api", topic_name="api/main")
+    for name, thread in (("a", 11), ("b", 12)):
+        await sessions_repo.upsert(db, name, workspace_id="ws-1")
+        await sessions_repo.bind_topic(
+            db, name, chat_id=-1001, topic_id=thread, topic_name=f"{name} · api/main"
+        )
+    bot = _ForumBot()
+
+    assert await topics.apply_marker(bot, db, "a", TopicMarker.WORKING)  # type: ignore[arg-type]
+    assert await topics.apply_marker(bot, db, "b", TopicMarker.DONE)  # type: ignore[arg-type]
+
+    first = await sessions_repo.get(db, "a")
+    second = await sessions_repo.get(db, "b")
+    assert first is not None and second is not None
+    assert first.topic_marker == TopicMarker.WORKING.value
+    assert second.topic_marker == TopicMarker.DONE.value
+    assert bot.renamed == ["⚙️ a · api/main", "✅ b · api/main"]
+
+
+# ── a deleted topic is silent, so one seam says it once ──────────────────────
+
+
+async def test_room_gone_frees_the_session_and_says_so_once(db: Database) -> None:
+    """Telegram sends **no update** for a deleted topic.
+
+    ``prompts._SERVICE_CONTENT`` enumerates created/edited/closed/reopened and
+    hidden/unhidden — there is no deleted member. So the bot finds out by trying
+    to use the room, from three places, and before this seam none of them told
+    the others: the session stayed bound to a dead thread, the poller kept
+    running, and every delivery paid the reroute again.
+    """
+    await workspaces_repo.upsert(db, "ws-1", name="api")
+    await sessions_repo.upsert(db, "sess-1", workspace_id="ws-1", title="fix login")
+    await sessions_repo.bind_topic(
+        db, "sess-1", chat_id=-1001, topic_id=7, topic_name="fix login · api/main"
+    )
+    await chats_repo.bind(db, -1001, 7, workspace_id="ws-1", session_id="sess-1")
+    bot = _ForumBot()
+
+    assert await topics.room_gone(bot, db, "sess-1") is True  # type: ignore[arg-type]
+
+    row = await sessions_repo.get(db, "sess-1")
+    assert row is not None and not row.has_room
+    route = await chats_repo.get(db, -1001, 7)
+    assert route is not None and route.session_id is None
+    assert len(bot.sent) == 1
+    assert bot.sent[0]["message_thread_id"] is None
+    assert "lost its topic" in bot.sent[0]["text"]
+    # A detach, not an archive: the session behind it costs money and holds
+    # uncommitted work, and the gesture is one accidental tap on a phone.
+    assert row.archived_at is None and row.is_bound
+
+    # Idempotent: three racing discoveries cost one line, not three.
+    assert await topics.room_gone(bot, db, "sess-1") is False  # type: ignore[arg-type]
+    assert len(bot.sent) == 1
+
+
+# ── /name -w renames the family, so every room of it ─────────────────────────
+
+
+async def test_renaming_a_workspace_relabels_every_room_it_has(
+    db: Database, monkeypatch: Any
+) -> None:
+    """``project/branch`` is in the name of all of them. One would leave the
+    rest asserting a project that no longer exists."""
+    monkeypatch.setattr(power_handlers, "tell", _swallow)
+
+    class _Renamer(_CountingClient):
+        async def rename_workspace(self, *_: Any, **__: Any) -> None:
+            return None
+
+    await workspaces_repo.upsert(
+        db, "ws-1", name="old", branch="main", topic_name="old/main"
+    )
+    for name, thread in (("a", 11), ("b", 12)):
+        await sessions_repo.upsert(db, name, workspace_id="ws-1", title=name)
+        await sessions_repo.bind_topic(
+            db, name, chat_id=-1001, topic_id=thread, topic_name=f"{name} · old/main"
+        )
+    bot = _ForumBot()
+    message = SimpleNamespace(
+        text="/name -w acme-api",
+        bot=bot,
+        chat=SimpleNamespace(id=-1001, type="supergroup"),
+        message_thread_id=11,
+        message_id=31,
+        from_user=SimpleNamespace(id=1001),
+    )
+    client = _Renamer()
+
+    await power_handlers.rename(
+        message,  # type: ignore[arg-type]
+        Route(
+            chat_id=-1001,
+            thread_id=11,
+            kind="topic",
+            chat=ChatRow(
+                chat_id=-1001, thread_id=11, workspace_id="ws-1", session_id="a"
+            ),
+        ),
+        fake_tenant(client),
+        _NullFsm(),  # type: ignore[arg-type]
+        db=db,
+        client=client,  # type: ignore[arg-type]
+    )
+
+    assert sorted(bot.renamed) == ["a · acme-api/main", "b · acme-api/main"]
+    workspace = await workspaces_repo.get(db, "ws-1")
+    assert workspace is not None and workspace.topic_name == "acme-api/main"

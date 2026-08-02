@@ -86,8 +86,9 @@ now fails the deployment instead of presenting a false-green service.
    phone. The prompt ledger and outbox—not the phone connection—carry the turn.
 3. **Redeploy mid-turn:** the new process reacquires the lease, recovers pending
    prompts/deliveries, and continues from the stored cursor.
-4. **Parallel work:** each workspace stays in its forum topic; `/s name` searches
-   workspace and session names; a topic can switch only among its own sessions.
+4. **Parallel work:** each *session* stays in its own forum topic; `/board name`
+   searches workspace names and drills into that workspace's sessions; a topic
+   belongs to one session for its whole life.
 5. **Uncertain button:** every decision has a recommended first option; archive
    and other destructive controls name the consequence and require confirmation.
 6. **Something feels stuck:** run `/mode`, then `/health`. Use Check/Retry/

@@ -1436,3 +1436,130 @@ async def test_anyone_can_remove_themselves(system_db: Database) -> None:
 
     assert await tenancy.remove_member(system_db, tenant.id, 9, removed_by=9) is True
     assert await tenancy.member(system_db, tenant.id, 9) is None
+
+
+# ── one topic per session: the rule, at the database ─────────────────────────
+
+
+async def test_a_room_holds_exactly_one_bound_session(db: Database) -> None:
+    """``uq_sessions_one_per_room``, and the bug it exists to make impossible.
+
+    Nothing anywhere unbound the session a seat already held, so ``/fork`` and
+    ``/s`` left *two* bound sessions on one thread: ``list_bound`` returned
+    both, the supervisor polled both, both delivered into the same room, and
+    which one a prompt reached was a ``created_at`` tiebreak.
+    """
+    await workspaces.upsert(db, "ws", name="api")
+    await sessions.upsert(db, "first", workspace_id="ws")
+    await sessions.upsert(db, "second", workspace_id="ws")
+    await sessions.bind(db, "first", chat_id=-1001, thread_id=7)
+
+    with pytest.raises(IntegrityError):
+        await sessions.update(db, "second", chat_id=-1001, thread_id=7, is_bound=True)
+
+    # The supported path releases the seat first, so it is one poller, always.
+    await sessions.bind(db, "second", chat_id=-1001, thread_id=7)
+    displaced = await sessions.get(db, "first")
+    assert displaced is not None and not displaced.is_bound
+    assert (await sessions.get_bound_for(db, -1001, 7)) is not None
+
+
+async def test_the_linear_seat_still_holds_a_mutable_binding(db: Database) -> None:
+    """Thread 0 is a *seat*, not a room — a DM without threads, or General.
+
+    It is the one place a binding legitimately moves, and the index carves it
+    out explicitly rather than by accident.
+    """
+    await workspaces.upsert(db, "ws", name="api")
+    await sessions.upsert(db, "a", workspace_id="ws")
+    await sessions.upsert(db, "b", workspace_id="ws")
+    await sessions.bind(db, "a", chat_id=1001, thread_id=NO_THREAD_ID)
+
+    # No IntegrityError: two rows may sit on thread 0 while the seat moves.
+    await sessions.update(db, "b", chat_id=1001, thread_id=NO_THREAD_ID)
+    await sessions.bind(db, "b", chat_id=1001, thread_id=NO_THREAD_ID)
+
+    assert (await sessions.get_bound_for(db, 1001)) is not None
+
+
+async def test_one_session_is_never_read_in_two_rooms(db: Database) -> None:
+    """``uq_chats_one_room_per_session``, from the other direction.
+
+    A reopened topic must stop the old room routing to this session, or the
+    insert collides and the reopen fails outright.
+    """
+    await workspaces.upsert(db, "ws", name="api")
+    await sessions.upsert(db, "s", workspace_id="ws")
+    await chats.bind(db, -1001, 7, workspace_id="ws", session_id="s")
+
+    await chats.bind(db, -1001, 8, workspace_id="ws", session_id="s")
+
+    old = await chats.get(db, -1001, 7)
+    assert old is not None and old.session_id is None
+    new = await chats.get(db, -1001, 8)
+    assert new is not None and new.session_id == "s"
+
+
+async def test_a_room_refuses_to_be_repointed_at_another_session(
+    db: Database,
+) -> None:
+    """A room is not a pointer. Repointing re-addresses a live transcript."""
+    await workspaces.upsert(db, "ws", name="api")
+    await sessions.upsert(db, "mine", workspace_id="ws")
+    await sessions.upsert(db, "theirs", workspace_id="ws")
+    await chats.bind(db, -1001, 7, workspace_id="ws", session_id="mine")
+
+    with pytest.raises(ValueError, match="already belongs to session"):
+        await chats.bind(db, -1001, 7, workspace_id="ws", session_id="theirs")
+
+    # The linear seat is exempt: it is the one binding that still moves.
+    await chats.bind(db, 1001, NO_THREAD_ID, workspace_id="ws", session_id="mine")
+    await chats.bind(db, 1001, NO_THREAD_ID, workspace_id="ws", session_id="theirs")
+    seat = await chats.get(db, 1001, NO_THREAD_ID)
+    assert seat is not None and seat.session_id == "theirs"
+
+
+async def test_the_rooms_columns_live_on_the_session(db: Database) -> None:
+    """``bind_topic`` / ``set_topic_marker`` / ``unbind_topic``, per session.
+
+    Two sessions of one workspace used to fight over a single ``topic_marker``:
+    whichever ticked last won, so a room could read "⚙️ working" for a session
+    nobody was looking at.
+    """
+    await workspaces.upsert(db, "ws", name="api")
+    await sessions.upsert(db, "a", workspace_id="ws")
+    await sessions.upsert(db, "b", workspace_id="ws")
+    await sessions.bind_topic(db, "a", chat_id=-1001, topic_id=7, topic_name="one")
+    await sessions.bind_topic(db, "b", chat_id=-1001, topic_id=8, topic_name="two")
+    await sessions.set_topic_marker(db, "a", "working")
+    await sessions.set_topic_marker(db, "b", "done")
+
+    first = await sessions.get(db, "a")
+    second = await sessions.get(db, "b")
+    assert first is not None and second is not None
+    assert (first.topic_name, first.topic_marker) == ("one", "working")
+    assert (second.topic_name, second.topic_marker) == ("two", "done")
+    assert first.has_room and second.has_room
+    assert await sessions.get_by_topic(db, -1001, 8) is not None
+
+    await sessions.unbind_topic(db, "a")
+    roomless = await sessions.get(db, "a")
+    assert roomless is not None
+    assert not roomless.has_room and roomless.topic_marker is None
+    assert [row.id for row in await sessions.list_with_room(db)] == ["b"]
+
+
+async def test_an_archived_session_is_not_a_dead_one(db: Database) -> None:
+    """``archived_at`` is the user's choice; ``dead_at`` is a 404.
+
+    "Is this the last live task?" must not be fooled by either, so they are two
+    columns rather than one.
+    """
+    await workspaces.upsert(db, "ws", name="api")
+    await sessions.upsert(db, "s", workspace_id="ws")
+
+    row = await sessions.mark_archived(db, "s")
+
+    assert row is not None
+    assert row.archived_at is not None and row.dead_at is None
+    assert not row.is_bound and not row.live

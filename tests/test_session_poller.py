@@ -19,7 +19,7 @@ from ctb.conductor.models import (
     WorkspaceStatusValue,
 )
 from ctb.db.connection import Database
-from ctb.db.repo import prompts, sessions, workspaces
+from ctb.db.repo import chats, prompts, sessions, workspaces
 from ctb.turn.session_poller import SessionPoller
 from ctb.turn.state import (
     E404,
@@ -424,10 +424,8 @@ async def test_dead_sink_runs_before_db_routing_is_cleared(db: Database) -> None
             )
             if any(isinstance(action, UnbindTopic) for action in actions):
                 session = await sessions.get(db, SESSION)
-                workspace = await workspaces.get(db, WORKSPACE)
                 assert session is not None
-                assert workspace is not None
-                observations.append((session.is_bound, workspace.topic_id))
+                observations.append((session.is_bound, session.thread_id))
 
     sink = OrderingSink()
     poller = SessionPoller(
@@ -438,8 +436,10 @@ async def test_dead_sink_runs_before_db_routing_is_cleared(db: Database) -> None
 
     assert observations == [(True, THREAD)]
     session = await sessions.get(db, SESSION)
-    workspace = await workspaces.get(db, WORKSPACE)
     assert session is not None
-    assert workspace is not None
     assert not session.is_bound
-    assert workspace.topic_id is None
+    # The room is the session's now, and the `chats` row goes with it: leaving
+    # it behind left a zombie room routing prompts to a session that is dead.
+    assert not session.has_room
+    route = await chats.get(db, CHAT, THREAD)
+    assert route is None or route.session_id is None

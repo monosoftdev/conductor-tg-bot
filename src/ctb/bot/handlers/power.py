@@ -13,33 +13,35 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
-    InlineKeyboardButton,
     Message,
 )
 
 from ctb.bot.app import register_router
-from ctb.bot.handlers.adopt import adopt_button
 from ctb.bot.handlers.common import (
+    CreatedBinding,
     abandon_wizard,
     command_text,
+    created_card,
     new_session_id,
+    note_linear_seat,
+    open_room,
     react_ok,
     require_session,
-    safe_title,
     short_error,
     tell,
     workspace_name,
 )
-from ctb.bot.handlers.core import adoptable_rows, status_icon
 from ctb.bot.handlers.topics import (
     apply_marker,
+    discard_topic,
     edit_html,
-    human_name,
-    jump_url,
     marker_for,
     resolve_client,
     resolve_db,
+    room_label,
+    session_marker,
     topic_label,
+    workspace_family,
 )
 from ctb.bot.keyboards import (
     CONTROL_TTL_S,
@@ -66,7 +68,7 @@ from ctb.db.repo.transcript import StoredMessage
 from ctb.db.repo.workspaces import WorkspaceRow
 from ctb.delivery.render.html import escape
 from ctb.turn import cursor as turn_cursor
-from ctb.turn.state import TopicMarker, TurnState
+from ctb.turn.state import TopicMarker
 
 router = Router(name=__name__)
 register_router(router, order=30)
@@ -79,13 +81,13 @@ _HELP = """<b>Phone loop</b>
 New thread · type a task; it becomes a workspace
 In a workspace · send text, voice, or audio
 Result · tap a numbered choice; ✓ is recommended
-<code>/attach</code> a laptop one · <code>/board</code> · <code>/home</code> buttons
+<code>/board</code> workspaces, then their sessions
+<code>/attach</code> a laptop one · <code>/home</code> buttons
 
-<code>/digest</code> what needs you · errors and stalls first
-<code>/stop</code> cancels this turn · also on the pinned card
+<code>/digest</code> what needs you · <code>/stop</code> ends this turn
 <code>/find text</code> searches transcripts · <code>/log</code> this one
-<code>/name text</code> renames this session · <code>-w</code> renames the topic
-<code>/s</code> switch · <code>/fork</code> another here · <code>/mode</code> settings
+<code>/name text</code> renames this task · <code>-w</code> the workspace
+<code>/fork</code> new session, new topic · <code>/mode</code> settings
 <code>/notify</code> loud·quiet·off · <code>/done</code> archives, always confirms
 
 <b>Your team</b> · <code>/team</code> adds a group, optional
@@ -95,9 +97,6 @@ Privately · <code>/key</code> Conductor · <code>/voicekey</code> voice ·
 <code>/use name</code> picks which team your DMs mean · <code>/leave</code> exits
 <code>/export</code> downloads your data · <code>/privacy</code> explains it
 Voice commands need “command” or “команда”."""
-
-#: Buttons ``/s`` shows in General before it says how many it hid.
-GENERAL_VISIBLE: Final = 12
 
 #: One line, both forms — the second is the only way to set a branch by hand.
 _DEFAULTS_USAGE: Final = (
@@ -119,50 +118,6 @@ LOG_LINE_CHARS: Final = 140
 #: HTML escaping expanding a character into six.
 LOG_BODY_CHARS: Final = 3_400
 LOG_USAGE: Final = "Usage: <code>/log [1-60]</code> · <code>/log raw [1-200]</code>"
-
-_SWITCH_ACTIVE = frozenset(
-    {
-        TurnState.SUBMIT_PENDING,
-        TurnState.QUEUED,
-        TurnState.WAKING,
-        TurnState.WORKING,
-        TurnState.DRAINING,
-        TurnState.CANCELLING,
-    }
-)
-
-
-def switchable_sessions(
-    sessions: list[SessionRow],
-    route: Route,
-) -> list[SessionRow]:
-    """A topic may switch sessions, never workspaces. DMs remain one seat."""
-    if route.is_dm:
-        return sessions
-    if route.workspace_id is None:
-        return []
-    return [row for row in sessions if row.workspace_id == route.workspace_id]
-
-
-def homed_elsewhere(
-    workspace: WorkspaceRow | None, seat: tuple[int | None, int] | Route
-) -> tuple[int, int] | None:
-    """``(chat_id, topic_id)`` of the room this workspace lives in, if not here.
-
-    ``/s`` binds a session to the seat it is run from, which is right for the
-    linear DM it was written for and wrong the moment a workspace has a topic:
-    the bind re-addresses the transcript, so the topic the replies had been
-    landing in goes quiet and the root starts speaking for a room it is not.
-    A workspace with a room of its own is *opened*, never switched to.
-
-    ``None`` means there is nothing to open — no topic, or the caller is
-    already standing in it.
-    """
-    if workspace is None or not workspace.topic_id or workspace.chat_id is None:
-        return None
-    key = seat.key if isinstance(seat, Route) else seat
-    home = (workspace.chat_id, workspace.topic_id)
-    return None if home == key else home
 
 
 @router.message(Command("help", "start"))
@@ -204,213 +159,44 @@ def _launchable(message: Message, tenant: TenantContext | None) -> bool:
 @router.message(Command("s"))
 async def switch_session(
     message: Message,
-    route: Route,
     tenant: TenantContext,
     state: FSMContext,
     nonces: NonceStore,
     db: Database | None = None,
 ) -> None:
-    await abandon_wizard(state)
-    database = resolve_db(db)
-    query = command_text(message).casefold()
-    sessions = [
-        row
-        for row in await sessions_repo.list_all(database)
-        if row.state is not TurnState.DEAD
-    ]
-    workspaces = {
-        row.id: row
-        for row in await workspaces_repo.list_all(database, include_archived=False)
-    }
-    if query:
-        sessions = [
-            row
-            for row in sessions
-            if query in row.id.casefold()
-            or query in (row.title or "").casefold()
-            or (
-                row.workspace_id in workspaces
-                and (
-                    query in workspace_name(workspaces[row.workspace_id]).casefold()
-                    or query in (workspaces[row.workspace_id].branch or "").casefold()
-                )
-            )
-        ]
-    sessions.sort(
-        key=lambda row: (
-            row.state in _SWITCH_ACTIVE,
-            row.last_prompt_at or row.updated_at or row.created_at,
-        ),
-        reverse=True,
-    )
-    in_general = message.chat.type in {"group", "supergroup"} and (
-        message.message_thread_id or 0
-    ) in {0, 1}
-    if in_general:
-        entries: list[InlineKeyboardButton] = []
-        seen: set[str] = set()
-        for session in sessions:
-            workspace_id = session.workspace_id or ""
-            workspace = workspaces.get(workspace_id)
-            if workspace is None or workspace_id in seen:
-                continue
-            seen.add(workspace_id)
-            target = (
-                jump_url(workspace.chat_id, workspace.topic_id)
-                if workspace.chat_id is not None
-                else None
-            )
-            if target:
-                entries.append(
-                    url_button(
-                        f"{status_icon(session.state)} {workspace_name(workspace)}",
-                        target,
-                    )
-                )
-        # "I know its name" also has to reach a workspace made on the laptop,
-        # which has no topic and therefore no local session to switch to.
-        for row in await adoptable_rows(
-            database, tenant.client, query=query, exclude=seen
-        ):
-            workspace_id = str(row.get("workspace_id") or "")
-            entries.append(
-                adopt_button(
-                    workspace_id=workspace_id,
-                    name=human_name(str(row.get("workspace_name") or ""))
-                    or str(row.get("session_title") or workspace_id[:8]),
-                    session_id=str(row.get("session_id") or "") or None,
-                    store=nonces,
-                    user_id=message.from_user.id if message.from_user else None,
-                    chat_id=message.chat.id,
-                    thread_id=route.thread_id,
-                )
-            )
-        if not entries:
-            await tell(message, "No workspace matches.")
-            return
-        shown = entries[:GENERAL_VISIBLE]
-        lines = ["<b>Open workspace</b> · + opens a laptop one here"]
-        if len(entries) > len(shown):
-            lines.append(f"<i>+{len(entries) - len(shown)} more · /s name</i>")
-        await tell(
-            message,
-            "\n".join(lines),
-            reply_markup=keyboard([[item] for item in shown]),
-        )
-        return
-    sessions = switchable_sessions(sessions, route)
-    if not sessions:
-        await tell(
-            message,
-            "No session in this workspace. Use /fork or /board.",
-        )
-        return
-    rows = []
-    elsewhere: list[str] = []
-    for row in sessions[:12]:
-        label = (
-            f"{status_icon(row.state)} {safe_title(row.title, row.id[:8])} "
-            f"· {row.model or '?'}"
-        )
-        home = homed_elsewhere(workspaces.get(row.workspace_id or ""), route)
-        if home is not None:
-            # This session already has a room, and it is not this one. Binding
-            # it here would re-address its transcript to this seat and leave its
-            # topic silent — the opposite of what "switch" promises. Offer the
-            # way in instead; a DM topic has no link syntax, so it gets named.
-            target = jump_url(*home)
-            if target:
-                rows.append([url_button(label, target)])
-            else:
-                elsewhere.append(label)
-            continue
-        current = "✓ " if row.id == route.session_id else ""
-        rows.append(
-            [
-                button(
-                    f"{current}{label}",
-                    "switch",
-                    row.id,
-                    store=nonces,
-                    user_id=message.from_user.id if message.from_user else None,
-                    chat_id=message.chat.id,
-                    thread_id=route.thread_id,
-                    ttl=CONTROL_TTL_S,
-                )
-            ]
-        )
-    lines = ["<b>Switch session</b>" if rows else "<b>Open a task</b>"]
-    if elsewhere:
-        lines.append("<i>These have their own topic — open it from the list:</i>")
-        lines.extend(f"· {escape(name)}" for name in elsewhere)
-    await tell(
-        message,
-        "\n".join(lines),
-        reply_markup=keyboard(rows) if rows else None,
-    )
+    """A silent alias for ``/board``. ``/s`` no longer has a job of its own.
+
+    Every one of them moved: per-session rooms removed *switch session inside a
+    workspace* as a concept, ``/board`` stage 2 is *see the workspace's other
+    sessions*, stage 1 is *reach a workspace from the root*, and stage 2's
+    bind-the-seat branch is the one thing only ``/s`` could do — move the
+    binding in a chat that cannot host topics.
+
+    Kept registered, and out of ``BOT_COMMANDS`` and ``_HELP``, because a
+    command in somebody's muscle memory should land somewhere useful rather than
+    on the catch-all's "Unknown command".
+    """
+    from ctb.bot.handlers.core import board
+
+    await board(message, tenant, state, nonces, db=db)
 
 
-@router.callback_query(Cb.filter(F.action == "switch"))
-async def switch_callback(
-    query: CallbackQuery,
-    nonces: NonceStore,
-    db: Database | None = None,
-) -> None:
-    try:
-        ticket = resolve(query, expect="switch", store=nonces)
-    except NonceError as exc:
-        await query.answer(exc.user_message, show_alert=True)
-        return
-    database = resolve_db(db)
-    session = await sessions_repo.get(database, ticket.target)
-    if session is None:
-        await query.answer("Session is gone.", show_alert=True)
-        return
-    seat = (ticket.chat_id or query.from_user.id, ticket.thread_id)
-    if ticket.thread_id != 0:
-        chat = await chats_repo.get(database, *seat)
-        if (
-            chat is None
-            or chat.workspace_id is None
-            or chat.workspace_id != session.workspace_id
-        ):
-            await query.answer(
-                "That session belongs to another workspace. Open its topic.",
-                show_alert=True,
-            )
-            return
-    # The button should never have been a switch button (see `/s`), but a stale
-    # one minted before the workspace got its topic still resolves. Refuse
-    # rather than silently move replies out of the room somebody is reading.
-    home = await workspaces_repo.get(database, session.workspace_id or "")
-    if homed_elsewhere(home, seat) is not None:
-        await query.answer(
-            "That task has its own topic. Open it there.", show_alert=True
-        )
-        return
-    await sessions_repo.bind(
-        database,
-        session.id,
-        chat_id=seat[0],
-        thread_id=ticket.thread_id,
-    )
-    await chats_repo.bind(
-        database,
-        seat[0],
-        ticket.thread_id,
-        workspace_id=session.workspace_id,
-        session_id=session.id,
-        kind="dm" if ticket.thread_id == 0 else "topic",
-    )
-    await query.answer("Switched")
-    if isinstance(query.message, Message) and query.bot is not None:
-        await edit_html(
-            query.bot,
-            query.message.chat.id,
-            query.message.message_id,
-            f"✓ Current · <b>{escape(safe_title(session.title, session.id[:8]))}</b>",
-            reply_markup=None,
-        )
+def fork_label(
+    workspace: WorkspaceRow | None,
+    siblings: Sequence[SessionRow],
+    title: str,
+    *,
+    named: bool,
+) -> str:
+    """What the fork's room is called. ``fork 2 · acme-api/main`` when unnamed.
+
+    A bare ``/fork`` titles its session ``Telegram fork``, which as a topic row
+    reads ``Telegram fork · acme-api/main`` — the same for every fork of every
+    workspace, and therefore useless in a list. The ordinal at least says *which*
+    attempt this is, and ``/fork <title>`` is the good path either way.
+    """
+    family = workspace_family(workspace)
+    return room_label(family, title if named else f"fork {len(siblings) + 1}")
 
 
 @router.message(Command("fork"))
@@ -422,6 +208,17 @@ async def fork(
     db: Database | None = None,
     client: ConductorClient | None = None,
 ) -> None:
+    """Another task in *this* workspace, in a room of its own.
+
+    No new workspace: the fork shares the container, the branch and the
+    checkout, and adds a second Conductor chat to them. What it does not share
+    any more is the room — the parent's ``chats`` row and marker are not touched,
+    so the conversation you forked from keeps talking where it was talking.
+
+    The order is ``/new``'s, for ``/new``'s reason: the room is opened *before*
+    ``POST /v0/sessions``, and discarded if that call fails, so a retry finds no
+    empty siblings.
+    """
     await abandon_wizard(state)
     if not route.workspace_id:
         await tell(message, "No workspace here.")
@@ -444,7 +241,23 @@ async def fork(
         or (current.effort if current else None)
         or tenant.settings.default_effort
     )
-    title = command_text(message) or "Telegram fork"
+    typed = command_text(message)
+    title = typed or "Telegram fork"
+    workspace = await workspaces_repo.get(database, route.workspace_id)
+    siblings = await sessions_repo.list_for_workspace(database, route.workspace_id)
+    label = fork_label(workspace, siblings, title, named=bool(typed))
+    # Every room of a workspace hashes its colour from the same key, so a fork
+    # joins the family in the topic list rather than arriving a different colour.
+    family = workspace_family(workspace)
+    seat = await open_room(
+        bot=message.bot,
+        chat_id=message.chat.id,
+        chat_type=message.chat.type,
+        label=label,
+        claimable_thread=route.claimable_thread,
+        color_key=family,
+    )
+    thread_id = seat.thread_id
     session_id = new_session_id()
     try:
         session = await turn_cursor.create_session(
@@ -465,31 +278,53 @@ async def fork(
             agent=agent,
             model=model,
             effort=effort,
-            chat_id=message.chat.id,
-            thread_id=route.thread_id,
-            is_bound=True,
+        )
+        if thread_id:
+            await sessions_repo.bind_topic(
+                database,
+                session.id,
+                chat_id=message.chat.id,
+                topic_id=thread_id,
+                topic_name=label,
+            )
+            if seat.fresh_topic is not None or seat.claimed_named:
+                await sessions_repo.set_topic_marker(
+                    database, session.id, TopicMarker.IDLE.value
+                )
+        # A session we just created is empty. Saying so beats letting the
+        # supervisor guess, exactly as `/new` does it.
+        await sessions_repo.seek_to_end(
+            database, session.id, message_id=None, session_index=-1
+        )
+        await sessions_repo.bind(
+            database, session.id, chat_id=message.chat.id, thread_id=thread_id
         )
         await chats_repo.bind(
             database,
             message.chat.id,
-            route.thread_id,
+            thread_id,
             workspace_id=route.workspace_id,
             session_id=session.id,
-            kind=route.kind if route.kind in {"dm", "topic"} else "topic",
+            kind="topic" if thread_id else "dm",
         )
     except Exception as exc:
+        # The room was opened before anything was paid for and nothing will ever
+        # live in it now. Free and deletable, unlike the Conductor chat it was
+        # meant to host.
+        if seat.fresh_topic is not None and message.bot is not None:
+            await discard_topic(message.bot, message.chat.id, seat.fresh_topic)
         await tell(message, f"Fork failed: {escape(short_error(exc))}", silent=False)
         return
-    # The topic now points at a session that has never run, so whatever the
-    # previous one left behind — most visibly a ✅ from its last finished turn —
-    # is now a claim about work that does not exist. The title stays correct
-    # (a fork shares the workspace, so `project/branch` is unchanged); only the
-    # state marker is stale.
-    if message.bot is not None:
-        await apply_marker(message.bot, database, route.workspace_id, TopicMarker.IDLE)
+    if seat.refusal is not None:
+        # A DM that cannot host topics has one seat, and the fork has just taken
+        # it. Say so once, through the same gate `/new` uses.
+        await note_linear_seat(message.bot, message.chat.id, seat.refusal)
     # The argument the user just typed is the whole message. React instead.
-    if not await react_ok(message):
-        await tell(message, f"Forked <b>{escape(title[:80])}</b>.")
+    if await react_ok(message):
+        return
+    created = CreatedBinding(route.workspace_id, session.id, thread_id, label)
+    text, markup = created_card(message.chat.id, created, from_thread=route.thread_id)
+    await tell(message, text, reply_markup=markup)
 
 
 @router.message(Command("name"))
@@ -517,25 +352,55 @@ async def rename(
             if not route.workspace_id:
                 raise ValueError("No workspace here.")
             await conductor.rename_workspace(route.workspace_id, name)
-            await workspaces_repo.update(database, route.workspace_id, name=name)
+            current_ws = await workspaces_repo.get(database, route.workspace_id)
+            family = topic_label(
+                name, current_ws.branch if current_ws is not None else None
+            )
+            await workspaces_repo.update(
+                database, route.workspace_id, name=name, topic_name=family
+            )
             workspace = await workspaces_repo.get(database, route.workspace_id)
             if workspace is not None and message.bot is not None:
-                await apply_marker(
-                    message.bot,
-                    database,
-                    route.workspace_id,
-                    marker_for(
-                        workspace_status=workspace.status_value,
-                        turn_state=route.session.state if route.session else None,
-                    ),
-                    label=topic_label(name, workspace.branch),
-                )
+                # `project/branch` is in the name of **every** room of this
+                # workspace, so renaming the workspace re-labels all of them.
+                # One room would leave the rest asserting the old project.
+                for row in await sessions_repo.list_for_workspace(
+                    database, route.workspace_id
+                ):
+                    if not row.has_room:
+                        continue
+                    await apply_marker(
+                        message.bot,
+                        database,
+                        row.id,
+                        marker_for(
+                            workspace_status=workspace.status_value,
+                            turn_state=row.state,
+                            session_status=row.status_value,
+                        ),
+                        label=room_label(family, row.title),
+                    )
         else:
             session_id = await require_session(message, route)
             if not session_id:
                 return
             await conductor.rename_session(session_id, name)
             await sessions_repo.update(database, session_id, title=name)
+            # The session *is* the room now, so `/name` renames both.
+            session = route.session
+            if message.bot is not None and session is not None and session.has_room:
+                workspace = (
+                    await workspaces_repo.get(database, session.workspace_id)
+                    if session.workspace_id
+                    else None
+                )
+                await apply_marker(
+                    message.bot,
+                    database,
+                    session_id,
+                    await session_marker(database, session),
+                    label=room_label(workspace_family(workspace), name),
+                )
     except Exception as exc:
         await tell(message, f"Rename failed: {escape(short_error(exc))}", silent=False)
         return
@@ -906,10 +771,20 @@ async def tidy(
     database = resolve_db(db)
     closed = 0
     cutoff = int(time.time() * 1000) - 7 * 24 * 60 * 60 * 1000
-    for row in await workspaces_repo.list_all(database, include_archived=True):
-        stale = row.updated_at < cutoff and row.topic_id is not None
-        archived = row.archived_at is not None
-        if not (stale or archived) or row.chat_id is None or row.topic_id is None:
+    workspaces = {
+        row.id: row
+        for row in await workspaces_repo.list_all(database, include_archived=True)
+    }
+    # One room per session, so the sweep is over sessions. The staleness test is
+    # the same seven days, read from the session's own `updated_at` — a workspace
+    # whose other task ran an hour ago must not keep this room alive.
+    for row in await sessions_repo.list_with_room(database):
+        workspace = workspaces.get(row.workspace_id or "")
+        stale = row.updated_at < cutoff
+        archived = row.archived_at is not None or (
+            workspace is not None and workspace.archived_at is not None
+        )
+        if not (stale or archived) or row.chat_id is None:
             continue
         try:
             if message.bot is None:
@@ -919,7 +794,7 @@ async def tidy(
             # "⚙️ working" forever, describing a session nobody is running.
             await apply_marker(message.bot, database, row.id, TopicMarker.ARCHIVED)
             await message.bot.close_forum_topic(
-                chat_id=row.chat_id, message_thread_id=row.topic_id
+                chat_id=row.chat_id, message_thread_id=row.thread_id
             )
         except Exception:
             continue

@@ -111,10 +111,10 @@ Got the wording wrong? Type it again — while the card is up, a new line
 thread it was typed in rather than opening one beside it.
 
 > **No threads in your chat?** You may see *Topics unavailable here · one
-> workspace at a time.* Telegram, not the bot, decides whether a private chat
+> task at a time.* Telegram, not the bot, decides whether a private chat
 > can hold them — see [below](#when-your-private-chat-has-no-topics). The bot
-> keeps working; it just holds one workspace at a time, `/s` switches, and
-> plain text there is a prompt for whatever is bound.
+> keeps working; it just holds one task at a time, `/board` moves the chat to
+> another, and plain text there is a prompt for whatever is bound.
 
 ---
 
@@ -128,12 +128,12 @@ thread it was typed in rather than opening one beside it.
 | Continue | Type, speak, or send audio **in that topic** |
 | Stop the current turn | Tap **⏹** on the pinned card, or `/stop` |
 | See what this session is doing | `/mode` |
-| See everything at once | `/board` |
-| Jump to another session | `/s` (or `/s name`) |
-| Another session, same workspace | `/fork` |
+| See everything at once | `/board` — workspaces, then their sessions |
+| Jump to another task | `/board`, tap the workspace, tap the task |
+| Another task, same workspace | `/fork` — it opens its own topic |
 | Open a laptop-made workspace here | `/attach`, then tap **+ Open** |
 | Search your transcripts | `/find some text` |
-| Finish and archive | `/done`, then confirm by name |
+| Finish and archive | `/done` — this task; the workspace too if it is the last |
 
 `/help` prints a short version of this in the chat.
 
@@ -149,10 +149,14 @@ your private chat itself when it has no topics. Three places it is not:
   reaches it. Type a task and you get one button — *Send to «that task»* —
   instead of a guess.
 
-`/s` reaches a session; it never moves one. A task that has a topic of its own
-is listed so you can open it, because binding it to where you typed `/s` would
-re-address its replies and leave its topic silent. Only tasks without a topic —
-a linear chat's — are switched to in place.
+`/board` reaches a task; it never moves one. Tapping a task that already has a
+topic just jumps to it, because re-addressing its replies would leave the topic
+you were reading silent. A task with no topic yet gets one on that tap — rooms
+are opened when you first open them, not when the task is created, so
+`/attach` on a nine-task workspace does not fill your list with nine rooms.
+
+In a chat that cannot hold topics there is one seat, and tapping a task moves
+it — which is the one thing `/s` used to do, and why `/s` could be retired.
 
 ### While it works, your phone stays quiet
 
@@ -207,10 +211,10 @@ for them. Two things decide whether you get them:
 - Telegram's own Bot API has to accept the call. This is new ground, and there
   is a known regression where a thread is created but cannot be written to.
 
-If either fails, the bot says **Topics unavailable here · one workspace at a
-time** — once, not every time — and carries on linearly: one bound workspace in
-this chat, `/s` to switch to another, everything else identical. Nothing is
-lost and nothing is stranded; the workspace is created either way.
+If either fails, the bot says **Topics unavailable here · one task at a
+time** — once, not every time — and carries on linearly: one bound task in
+this chat, `/board` to move it to another, everything else identical. Nothing
+is lost and nothing is stranded; the workspace is created either way.
 
 Operators: `scripts/probe_dm_topics.py` answers this against a live token in
 about five seconds. Run it before promising anybody a topic list.
@@ -252,7 +256,7 @@ Give it these four permissions and no others:
 
 | Permission | Why |
 |---|---|
-| **Manage Topics** | it creates one topic per workspace |
+| **Manage Topics** | it creates one topic per task |
 | **Pin Messages** | the status card is pinned so it stays reachable |
 | **Delete Messages** | it deletes an API key you paste by mistake |
 | **Send Messages** | it has to answer you |

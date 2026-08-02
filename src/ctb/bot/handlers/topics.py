@@ -1,9 +1,17 @@
 """Forum-topic lifecycle, and the small chat plumbing every handler shares.
 
-One topic per workspace — **in a group and in a DM alike**. The address of a
+One topic per **session** — **in a group and in a DM alike**. The address of a
 prompt is the topic your thumb is in (PLAN §Chat model), so the topic is created
-*instantly* — before the workspace exists — and adopted by the workspace id once
-``POST /v0/workspaces`` returns.
+*instantly* — before the workspace exists — and adopted by the session id once
+``POST /v0/workspaces`` returns. A workspace is a *group of rooms*: several
+Conductor chats over one container, one branch and one checkout, each with its
+own Telegram topic.
+
+A session gets its room the first time it is **opened**, not when it is created.
+``/new`` and ``/fork`` open one immediately because both are explicit acts;
+everything else — the other sessions of an adopted workspace — materialises one
+lazily through :func:`ensure_topic`, so ``/attach`` on a nine-session workspace
+does not open nine rooms nobody asked for.
 
 A bot needs no admin rights and no Premium to open a topic in a private chat;
 the one precondition is @BotFather's *Threaded Mode*, which ``getMe`` reports as
@@ -17,7 +25,7 @@ Telegram says the thread is gone, exactly as the outbox reroutes a delivery.
 **Renamed only on state transitions, never on a timer** (PLAN §Chat model). A
 rename is a Telegram API call; a 5-second init card that renamed the topic every
 tick would spend the whole flood budget on cosmetics. The last applied prefix
-lives in ``workspaces.topic_marker``, and :func:`apply_marker` is a no-op when
+lives in ``sessions.topic_marker``, and :func:`apply_marker` is a no-op when
 the marker has not actually changed — that check is the rule, in code.
 
 The name is ``<marker> <task> · <project>/<branch>`` — a **state prefix** that
@@ -89,11 +97,12 @@ from ctb.db.repo import workspaces as workspaces_repo
 from ctb.db.repo.sessions import SessionRow
 from ctb.db.repo.workspaces import WorkspaceRow
 from ctb.delivery.outbox import THREAD_GONE_MARKERS, is_entity_error
-from ctb.delivery.render.html import strip_html
+from ctb.delivery.render.html import escape, strip_html
 from ctb.logging import get_logger
 from ctb.turn.state import TopicMarker, TurnState
 
 __all__ = [
+    "ROOM_GONE_NOTICE",
     "TOPIC_NAME_LIMIT",
     "TOPIC_ICON_COLORS",
     "Claim",
@@ -102,6 +111,8 @@ __all__ = [
     "TopicRetirement",
     "apply_marker",
     "attach_topic",
+    "room_gone",
+    "session_marker",
     "claim_topic",
     "create_topic",
     "discard_topic",
@@ -116,11 +127,13 @@ __all__ = [
     "marker_for",
     "require_topic",
     "resolve_client",
+    "room_label",
     "resolve_db",
     "retire_topic",
     "send_html",
     "telegram_reason",
     "topic_label",
+    "workspace_family",
     "topic_icon_color",
     "topic_icon_id",
     "topic_title",
@@ -298,6 +311,31 @@ def topic_label(
     hint = task_hint(task)
     label = f"{hint} · {where}" if hint else where
     return label[:TOPIC_NAME_LIMIT]
+
+
+def workspace_family(row: WorkspaceRow | None) -> str:
+    """``acme-api/main`` — what every room of one workspace has in common.
+
+    Written to ``workspaces.topic_name`` at create time and kept there after the
+    room moved to the session, because it is still two things: what ``/board``
+    stage 1 calls this workspace, and the key every one of its rooms hashes its
+    colour from, so they read as a family in the topic list.
+    """
+    if row is None:
+        return topic_label(None, None)
+    return human_name(row.topic_name) or topic_label(
+        human_name(row.name) or row.id[:8], row.branch
+    )
+
+
+def room_label(family: str | None, task: str | None) -> str:
+    """``fix flaky login · acme-api/main`` — one room inside a known workspace.
+
+    :func:`topic_label` composed the other way round: the workspace part is
+    already rendered, so it goes in whole rather than being rebuilt from a
+    project and a branch that would end up appended twice.
+    """
+    return topic_label(family or None, None, task=task)
 
 
 def topic_title(marker: TopicMarker, label: str) -> str:
@@ -725,12 +763,18 @@ async def require_topic(
     label: str,
     *,
     marker: TopicMarker = TopicMarker.INITIALIZING,
+    color_key: str | None = None,
 ) -> int:
     """Create the topic **now**, before the workspace exists — or raise.
 
     This call is the *proof* that a topic can exist here. ``can_manage_topics``
     is not: it has been observed ``true`` on a chat that then refused
     ``createForumTopic``. Anything that costs money runs after this returns.
+
+    ``color_key`` is what the colour is hashed from, and it is the *workspace*
+    label rather than this room's: one workspace now owns several rooms, and
+    they read as a family in the list only if they share a colour. Defaults to
+    ``label``, which is right for the first room of a new workspace.
     """
     icon = await topic_icon_id(bot, marker)
     try:
@@ -741,7 +785,7 @@ async def require_topic(
             # and changes with every later rename. Telegram ignores the colour
             # entirely once a custom emoji is set, which is the right trade —
             # state is what you scan the list for.
-            icon_color=topic_icon_color(label),
+            icon_color=topic_icon_color(color_key or label),
             icon_custom_emoji_id=icon,
         )
     except TelegramAPIError as exc:
@@ -835,6 +879,7 @@ async def create_topic(
     label: str,
     *,
     marker: TopicMarker = TopicMarker.INITIALIZING,
+    color_key: str | None = None,
 ) -> int | None:
     """:func:`require_topic` for callers that degrade instead of failing.
 
@@ -843,7 +888,9 @@ async def create_topic(
     than failing the command.
     """
     try:
-        return await require_topic(bot, chat_id, label, marker=marker)
+        return await require_topic(
+            bot, chat_id, label, marker=marker, color_key=color_key
+        )
     except TopicCreateError:
         return None
 
@@ -882,21 +929,21 @@ async def discard_topic(bot: Bot, chat_id: int, topic_id: int) -> bool:
 async def attach_topic(
     db: Database,
     *,
-    workspace_id: str,
+    session_id: str,
     chat_id: int,
     topic_id: int,
     label: str,
     marker: TopicMarker = TopicMarker.INITIALIZING,
 ) -> None:
-    """Adopt an already-created topic once the workspace id is known."""
-    await workspaces_repo.bind_topic(
+    """Adopt an already-created topic once the session id is known."""
+    await sessions_repo.bind_topic(
         db,
-        workspace_id,
+        session_id,
         chat_id=chat_id,
         topic_id=topic_id,
         topic_name=label,
     )
-    await workspaces_repo.set_topic_marker(db, workspace_id, marker.value)
+    await sessions_repo.set_topic_marker(db, session_id, marker.value)
     await chats_repo.ensure(db, chat_id, topic_id, kind="topic")
 
 
@@ -905,20 +952,28 @@ async def ensure_topic(
     db: Database,
     *,
     chat_id: int,
-    workspace_id: str,
+    session_id: str,
     label: str,
     marker: TopicMarker = TopicMarker.INITIALIZING,
+    color_key: str | None = None,
 ) -> int | None:
-    """Idempotent create-and-adopt for a workspace that already exists."""
-    existing = await workspaces_repo.get(db, workspace_id)
-    if existing is not None and existing.has_topic and existing.topic_id is not None:
-        return existing.topic_id
-    topic_id = await create_topic(bot, chat_id, label, marker=marker)
+    """Idempotent create-and-adopt for a session that already exists.
+
+    This is the *lazy* half of the model: a session gets its room the first
+    time it is opened, not when it is created. Without that, ``/attach`` on a
+    laptop workspace with nine sessions would open nine rooms nobody asked for.
+    """
+    existing = await sessions_repo.get(db, session_id)
+    if existing is not None and existing.has_room and existing.chat_id == chat_id:
+        return existing.thread_id
+    topic_id = await create_topic(
+        bot, chat_id, label, marker=marker, color_key=color_key
+    )
     if topic_id is None:
         return None
     await attach_topic(
         db,
-        workspace_id=workspace_id,
+        session_id=session_id,
         chat_id=chat_id,
         topic_id=topic_id,
         label=label,
@@ -927,15 +982,35 @@ async def ensure_topic(
     return topic_id
 
 
+async def session_marker(db: Database, session: SessionRow) -> TopicMarker:
+    """:func:`marker_for` for one session, workspace lifecycle included.
+
+    The workspace still wins — a sleeping container cannot be working — it is
+    just resolved per session now, which is the whole point: two sessions of one
+    workspace in different states used to fight over a single ``topic_marker``
+    and whichever ticked last won.
+    """
+    workspace = (
+        await workspaces_repo.get(db, session.workspace_id)
+        if session.workspace_id
+        else None
+    )
+    return marker_for(
+        workspace_status=workspace.status_value if workspace is not None else None,
+        turn_state=session.state,
+        session_status=session.status_value,
+    )
+
+
 async def apply_marker(
     bot: Bot,
     db: Database,
-    workspace_id: str,
+    session_id: str,
     marker: TopicMarker,
     *,
     label: str | None = None,
 ) -> bool:
-    """Rename the topic **only if the title would actually change**.
+    """Rename the session's topic **only if the title would actually change**.
 
     Returns ``True`` when a rename was issued. Everything else — same title,
     no topic, a Telegram failure — returns ``False`` and costs no API call
@@ -950,14 +1025,19 @@ async def apply_marker(
     channel Telegram lets a bot change after creation (``icon_color`` is fixed
     for the topic's life), and the rename call is already being made.
     """
-    row = await workspaces_repo.get(db, workspace_id)
-    if row is None or row.chat_id is None or row.topic_id is None:
+    row = await sessions_repo.get(db, session_id)
+    if row is None or not row.has_room or row.chat_id is None:
         return False
-    # Never `row.name` (the *Conductor* name, `tg-<chat>-<nonce>`) and never
-    # `row.project_id` (an id, not a project). Retitling somebody's topic to an
-    # internal identifier because one column came back NULL is worse than
-    # leaving the generic word a nameless workspace would have been given.
-    name = label or row.topic_name or topic_label(None, row.branch)
+    # Never the *Conductor* workspace name (`tg-<chat>-<nonce>`) and never a
+    # project id. Retitling somebody's topic to an internal identifier because
+    # one column came back NULL is worse than leaving the generic word a
+    # nameless workspace would have been given.
+    fallback = topic_label(None, None)
+    if row.workspace_id:
+        workspace = await workspaces_repo.get(db, row.workspace_id)
+        if workspace is not None:
+            fallback = topic_label(None, workspace.branch)
+    name = label or row.topic_name or fallback
     title = topic_title(marker, name)
     # Compare the *rendered title*, not just the marker. Comparing markers
     # meant `/name -w` with an unchanged name always spent an API call, while a
@@ -972,6 +1052,7 @@ async def apply_marker(
         current = None
     if row.topic_marker == marker.value and title == current:
         return False
+    thread_id = row.thread_id
     # ``None`` here means "keep whatever icon the topic has". aiogram omits an
     # unset optional from the payload, and Telegram keeps the existing value
     # for an omitted field — so a pack we could not fetch costs the icon
@@ -980,21 +1061,26 @@ async def apply_marker(
     try:
         await bot.edit_forum_topic(
             chat_id=row.chat_id,
-            message_thread_id=row.topic_id,
+            message_thread_id=thread_id,
             name=title,
             icon_custom_emoji_id=icon,
         )
     except TelegramAPIError as exc:
         log.warning(
             "topics.rename_failed",
-            workspace_id=workspace_id,
+            session_id=session_id,
             marker=marker.value,
             error=str(exc),
         )
+        # A rename refused because the *thread* is gone is the only signal
+        # Telegram ever gives that a topic was deleted — there is no service
+        # message for it (see :func:`room_gone`). Say it once, here.
+        if thread_is_gone(exc):
+            await room_gone(bot, db, session_id)
         return False
-    await workspaces_repo.set_topic_marker(db, workspace_id, marker.value)
+    await sessions_repo.set_topic_marker(db, session_id, marker.value)
     if label is not None and label != row.topic_name:
-        await workspaces_repo.update(db, workspace_id, topic_name=label)
+        await sessions_repo.update(db, session_id, topic_name=label)
     return True
 
 
@@ -1011,13 +1097,13 @@ class TopicRetirement(StrEnum):
     NONE = "none"
 
 
-async def retire_topic(bot: Bot, db: Database, workspace_id: str) -> TopicRetirement:
+async def retire_topic(bot: Bot, db: Database, session_id: str) -> TopicRetirement:
     """Archive: take the room away, or close it if Telegram will not.
 
     Deleting is what archiving *means* on a phone. A closed topic is still a row
     in the list, at the same size and in the same reach of the thumb as a live
-    one — so ``/done`` on the ten workspaces of a busy week left ten rooms
-    behind, and the list stopped being scannable, which is the one job it has.
+    one — so ``/done`` on the ten tasks of a busy week left ten rooms behind,
+    and the list stopped being scannable, which is the one job it has.
 
     Deletion needs ``can_delete_messages``, which a bot has in its own DM and
     may not have in somebody's group, so the old rename-and-close stays as the
@@ -1025,10 +1111,10 @@ async def retire_topic(bot: Bot, db: Database, workspace_id: str) -> TopicRetire
     binding is dropped only on the delete path — a closed topic still exists,
     and forgetting where it is would strand every later state change.
     """
-    row = await workspaces_repo.get(db, workspace_id)
-    if row is None or row.chat_id is None or row.topic_id is None:
+    row = await sessions_repo.get(db, session_id)
+    if row is None or not row.has_room or row.chat_id is None:
         return TopicRetirement.NONE
-    chat_id, topic_id = row.chat_id, row.topic_id
+    chat_id, topic_id = row.chat_id, row.thread_id
     try:
         await bot.delete_forum_topic(chat_id=chat_id, message_thread_id=topic_id)
     except TelegramAPIError as exc:
@@ -1036,27 +1122,65 @@ async def retire_topic(bot: Bot, db: Database, workspace_id: str) -> TopicRetire
         # answer and the fallback below is a perfectly good outcome.
         log.info(
             "topics.delete_refused",
-            workspace_id=workspace_id,
+            session_id=session_id,
             topic_id=topic_id,
             error=str(exc),
         )
     else:
-        await workspaces_repo.unbind_topic(db, workspace_id)
+        await sessions_repo.unbind_topic(db, session_id)
         await chats_repo.unbind(db, chat_id, topic_id)
         return TopicRetirement.DELETED
-    await apply_marker(bot, db, workspace_id, TopicMarker.ARCHIVED)
+    await apply_marker(bot, db, session_id, TopicMarker.ARCHIVED)
     try:
         await bot.close_forum_topic(chat_id=chat_id, message_thread_id=topic_id)
     except TelegramAPIError as exc:
-        log.warning("topics.close_failed", workspace_id=workspace_id, error=str(exc))
+        log.warning("topics.close_failed", session_id=session_id, error=str(exc))
         return TopicRetirement.FAILED
     return TopicRetirement.CLOSED
 
 
-async def _newest_session(db: Database, row: WorkspaceRow) -> SessionRow | None:
-    sessions = await sessions_repo.list_for_workspace(db, row.id)
-    if not sessions:
-        return None
-    bound = [s for s in sessions if s.is_bound]
-    pool = bound or sessions
-    return max(pool, key=lambda s: s.updated_at)
+#: Said in the chat root when a topic turns out to have been deleted. It names
+#: both ways out, because the session behind it is still live and still costing
+#: money — this seam deliberately does *not* archive anything.
+ROOM_GONE_NOTICE: Final = (
+    "«{name}» lost its topic · <code>/board</code> to open it again, "
+    "<code>/done</code> to archive it."
+)
+
+
+async def room_gone(bot: Bot, db: Database, session_id: str) -> bool:
+    """A topic was deleted from Telegram. Free the session and say so once.
+
+    **Telegram sends no update for a deleted topic.** ``prompts._SERVICE_CONTENT``
+    enumerates created/edited/closed/reopened and hidden/unhidden — there is no
+    deleted member. The bot finds out only by trying to use the room, and three
+    places discover it independently: :func:`send_html`'s thread-gone resend,
+    the outbox reroute, and :func:`apply_marker`'s refused rename. Before this
+    seam none of them told the others, so the session stayed bound to a dead
+    thread, the poller kept running, ``/board`` kept offering a jump to a room
+    that was gone, and every delivery paid the reroute again row by row.
+
+    **A deleted topic is a detach, not an archive.** The gesture is reachable by
+    accident from a phone, it has no confirm of its own, and the thing on the
+    other side costs money and holds uncommitted work. Unbinding is free to
+    undo; archiving on a Telegram gesture is not.
+
+    Idempotent — three racing discoveries cost one line, not three — and it
+    returns whether this call was the one that did the work.
+    """
+    row = await sessions_repo.get(db, session_id)
+    if row is None or not row.has_room or row.chat_id is None:
+        return False
+    chat_id, thread_id = row.chat_id, row.thread_id
+    name = (row.topic_name or row.title or session_id[:8]).strip() or session_id[:8]
+    await sessions_repo.unbind_topic(db, session_id)
+    await chats_repo.unbind(db, chat_id, thread_id)
+    log.info("topics.room_gone", session_id=session_id, thread_id=thread_id)
+    await send_html(
+        bot,
+        chat_id,
+        ROOM_GONE_NOTICE.format(name=escape(name)),
+        thread_id=NO_THREAD_ID,
+        silent=True,
+    )
+    return True
