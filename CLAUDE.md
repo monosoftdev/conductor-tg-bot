@@ -96,7 +96,11 @@ key.
   context. Without that, a child task would issue statements on its parent's connection.
 - `content_json` and `payload_json` are `text`, not `jsonb`: agent output can contain NUL escapes,
   which `jsonb` rejects, and losing a delivery to one is not a trade worth making.
-- The application never applies DDL. `python -m ctb.db.bootstrap` does, once, as an operator.
+- The application never applies DDL. `python -m ctb.db.bootstrap` does, once, as an operator,
+  and `python -m ctb.db.upgrade` does on every deploy — a separate one-shot process, run by
+  Railway's `preDeployCommand` before the image starts, and a no-op without `ADMIN_DATABASE_URL`.
+  That variable is a superuser DSN and is deliberately not a `Settings` field: nothing that serves
+  a request may reach a connection that bypasses row-level security.
 
 ## Conventions
 

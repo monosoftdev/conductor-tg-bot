@@ -27,5 +27,7 @@ USER ctb
 
 # The application never applies DDL. Run `python -m ctb.db.bootstrap` once, as
 # an operator, before the first deploy; boot verifies the schema and refuses to
-# start if it is missing.
+# start if it is missing. Later migrations can ride the deploy instead — the
+# pre-deploy step in `railway.toml` runs `python -m ctb.db.upgrade` from this
+# image, in its own process, before this CMD ever starts.
 CMD ["python", "-m", "ctb"]
