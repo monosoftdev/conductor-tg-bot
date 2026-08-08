@@ -18,6 +18,31 @@ Verified offline, on every commit:
 - The real runtime boots against a real database: all seven services start,
   `/health` returns `ok`, the lease is acquired, shutdown is clean.
 
+## TOPIC_ID_INVALID locked people out of their own rooms (2026-08-08)
+
+Live: *"Open failed · Topic check failed · Bad Request: TOPIC_ID_INVALID"*, on
+every attempt, for a workspace that was fine.
+
+`TOPIC_ID_INVALID` is the raw MTProto refusal, and it leaks through
+untranslated on the **private-chat** topic methods — where a supergroup would
+have said *"message thread not found"*. Adoption's own probe knew only the
+supergroup phrasings and turned everything else into a hard failure, so the one
+error a DM actually produces was the one error that could not be recovered
+from. And a DM has no second channel to learn it from: it **ignores**
+`message_thread_id` for a deleted topic and silently sends to the root
+(tdlib/telegram-bot-api#854), so the rename *is* the question.
+
+Two changes, and the second is the one that matters:
+
+- `TOPIC_ID_INVALID` joins `THREAD_GONE_MARKERS`, so a deleted DM topic is
+  detected wherever a group's is — the adoption probe, `apply_marker`'s
+  `room_gone`, the outbox reroute.
+- The probe is `claim_topic` now, shared with `/attach`, and it **cannot fail
+  the open**. Gone → reopen the room; a refusal we cannot read → keep the room
+  unnamed and leave `topic_marker` unwritten, so the next transition retries
+  the rename. Raising there was a Telegram blip locking the owner out of a
+  workspace; creating a topic there would have left a permanent duplicate.
+
 ## One topic per session (2026-08-02)
 
 `workspaces` used to own the room, so every session of a workspace was bound to

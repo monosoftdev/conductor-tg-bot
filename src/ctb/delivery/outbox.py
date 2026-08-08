@@ -163,11 +163,22 @@ ENTITY_ERROR_MARKERS: Final[tuple[str, ...]] = (
 #: Substrings that identify a vanished forum topic. Telegram phrases it as a
 #: 400 *or* a 404 depending on the method, and neither is a dead chat: the group
 #: is fine and the answer can still be delivered to its General.
+#:
+#: ``TOPIC_ID_INVALID`` is the raw MTProto refusal, and it leaks through
+#: untranslated on the *private-chat* topic methods — where it is the only
+#: signal there is. A DM ignores ``message_thread_id`` for a deleted topic and
+#: silently sends to the root (tdlib/telegram-bot-api#854), so a rename is the
+#: one call that still answers "is this room there?", and this is how it says
+#: no. Treating it as anything else is what made ``/board`` refuse to reopen a
+#: workspace whose DM topic had been deleted from the phone.
 THREAD_GONE_MARKERS: Final[tuple[str, ...]] = (
     "message thread not found",
     "topic_deleted",
     "topic deleted",
     "thread not found",
+    "topic not found",
+    "topic_id_invalid",
+    "topic id invalid",
 )
 
 

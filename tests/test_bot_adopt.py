@@ -119,6 +119,9 @@ class _Bot:
         self.edit_error: Exception | None = None
         #: Threads Telegram has forgotten — a topic deleted from the phone.
         self.dead: set[int] = set()
+        #: The same fact, phrased the way the *private-chat* topic methods
+        #: phrase it: the raw MTProto refusal, untranslated.
+        self.invalid: set[int] = set()
         #: @BotFather's Threaded Mode, as ``getMe`` reports it. ``None`` is the
         #: shape Telegram actually sends when it is off, and the bot tries
         #: anyway; ``False`` is the only explicit refusal.
@@ -143,10 +146,16 @@ class _Bot:
     async def edit_forum_topic(self, **kwargs: Any) -> None:
         if self.edit_error is not None:
             raise self.edit_error
-        if int(kwargs.get("message_thread_id") or 0) in self.dead:
+        thread_id = int(kwargs.get("message_thread_id") or 0)
+        if thread_id in self.dead:
             raise TelegramBadRequest(
                 method=SendMessage(chat_id=CHAT_ID, text="x"),
                 message="Bad Request: message thread not found",
+            )
+        if thread_id in self.invalid:
+            raise TelegramBadRequest(
+                method=SendMessage(chat_id=CHAT_ID, text="x"),
+                message="Bad Request: TOPIC_ID_INVALID",
             )
         self.renamed.append(str(kwargs["name"]))
 
@@ -424,9 +433,39 @@ async def test_a_workspace_bound_to_another_chat_is_not_silently_moved(
     assert bot.topics == []
 
 
-async def test_an_ambiguous_topic_check_never_creates_a_duplicate(
+async def test_a_dm_topic_deleted_from_the_phone_is_reopened(
     db: Database, client: ConductorClient, fake: FakeConductor
 ) -> None:
+    """``TOPIC_ID_INVALID`` is how a *private* chat says the room is gone.
+
+    A DM never answers "message thread not found": it ignores the thread and
+    sends to the root (tdlib/telegram-bot-api#854), so the rename is the only
+    call that still asks the question. Reading its refusal as anything but
+    "gone" is what made ``/board`` refuse to reopen the workspace at all.
+    """
+    session = _seeded(fake)
+    bot = _Bot()
+    await _adopt(bot, db, client, session)
+
+    bot.invalid.add(FIRST_TOPIC)
+    outcome = await _adopt(bot, db, client, session)
+
+    assert outcome.thread_id == FIRST_TOPIC + 1
+    assert not outcome.already
+    row = await sessions_repo.get(db, session.session_id)
+    assert row is not None and row.thread_id == FIRST_TOPIC + 1
+
+
+async def test_an_ambiguous_topic_check_keeps_the_room_and_still_opens(
+    db: Database, client: ConductorClient, fake: FakeConductor
+) -> None:
+    """A refusal we cannot read costs the title, never the open.
+
+    Raising here meant one Telegram blip locked the owner out of a workspace
+    that was fine; creating a topic would have left a permanent duplicate. The
+    room is kept, and the marker is *not* recorded — so the next state
+    transition retries the rename this call could not make.
+    """
     session = _seeded(fake)
     bot = _Bot()
     await _adopt(bot, db, client, session)
@@ -434,11 +473,16 @@ async def test_an_ambiguous_topic_check_never_creates_a_duplicate(
         method=SendMessage(chat_id=CHAT_ID, text="x"),
         message="connection reset",
     )
+    # A state the refused rename would have painted, had it landed.
+    session.workspace.status = WorkspaceStatusValue.SLEEPING
 
-    with pytest.raises(AdoptError, match="Topic check unavailable"):
-        await _adopt(bot, db, client, session)
+    outcome = await _adopt(bot, db, client, session)
 
+    assert outcome.already and outcome.thread_id == FIRST_TOPIC
     assert bot.topics == [FIRST_TOPIC]
+    row = await sessions_repo.get(db, session.session_id)
+    assert row is not None and row.thread_id == FIRST_TOPIC
+    assert row.topic_marker != TopicMarker.SLEEPING.value
 
 
 async def test_a_partial_binding_repairs_the_remembered_topic_in_place(
