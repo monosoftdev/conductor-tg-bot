@@ -9,6 +9,16 @@ from its first tagged release.
 
 ### Added
 
+- **Migrations can ride the deploy.** `python -m ctb.db.upgrade`, wired to
+  Railway's `preDeployCommand`, applies pending migrations from the new image
+  while the old instance is still serving. It is a no-op unless
+  `ADMIN_DATABASE_URL` is set, and a failure aborts the deploy rather than
+  starting an image that cannot boot. Until now the migration and the image
+  requiring it shipped in one commit but only the image deployed itself, so the
+  ordinary way to release was also the way to take the bot down — schema 1
+  under a build needing 4, presenting as a healthcheck failure, until somebody
+  with a laptop ran `bootstrap`.
+
 - **One topic per session.** A workspace is now a *group* of rooms sharing one
   container, branch and checkout, rather than one room its sessions took turns
   owning. `/fork` opens its own topic and leaves the parent's alone; `/board`

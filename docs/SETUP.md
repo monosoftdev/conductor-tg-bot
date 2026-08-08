@@ -250,10 +250,19 @@ TELEGRAM_BOT_TOKEN=<from step 2>
 DATABASE_URL=postgresql://ctb_app:<APP_PW>@<internal-host>:5432/railway
 SYSTEM_DATABASE_URL=postgresql://ctb_worker:<WORKER_PW>@<internal-host>:5432/railway
 CTB_MASTER_KEYS=<from step 5>
+ADMIN_DATABASE_URL=${{Postgres.DATABASE_URL}}
 PLATFORM_ADMIN_IDS=<your Telegram user id from step 2>
 HEALTH_TOKEN=<openssl rand -hex 16>
 REGISTRATION_OPEN=false
 ```
+
+`ADMIN_DATABASE_URL` is the one place the superuser URL belongs, and it is a
+*reference* — paste it exactly as written above if your Postgres service is
+named `Postgres`, and Railway resolves it. Nothing in the bot reads it. The
+pre-deploy step does, and only to apply migrations: from then on a release that
+adds one migrates itself instead of failing its healthcheck until you find a
+laptop. Leave it out and everything still works, with the migration yours to
+run by hand before each such release (step 4's command, which is idempotent).
 
 `<internal-host>` and the database name come from the Postgres service's own
 `DATABASE_URL` — you are reusing its host and swapping the credentials. Using
@@ -315,6 +324,7 @@ If it crash-loops, the log line names the cause. The three that actually happen:
 | Log says | Fix |
 |---|---|
 | `The database has no schema` | Step 4 did not run, or ran against a different database |
+| `The database is at schema N; this build needs M` | The image is ahead of the database. Set `ADMIN_DATABASE_URL` (step 6) and redeploy, or re-run step 4's command. |
 | `DATABASE_URL connects as a role that bypasses row-level security` | You used the superuser URL. Use `ctb_app`. |
 | `Telegram rejected TELEGRAM_BOT_TOKEN` | Re-check with the `getMe` curl from step 2 |
 

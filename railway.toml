@@ -3,6 +3,17 @@ builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
 
 [deploy]
+# Runs from the *new* image, with the service's variables, while the old
+# instance is still serving — the same window `docs/DEPLOY.md` says the old
+# code tolerates a newer schema in. Without it, the migration and the image
+# that requires it ship together but only one of them deploys itself, so the
+# ordinary way to release was also the way to take the bot down.
+#
+# No-op unless ADMIN_DATABASE_URL is set (a superuser DSN; migrations are
+# owner-level DDL, and neither runtime role owns a table). A failure here
+# exits non-zero and aborts the deploy, leaving the old instance up.
+preDeployCommand = ["python -m ctb.db.upgrade"]
+
 # Service variables cannot be set from this file; set them in the Railway UI.
 # There is no volume any more — all state is in PostgreSQL — so the old
 # `RAILWAY_RUN_UID=0` ownership trap is gone with it.
