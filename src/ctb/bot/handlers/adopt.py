@@ -31,12 +31,12 @@ from dataclasses import dataclass
 from typing import Final
 
 from aiogram import Bot, F, Router
-from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
 
 from ctb.bot.app import register_router
 from ctb.bot.handlers.common import note_linear_seat, short_error
 from ctb.bot.handlers.topics import (
+    Claim,
     TopicCreateError,
     attach_topic,
     claim_topic,
@@ -51,7 +51,6 @@ from ctb.bot.handlers.topics import (
     room_label,
     send_html,
     topic_label,
-    topic_title,
 )
 from ctb.bot.keyboards import (
     CONTROL_TTL_S,
@@ -121,7 +120,6 @@ class _WorkspaceLock:
 
 
 _locks: dict[str, _WorkspaceLock] = {}
-_TOPIC_GONE: Final = ("topic not found", "message thread not found", "thread not found")
 
 
 class AdoptError(RuntimeError):
@@ -349,13 +347,22 @@ async def _adopt_workspace(
     remembered = _remembered_topic(
         next((row for row in known_rooms if row.id == chosen.id), None), chat_id
     )
+    # The same probe ``/attach`` uses on the thread it was typed in, and for the
+    # same reason: a rename is the only call that proves a room is still there,
+    # and it is one we owe anyway. It never raises — a refusal we cannot read
+    # keeps the room unnamed rather than failing the whole open, because the
+    # room the user is trying to reach is the one thing this must not lose.
+    claim = (
+        await claim_topic(bot, chat_id, remembered, label, marker=marker)
+        if remembered is not None
+        else Claim(False)
+    )
     existing_thread: int | None = None
-    if remembered is not None and await _topic_exists(
-        bot, chat_id, remembered, label, marker
-    ):
+    if remembered is not None and claim.alive:
         # The existence probe also reconciled the visible title to the current
-        # remote status. Persist the same marker, otherwise a later transition
-        # can incorrectly skip the rename.
+        # remote status — when Telegram let it. Persist the marker only then:
+        # recording a title the topic list is not showing makes the next
+        # transition skip the rename that would have fixed it.
         async with db.transaction():
             await workspaces_repo.upsert(
                 db,
@@ -380,7 +387,8 @@ async def _adopt_workspace(
                 topic_id=remembered,
                 topic_name=label,
             )
-            await sessions_repo.set_topic_marker(db, chosen.id, marker.value)
+            if claim.named:
+                await sessions_repo.set_topic_marker(db, chosen.id, marker.value)
             # Repair a route that a partial write lost. The room is this
             # session's, so the only thing the `chats` row can be repaired *to*
             # is this session — which is what keying the memory on the session
@@ -527,34 +535,6 @@ async def _all_sessions(client: ConductorClient, workspace_id: str) -> list[Sess
             break
         offset += len(page.data)
     return sessions
-
-
-async def _topic_exists(
-    bot: Bot,
-    chat_id: int,
-    thread_id: int,
-    label: str,
-    marker: TopicMarker,
-) -> bool:
-    """Only an explicit not-found response permits a replacement topic."""
-    try:
-        await bot.edit_forum_topic(
-            chat_id=chat_id,
-            message_thread_id=thread_id,
-            name=topic_title(marker, label),
-        )
-        return True
-    except TelegramBadRequest as exc:
-        detail = str(exc).casefold()
-        if "not modified" in detail:
-            return True
-        if any(value in detail for value in _TOPIC_GONE):
-            return False
-        raise AdoptError(f"Topic check failed · {short_error(exc)}") from exc
-    except TelegramAPIError as exc:
-        # A network/server failure is ambiguous. Creating a sibling topic here
-        # would turn a brief Telegram outage into permanent duplicate rooms.
-        raise AdoptError(f"Topic check unavailable · {short_error(exc)}") from exc
 
 
 def _pick_session(sessions: Sequence[Session], hint: str | None) -> Session:
