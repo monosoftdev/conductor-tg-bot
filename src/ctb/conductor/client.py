@@ -164,7 +164,15 @@ class ApiEvent:
     tenant_id: uuid.UUID | None = None
 
     def as_row(self) -> dict[str, Any]:
-        """Kwargs for an ``INSERT INTO api_events`` in the repo layer."""
+        """Kwargs for an ``INSERT INTO api_events`` in the repo layer.
+
+        ``ok`` stays a ``bool``. It used to be widened to ``1``/``0`` for
+        SQLite, which has no boolean type; PostgreSQL does, and rejects the
+        integer outright — ``column "ok" is of type boolean but expression is
+        of type smallint``. The hook swallows what it raises, so the only
+        symptom was an ``api_events`` table that stayed empty forever and a
+        ``conductor.event_hook_failed`` line per API call.
+        """
         return {
             "at": self.at,
             "tenant_id": self.tenant_id,
@@ -173,7 +181,7 @@ class ApiEvent:
             "status_code": self.status_code,
             "duration_ms": self.duration_ms,
             "attempt": self.attempt,
-            "ok": 1 if self.ok else 0,
+            "ok": self.ok,
             "error": self.error,
             "circuit_state": self.circuit_state,
             "request_id": self.request_id,

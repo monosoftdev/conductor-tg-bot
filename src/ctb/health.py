@@ -90,6 +90,8 @@ CACHE_TTL_S: Final[float] = 2.0
 API_EVENT_LIMIT: Final[int] = 20
 UNKNOWN_TYPE_LIMIT: Final[int] = 10
 SESSION_DETAIL_LIMIT: Final[int] = 25
+#: Unwatched session ids listed by name before the report just counts them.
+UNWATCHED_LIMIT: Final[int] = 10
 STATS_WINDOW_MS: Final[int] = 15 * 60_000
 
 #: A session is *overdue* when it has been silent for this multiple of its own
@@ -98,6 +100,22 @@ POLL_LAG_FACTOR: Final[float] = 3.0
 POLL_LAG_GRACE_MS: Final[int] = 30_000
 #: Deliveries drain in seconds; a standing queue this deep means a stuck outbox.
 DELIVERY_BACKLOG: Final[int] = 50
+#: How long the head of the queue may wait before the outbox counts as stalled.
+#:
+#: **The signal a depth threshold cannot give.** One answer stuck behind a
+#: wedged hold is a single row — 1, against a threshold of 50 — and it is
+#: exactly what somebody experiences as the bot going quiet. Comfortably past
+#: :data:`ctb.delivery.outbox.MAX_HOLD_MS`, so a legitimately held turn never
+#: raises it and anything the hold has already released and still not sent does.
+DELIVERY_STALL_MS: Final[int] = 6 * 60_000
+#: A claim older than this is not in flight, it is stranded. Several times
+#: ``ORPHAN_AFTER_MS``, so the recovery sweep has had its own chances first.
+DELIVERY_STRANDED_MS: Final[int] = 10 * 60_000
+#: Terminal failures are reported for this long and then stop being *news*. A
+#: permanent Telegram refusal — a bot kicked from a group — is real once; left
+#: unwindowed it pinned the report to ``degraded`` for a week, which is how a
+#: health check stops being read at all.
+DELIVERY_FAILED_WINDOW_MS: Final[int] = 60 * 60_000
 
 
 class HealthStatus(StrEnum):
@@ -126,6 +144,8 @@ DEGRADATION_RATE_LIMITED: Final[str] = "rate_limited"
 DEGRADATION_POLL_LAG: Final[str] = "poll_lag"
 DEGRADATION_DELIVERY_BACKLOG: Final[str] = "delivery_backlog"
 DEGRADATION_DELIVERY_FAILED: Final[str] = "delivery_failed"
+DEGRADATION_DELIVERY_STALLED: Final[str] = "delivery_stalled"
+DEGRADATION_DELIVERY_STRANDED: Final[str] = "delivery_stranded"
 DEGRADATION_LEASE_LOST: Final[str] = "lease_lost"
 DEGRADATION_TELEGRAM: Final[str] = "telegram_polling"
 
@@ -592,6 +612,13 @@ class HealthMonitor:
         at = self._wall_clock()
         bound = await sessions_repo.list_bound(db)
         polling = self._polling_section(bound, at=at)
+        # "How many am I watching" was the only number here, and it cannot say
+        # how many stopped being watched. A session that had a seat and lost
+        # its poller — a deleted topic, the seat release behind it — is exactly
+        # the workspace somebody is still waiting on.
+        unwatched = await sessions_repo.list_unwatched(db)
+        polling["unwatched"] = len(unwatched)
+        polling["unwatched_sessions"] = [row.id for row in unwatched[:UNWATCHED_LIMIT]]
         if polling["overdue"]:
             degradations.append(
                 Degradation(
@@ -602,12 +629,20 @@ class HealthMonitor:
             )
 
         counts = await deliveries_repo.counts_by_state(db)
+        queue = await deliveries_repo.queue_age(
+            db, failed_within_ms=DELIVERY_FAILED_WINDOW_MS, at=at
+        )
         pending = counts.get("pending", 0) + counts.get("sending", 0)
-        failed = counts.get("failed", 0)
         deliveries_section = {
-            "pending": counts.get("pending", 0),
-            "sending": counts.get("sending", 0),
-            "failed": failed,
+            "pending": queue.pending,
+            "sending": queue.sending,
+            "failed": counts.get("failed", 0),
+            "failed_recent": queue.failed_recent,
+            # The two numbers this report was missing. A queue is diagnosed by
+            # how long its head has waited, not by how many rows are behind it.
+            "oldest_pending_ms": queue.oldest_pending_ms,
+            "oldest_sending_ms": queue.oldest_sending_ms,
+            "destinations": queue.destinations,
             "by_state": counts,
         }
         if pending > DELIVERY_BACKLOG:
@@ -618,11 +653,31 @@ class HealthMonitor:
                     f"{DELIVERY_BACKLOG}); the outbox may be stuck.",
                 )
             )
-        if failed:
+        if queue.oldest_pending_ms > DELIVERY_STALL_MS:
+            degradations.append(
+                Degradation(
+                    DEGRADATION_DELIVERY_STALLED,
+                    f"the oldest queued delivery has waited "
+                    f"{queue.oldest_pending_ms // 1000}s "
+                    f"(threshold {DELIVERY_STALL_MS // 1000}s); somebody is "
+                    "watching a topic that has gone quiet.",
+                )
+            )
+        if queue.oldest_sending_ms > DELIVERY_STRANDED_MS:
+            degradations.append(
+                Degradation(
+                    DEGRADATION_DELIVERY_STRANDED,
+                    f"a delivery has been claimed for "
+                    f"{queue.oldest_sending_ms // 1000}s without resolving; "
+                    "recovery should have re-sent it.",
+                )
+            )
+        if queue.failed_recent:
             degradations.append(
                 Degradation(
                     DEGRADATION_DELIVERY_FAILED,
-                    f"{failed} deliveries exhausted their retries.",
+                    f"{queue.failed_recent} deliveries exhausted their retries "
+                    f"in the last {DELIVERY_FAILED_WINDOW_MS // 60_000} minutes.",
                 )
             )
 
@@ -1164,11 +1219,16 @@ __all__ = [
     "DEGRADATION_DATABASE",
     "DEGRADATION_DELIVERY_BACKLOG",
     "DEGRADATION_DELIVERY_FAILED",
+    "DEGRADATION_DELIVERY_STALLED",
+    "DEGRADATION_DELIVERY_STRANDED",
     "DEGRADATION_LEASE_LOST",
     "DEGRADATION_POLL_LAG",
     "DEGRADATION_RATE_LIMITED",
     "DEGRADATION_TELEGRAM",
     "DELIVERY_BACKLOG",
+    "DELIVERY_FAILED_WINDOW_MS",
+    "DELIVERY_STALL_MS",
+    "DELIVERY_STRANDED_MS",
     "HEALTH_PATH",
     "POLL_LAG_FACTOR",
     "POLL_LAG_GRACE_MS",

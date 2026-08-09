@@ -77,7 +77,12 @@ from ctb.db.repo.transcript import AdvanceItem, DeliveryDraft
 from ctb.delivery.render.adapters import activity_text, best_effort_text
 from ctb.delivery.render.adapters.diff import describe_file_edit
 from ctb.delivery.render.adapters.result import turn_cost
-from ctb.delivery.render.adapters.shapes import BlockRole, classify_block, first_str
+from ctb.delivery.render.adapters.shapes import (
+    BlockRole,
+    calls_tool,
+    classify_block,
+    first_str,
+)
 from ctb.delivery.render.chunk import PartKind, chunk_blocks, chunk_html
 from ctb.delivery.render.html import escape
 from ctb.delivery.render.registry import RenderResult, render_message
@@ -85,6 +90,7 @@ from ctb.delivery.render.types import (
     Block,
     BlockKind,
     RenderContext,
+    Successor,
     TextBlock,
     Verbosity,
     chat_blocks,
@@ -118,6 +124,7 @@ __all__ = [
     "seek_to_end",
     "send_prompt",
     "stable_nonce",
+    "successor_hints",
     "workspace_name",
 ]
 
@@ -241,6 +248,37 @@ def _draft(
         kind=kind,
         payload_json=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
     )
+
+
+def successor_hints(page: Sequence[TranscriptMessage]) -> list[Successor]:
+    """What follows each message *inside its own turn*, for the renderer.
+
+    One entry per message, same order. The rule is the protocol's, not the
+    state machine's: a turn that continues into a ``tool_use`` cannot have
+    ended, so text before that call is narration however many messages away it
+    sits. :data:`~ctb.delivery.render.types.Successor.UNKNOWN` whenever this
+    batch does not answer the question — the last message of a page looks
+    exactly like the last message of a turn, and only one of them may be
+    withheld, so neither is.
+
+    Pure, and given the page rather than the session, because it is a statement
+    about what was *observed together*: a message whose successor arrives on the
+    next tick is legitimately unknown here and renders as an answer.
+    """
+    hints: list[Successor] = [Successor.UNKNOWN] * len(page)
+    for index, message in enumerate(page):
+        turn = message.turn_id
+        if turn is None:
+            continue
+        for candidate in page[index + 1 :]:
+            if candidate.turn_id != turn:
+                continue
+            if calls_tool(candidate.content):
+                hints[index] = Successor.TOOL_CALL
+            elif candidate.is_result:
+                hints[index] = Successor.TURN_END
+            break
+    return hints
 
 
 def plan_deliveries(
@@ -863,7 +901,8 @@ async def drain(
         if fresh:
             items: list[AdvanceItem] = []
             unknown_records: list[Any] = []
-            for message in fresh:
+            hints = successor_hints(fresh)
+            for index, message in enumerate(fresh):
                 drafts: tuple[DeliveryDraft, ...] = ()
                 cost = turn_cost(message.content)
                 if cost is not None:
@@ -876,7 +915,8 @@ async def drain(
                                 destination.verbosity
                                 if destination is not None
                                 else Verbosity.NORMAL
-                            )
+                            ),
+                            successor=hints[index],
                         ),
                     )
                     if rendered.activity:

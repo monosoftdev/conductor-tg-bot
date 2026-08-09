@@ -1175,7 +1175,27 @@ async def room_gone(bot: Bot, db: Database, session_id: str) -> bool:
     name = (row.topic_name or row.title or session_id[:8]).strip() or session_id[:8]
     await sessions_repo.unbind_topic(db, session_id)
     await chats_repo.unbind(db, chat_id, thread_id)
-    log.info("topics.room_gone", session_id=session_id, thread_id=thread_id)
+    # ``unbind_topic`` lands the session on the chat's *seat* (thread 0), which
+    # is where its deliveries reroute to — and the seat is the one place the
+    # uniqueness index deliberately does not cover. Two rooms deleted in one
+    # chat therefore left two bound sessions sharing the root: both polled, both
+    # delivered into it with nothing saying which was which, and a prompt typed
+    # there went to whichever was created last. That is vector 3 of
+    # ``docs/TOPIC_PER_SESSION.md``, resurrected at the one seat the index
+    # cannot hold. Release it on the same tiebreak ``get_bound_for`` already
+    # applies, so nothing moves — it only stops the losers polling. Their queued
+    # rows still flush (a delivery does not consult ``is_bound``) and the cursor
+    # is durable, so reopening one from ``/board`` resumes exactly where it
+    # stopped.
+    released = await sessions_repo.release_room(
+        db, chat_id, NO_THREAD_ID, keep=session_id
+    )
+    log.info(
+        "topics.room_gone",
+        session_id=session_id,
+        thread_id=thread_id,
+        seat_released=released,
+    )
     await send_html(
         bot,
         chat_id,

@@ -34,11 +34,16 @@ from ctb.health import (
     DEGRADATION_DATABASE,
     DEGRADATION_DELIVERY_BACKLOG,
     DEGRADATION_DELIVERY_FAILED,
+    DEGRADATION_DELIVERY_STALLED,
+    DEGRADATION_DELIVERY_STRANDED,
     DEGRADATION_LEASE_LOST,
     DEGRADATION_POLL_LAG,
     DEGRADATION_RATE_LIMITED,
     DEGRADATION_TELEGRAM,
     DELIVERY_BACKLOG,
+    DELIVERY_FAILED_WINDOW_MS,
+    DELIVERY_STALL_MS,
+    DELIVERY_STRANDED_MS,
     HEALTH_PATH,
     MONITOR_KEY,
     TELEGRAM_FAILURE_THRESHOLD,
@@ -537,6 +542,38 @@ async def test_unbound_sessions_are_not_polled_and_not_counted(
     assert report.status is HealthStatus.OK
 
 
+async def test_a_workspace_that_stopped_being_watched_is_counted(
+    system_db: Database,
+) -> None:
+    """The number this report could not produce: *how many did I lose?*
+
+    ``bound_sessions`` only ever says how many are watched. A session whose
+    topic was deleted is unbound, still live, still costing money, and still
+    something somebody is waiting on — and it left the report entirely. The
+    sessions ``/attach`` upserts unbound are deliberately not counted: they
+    were never watched, because a room is opened the first time it is used.
+    """
+    async with as_tenant():
+        # One room each — `uq_sessions_one_per_room` is the reason that is not
+        # a detail: two bound sessions cannot share a thread.
+        for index, session_id in enumerate(("watched", "dropped", "never-opened")):
+            await sessions_repo.upsert(
+                system_db, session_id, chat_id=-100123, thread_id=7 + index
+            )
+        # Seeded means its cursor was placed: this one *was* being read.
+        await sessions_repo.seek_to_end(
+            system_db, "dropped", message_id="m-9", session_index=9
+        )
+        await sessions_repo.unbind(system_db, "dropped")
+        await sessions_repo.unbind(system_db, "never-opened")
+
+        report = await make_monitor(db=system_db).report()
+
+    assert report.polling["bound_sessions"] == 1
+    assert report.polling["unwatched"] == 1
+    assert report.polling["unwatched_sessions"] == ["dropped"]
+
+
 # ── deliveries ───────────────────────────────────────────────────────────────
 
 
@@ -572,6 +609,86 @@ async def test_failed_deliveries_are_degradations(system_db: Database) -> None:
         report = await make_monitor(db=system_db).report()
         assert report.deliveries["failed"] == 1
         assert report.has(DEGRADATION_DELIVERY_FAILED)
+
+
+async def test_one_message_stuck_for_an_hour_is_a_degradation(
+    system_db: Database,
+) -> None:
+    """The signal a depth threshold cannot give.
+
+    A backlog of 50 was the only alarm the report had, and the failure people
+    actually hit is *one* row: an answer behind a wedged hold, a single pending
+    delivery against a threshold of fifty. To the person waiting it is the bot
+    going quiet, and to this report it was ``ok``.
+    """
+    async with as_tenant():
+        await seed_session(system_db)
+        await deliveries_repo.enqueue(
+            system_db,
+            session_id="sess-1",
+            message_id="m1",
+            chat_id=-100123,
+            payload_json=json.dumps({"html": "hi"}),
+            at=WALL - DELIVERY_STALL_MS - 1_000,
+        )
+        report = await make_monitor(db=system_db).report()
+
+        assert report.deliveries["pending"] == 1
+        assert not report.has(DEGRADATION_DELIVERY_BACKLOG), "one row is not a backlog"
+        assert report.has(DEGRADATION_DELIVERY_STALLED)
+        assert report.deliveries["oldest_pending_ms"] >= DELIVERY_STALL_MS
+
+
+async def test_a_claim_nobody_resolved_is_reported_separately(
+    system_db: Database,
+) -> None:
+    """A stranded claim is a different fault from a queue that will not drain.
+
+    ``sending`` rows are invisible to the pending count, so a worker that died
+    between Telegram and the database took its row out of every number this
+    report had. Recovery should have re-sent it; saying so names the thing that
+    did not happen.
+    """
+    async with as_tenant():
+        await seed_session(system_db)
+        await deliveries_repo.enqueue(
+            system_db, session_id="sess-1", message_id="m1", chat_id=-100123
+        )
+        await deliveries_repo.claim(
+            system_db, claim_id="dead-worker", at=WALL - DELIVERY_STRANDED_MS - 1_000
+        )
+        report = await make_monitor(db=system_db).report()
+
+        assert report.deliveries["sending"] == 1
+        assert report.has(DEGRADATION_DELIVERY_STRANDED)
+
+
+async def test_an_old_terminal_failure_stops_being_news(system_db: Database) -> None:
+    """A permanent refusal is real once, not for a week.
+
+    One bot kicked from one group pinned the whole report to ``degraded`` until
+    retention dropped the row — and a health check that is always amber is a
+    health check nobody reads. The count stays in the body; only the alarm is
+    windowed.
+    """
+    async with as_tenant():
+        await seed_session(system_db)
+        await deliveries_repo.enqueue(
+            system_db, session_id="sess-1", message_id="m1", chat_id=-100123
+        )
+        await deliveries_repo.mark_failed(
+            system_db,
+            ("sess-1", "m1", 0, -100123),
+            error="bot was kicked",
+            retry=False,
+            at=WALL - DELIVERY_FAILED_WINDOW_MS - 1_000,
+        )
+        report = await make_monitor(db=system_db).report()
+
+        assert report.deliveries["failed"] == 1
+        assert report.deliveries["failed_recent"] == 0
+        assert not report.has(DEGRADATION_DELIVERY_FAILED)
+        assert report.status is HealthStatus.OK
 
 
 # ── the singleton lease ──────────────────────────────────────────────────────
