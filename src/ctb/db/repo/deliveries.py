@@ -57,6 +57,7 @@ __all__ = [
     "RECOVERY_BATCH",
     "Destination",
     "DeliveryKey",
+    "QueueAge",
     "DeliveryRow",
     "RecoveryResult",
     "claim",
@@ -78,6 +79,7 @@ __all__ = [
     "pending_count",
     "prune_terminal",
     "pending_destinations",
+    "queue_age",
     "recover_orphaned",
     "release",
     "requeue",
@@ -339,18 +341,39 @@ async def held_destinations(
     believes — CLAUDE.md rule 1 holds, delivery is never *conditional* on the
     machine, only briefly *paced* by it, with the outbox's own
     :data:`ctb.delivery.outbox.MAX_HOLD_MS` capping even a live-but-wrong one.
+
+    **The question is asked of the rows, not of the room.** It used to hold a
+    destination whenever *any* session addressed there was mid-turn, which is
+    the same thing only while one session owns one room. It is not the same at
+    ``thread_id = 0``: the linear DM seat, a group's General, and every session
+    ``room_gone`` has parked all share that address, so one session stuck in
+    ``WAKING`` — a container that never came up, with its poller dutifully
+    refreshing ``updated_at`` every tick — held the whole chat root, including
+    another session's rerouted answer and every notice queued behind it. A
+    destination is held now only while *every pending row on it* belongs to a
+    live mid-turn session, so a row nobody is waiting on releases the queue.
+
+    ``is_bound`` is part of that test for the same reason: a session nobody
+    polls cannot produce more output, so waiting for its turn to finish is
+    waiting for something that will not happen.
     """
     stamp = now_ms() if at is None else at
     rows = await db.fetch_all(
         f"""
-        SELECT DISTINCT s.chat_id, s.thread_id
-          FROM sessions s
+        SELECT d.chat_id, d.thread_id
+          FROM deliveries d
+          LEFT JOIN sessions s ON s.id = d.session_id
           LEFT JOIN chats c
-            ON c.chat_id = s.chat_id AND c.thread_id = s.thread_id
-         WHERE s.chat_id IS NOT NULL
-           AND s.turn_state IN {_MID_TURN_SQL}
-           AND s.updated_at >= ?
-           AND COALESCE(c.notify, 'quiet') <> 'loud'
+            ON c.chat_id = d.chat_id AND c.thread_id = d.thread_id
+         WHERE d.state = 'pending'
+         GROUP BY d.chat_id, d.thread_id
+        HAVING bool_and(
+                   s.id IS NOT NULL
+               AND s.is_bound
+               AND s.turn_state IN {_MID_TURN_SQL}
+               AND s.updated_at >= ?
+               AND COALESCE(c.notify, 'quiet') <> 'loud'
+               )
         """,
         (stamp - max(0, fresh_within_ms),),
     )
@@ -868,6 +891,68 @@ async def counts_by_state(
             (session_id,),
         )
     return {as_str(row["state"]): as_int(row["n"]) for row in rows}
+
+
+@dataclass(frozen=True, slots=True)
+class QueueAge:
+    """How long the queue's head has been waiting, and how big it is.
+
+    A **count** never described this failure mode. One answer stuck behind a
+    wedged turn is a single row, far under any backlog threshold, and it is the
+    whole of what a person experiences as *the bot stopped talking to me*. Age
+    is the signal; the counts are context for reading it.
+    """
+
+    #: Rows waiting to be claimed.
+    pending: int = 0
+    #: Rows claimed by some worker and not yet resolved. A number that does not
+    #: fall is the stranded-claim signature.
+    sending: int = 0
+    #: Age of the oldest pending row. ``0`` when the queue is empty.
+    oldest_pending_ms: int = 0
+    #: Age of the oldest ``sending`` row, for the same reason.
+    oldest_sending_ms: int = 0
+    #: Terminal failures inside the health window — not since the dawn of time.
+    failed_recent: int = 0
+    #: Distinct ``(chat_id, thread_id)`` queues with anything pending.
+    destinations: int = 0
+
+
+async def queue_age(
+    db: Database, *, failed_within_ms: int, at: int | None = None
+) -> QueueAge:
+    """The delivery queue as ``/health`` should read it: by age, not by size.
+
+    One statement, because it runs on every health report and the report is
+    also what a probe hits.
+    """
+    stamp = now_ms() if at is None else at
+    row = await db.fetch_one(
+        """
+        SELECT
+          COUNT(*) FILTER (WHERE state = 'pending')                  AS pending,
+          COUNT(*) FILTER (WHERE state = 'sending')                  AS sending,
+          COALESCE(MIN(created_at) FILTER (WHERE state = 'pending'), 0) AS head_at,
+          COALESCE(MIN(claimed_at) FILTER (WHERE state = 'sending'), 0) AS claim_at,
+          COUNT(*) FILTER (WHERE state = 'failed' AND updated_at >= ?) AS failed,
+          COUNT(DISTINCT (chat_id, thread_id)) FILTER (WHERE state = 'pending')
+                                                                     AS destinations
+          FROM deliveries
+        """,
+        (stamp - max(0, failed_within_ms),),
+    )
+    if row is None:  # pragma: no cover - an aggregate always returns one row
+        return QueueAge()
+    head = as_int(row["head_at"])
+    claim = as_int(row["claim_at"])
+    return QueueAge(
+        pending=as_int(row["pending"]),
+        sending=as_int(row["sending"]),
+        oldest_pending_ms=max(0, stamp - head) if head else 0,
+        oldest_sending_ms=max(0, stamp - claim) if claim else 0,
+        failed_recent=as_int(row["failed"]),
+        destinations=as_int(row["destinations"]),
+    )
 
 
 async def list_for_session(

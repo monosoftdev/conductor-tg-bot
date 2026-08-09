@@ -80,6 +80,7 @@ __all__ = [
     "MAX_ATTEMPTS",
     "INLINE_RETRY_CEILING_S",
     "MAX_RETRY_AFTER_S",
+    "RECOVERY_RECHECK_S",
     "NO_LINK_PREVIEW",
     "FocusTracker",
     "ControlFactory",
@@ -131,6 +132,10 @@ INLINE_RETRY_CEILING_S: Final = 2.0
 RETRY_AFTER_PADDING_S: Final = 0.5
 #: Idle poll interval for :meth:`Outbox.run` when the queue is empty.
 IDLE_INTERVAL_S: Final = 1.0
+#: How often an idle outbox re-asks whether anything is stranded in ``sending``.
+#: One counting query a minute, against the alternative of a row that waits for
+#: the next deploy to be noticed.
+RECOVERY_RECHECK_S: Final = 60.0
 #: How stale a mid-turn session's ``updated_at`` may be before the hold lapses.
 #: A live poller touches it every tick, so anything older means nobody is coming
 #: back for that turn and its output must go out now.
@@ -138,9 +143,21 @@ HOLD_FRESH_MS: Final = 300_000
 #: The longest one destination's queue may be held, however healthy the turn
 #: looks. A turn that runs longer than this is real, so the batch goes out —
 #: silently, which is the point: the cap bounds *latency*, never the single
-#: buzz, and a state machine wedged in ``WORKING`` costs half an hour, not a
-#: reply.
-MAX_HOLD_MS: Final = 1_800_000
+#: buzz.
+#:
+#: **Thirty minutes, measured.** On the live database the mean queue latency
+#: was 771s, the median 690s, and the maximum 1801.2s — the old cap, to the
+#: second. 46 of 157 deliveries sat between 25 and 30 minutes: they were
+#: released by the clock, not by a turn ending. A coding turn legitimately runs
+#: that long, so "wait for the turn to finish" *was* the delay, and to a person
+#: it is indistinguishable from a bot that has stopped answering.
+#:
+#: The premise it was built on has since moved. Holding existed because an
+#: agent narrating through a six-tool turn put six messages in the tray; the
+#: renderer now keeps narration off the chat entirely (``Successor.TOOL_CALL``),
+#: so what is left to batch is at most a couple of genuine answers. Five
+#: minutes still coalesces those; half an hour only hides them.
+MAX_HOLD_MS: Final = 300_000
 
 #: PLAN: link previews are disabled everywhere. Agent output is full of URLs and
 #: a preview card under every reply is noise.
@@ -494,6 +511,7 @@ class Outbox:
         focus: FocusTracker | None = None,
         hold_fresh_ms: int = HOLD_FRESH_MS,
         max_hold_ms: int = MAX_HOLD_MS,
+        recovery_recheck_s: float = RECOVERY_RECHECK_S,
     ) -> None:
         self._bot = bot
         self._db = db
@@ -530,6 +548,8 @@ class Outbox:
         self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._recovered = False
+        self._recheck_interval = max(0.0, recovery_recheck_s)
+        self._recheck_at = 0.0
         self._counters: dict[str, int] = {
             "sent": 0,
             "skipped": 0,
@@ -777,9 +797,10 @@ class Outbox:
                 continue
             failures = 0
             if sent == 0:
-                if not self._recovered:
-                    # Rows were still inside the orphan window last time.
-                    sent += await self._guarded(self.recover) or 0
+                # Unconditional: `recover` throttles itself. Rows may still be
+                # inside the orphan window from boot, *and* a claim can strand
+                # at any hour of an uptime — see the note there.
+                sent += await self._guarded(self.recover) or 0
                 await self._idle_wait()
 
     async def _guarded(self, step: Callable[[], Awaitable[int]]) -> int | None:
@@ -816,8 +837,16 @@ class Outbox:
         until a pass finds none left, and :meth:`run` calls it again on each
         idle tick. Latching after the first pass would strand them forever.
         """
-        if self._recovered:
+        if self._recovered and self._clock() < self._recheck_at:
             return 0
+        # Re-armed on a timer, not latched for the life of the process. A claim
+        # is stranded by *any* crash between the Telegram call and the DB write
+        # — a database blip inside ``mark_sent``, a cancelled task, a pod
+        # evicted mid-send — and every one of those can happen on hour six of an
+        # uptime, long after the boot sweep concluded there was nothing to do.
+        # Latched, that row waited for the next deploy to be noticed; on a
+        # healthy service that is the definition of a stuck message.
+        self._recheck_at = self._clock() + self._recheck_interval
         result = await deliveries_repo.recover_orphaned(
             self._db, claim_id=self._claim_id, orphan_after_ms=self._orphan_after_ms
         )

@@ -57,6 +57,7 @@ __all__ = [
     "list_all",
     "list_bound",
     "list_for_workspace",
+    "list_unwatched",
     "list_with_room",
     "load_turn_context",
     "mark_archived",
@@ -320,6 +321,37 @@ async def list_bound(db: Database) -> list[SessionRow]:
             s.tenant_id,
             CASE WHEN s.turn_state IN {_ACTIVE_STATES_SQL} THEN 0 ELSE 1 END,
             s.updated_at DESC
+        """
+    )
+    return [SessionRow.from_row(row) for row in rows]
+
+
+async def list_unwatched(db: Database) -> list[SessionRow]:
+    """Sessions that had a seat here and no longer have a poller.
+
+    "Am I still on top of every workspace I launched?" has one honest answer,
+    and it is not the bound count — that only ever says how many are watched,
+    never how many stopped being. A session reaches this list by exactly one
+    route: it was addressed in a chat, then unbound without being archived or
+    404ed. A deleted topic (``topics.room_gone``) and the seat release behind
+    it are the two that happen in normal use, and both are recoverable with
+    ``/board`` — but only by somebody who knows.
+
+    Deliberately *not* every unbound session: ``/attach`` upserts every remote
+    session of a workspace unbound, on purpose, because a room is materialised
+    the first time it is opened. Those were never watched and are not missing.
+
+    Cross-tenant, for the system pool, like every other census here.
+    """
+    rows = await db.fetch_all(
+        f"""
+        SELECT {_COLUMNS} FROM sessions
+         WHERE NOT is_bound
+           AND chat_id IS NOT NULL
+           AND archived_at IS NULL
+           AND turn_state != 'DEAD'
+           AND seeded
+         ORDER BY updated_at DESC
         """
     )
     return [SessionRow.from_row(row) for row in rows]

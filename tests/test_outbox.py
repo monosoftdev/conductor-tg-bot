@@ -61,6 +61,7 @@ from ctb.db.repo import chats as chats_repo
 from ctb.db.repo import deliveries as deliveries_repo
 from ctb.db.repo import sessions as sessions_repo
 from ctb.delivery.outbox import (
+    RECOVERY_RECHECK_S,
     FocusTracker,
     Outbox,
     Priority,
@@ -266,10 +267,11 @@ async def enqueue(
     session_index: int = 0,
     priority: Priority = Priority.NORMAL,
     parts: list[MessagePart] | None = None,
+    session_id: str = SESSION,
 ) -> int:
     return await outbox.enqueue_parts(
         parts if parts is not None else [part()],
-        session_id=SESSION,
+        session_id=session_id,
         message_id=message_id,
         chat_id=chat_id,
         thread_id=thread_id,
@@ -906,7 +908,7 @@ async def test_boot_resends_when_the_hash_differs(
     assert bot.calls_to("send_message")[0]["text"] == "<b>new</b>"
 
 
-async def test_recovery_runs_only_once(
+async def test_recovery_does_not_repeat_itself_inside_the_interval(
     outbox: Outbox, bot: FakeBot, db: Database, session: str
 ) -> None:
     await enqueue(outbox)
@@ -914,6 +916,32 @@ async def test_recovery_runs_only_once(
 
     assert await outbox.recover() == 1
     assert await outbox.recover() == 0
+    assert len(bot.calls_to("send_message")) == 1
+
+
+async def test_a_claim_stranded_hours_into_an_uptime_is_still_recovered(
+    outbox: Outbox, bot: FakeBot, db: Database, session: str, clock: FakeClock
+) -> None:
+    """Recovery is a heartbeat, not a boot step.
+
+    It used to latch: the first pass that found nothing stranded disarmed it
+    for the life of the process. But a claim strands on *any* crash between the
+    Telegram call and the database write — a blip inside ``mark_sent``, a
+    cancelled task, a pod evicted mid-send — and every one of those happens
+    long after boot. Latched, that row waited for the next deploy to be
+    noticed, which on a healthy service is the definition of a stuck message.
+    """
+    assert await outbox.recover() == 0  # a clean boot: nothing to do
+    assert await outbox.recover() == 0  # and it stays quiet inside the window
+
+    # Hours later, a send strands a claim.
+    await enqueue(outbox)
+    await deliveries_repo.claim(db, claim_id="dead-worker")
+    assert await outbox.recover() == 0, "still inside the recheck interval"
+
+    clock.advance(RECOVERY_RECHECK_S + 1)
+
+    assert await outbox.recover() == 1
     assert len(bot.calls_to("send_message")) == 1
 
 
@@ -1097,8 +1125,8 @@ async def test_a_turn_that_never_ends_releases_the_queue_anyway(
 async def test_an_unbound_session_is_never_held(
     outbox: Outbox, bot: FakeBot, db: Database, session: str
 ) -> None:
-    """A hold keys on the *destination*, and this session has none."""
-    await sessions_repo.update(db, SESSION, turn_state="WORKING")
+    """Nobody is polling it, so no more output is coming to wait for."""
+    await sessions_repo.update(db, SESSION, turn_state="WORKING", is_bound=False)
     await enqueue(outbox)
 
     assert await outbox.run_once() == 1
@@ -1108,11 +1136,35 @@ async def test_another_topic_drains_while_this_one_holds(
     outbox: Outbox, bot: FakeBot, db: Database, session: str
 ) -> None:
     await working(db)
+    await sessions_repo.upsert(db, "sess-2", chat_id=CHAT + 1, thread_id=0)
     await enqueue(outbox, message_id="held")
-    await enqueue(outbox, message_id="free", chat_id=CHAT + 1)
+    await enqueue(outbox, message_id="free", chat_id=CHAT + 1, session_id="sess-2")
 
     assert await outbox.run_once() == 1
     assert bot.calls_to("send_message")[0]["chat_id"] == CHAT + 1
+
+
+async def test_one_stuck_turn_cannot_hold_another_session_s_reply(
+    outbox: Outbox, bot: FakeBot, db: Database, session: str
+) -> None:
+    """The clog, in one test.
+
+    A hold used to key on the *room*: any session addressed at
+    ``(chat, thread)`` being mid-turn held everything queued there. One room
+    per session makes that the same question — **except at ``thread_id = 0``**,
+    which the linear DM seat, a group's General and every session ``room_gone``
+    has parked all share. So one container that never came up, its poller
+    dutifully refreshing ``updated_at`` every tick, held the whole chat root:
+    another session's finished answer, and every notice queued behind it, for
+    as long as the cap allowed.
+    """
+    await working(db)  # sess-1: stuck mid-turn, addressed at the chat root
+    await sessions_repo.upsert(db, "sess-2", chat_id=CHAT, thread_id=0)
+    await sessions_repo.update(db, "sess-2", turn_state="IDLE")
+    await enqueue(outbox, message_id="answer", session_id="sess-2")
+
+    assert await outbox.run_once() == 1
+    assert bot.calls_to("send_message")[0]["chat_id"] == CHAT
 
 
 # ── the status card ──────────────────────────────────────────────────────────

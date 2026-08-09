@@ -18,6 +18,46 @@ Verified offline, on every commit:
 - The real runtime boots against a real database: all seven services start,
   `/health` returns `ok`, the lease is acquired, shutdown is clean.
 
+## The pipe was clogged by design (2026-08-08)
+
+Measured on the live database, across 157 real deliveries: the time from a row
+being queued to it reaching Telegram had a **mean of 771s, a median of 690s, and
+a maximum of 1801.2s**. That maximum is `MAX_HOLD_MS`, to the second — 46 of the
+157 sat between 25 and 30 minutes and were released *by the clock*, not by a
+turn ending.
+
+Three faults, one symptom:
+
+- **The hold was the delay.** Output waits for the turn to finish so the tray
+  gets one buzz instead of eight. A coding turn legitimately runs half an hour,
+  and to a person "your answer exists but you may not see it yet" is
+  indistinguishable from a bot that stopped answering. The premise moved when
+  the renderer took narration off the chat entirely, so what is left to batch is
+  a couple of genuine answers: `MAX_HOLD_MS` is **five minutes**, not thirty.
+- **The hold keyed on the room, not the rows.** One session per room makes those
+  the same question — except at `thread_id = 0`, which the linear DM seat, a
+  group's General and every session `room_gone` has parked all share. One
+  container that never came up, its poller dutifully refreshing `updated_at`
+  every tick, held the whole chat root: another session's finished answer and
+  every notice behind it. `held_destinations` now asks of the *pending rows*,
+  and only holds while every one of them belongs to a live, still-polled,
+  mid-turn session.
+- **Recovery latched off after boot.** The first pass that found nothing
+  stranded disarmed it for the life of the process — but a claim strands on any
+  crash between the Telegram call and the database write, and those happen on
+  hour six of an uptime. That row then waited for the next deploy. It is a
+  60-second heartbeat now.
+
+And the reason none of it showed: `/health` measured the queue by **depth**
+(threshold 50) and never by **age**. One answer stuck behind a wedged hold is a
+single row. `deliveries` now reports `oldest_pending_ms`, `oldest_sending_ms`
+and `destinations`, with `delivery_stalled` and `delivery_stranded` raised on
+age; `delivery_failed` is windowed to the last hour, because one bot kicked from
+one group had pinned the report to `degraded` for a week, and a health check
+that is always amber is one nobody reads. `polling.unwatched` counts the
+sessions that *had* a seat and lost their poller — the workspaces somebody is
+still waiting on.
+
 ## A turn was landing one bubble per tool call (2026-08-08)
 
 Measured on the live database, not inferred: **16,967 agent messages produced
