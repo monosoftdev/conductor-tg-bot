@@ -34,6 +34,7 @@ __all__ = [
     "MAX_INLINE_CODE_LINES",
     "RenderContext",
     "SINGLE_MESSAGE_SOFT_LIMIT",
+    "Successor",
     "TELEGRAM_CAPTION_LIMIT",
     "TELEGRAM_TEXT_LIMIT",
     "TextBlock",
@@ -240,6 +241,33 @@ def payload_utf16_len(block: Block) -> int:
     return utf16_len(payload_text(block))
 
 
+class Successor(StrEnum):
+    """What comes *after* this message inside the same turn, when it is known.
+
+    ``preamble_span`` can already tell narration from an answer when the tool
+    call shares the message: text in front of a ``tool_use`` block cannot be
+    the end of a turn, so it goes to the status card. Conductor's transport
+    splits them — the text arrives as one message and the ``tool_use`` as the
+    next — so that rule almost never fires in production, and a 46-minute turn
+    landed 54 separate bubbles of "Let me check the fixture", one per tool call.
+
+    The same argument holds one message out: a text message *followed by a tool
+    call in its own turn* is narration by the same protocol rule. The poller
+    knows that whenever both arrived in one drain.
+
+    :data:`UNKNOWN` is the honest default and the only safe one — it means
+    "nothing followed it in this batch", which is also what the last message of
+    a finished turn looks like. Answers are never withheld on a guess.
+    """
+
+    #: Nothing followed in the batch. Render as an answer.
+    UNKNOWN = "unknown"
+    #: The next message of this turn calls a tool, so this text is narration.
+    TOOL_CALL = "tool_call"
+    #: The next message of this turn is its end record. This *is* the answer.
+    TURN_END = "turn_end"
+
+
 @dataclass(frozen=True, slots=True)
 class RenderContext:
     """What an adapter is told about the chat it is rendering for."""
@@ -253,3 +281,5 @@ class RenderContext:
     #: message: how long until a rate limit resets. ``None`` means "ask the
     #: clock" — set it and the render is a pure function of its inputs.
     now_epoch_s: float | None = None
+    #: What the drain saw next in this turn. See :class:`Successor`.
+    successor: Successor = Successor.UNKNOWN

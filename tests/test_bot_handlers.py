@@ -1281,6 +1281,7 @@ async def _archive_tap(
     topic_id: int = 99,
     siblings: int = 0,
     countable: bool = True,
+    ticket_seat: tuple[int, int] | None = None,
 ) -> tuple[_ArchivingClient, _ArchiveTap]:
     """Seed a session with a room, then tap its named Archive button."""
     await workspaces_repo.upsert(
@@ -1305,6 +1306,9 @@ async def _archive_tap(
         db, chat_id, topic_id, workspace_id="workspace-1", session_id="session-1"
     )
     store = NonceStore()
+    # ``ticket_seat`` is where the *button* was minted, which is only the task's
+    # own room by coincidence — see the reply-routed and stale-card cases.
+    seat_chat, seat_thread = ticket_seat or (chat_id, topic_id)
     markup = confirm_keyboard(
         Action.ARCHIVE,
         "session-1",
@@ -1312,11 +1316,13 @@ async def _archive_tap(
         verb="Archive",
         store=store,
         user_id=1001,
+        chat_id=seat_chat,
+        thread_id=seat_thread,
     )
     payload = markup.inline_keyboard[0][0].callback_data
     assert payload is not None
     client = _ArchivingClient(siblings=siblings, countable=countable)
-    query = _ArchiveTap(bot, payload, _card_in(chat_id, topic_id))
+    query = _ArchiveTap(bot, payload, _card_in(seat_chat, seat_thread))
     await core_handlers.confirm_archive(
         cast(Any, query), store, fake_tenant(client), db=db
     )
@@ -1389,6 +1395,45 @@ async def test_a_topic_that_will_neither_delete_nor_close_says_so(
     _, _ = await _archive_tap(db, bot, siblings=1)
 
     assert bot.edits == ["✓ Archived <b>fix flaky</b>. Topic left open."]
+
+
+async def test_archive_detaches_the_task_s_own_room_not_the_seat_tapped_in(
+    db: Database,
+) -> None:
+    """The ticket's seat and the task's room are not the same thing.
+
+    They coincide for a ``/done`` typed inside the room, and diverge every
+    other way the target is chosen: a ``/done`` sent as a *reply* routes to the
+    replied-to session (``Route.via_reply``), and the status card's Archive can
+    be tapped from a card that outlived its own room. Unbinding the ticket's
+    seat then detached the room the tap was made in — silencing a task nobody
+    archived — and left the archived one still routing prompts in its own.
+
+    A refused delete is the case that shows it: the topic survives, so
+    something has to stop it routing, and it must be the right something.
+    """
+    other_session = "session-elsewhere"
+    await workspaces_repo.upsert(db, "workspace-2", name="tg-1-def", chat_id=-1001)
+    await sessions_repo.upsert(db, other_session, workspace_id="workspace-2")
+    await sessions_repo.bind_topic(
+        db, other_session, chat_id=-1001, topic_id=7, topic_name="other"
+    )
+    await chats_repo.bind(
+        db, -1001, 7, workspace_id="workspace-2", session_id=other_session
+    )
+    bot = _ForumBot(delete_error=_refused("Bad Request: not enough rights"))
+
+    await _archive_tap(db, bot, siblings=1, ticket_seat=(-1001, 7))
+
+    assert bot.deleted == [] and bot.closed == [99], "the room outlived the archive"
+    archived_room = await chats_repo.get(db, -1001, 99)
+    assert archived_room is not None and archived_room.session_id is None, (
+        "the archived task's room is still routing prompts to it"
+    )
+    tapped_seat = await chats_repo.get(db, -1001, 7)
+    assert tapped_seat is not None and tapped_seat.session_id == other_session, (
+        "archiving one task silenced the room the button was tapped in"
+    )
 
 
 async def test_done_never_archives_a_workspace_it_could_not_count(
@@ -2298,6 +2343,36 @@ async def test_stage_two_offers_a_ticket_for_a_session_with_no_room(
     assert first.url is None
     assert first.callback_data is not None
     assert markup.inline_keyboard[-1][0].text == "« All workspaces"
+
+
+async def test_stage_two_never_offers_a_session_conductor_has_lost(
+    db: Database,
+) -> None:
+    """A dead session is unopenable, so listing it is a tap that cannot work.
+
+    ``DEAD`` means the session 404ed (transition 20). The remote listing drops
+    it; the *local union* — which exists so a session created thirty seconds
+    ago on the laptop is still reachable — is what puts it back. Tapping it
+    opens a room and then fails on ``seek_to_end``, leaving an empty topic
+    named after a task that no longer exists.
+
+    Archived is the same question asked by the user rather than by Conductor,
+    which is why ``SessionRow.live`` answers both.
+    """
+    await workspaces_repo.upsert(db, "ws-dead", name="api", chat_id=-1001040)
+    await sessions_repo.upsert(db, "sess-alive", workspace_id="ws-dead", title="live")
+    await sessions_repo.upsert(db, "sess-dead", workspace_id="ws-dead", title="gone")
+    await sessions_repo.mark_dead(db, "sess-dead", reason="404")
+
+    class _NoSql:
+        async def list_workspace_sessions(self, *_: Any, **__: Any) -> Any:
+            raise RuntimeError("offline")
+
+    rows = await core_handlers.board_sessions(
+        db, cast(Any, _NoSql()), "ws-dead", chat_id=-1001040
+    )
+
+    assert [row.session_id for row in rows] == ["sess-alive"]
 
 
 def test_the_two_board_stages_share_no_verb() -> None:
@@ -4156,6 +4231,54 @@ async def test_room_gone_frees_the_session_and_says_so_once(db: Database) -> Non
     # Idempotent: three racing discoveries cost one line, not three.
     assert await topics.room_gone(bot, db, "sess-1") is False  # type: ignore[arg-type]
     assert len(bot.sent) == 1
+
+
+async def test_two_deleted_rooms_do_not_end_up_sharing_the_chat_root(
+    db: Database,
+) -> None:
+    """Vector 3, at the one seat the uniqueness index cannot hold.
+
+    ``unbind_topic`` lands an orphaned session on ``thread_id = 0``, which is
+    where its deliveries reroute to — and thread 0 is carved out of
+    ``uq_sessions_one_per_room`` because the linear seat legitimately moves. So
+    deleting two topics in one chat left *two* bound sessions on the root: both
+    polled, both delivered into it with nothing saying which was which, and a
+    prompt typed there went to whichever ``get_bound_for`` sorted first.
+
+    Release it on that same tiebreak, so nothing moves and the losers only stop
+    polling. Their queued rows still flush and their cursors are durable, so
+    reopening one from ``/board`` resumes exactly where it stopped.
+    """
+    await workspaces_repo.upsert(db, "ws-1", name="api")
+    for index, (session_id, topic_id) in enumerate((("older", 11), ("newer", 12))):
+        await sessions_repo.upsert(
+            db, session_id, workspace_id="ws-1", title=session_id, at=1_000 + index
+        )
+        await sessions_repo.bind_topic(
+            db, session_id, chat_id=-1001, topic_id=topic_id, topic_name=session_id
+        )
+        await chats_repo.bind(
+            db, -1001, topic_id, workspace_id="ws-1", session_id=session_id
+        )
+    bot = _ForumBot()
+
+    for session_id in ("older", "newer"):
+        assert await topics.room_gone(bot, db, session_id) is True  # type: ignore[arg-type]
+
+    seated = [
+        row
+        for row in await sessions_repo.list_for_workspace(db, "ws-1")
+        if row.is_bound and row.chat_id == -1001 and row.thread_id == 0
+    ]
+    assert [row.id for row in seated] == ["newer"], (
+        "two orphaned sessions are both polling and delivering into the chat root"
+    )
+    # And the seat resolves to exactly that one, with no tiebreak deciding it.
+    bound = await sessions_repo.get_bound_for(db, -1001, 0)
+    assert bound is not None and bound.id == "newer"
+    # The loser is parked, never archived: it still costs money and holds work.
+    older = await sessions_repo.get(db, "older")
+    assert older is not None and older.archived_at is None
 
 
 # ── /name -w renames the family, so every room of it ─────────────────────────

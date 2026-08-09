@@ -524,7 +524,11 @@ async def board_sessions(
             continue
         seen.add(session_id)
         row = local.get(session_id)
-        if row is not None and row.archived_at is not None:
+        # `live`, not just `archived_at`: a session Conductor has 404ed is DEAD
+        # locally and cannot be opened at all, so offering it means a room is
+        # created and the open then fails on `seek_to_end`. The remote listing
+        # drops a dead session; the local union is what puts it back.
+        if row is not None and not row.live:
             continue
         out.append(
             BoardSession(
@@ -1413,9 +1417,22 @@ async def confirm_archive(
             took_workspace = True
         retirement = await retire_topic(query.bot, database, session.id)
         await sessions_repo.mark_archived(database, session.id)
-        await chats_repo.unbind(
-            database, ticket.chat_id or query.from_user.id, ticket.thread_id
-        )
+        # **The archived session's own room**, not the seat the button was
+        # minted in. They are the same seat for a `/done` typed in the room —
+        # and a different one whenever the target came from somewhere else: a
+        # `/done` sent as a reply routes to the replied-to session
+        # (`Route.via_reply`), and the status card's Archive can be tapped from
+        # a card that outlived its room. Unbinding the ticket's seat then
+        # detached the room the tap was made in and left the archived session
+        # still routing in its own.
+        # And only while it is *this* task's: a room ``room_gone`` already
+        # detached leaves the session addressed at the chat's seat, which the
+        # linear DM legitimately shares. Unbinding what the row actually routes
+        # to is the only version that cannot take a bystander with it.
+        if session.chat_id is not None:
+            room = await chats_repo.get(database, session.chat_id, session.thread_id)
+            if room is not None and room.session_id == session.id:
+                await chats_repo.unbind(database, session.chat_id, session.thread_id)
     except Exception as exc:
         if isinstance(query.message, Message) and query.bot is not None:
             changed = await edit_html(

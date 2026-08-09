@@ -49,6 +49,7 @@ from ctb.delivery.render.types import (
     Block,
     BlockKind,
     RenderContext,
+    Successor,
     TextBlock,
     Verbosity,
 )
@@ -86,6 +87,14 @@ class AssistantAdapter(Adapter):
     def render(self, message: TranscriptMessage, context: RenderContext) -> list[Block]:
         raw = payload_blocks(message.content)
         span = preamble_span(raw)
+        # The same rule, one message out. A message whose turn continues into a
+        # tool call cannot be carrying that turn's answer, and Conductor's
+        # transport splits text from the ``tool_use`` it precedes far more often
+        # than it combines them — which is why `span` alone left a long turn
+        # posting one bubble per tool call. `UNKNOWN` (nothing followed in this
+        # batch) keeps today's behaviour: an answer is never withheld on a guess.
+        if context.successor is Successor.TOOL_CALL:
+            span = len(raw)
         blocks: list[Block] = []
         for index, block in enumerate(raw):
             blocks.extend(

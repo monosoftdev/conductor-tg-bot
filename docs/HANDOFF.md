@@ -18,6 +18,35 @@ Verified offline, on every commit:
 - The real runtime boots against a real database: all seven services start,
   `/health` returns `ok`, the lease is acquired, shutdown is clean.
 
+## A turn was landing one bubble per tool call (2026-08-08)
+
+Measured on the live database, not inferred: **16,967 agent messages produced
+118 chat bubbles**, and of those 118, **95 were a standalone `text` message
+followed, inside its own turn, by a tool call**. One 46-minute turn spent 54
+separate bubbles on lines like *"Let me check the fixture"*, median length 50
+characters. 21 were genuine final answers — the ones followed by the turn's
+`result` record.
+
+`preamble_span` was written for exactly that noise, but it only looks *inside*
+one message: text in front of a `tool_use` block cannot end a turn, so it goes
+to the status card. Conductor's transport emits the two as **separate
+messages**, so the rule almost never fired.
+
+The protocol argument does not depend on them sharing a message, so the drain
+now looks one message out. `cursor.successor_hints` reads each message's
+successor *within its own turn* from the batch it was fetched with, and
+`RenderContext.successor` carries the answer to the adapter: a turn that
+continues into a tool call has not produced its answer yet, so the text is card
+activity. Nothing is lost — `transcript_messages` keeps every word and `/log`
+still prints it.
+
+`UNKNOWN` — nothing followed in this batch — keeps today's behaviour and is the
+only safe default: the last message of a page looks exactly like the last
+message of a turn, and only one of them may be withheld. On the live data
+59% of narration shares a batch with the call that proves it; the other 41%
+still shows, because losing an answer is unrecoverable and one line of
+narration is not.
+
 ## TOPIC_ID_INVALID locked people out of their own rooms (2026-08-08)
 
 Live: *"Open failed · Topic check failed · Bad Request: TOPIC_ID_INVALID"*, on

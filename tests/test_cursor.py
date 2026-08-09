@@ -33,7 +33,7 @@ from ctb.conductor.client import ConductorClient
 from ctb.conductor.errors import ApiError, NotFound, PairingError
 from ctb.db.connection import Database
 from ctb.db.repo import chats, deliveries, prompts, sessions, transcript, workspaces
-from ctb.delivery.render.types import Verbosity
+from ctb.delivery.render.types import Successor, Verbosity
 from ctb.settings import Settings
 from ctb.turn import cursor
 from ctb.turn.state import EDITED_PATHS_CAP, PostOk
@@ -300,6 +300,101 @@ async def test_find_last_message_survives_a_lying_has_more(
     assert message is not None
     assert message.id == session.messages_model()[-1].id
     assert offset == 8
+
+
+# ── narration versus the answer ──────────────────────────────────────────────
+
+
+def test_successor_hints_read_the_turn_not_the_page(
+    message_factory: Callable[..., Any],
+) -> None:
+    """Only a message of the *same* turn answers the question.
+
+    A page routinely carries the tail of one turn and the head of the next, and
+    a tool call in somebody else's turn says nothing about whether this text was
+    an answer.
+    """
+    page = [
+        message_factory(0, turn_id="t1", text="checking"),
+        message_factory(1, turn_id="t2", text="unrelated"),
+        message_factory(2, turn_id="t1", kind="result", text="done"),
+    ]
+
+    hints = cursor.successor_hints(page)
+
+    assert hints[0] is Successor.TURN_END, "a foreign turn is not this turn's tail"
+    assert hints[1] is Successor.UNKNOWN, "nothing followed it in this batch"
+    assert hints[2] is Successor.UNKNOWN
+
+
+async def test_a_turn_lands_one_bubble_not_one_per_tool_call(
+    db: Database, fake: FakeConductor, client: ConductorClient
+) -> None:
+    """The noise ``preamble_span`` was written for, one message further out.
+
+    Conductor's transport emits the narration and the ``tool_use`` it precedes
+    as *separate* messages, so the same-message rule almost never fired: on the
+    live database 95 of 118 delivered messages were a standalone ``text``
+    followed, inside its own turn, by a tool call — a 46-minute turn spent 54
+    chat bubbles on "Let me check the fixture".
+
+    The protocol argument does not depend on the two sharing a message: a turn
+    that continues into a tool call has not produced its answer yet. What is
+    left is the answer, and the transcript keeps every word either way, so
+    ``/log`` still has the narration.
+    """
+    session = fake.add_session(
+        script=[
+            Tick(
+                emit=(
+                    state_changed(),
+                    assistant("Let me look at the fixture."),
+                    tool_use("Bash"),
+                    assistant("Now the migration."),
+                    tool_use("Read"),
+                    assistant("fixed · the fixture was session-scoped"),
+                    result("done"),
+                )
+            )
+        ],
+        advance=Advance.MANUAL,
+    )
+    await bind(db, session)
+    session.tick()
+
+    await cursor.drain(client, db, session.session_id)
+
+    html = await delivered_html(db, session.session_id)
+    assert "fixed · the fixture was session-scoped" in html
+    assert "Let me look at the fixture" not in html
+    assert "Now the migration" not in html
+    rows = await deliveries.list_for_session(db, session.session_id)
+    assert len(rows) == 1, "one turn, one bubble"
+
+
+async def test_narration_is_still_delivered_when_the_batch_cannot_prove_it(
+    db: Database, fake: FakeConductor, client: ConductorClient
+) -> None:
+    """The last message of a page looks exactly like the last of a turn.
+
+    A poll that lands between the text and the tool call it precedes sees only
+    the text — and on the live database that was 41% of them. Withholding on
+    that guess would lose real answers, which is unrecoverable; showing one
+    line of narration is not. So ``UNKNOWN`` delivers, exactly as before.
+    """
+    session = fake.add_session(
+        script=[
+            Tick(emit=(state_changed(), assistant("Let me look at the fixture."))),
+            Tick(emit=(tool_use("Bash"), assistant("fixed"), result("done"))),
+        ],
+        advance=Advance.MANUAL,
+    )
+    await bind(db, session)
+    session.tick()
+
+    await cursor.drain(client, db, session.session_id)
+
+    assert "Let me look at the fixture" in await delivered_html(db, session.session_id)
 
 
 # ── the drain ────────────────────────────────────────────────────────────────

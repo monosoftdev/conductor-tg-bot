@@ -550,14 +550,21 @@ class TestDatabase:
         ``now()`` is fixed at transaction start, which would give every row a
         batch inserts an identical ``created_at`` and flip every
         ``ORDER BY created_at`` tiebreak.
+
+        The sleep is what makes this a *proof* rather than a race. The column
+        is epoch **milliseconds**, and three unqualified inserts land inside one
+        of them often enough to fail roughly one run in five on a fast machine —
+        a red build that says nothing about the property. Two milliseconds of
+        real time is a gap ``clock_timestamp()`` must show and ``now()`` cannot.
         """
         async with db.transaction():
             for index in range(3):
                 await db.execute(
                     "INSERT INTO workspaces(id) VALUES (?)", (f"w{index}",)
                 )
+                await db.execute("SELECT pg_sleep(0.002)")
         rows = await db.fetch_all("SELECT created_at FROM workspaces")
-        assert len({row["created_at"] for row in rows}) > 1
+        assert len({row["created_at"] for row in rows}) == 3
 
     async def test_the_pool_reports_its_stats(self, db: Database) -> None:
         """Exhaustion is the new deadlock class; it must be visible first."""

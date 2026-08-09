@@ -21,6 +21,7 @@ from typing import Any, Final
 __all__ = [
     "BlockRole",
     "TOOL_INPUT_KEYS",
+    "calls_tool",
     "classify_block",
     "first_str",
     "is_error_signal",
@@ -177,6 +178,18 @@ def classify_block(block: Mapping[str, Any]) -> BlockRole:
     if first_str(block, "text"):
         return BlockRole.TEXT
     return BlockRole.OTHER
+
+
+def calls_tool(content: Mapping[str, Any]) -> bool:
+    """Does this whole message invoke a tool?
+
+    The cross-message half of :func:`preamble_span`'s argument. Shape-only,
+    like everything else here: a ``tool_use`` block anywhere in the payload's
+    block list, whatever the envelope calls itself.
+    """
+    return any(
+        classify_block(block) is BlockRole.TOOL_USE for block in payload_blocks(content)
+    )
 
 
 def preamble_span(blocks: Sequence[Mapping[str, Any]]) -> int:

@@ -357,7 +357,6 @@ async def _adopt_workspace(
         if remembered is not None
         else Claim(False)
     )
-    existing_thread: int | None = None
     if remembered is not None and claim.alive:
         # The existence probe also reconciled the visible title to the current
         # remote status — when Telegram let it. Persist the marker only then:
@@ -421,9 +420,7 @@ async def _adopt_workspace(
     fresh = False
     claimed = False
     named = False
-    if existing_thread is not None:
-        thread_id = existing_thread
-    elif (
+    if (
         claim_thread
         and (
             claim := await claim_topic(bot, chat_id, claim_thread, label, marker=marker)
