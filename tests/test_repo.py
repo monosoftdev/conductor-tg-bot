@@ -22,6 +22,7 @@ from typing import Any
 
 import pytest
 
+from ctb.conductor.client import ApiEvent
 from ctb.conductor.models import SessionStatusValue, TranscriptMessage
 from ctb.db import MAX_CONTENT_BYTES, NO_THREAD_ID
 from ctb.db.connection import Database, now_ms, tenant_scope
@@ -1177,6 +1178,39 @@ async def test_api_events_ring_buffer(system_db: Database) -> None:
     assert await events.prune_api_events(system_db, keep=2) == 4
     assert len(await events.recent_api_events(system_db, limit=50)) == 2
     assert (await events.stats(system_db, since_ms=stamp + 999_999)).total == 0
+
+
+async def test_client_api_event_records_through_as_row(system_db: Database) -> None:
+    """The boot path's hook, end to end: ``ApiEvent`` → ``as_row`` → the table.
+
+    Both halves were covered and the seam between them was not: the client
+    handed ``ok`` over as ``1``/``0`` and PostgreSQL refused the insert, which
+    the hook then swallowed. Every call the bot made was dropped on the floor.
+    """
+    stamp = now_ms()
+    for ok, status in ((True, 200), (False, 401)):
+        event = ApiEvent(
+            at=stamp + status,
+            method="GET",
+            endpoint="/sessions/{id}/messages",
+            status_code=status,
+            duration_ms=12,
+            attempt=1,
+            ok=ok,
+            error=None if ok else "unauthorized",
+            circuit_state="closed",
+            request_id="req-1",
+            session_id=SESSION,
+        )
+        assert await events.record_api_event(system_db, **event.as_row()) > 0
+
+    recorded = await events.recent_api_events(system_db, limit=2)
+    assert [event.ok for event in recorded] == [False, True]
+    assert [event.status_code for event in recorded] == [401, 200]
+    assert [
+        event.ok
+        for event in await events.recent_api_events(system_db, only_failed=True)
+    ] == [False]
 
 
 async def test_shape_signature_ignores_values(seeded: Database) -> None:
