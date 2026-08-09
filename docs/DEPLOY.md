@@ -90,6 +90,11 @@ everything you forgot rather than one thing per redeploy.
 
 Worth setting straight away:
 
+- `ADMIN_DATABASE_URL` — Railway's own `DATABASE_URL`, added as a variable
+  reference (`${{Postgres.DATABASE_URL}}`). It turns every later migration into
+  part of the deploy; see [Upgrading](#upgrading). Nothing in the bot reads it —
+  only the pre-deploy step does — because connecting as a superuser disables
+  row-level security, which is the one thing `DATABASE_URL` must never be.
 - `PLATFORM_ADMIN_IDS` — your Telegram user id, so `/platform` works.
 - `HEALTH_TOKEN` — a random string. Without it the detailed `/health` body is
   served to loopback only, which means a public domain shows you the summary
@@ -151,15 +156,35 @@ in-flight deliveries are re-claimed after the orphan window, the transcript
 cursor picks up where it left off, and wizards survive because their state is
 in `wizard_state` rather than in memory.
 
-If a release adds a migration, run it before deploying the new image — the same
-`ctb.db.bootstrap` command, which is idempotent. The old image keeps running
-against the new schema in the window between: every migration so far only adds
-columns and relaxes constraints, and the old code names the columns it reads,
-so it neither sees nor misses the new ones.
+A release that adds a migration has to migrate first: the old image tolerates
+the new schema — every migration so far only adds columns and relaxes
+constraints, and the old code names the columns it reads — while the new image
+refuses to boot against the old one.
+
+**With `ADMIN_DATABASE_URL` set, that is already the order.** Railway's
+`preDeployCommand` (in `railway.toml`) runs `python -m ctb.db.upgrade` from the
+new image, with the service's variables, while the old instance is still
+serving. It is idempotent, so the deploys that carry no migration print
+`schema already up to date` and cost a second. If it fails, it exits non-zero,
+the deploy is aborted and the old instance stays up — the error is in the
+deploy log rather than being a healthcheck timeout.
+
+Without the variable it does nothing at all, and the migration is yours to run
+before you push:
+
+```bash
+python -m ctb.db.bootstrap --admin-dsn "$DATABASE_PUBLIC_URL" \
+    --app-password ... --worker-password ...
+```
 
 Deploying first is the order that fails, and it fails as a healthcheck timeout
-rather than an error — which is why boot now refuses on the version instead of
+rather than an error — which is why boot refuses on the version instead of
 letting the first query find out.
+
+The DSN has to be the superuser one. Migrations are owner-level DDL
+(`ALTER TABLE tenants ...`) and neither `ctb_app` nor `ctb_worker` owns a
+table, so pointing the step at a runtime role fails on the first statement
+instead of half-applying anything.
 
 ## Key rotation
 

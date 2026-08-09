@@ -405,7 +405,10 @@ async def _default_verify_schema(db: Any) -> int:
             f"{REQUIRED_SCHEMA_VERSION}. Run, from somewhere that can reach it:\n"
             f"  {_BOOTSTRAP_COMMAND}\n"
             "It is idempotent, and the image already running tolerates the new "
-            "schema — so migrate first, then deploy."
+            "schema — so migrate first, then deploy.\n"
+            "Or set ADMIN_DATABASE_URL on the service and redeploy: the "
+            "pre-deploy step applies migrations from the image itself, and this "
+            "message stops needing a laptop."
         )
     return version
 
