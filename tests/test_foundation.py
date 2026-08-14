@@ -159,18 +159,21 @@ class TestSettings:
     ) -> None:
         """Neither operator credential may be reachable from a running bot.
 
-        ``ADMIN_DATABASE_URL`` is a superuser and ``OPS_DATABASE_URL`` holds
-        BYPASSRLS: both sit outside row-level security, and both are set on the
-        same service. So they must be inert here — a field named for one is a
-        pool waiting to be opened.
+        ``ADMIN_DATABASE_URL`` is a superuser and
+        ``TELEGRAM_CONDUCTOR_BOT_DATABASE_URL`` holds BYPASSRLS: both sit
+        outside row-level security, and both are set on the same service. So
+        they must be inert here — a field named for one is a pool waiting to be
+        opened.
         """
         monkeypatch.setenv("ADMIN_DATABASE_URL", "postgresql://su@h/db")
-        monkeypatch.setenv("OPS_DATABASE_URL", "postgresql://ops@h/db")
+        monkeypatch.setenv(
+            "TELEGRAM_CONDUCTOR_BOT_DATABASE_URL", "postgresql://ops@h/db"
+        )
 
         cfg = settings_factory()
 
         assert not hasattr(cfg, "admin_database_url")
-        assert not hasattr(cfg, "ops_database_url")
+        assert not hasattr(cfg, "telegram_conductor_bot_database_url")
         assert "postgresql://su@h/db" not in repr(cfg.model_dump())
         assert "postgresql://ops@h/db" not in repr(cfg.model_dump())
 

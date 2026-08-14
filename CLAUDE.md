@@ -105,14 +105,15 @@ key.
 
 ## Touching production
 
-`OPS_DATABASE_URL` is a psql DSN for the **live** database as `ctb_ops` — read and write, every
-table, every tenant. Use it to answer "what is actually happening right now": a stuck delivery, a
-session parked in the wrong turn state, a tenant whose key stopped authenticating. It is set in the
-Conductor environment, so it is already in `env` here; never paste it into a file, a commit, or a
-bot message.
+`TELEGRAM_CONDUCTOR_BOT_DATABASE_URL` is a psql DSN for the **live** database as `ctb_ops` — read
+and write, every table, every tenant. Use it to answer "what is actually happening right now": a
+stuck delivery, a session parked in the wrong turn state, a tenant whose key stopped authenticating.
+It is set in the Conductor environment, so it is already in `env` here; never paste it into a file,
+a commit, or a bot message. The name is long because it is one of several databases reachable from a
+Conductor workspace, and reaching for the wrong one is the mistake worth making impossible.
 
 ```bash
-psql "$OPS_DATABASE_URL" -c "select state, count(*) from deliveries group by 1"
+psql "$TELEGRAM_CONDUCTOR_BOT_DATABASE_URL" -c "select state, count(*) from deliveries group by 1"
 ```
 
 `scripts/ops_role.sql` builds the role and is idempotent; run it with `ADMIN_DATABASE_URL` if it
@@ -152,8 +153,8 @@ outlive the session. When there is a second tenant that is not us, this role nar
 ## Safety
 
 - `TELEGRAM_BOT_TOKEN`, the DSNs (`DATABASE_URL`, `SYSTEM_DATABASE_URL`, `ADMIN_DATABASE_URL`,
-  `OPS_DATABASE_URL`) and `CTB_MASTER_KEYS` come from env only. Never commit them, never log them —
-  structlog runs a mandatory scrubbing processor.
+  `TELEGRAM_CONDUCTOR_BOT_DATABASE_URL`) and `CTB_MASTER_KEYS` come from env only. Never commit
+  them, never log them — structlog runs a mandatory scrubbing processor.
 - **Tenant API keys are never registered with the log scrubber.** A process-wide set of every
   customer's plaintext key would keep it in memory for the life of the process and make scrubbing
   O(tenants) per line. They appear only in an `Authorization` header, which `_BEARER_RE` already

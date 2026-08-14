@@ -22,7 +22,7 @@
 --        -f scripts/ops_role.sql
 --
 -- The password is passed in and never lives in this file. The resulting DSN belongs
--- in the environment as OPS_DATABASE_URL; see CLAUDE.md.
+-- in the environment as TELEGRAM_CONDUCTOR_BOT_DATABASE_URL; see CLAUDE.md.
 
 \set ON_ERROR_STOP on
 
