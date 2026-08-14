@@ -37,10 +37,11 @@ security ENABLEd *and* FORCEd. `Database` publishes that GUC on every connection
 SQL contains **no `WHERE tenant_id = ?` anywhere** — and a forgotten filter returns zero rows rather
 than another customer's data.
 
-Two roles. `ctb_app` runs under the policies; `ctb_worker` holds `BYPASSRLS` and is used only by the
-cross-tenant workers (supervisor reconcile, the delivery and voice claim loops, prune, and the
-tenancy lookups that decide scope in the first place). `ctb_app` is **not** a member of `ctb_worker`,
-so there is no `SET ROLE` path from the request path to the bypass role.
+Two roles serve traffic. `ctb_app` runs under the policies; `ctb_worker` holds `BYPASSRLS` and is
+used only by the cross-tenant workers (supervisor reconcile, the delivery and voice claim loops,
+prune, and the tenancy lookups that decide scope in the first place). `ctb_app` is **not** a member
+of `ctb_worker`, so there is no `SET ROLE` path from the request path to the bypass role. A third,
+`ctb_ops`, serves nothing and belongs to no pool — see *Touching production* below.
 
 **Never add a process-wide Conductor client, database handle or API key back.** Deleting the
 `get_client()` global is what makes a cross-organisation read impossible to write by accident: a
@@ -102,6 +103,41 @@ key.
   That variable is a superuser DSN and is deliberately not a `Settings` field: nothing that serves
   a request may reach a connection that bypasses row-level security.
 
+## Touching production
+
+`OPS_DATABASE_URL` is a psql DSN for the **live** database as `ctb_ops` — read and write, every
+table, every tenant. Use it to answer "what is actually happening right now": a stuck delivery, a
+session parked in the wrong turn state, a tenant whose key stopped authenticating. It is set in the
+Conductor environment, so it is already in `env` here; never paste it into a file, a commit, or a
+bot message.
+
+```bash
+psql "$OPS_DATABASE_URL" -c "select state, count(*) from deliveries group by 1"
+```
+
+`scripts/ops_role.sql` builds the role and is idempotent; run it with `ADMIN_DATABASE_URL` if it
+ever has to be rebuilt or the password rotated. Default privileges are pinned to the migration
+superuser, so a table added by a later migration is writable without re-running it.
+
+What that role is, and what it therefore is not:
+
+- **`BYPASSRLS`.** No `ctb.tenant_id` to set, one query spans every customer — and row-level
+  security is not the safety net it is everywhere else in this codebase. An `UPDATE` that loses its
+  `WHERE` rewrites all of them.
+- **Not a superuser.** It cannot read `pg_authid` or drop the database, and one `DROP ROLE` revokes
+  it. `ADMIN_DATABASE_URL` remains the superuser DSN, and remains for migrations only.
+- **It reads customer source code.** Transcript bodies, prompt text and voice transcripts are all
+  in reach. Query for shape and counts by default; select `content_json` when the question actually
+  requires it, and keep the answer out of the transcript you are writing into.
+- **`lock_timeout` is 5s** and `idle_in_transaction_session_timeout` is 60s, so a stray `ALTER` or
+  a forgotten open transaction fails instead of blocking the running bot. Neither restricts what
+  may be done — they only stop it being done *slowly*, in front of live traffic.
+
+Write access is a deliberate, temporary posture: today the platform has one operator and no third
+party's data on it. **Confirm before any statement that writes**, wrap anything non-trivial in an
+explicit transaction, and prefer a migration over a hand-run `UPDATE` when the change should
+outlive the session. When there is a second tenant that is not us, this role narrows.
+
 ## Conventions
 
 - Line length 88, ruff format + ruff check + pyright must all be clean before committing.
@@ -115,8 +151,9 @@ key.
 
 ## Safety
 
-- `TELEGRAM_BOT_TOKEN`, the two DSNs and `CTB_MASTER_KEYS` come from env only. Never commit them,
-  never log them — structlog runs a mandatory scrubbing processor.
+- `TELEGRAM_BOT_TOKEN`, the DSNs (`DATABASE_URL`, `SYSTEM_DATABASE_URL`, `ADMIN_DATABASE_URL`,
+  `OPS_DATABASE_URL`) and `CTB_MASTER_KEYS` come from env only. Never commit them, never log them —
+  structlog runs a mandatory scrubbing processor.
 - **Tenant API keys are never registered with the log scrubber.** A process-wide set of every
   customer's plaintext key would keep it in memory for the life of the process and make scrubbing
   O(tenants) per line. They appear only in an `Authorization` header, which `_BEARER_RE` already
