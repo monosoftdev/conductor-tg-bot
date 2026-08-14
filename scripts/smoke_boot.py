@@ -11,7 +11,7 @@ This is the cheapest possible check of the whole seam. It needs no Telegram
 token and no Conductor key — the bot token is a syntactically valid fake, and
 Telegram's inevitable 401 is the *expected* end state. Everything before that
 point is real: two pools, the schema check, the RLS-confinement guard, the
-client pool, the crypto canary, all seven services, and ``/health``.
+client pool, the crypto canary, every service, and ``/health``.
 
 Usage::
 
@@ -84,8 +84,21 @@ async def main() -> int:
     try:
         names = [name for name, _runner in runtime.runners()]
         print(f"smoke: services = {names}")
-        if len(names) != 7:
-            print(f"smoke: expected seven services, got {len(names)}", file=sys.stderr)
+        # Named rather than counted: a count says "8 != 7" when a service is
+        # added *and* when one silently vanishes, and only one of those is a
+        # bug. This says which.
+        expected = [
+            "telegram",
+            "outbox",
+            "status_cards",
+            "voice",
+            "ci",
+            "watchdog",
+            "supervisor",
+            "health",
+        ]
+        if names != expected:
+            print(f"smoke: expected {expected}, got {names}", file=sys.stderr)
             return 1
 
         # Start everything, but only long enough to prove it starts. The
