@@ -101,6 +101,14 @@ Worth setting straight away:
   and nothing useful.
 - `REGISTRATION_OPEN=false` for the first weeks, so your first users are people
   you can call when something breaks.
+- `TELEGRAM_CONDUCTOR_BOT_DATABASE_URL` — optional, and only while the
+  deployment is still yours alone. It is a psql DSN for the `ctb_ops` role
+  (`scripts/ops_role.sql`): read and write across every tenant, `BYPASSRLS`, no
+  superuser. It exists so a stuck row can be looked at and repaired from a
+  terminal, and it is named for the bot because it is read from environments
+  that hold several projects' DSNs at once. Nothing in the bot reads it either.
+  Once somebody else's data is in the database, narrowing or dropping this role
+  is the first thing to do.
 
 ## 5. Confirm
 
