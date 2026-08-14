@@ -98,6 +98,24 @@ STATS_WINDOW_MS: Final[int] = 15 * 60_000
 #: cadence. The floor absorbs a 3s QUEUED cadence plus one slow round trip.
 POLL_LAG_FACTOR: Final[float] = 3.0
 POLL_LAG_GRACE_MS: Final[int] = 30_000
+#: How long a session that *should* be polled may go untouched before the
+#: report calls it silent.
+#:
+#: **This is the number the four-day outage needed and did not have.** Every
+#: other signal here is computed from work the process is observably doing, so
+#: when the work stopped entirely there was nothing left to compute from:
+#: ``polling`` counts what ``list_bound`` returns, and that query's
+#: ``auth_failed_at`` filter *was* the outage; ``unwatched`` requires
+#: ``NOT is_bound`` and these stayed bound; the client pool had no clients left
+#: to count a 401 on. Zero pollers doing zero work is indistinguishable from
+#: perfect health to all three. ``sessions.list_silent`` asks the inverse
+#: question — what should be happening and isn't — and this is its threshold.
+#:
+#: Five times the slowest legitimate cadence (``CADENCE_IDLE_DECAY_MS`` tops out
+#: at 120s), so a non-zero count is never a matter of interpretation.
+POLL_SILENT_MS: Final[int] = 10 * 60_000
+#: Silent sessions named before the report just counts them.
+SILENT_LIMIT: Final[int] = 10
 #: Deliveries drain in seconds; a standing queue this deep means a stuck outbox.
 DELIVERY_BACKLOG: Final[int] = 50
 #: How long the head of the queue may wait before the outbox counts as stalled.
@@ -142,6 +160,7 @@ DEGRADATION_AUTH_FATAL: Final[str] = "auth_fatal"
 DEGRADATION_CIRCUIT_OPEN: Final[str] = "circuit_open"
 DEGRADATION_RATE_LIMITED: Final[str] = "rate_limited"
 DEGRADATION_POLL_LAG: Final[str] = "poll_lag"
+DEGRADATION_POLL_SILENT: Final[str] = "poll_silent"
 DEGRADATION_DELIVERY_BACKLOG: Final[str] = "delivery_backlog"
 DEGRADATION_DELIVERY_FAILED: Final[str] = "delivery_failed"
 DEGRADATION_DELIVERY_STALLED: Final[str] = "delivery_stalled"
@@ -619,6 +638,26 @@ class HealthMonitor:
         unwatched = await sessions_repo.list_unwatched(db)
         polling["unwatched"] = len(unwatched)
         polling["unwatched_sessions"] = [row.id for row in unwatched[:UNWATCHED_LIMIT]]
+        # The one number not derived from a live worker. Everything above counts
+        # what the process is doing, so all of it reads perfect when the process
+        # is doing nothing — which is precisely the four-day outage.
+        silent = await sessions_repo.list_silent(
+            db, silent_after_ms=POLL_SILENT_MS, at=at
+        )
+        polling["silent"] = len(silent)
+        polling["silent_sessions"] = [row.id for row in silent[:SILENT_LIMIT]]
+        if silent:
+            oldest = (at - min(row.updated_at for row in silent)) // 1000
+            degradations.append(
+                Degradation(
+                    DEGRADATION_POLL_SILENT,
+                    f"{len(silent)} session(s) that should be polled have not "
+                    f"been touched in over {POLL_SILENT_MS // 60_000} minutes "
+                    f"(oldest {oldest}s). Somebody is waiting on a room nothing "
+                    "is watching — this counts the work, not the workers, so it "
+                    "is raised even when no poller exists to report it.",
+                )
+            )
         if polling["overdue"]:
             degradations.append(
                 Degradation(
@@ -1222,6 +1261,7 @@ __all__ = [
     "DEGRADATION_DELIVERY_STALLED",
     "DEGRADATION_DELIVERY_STRANDED",
     "DEGRADATION_LEASE_LOST",
+    "DEGRADATION_POLL_SILENT",
     "DEGRADATION_POLL_LAG",
     "DEGRADATION_RATE_LIMITED",
     "DEGRADATION_TELEGRAM",

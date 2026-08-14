@@ -27,6 +27,7 @@ from ctb.db.repo import deliveries as deliveries_repo
 from ctb.db.repo import events as events_repo
 from ctb.db.repo import lease as lease_repo
 from ctb.db.repo import sessions as sessions_repo
+from ctb.db.repo import tenancy
 from ctb.health import (
     API_EVENT_LIMIT,
     DEGRADATION_AUTH_FATAL,
@@ -38,6 +39,7 @@ from ctb.health import (
     DEGRADATION_DELIVERY_STRANDED,
     DEGRADATION_LEASE_LOST,
     DEGRADATION_POLL_LAG,
+    DEGRADATION_POLL_SILENT,
     DEGRADATION_RATE_LIMITED,
     DEGRADATION_TELEGRAM,
     DELIVERY_BACKLOG,
@@ -67,9 +69,10 @@ from ctb.health import (
 )
 from ctb.settings import Settings, reset_settings
 from tests.conftest import FAKE_API_KEY, FakeClock
-from tests.pg import as_tenant, worker_dsn
+from tests.pg import BOOTSTRAP_TENANT_ID, as_tenant, worker_dsn
 
 WALL = 1_700_000_000_000  # a fixed epoch-ms "now" for every deterministic test
+HOUR_MS = 60 * 60_000
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -572,6 +575,116 @@ async def test_a_workspace_that_stopped_being_watched_is_counted(
     assert report.polling["bound_sessions"] == 1
     assert report.polling["unwatched"] == 1
     assert report.polling["unwatched_sessions"] == ["dropped"]
+
+
+async def test_a_latched_tenant_is_reported_silent_not_healthy(
+    system_db: Database,
+) -> None:
+    """The four-day outage, reproduced: every other signal reads perfect.
+
+    ``auth_failed_at`` drops the tenant from ``list_bound``, which is the query
+    ``polling`` is built from — so ``bound_sessions`` is 0, ``overdue`` is 0,
+    and no poll-lag degradation can fire. ``unwatched`` needs ``NOT is_bound``
+    and this session stays bound. No client is in the pool to carry a 401.
+    Nothing was polled, so nothing was queued.
+
+    Live, that combination answered ``ok`` for four days while the bot did
+    absolutely nothing. ``polling.silent`` is the one number counted from the
+    work rather than from the workers.
+    """
+    async with as_tenant():
+        await sessions_repo.upsert(
+            system_db, "abandoned", chat_id=-100123, thread_id=7, at=WALL - HOUR_MS
+        )
+        # Stamped *now*, in real time: `list_bound` compares against the wall
+        # clock, and a stamp older than the retry window would be readmitted —
+        # which is the other half of this fix and not what is under test here.
+        await tenancy.mark_auth_failed(system_db, BOOTSTRAP_TENANT_ID, reason="401")
+
+        report = await make_monitor(db=system_db).report()
+
+    # Every pre-existing signal still reads clean — that is the point.
+    assert report.polling["bound_sessions"] == 0
+    assert report.polling["overdue"] == 0
+    assert report.polling["unwatched"] == 0
+    assert not report.has(DEGRADATION_POLL_LAG)
+
+    # And the report is no longer fooled by it.
+    assert report.polling["silent"] == 1
+    assert report.polling["silent_sessions"] == ["abandoned"]
+    assert report.has(DEGRADATION_POLL_SILENT)
+    assert report.status is HealthStatus.DEGRADED
+
+
+async def test_silence_counts_work_owed_not_work_declined(
+    system_db: Database,
+) -> None:
+    """A number that cries wolf is one nobody reads, so absence has limits.
+
+    Three things look like silence and are not: a tenant that never set a key,
+    one an operator suspended on purpose, and a session that was archived. Each
+    would otherwise pin the report amber forever — the failure mode that made
+    ``delivery_failed`` need a window.
+    """
+    async with as_tenant():
+        for index, session_id in enumerate(("waiting", "archived-away")):
+            await sessions_repo.upsert(
+                system_db,
+                session_id,
+                chat_id=-100123,
+                thread_id=7 + index,
+                at=WALL - HOUR_MS,
+            )
+
+        await tenancy.set_conductor_key(
+            system_db, BOOTSTRAP_TENANT_ID, ciphertext=None, kid=None, fingerprint=None
+        )
+        report = await make_monitor(db=system_db).report()
+        assert report.polling["silent"] == 0  # no key: unconfigured, not broken
+
+        await tenancy.set_conductor_key(
+            system_db,
+            BOOTSTRAP_TENANT_ID,
+            ciphertext=b"sealed",
+            kid="v1",
+            fingerprint="fp",
+        )
+        report = await make_monitor(db=system_db).report()
+        assert report.polling["silent"] == 2
+
+        # Written directly, still bound, so the `archived_at` guard is the only
+        # thing that can exclude it — `mark_archived` unbinds too, which would
+        # let the test pass for the wrong reason.
+        await sessions_repo.update(
+            system_db, "archived-away", at=WALL - HOUR_MS, archived_at=WALL - HOUR_MS
+        )
+        report = await make_monitor(db=system_db).report()
+        assert report.polling["silent"] == 1
+        assert report.polling["silent_sessions"] == ["waiting"]
+
+        await tenancy.set_status(system_db, BOOTSTRAP_TENANT_ID, "suspended")
+        report = await make_monitor(db=system_db).report()
+        assert report.polling["silent"] == 0  # stopped on purpose
+        assert not report.has(DEGRADATION_POLL_SILENT)
+
+
+async def test_a_freshly_polled_session_is_not_silent(system_db: Database) -> None:
+    """The cadence tops out at 120s, so the threshold has a lot of daylight."""
+    async with as_tenant():
+        await tenancy.set_conductor_key(
+            system_db,
+            BOOTSTRAP_TENANT_ID,
+            ciphertext=b"sealed",
+            kid="v1",
+            fingerprint="fp",
+        )
+        await sessions_repo.upsert(
+            system_db, "busy", chat_id=-100123, thread_id=7, at=WALL - 60_000
+        )
+        report = await make_monitor(db=system_db).report()
+
+    assert report.polling["silent"] == 0
+    assert not report.has(DEGRADATION_POLL_SILENT)
 
 
 # ── deliveries ───────────────────────────────────────────────────────────────

@@ -39,6 +39,19 @@ from its first tagged release.
 
 ### Fixed
 
+- **`/health` can finally see its own absence.** During the four-day polling
+  outage the report read `ok` at HTTP 200 the whole time, so Railway never
+  restarted anything and nothing paged anybody: `polling` is built from
+  `list_bound`, and that query's `auth_failed_at` filter *was* the outage;
+  `unwatched` needs `NOT is_bound`; the auth counter iterates live clients and
+  every client had been swept; nothing polled means nothing queued. Zero
+  pollers doing zero work is indistinguishable from perfect health to all of
+  them. `sessions.list_silent` counts the *work owed* instead of the workers —
+  bound, unarchived sessions of an active, keyed tenant that nothing has
+  touched in 10 minutes — with no `auth_failed_at` filter, and raises the new
+  `poll_silent` degradation. Deliberately still zero for a tenant with no key,
+  a suspended tenant or an archived session, so it cannot become the amber
+  light nobody reads.
 - **One transient 401 no longer takes a whole team off the air indefinitely.**
   A single `401` — the only two in 2,246 live requests, arriving either side of
   a `500 timeout exceeded when trying to connect` and a `ReadTimeout` — stamped

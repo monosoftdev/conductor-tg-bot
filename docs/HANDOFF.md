@@ -76,6 +76,51 @@ of a single request.
 **The live database was repaired by clearing both stamps**; polling resumed
 within five seconds, on the same keys, all 200s. Nothing else was touched.
 
+## `/health` said `ok` for all four days (2026-08-14)
+
+The worst finding of the day is not either bug. It is that **the bot was 100%
+dark and its own health report was green**, so Railway never restarted it and
+nothing ever paged anybody. The outage ended because a human tried to use the
+product.
+
+Every signal in the report is computed from work the process is *observably
+doing*, and each one is therefore blind in exactly the case where it stops
+doing any:
+
+| signal | why it read clean |
+|---|---|
+| `polling.bound_sessions` / `overdue` | built from `sessions.list_bound` — the query whose `auth_failed_at` filter **was** the outage. Zero rows in, zero overdue out. |
+| `polling.unwatched` | requires `NOT is_bound`; these sessions stayed bound. |
+| `conductor.auth_failures` | iterates **live clients** in the pool. Every poller was cancelled, so the clients were swept and there was nothing left to carry the 401. |
+| `deliveries.*` | nothing polled means nothing queued, so no backlog, no stall, no stranded row. |
+
+A monitor assembled from live workers cannot see the case where there are no
+live workers. Zero pollers doing zero work is byte-for-byte "perfectly caught
+up".
+
+`sessions.list_silent` asks the inverse question — *what should be happening
+and isn't* — and it is deliberately built to survive every mechanism below it.
+It does **not** filter on `auth_failed_at`, and it does not care whether a
+poller exists; it joins `sessions` to `tenants` and asks whether any room
+somebody is waiting on has gone untouched for `POLL_SILENT_MS`. What it still
+excludes is work that is *meant* to be stopped, so the number stays honestly
+zero in normal use: a tenant with no key is unconfigured, a suspended tenant was
+stopped on purpose, and an archived or `DEAD` session has no poller by design.
+
+The threshold is 10 minutes, and that is measured rather than guessed. Against
+the live database: at 0s it sees all four bound sessions, at 60s it sees one —
+a session legitimately sitting on the decayed idle cadence — and at 600s it sees
+none. `CADENCE_IDLE_DECAY_MS` tops out at 120s, so 10 minutes is five times the
+slowest honest silence and a non-zero count is never a matter of interpretation.
+
+**Still open, and it is the one that matters most.** `poll_silent` is a
+degradation, so it reports at HTTP 200 and shows in `/health` — which still
+requires somebody to *look*. The bot holds an open channel to the exact person
+who cares, and does not use it to say it is broken. A watchdog that messages a
+tenant's owners once per episode ("nothing has polled *acme-api/main* for 30
+minutes — reason: …") is what turns four days into thirty minutes, and it is
+not built yet.
+
 ## …and one voice note died of the same disease (2026-08-14)
 
 Reported separately, an hour later: *"Failed: HTTP Client says - Request timeout

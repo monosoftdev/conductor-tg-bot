@@ -369,6 +369,60 @@ async def list_unwatched(db: Database) -> list[SessionRow]:
     return [SessionRow.from_row(row) for row in rows]
 
 
+async def list_silent(
+    db: Database, *, silent_after_ms: int, at: int | None = None
+) -> list[SessionRow]:
+    """Sessions that *ought* to be polling and are not. The absence census.
+
+    Every other number in ``/health`` is derived from work the process is
+    observably doing, and that is exactly why the report read ``ok`` through
+    four days of total silence. ``polling`` counts what ``list_bound`` returns —
+    the same query whose ``auth_failed_at`` filter *was* the outage — so with
+    both tenants dropped there were zero bound sessions, therefore zero overdue,
+    therefore nothing to report. ``unwatched`` needs ``NOT is_bound`` and these
+    stayed bound. The client pool had no clients left to count a 401 on. A
+    monitor assembled only from live workers cannot see the case where there
+    are no live workers.
+
+    So this query deliberately **omits the gates that can hide the work**: it
+    does not filter on ``auth_failed_at``, and it does not care whether a poller
+    exists. It asks the one question that survives every mechanism below it —
+    *is there a room somebody is waiting on whose session has not been touched
+    in ``silent_after_ms``?*
+
+    What it still excludes is work that is *meant* not to be running, so the
+    number stays honestly zero in normal operation:
+
+    * a tenant with no Conductor key is unconfigured, not silent;
+    * a ``suspended`` or ``deleted`` tenant was stopped on purpose, and an
+      operator's decision must not read as an incident;
+    * an archived, unbound or ``DEAD`` session has no poller by design.
+
+    The threshold wants to be well clear of the slowest legitimate cadence —
+    ``CADENCE_IDLE_DECAY_MS`` tops out at 120s — so that a non-zero count is
+    never a matter of interpretation.
+    """
+    stamp = now_ms() if at is None else at
+    qualified = ", ".join(f"s.{name.strip()}" for name in _COLUMNS.split(","))
+    rows = await db.fetch_all(
+        f"""
+        SELECT {qualified}
+          FROM sessions s
+          JOIN tenants t ON t.id = s.tenant_id
+         WHERE s.is_bound
+           AND s.chat_id IS NOT NULL
+           AND s.archived_at IS NULL
+           AND s.turn_state != 'DEAD'
+           AND t.status = 'active'
+           AND t.conductor_key_ct IS NOT NULL
+           AND s.updated_at <= ?
+         ORDER BY s.updated_at
+        """,
+        (stamp - max(0, silent_after_ms),),
+    )
+    return [SessionRow.from_row(row) for row in rows]
+
+
 async def list_all(db: Database) -> list[SessionRow]:
     rows = await db.fetch_all(
         f"SELECT {_COLUMNS} FROM sessions ORDER BY created_at DESC"
