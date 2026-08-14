@@ -25,6 +25,7 @@ from typing import Any, Self
 from ctb.conductor.models import SessionStatusValue, WorkspaceStatusValue
 from ctb.db import NO_THREAD_ID
 from ctb.db.connection import Database, Row, now_ms
+from ctb.db.repo import tenancy
 from ctb.db.repo._util import (
     UNSET,
     Maybe,
@@ -304,6 +305,16 @@ async def list_bound(db: Database) -> list[SessionRow]:
     ``active``, or stamping ``auth_failed_at``, stops that tenant's polling on
     the next pass with no code path involved and nobody else affected.
 
+    **The auth latch is a pause, not a tombstone.** A tenant reappears here once
+    its ``auth_failed_at`` is older than :data:`tenancy.AUTH_RETRY_AFTER_MS`, so
+    membership in this result *is* permission to try the key again — and the
+    supervisor treats it that way, discarding its in-memory latch for anyone who
+    comes back. Suspension has no such clock on purpose: ``status`` is a
+    deliberate act by an operator and only another one should undo it, whereas a
+    401 is a remote server's opinion of one request. Written as `IS NULL OR <=`
+    rather than a `COALESCE`, so the partial index on the join still applies to
+    the common case where nobody has failed at all.
+
     Ordered by tenant so the supervisor can round-robin, and by turn state
     within each tenant so a starved tenant still gets its *busy* sessions
     polled.
@@ -316,12 +327,13 @@ async def list_bound(db: Database) -> list[SessionRow]:
          WHERE s.is_bound
            AND s.turn_state != 'DEAD'
            AND t.status = 'active'
-           AND t.auth_failed_at IS NULL
+           AND (t.auth_failed_at IS NULL OR t.auth_failed_at <= ?)
          ORDER BY
             s.tenant_id,
             CASE WHEN s.turn_state IN {_ACTIVE_STATES_SQL} THEN 0 ELSE 1 END,
             s.updated_at DESC
-        """
+        """,
+        (now_ms() - tenancy.AUTH_RETRY_AFTER_MS,),
     )
     return [SessionRow.from_row(row) for row in rows]
 

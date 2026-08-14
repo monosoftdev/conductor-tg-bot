@@ -18,6 +18,64 @@ Verified offline, on every commit:
 - The real runtime boots against a real database: all seven services start,
   `/health` returns `ok`, the lease is acquired, shutdown is clean.
 
+## One 401 took two teams off the air for four days (2026-08-14)
+
+Reported as *"nothing works — I attach to an existing session and see errors."*
+Everything about that report was true except the diagnosis: attaching worked
+perfectly. Nothing was ever going to arrive afterwards.
+
+The database says it plainly. Polling ran normally until **2026-08-10 18:58**,
+when the Conductor API wobbled: a `500 timeout exceeded when trying to connect`,
+then a `ReadTimeout` a minute later — and, between them, one `401 Unauthorized
+client request` for tenant `reclaimly` at 18:59:35 and one for `dteam` at
+19:00:44. In `api_events` those two 401s are the **only** two in 2,246 requests.
+Every other request either side of them, on the same keys, returned 200 —
+including the `/attach` the owner ran four days later, which is why the bot
+looked alive while answering nothing.
+
+A 401 raises `AuthFatal`, which is never retried. One of those, from one
+request, stamped `tenants.auth_failed_at`; `sessions.list_bound` drops any
+tenant carrying that stamp; so the supervisor spawned **zero** pollers for both
+teams from that minute on. Between 2026-08-10 19:00 and the repair there is not
+one background API call in the table. Meanwhile the process stayed up — same
+lease holder for five days — and every command still worked, because commands
+use the tenant's client directly and never consult the latch.
+
+Three things had to line up for four days of silence, and the third is the one
+worth remembering:
+
+- **A single 401 was treated as proof.** It is proof of one bad *response*. The
+  code's own comment — *"the failure is not going to fix itself"* — was the
+  assumption that failed. `_key_still_rejected` now asks once more on `GET /me`
+  before stopping a team; only a second 401 latches. A timeout, a 5xx or an
+  unreachable host proves nothing about the key and is written off as a blip,
+  because a real rejection simply 401s again on the next poll.
+- **The latch had no clock.** Only `set_conductor_key` cleared it, so recovery
+  required a person to know that the fix for "my bot went quiet" is to re-send
+  `/key` — a thing nothing in the chat said, and nothing could have said, since
+  the notice fires once and scrolls away. `auth_failed_at` now expires after
+  `AUTH_RETRY_AFTER_MS` (15 minutes) and `list_bound` lets one poller back
+  through to ask again. One probe per quarter hour is nothing a rate limiter
+  could mistake for a lockout attempt, which is the only thing the no-retry rule
+  was protecting. The stamp is also **refreshed** on each fresh rejection
+  instead of being kept — a stamp that never moves is a window that never
+  closes.
+- **The in-memory half could not save the database half.** `auth_fatal_tenants`
+  already cleared itself when a client's counter went to zero, and that recovery
+  was unreachable in production: with the row filtered out there is no poller,
+  with no poller there is no client, and with no client there is no counter to
+  clear. `_readmit_expired_latches` makes the row the authority — a tenant
+  reappearing from `list_bound` *is* permission to try again — and forgets the
+  pooled client on the way, because the owner's likeliest response to "your key
+  was rejected" is a new key.
+
+Suspension deliberately has no such clock: `status` is an operator's decision
+and only another one should undo it, whereas a 401 is a remote server's opinion
+of a single request.
+
+**The live database was repaired by clearing both stamps**; polling resumed
+within five seconds, on the same keys, all 200s. Nothing else was touched.
+
 ## The pipe was clogged by design (2026-08-08)
 
 Measured on the live database, across 157 real deliveries: the time from a row

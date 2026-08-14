@@ -39,6 +39,18 @@ from its first tagged release.
 
 ### Fixed
 
+- **One transient 401 no longer takes a whole team off the air indefinitely.**
+  A single `401` — the only two in 2,246 live requests, arriving either side of
+  a `500 timeout exceeded when trying to connect` and a `ReadTimeout` — stamped
+  `tenants.auth_failed_at` for two unrelated teams sixty-nine seconds apart.
+  `sessions.list_bound` drops any tenant carrying that stamp, so both stopped
+  polling entirely; the process stayed up, every command kept working on the
+  same keys, and no background API call was made for four days. Only re-sending
+  `/key` cleared it, and nothing on screen said so. Now a 401 is corroborated
+  with one `GET /me` before a team is stopped at all, and the stamp expires
+  after 15 minutes so one poller is let back through to ask again — refreshed
+  on each fresh rejection, so a genuinely revoked key still waits. Suspension
+  keeps its permanence: that one is an operator's decision, not a proxy's.
 - **A database one migration behind now fails the boot, by name.** The gate
   only asked whether *any* schema was present, but the repo layer names its
   columns — so a deploy that skipped `ctb.db.bootstrap` came up, `/health`
