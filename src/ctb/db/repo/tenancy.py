@@ -38,6 +38,7 @@ from ctb.db.repo._util import (
 )
 
 __all__ = [
+    "AUTH_RETRY_AFTER_MS",
     "ROLE_ORDER",
     "RoleError",
     "TenantChat",
@@ -76,6 +77,23 @@ __all__ = [
 #: Ascending authority. ``admin`` and ``owner`` both pass ``is_owner`` checks;
 #: only ``owner`` may delete the tenant or remove another owner.
 ROLE_ORDER: Final[dict[str, int]] = {"member": 0, "admin": 1, "owner": 2}
+
+#: How long ``auth_failed_at`` keeps a tenant dark before one poller is let
+#: back through to ask again.
+#:
+#: The latch used to have no clock at all: ``sessions.list_bound`` dropped any
+#: tenant with a stamp, and only ``set_conductor_key`` ever cleared it. So a
+#: *single* 401 — one Conductor proxy answered 401 in the middle of an upstream
+#: wobble, sixty seconds apart, for two unrelated teams — stopped every poller
+#: those teams had, permanently, while the same key kept returning 200 to every
+#: command the bot ran by hand. Nothing short of re-sending ``/key`` brought
+#: them back, and nothing in the chat said which key to re-send or why.
+#:
+#: Fifteen minutes is chosen against the thing the no-retry rule exists to
+#: avoid: one probe per quarter hour cannot look like a credential-stuffing
+#: loop to any rate limiter, and it bounds a false latch to an outage a person
+#: waits out rather than one they have to diagnose.
+AUTH_RETRY_AFTER_MS: Final[int] = 15 * 60 * 1000
 
 type TenantStatus = str  # 'pending' | 'active' | 'suspended' | 'deleted'
 
@@ -504,13 +522,24 @@ async def mark_auth_failed(
     reason: str | None = None,
     at: int | None = None,
 ) -> None:
-    """Stop this tenant's pollers. Cleared by :func:`set_conductor_key`."""
+    """Pause this tenant's pollers for :data:`AUTH_RETRY_AFTER_MS`.
+
+    Cleared early by :func:`set_conductor_key`; otherwise it expires on its own
+    and ``sessions.list_bound`` lets one poller back through to ask again.
+
+    The stamp is **refreshed**, not kept. It used to carry ``AND auth_failed_at
+    IS NULL`` so the first rejection's time survived — which was free while the
+    latch was permanent and is a bug now that the same column is the clock: a
+    stamp that never moves forward is a window that never closes, so a genuinely
+    revoked key would be re-probed on every pass instead of every fifteen
+    minutes. Each fresh rejection restarts the wait.
+    """
     stamp = now_ms() if at is None else at
     await db.execute(
         """
         UPDATE tenants
            SET auth_failed_at = ?, auth_failed_reason = ?, updated_at = ?
-         WHERE id = ? AND auth_failed_at IS NULL
+         WHERE id = ?
         """,
         (stamp, reason, stamp, tenant_id),
     )

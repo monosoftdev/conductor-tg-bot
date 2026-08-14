@@ -283,6 +283,7 @@ class Supervisor:
         # Rebuilt every pass: a suspension or a rotated key must be seen now.
         self._tenant_rows.clear()
         rows = await sessions.list_bound(self.system_db)
+        await self._readmit_expired_latches(rows)
         # Load the quotas *before* selecting. `_quota` reads this cache, and
         # filling it lazily inside `_spawn` — which runs after — meant every
         # tenant silently got the global ceiling instead of its own.
@@ -355,6 +356,78 @@ class Supervisor:
                 tenants=len(by_tenant),
             )
         return chosen
+
+    async def _readmit_expired_latches(self, rows: Sequence[SessionRow]) -> None:
+        """Let go of the in-memory latch for anyone the database let back in.
+
+        ``sessions.list_bound`` is the clock: it returns a tenant again once its
+        ``auth_failed_at`` is older than ``AUTH_RETRY_AFTER_MS``. Being in
+        ``rows`` therefore *is* permission to try the key again — and without
+        this, it would not be enough. ``_auth_fatal`` is a set in this process,
+        ``is_auth_fatal`` is consulted before every spawn, and its only escape
+        hatch reads a counter off a live client, so a tenant whose pollers were
+        all cancelled has no client to clear the counter on and would stay dark
+        until the next deploy no matter what the row said.
+
+        The pooled client goes too, not just the flag: the owner's most likely
+        response to "your key was rejected" is to set a new one, and a cached
+        client is a header built from the old ciphertext.
+        """
+        returning = self._auth_fatal & {
+            row.tenant_id for row in rows if row.tenant_id is not None
+        }
+        for tenant_id in returning:
+            self._auth_fatal.discard(tenant_id)
+            self._auth_notified.discard(tenant_id)
+            await self.clients.forget(tenant_id)
+            _log.info("supervisor.auth_retry_admitted", tenant=str(tenant_id))
+
+    async def _key_still_rejected(self, tenant_id: uuid.UUID) -> bool:
+        """Corroborate one 401 with a second question before stopping a team.
+
+        A 401 is proof of one bad *response*, not of a bad key. Live evidence:
+        two unrelated tenants were latched sixty-nine seconds apart, either side
+        of a 500 ``timeout exceeded when trying to connect`` and a ``ReadTimeout``
+        — Conductor's proxy answering 401 through an upstream wobble — while the
+        very same keys went on returning 200 to every request the bot made by
+        hand for the next four days.
+
+        So ask once more, on the cheapest endpoint there is. Only a second 401
+        latches. Anything else — a timeout, a 5xx, an unreachable host — proves
+        nothing about the key and is treated as a blip: the poller restarts on
+        the ordinary backoff and a genuine rejection simply 401s again there.
+        """
+        client = self.clients.peek(tenant_id)
+        if client is None:
+            tenant = await self._tenant(tenant_id)
+            if tenant is None:
+                return True
+            try:
+                client = await self.clients.get(tenant)
+            except MissingKeyError:
+                # Revoked between the poll and here. Nothing to probe with.
+                return True
+            except Exception as exc:
+                _log.warning(
+                    "supervisor.auth_probe_unavailable",
+                    tenant=str(tenant_id),
+                    error=repr(exc),
+                )
+                return True
+        try:
+            await client.get_me()
+        except AuthFatal:
+            return True
+        except Exception as exc:
+            _log.warning(
+                "supervisor.auth_probe_inconclusive",
+                tenant=str(tenant_id),
+                error=repr(exc),
+            )
+            return False
+        # A 2xx also zeroed the client's own auth counter, which is what clears
+        # `auth_fatal_tenants`'s `rejecting` half for the sibling pollers.
+        return False
 
     def _quota(self, tenant_id: uuid.UUID) -> int:
         row = self._tenant_rows.get(tenant_id)
@@ -469,31 +542,27 @@ class Supervisor:
             self._restart.pop(session_id, None)
             return
         if isinstance(error, AuthFatal):
-            _log.error(
-                "supervisor.auth_fatal", session_id=session_id, tenant=str(tenant_id)
-            )
             if tenant_id is None:  # pragma: no cover - set by _spawn
                 return
-            self._auth_fatal.add(tenant_id)
-            # Only this tenant stops. Everyone else keeps polling.
-            await self._cancel_tenant(tenant_id)
-            await tenancy.mark_auth_failed(
-                self.system_db, tenant_id, reason="Conductor rejected the API key"
+            # One 401 stops one poller. Stopping the whole *team* — and telling
+            # its owners their key was rejected — needs a second opinion, since
+            # that verdict silences every session they have.
+            if await self._key_still_rejected(tenant_id):
+                _log.error(
+                    "supervisor.auth_fatal",
+                    session_id=session_id,
+                    tenant=str(tenant_id),
+                )
+                await self._latch_auth_fatal(session_id, tenant_id)
+                return
+            _log.warning(
+                "supervisor.auth_fatal_unconfirmed",
+                session_id=session_id,
+                tenant=str(tenant_id),
             )
-            notify = getattr(self.action_sink, "auth_fatal", None)
-            if callable(notify) and tenant_id not in self._auth_notified:
-                self._auth_notified.add(tenant_id)
-                try:
-                    await cast(Callable[[str, uuid.UUID], Awaitable[None]], notify)(
-                        session_id, tenant_id
-                    )
-                except Exception as exc:
-                    _log.error(
-                        "supervisor.auth_notice_failed",
-                        session_id=session_id,
-                        error=repr(exc),
-                    )
-            return
+            self._auth_fatal.discard(tenant_id)
+            self._auth_notified.discard(tenant_id)
+            # Fall through: this poller restarts on the ordinary backoff.
 
         restart = self._restart.setdefault(session_id, _Restart())
         restart.failures += 1
@@ -506,6 +575,28 @@ class Supervisor:
             restart_in_s=delay,
             error=repr(error),
         )
+
+    async def _latch_auth_fatal(self, session_id: str, tenant_id: uuid.UUID) -> None:
+        """Stop one tenant and say so once, until the retry window expires."""
+        self._auth_fatal.add(tenant_id)
+        # Only this tenant stops. Everyone else keeps polling.
+        await self._cancel_tenant(tenant_id)
+        await tenancy.mark_auth_failed(
+            self.system_db, tenant_id, reason="Conductor rejected the API key"
+        )
+        notify = getattr(self.action_sink, "auth_fatal", None)
+        if callable(notify) and tenant_id not in self._auth_notified:
+            self._auth_notified.add(tenant_id)
+            try:
+                await cast(Callable[[str, uuid.UUID], Awaitable[None]], notify)(
+                    session_id, tenant_id
+                )
+            except Exception as exc:
+                _log.error(
+                    "supervisor.auth_notice_failed",
+                    session_id=session_id,
+                    error=repr(exc),
+                )
 
     async def _drop(self, session_id: str, *, cancel: bool) -> None:
         poller = self._pollers.pop(session_id, None)

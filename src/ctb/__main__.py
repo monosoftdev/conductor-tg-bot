@@ -92,7 +92,7 @@ _BOOTSTRAP_COMMAND: Final = (
 #: ``ci`` joins it for the same reasons: it needs a token most teams will not
 #: have stored, it depends on GitHub being up, and a CI verdict nobody hears is
 #: not worth losing an agent reply over.
-OPTIONAL_SERVICES: Final[frozenset[str]] = frozenset({"voice", "ci"})
+OPTIONAL_SERVICES: Final[frozenset[str]] = frozenset({"voice", "ci", "watchdog"})
 
 
 class ServiceStoppedError(RuntimeError):
@@ -123,6 +123,7 @@ class RuntimeFactories:
     make_supervisor: Factory
     make_voice: Factory
     make_ci: Factory
+    make_watchdog: Factory
     make_health_monitor: Factory
     make_health_server: Factory
     make_app: Factory
@@ -145,6 +146,7 @@ class RuntimeServices:
     supervisor: Any | None = None
     voice: Any | None = None
     ci: Any | None = None
+    watchdog: Any | None = None
     health_monitor: Any | None = None
     health_server: Any | None = None
     app: Any | None = None
@@ -163,6 +165,7 @@ class RuntimeServices:
             ("status_cards", self.status_cards),
             ("voice", self.voice),
             ("ci", self.ci),
+            ("watchdog", self.watchdog),
             ("supervisor", self.supervisor),
             ("health", self.health_server),
         )
@@ -200,6 +203,7 @@ class RuntimeServices:
         for name, component, method_name in (
             ("voice", self.voice, "stop"),
             ("ci", self.ci, "stop"),
+            ("watchdog", self.watchdog, "stop"),
             ("supervisor", self.supervisor, "stop"),
             ("status_cards", self.status_cards, "stop"),
             ("outbox", self.outbox, "stop"),
@@ -521,6 +525,25 @@ def _default_make_ci(system_db: Any, outbox: Any, enabled: bool = True) -> Any:
     )
 
 
+def _default_make_watchdog(
+    bot: Any, db: Any, system_db: Any, outbox: Any, status_cards: Any
+) -> Any:
+    """The one service whose job is to notice the others have stopped.
+
+    It is built from the outbox and its own database handle, and takes no
+    reference to the supervisor at all — it has to be able to report that the
+    supervisor is doing nothing, which it could not do if it depended on the
+    supervisor to speak. Its own ``BotActionSink`` rather than a shared one for
+    the same reason: no object in the failure path is on the reporting path.
+    """
+    from ctb.bot.actions import BotActionSink
+    from ctb.watchdog import Watchdog
+
+    return Watchdog(
+        system_db, sink=BotActionSink(bot, db, system_db, outbox, status_cards)
+    )
+
+
 def _default_make_health_monitor(system_db: Any, clients: Any, holder: str) -> Any:
     from ctb.health import HealthMonitor
 
@@ -629,6 +652,7 @@ def production_factories() -> RuntimeFactories:
         make_supervisor=_default_make_supervisor,
         make_voice=_default_make_voice,
         make_ci=_default_make_ci,
+        make_watchdog=_default_make_watchdog,
         make_health_monitor=_default_make_health_monitor,
         make_health_server=_default_make_health_server,
         make_app=_default_make_app,
@@ -701,6 +725,13 @@ async def build_runtime(
                 required_schema_version=_CI_SCHEMA_VERSION,
             )
         runtime.ci = made.make_ci(runtime.system_db, runtime.outbox, ci_enabled)
+        runtime.watchdog = made.make_watchdog(
+            runtime.bot,
+            runtime.db,
+            runtime.system_db,
+            runtime.outbox,
+            runtime.status_cards,
+        )
         runtime.health_monitor = made.make_health_monitor(
             runtime.system_db,
             runtime.clients,

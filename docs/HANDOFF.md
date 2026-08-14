@@ -18,6 +18,205 @@ Verified offline, on every commit:
 - The real runtime boots against a real database: all seven services start,
   `/health` returns `ok`, the lease is acquired, shutdown is clean.
 
+## One 401 took two teams off the air for four days (2026-08-14)
+
+Reported as *"nothing works — I attach to an existing session and see errors."*
+Everything about that report was true except the diagnosis: attaching worked
+perfectly. Nothing was ever going to arrive afterwards.
+
+The database says it plainly. Polling ran normally until **2026-08-10 18:58**,
+when the Conductor API wobbled: a `500 timeout exceeded when trying to connect`,
+then a `ReadTimeout` a minute later — and, between them, one `401 Unauthorized
+client request` for tenant `reclaimly` at 18:59:35 and one for `dteam` at
+19:00:44. In `api_events` those two 401s are the **only** two in 2,246 requests.
+Every other request either side of them, on the same keys, returned 200 —
+including the `/attach` the owner ran four days later, which is why the bot
+looked alive while answering nothing.
+
+A 401 raises `AuthFatal`, which is never retried. One of those, from one
+request, stamped `tenants.auth_failed_at`; `sessions.list_bound` drops any
+tenant carrying that stamp; so the supervisor spawned **zero** pollers for both
+teams from that minute on. Between 2026-08-10 19:00 and the repair there is not
+one background API call in the table. Meanwhile the process stayed up — same
+lease holder for five days — and every command still worked, because commands
+use the tenant's client directly and never consult the latch.
+
+Three things had to line up for four days of silence, and the third is the one
+worth remembering:
+
+- **A single 401 was treated as proof.** It is proof of one bad *response*. The
+  code's own comment — *"the failure is not going to fix itself"* — was the
+  assumption that failed. `_key_still_rejected` now asks once more on `GET /me`
+  before stopping a team; only a second 401 latches. A timeout, a 5xx or an
+  unreachable host proves nothing about the key and is written off as a blip,
+  because a real rejection simply 401s again on the next poll.
+- **The latch had no clock.** Only `set_conductor_key` cleared it, so recovery
+  required a person to know that the fix for "my bot went quiet" is to re-send
+  `/key` — a thing nothing in the chat said, and nothing could have said, since
+  the notice fires once and scrolls away. `auth_failed_at` now expires after
+  `AUTH_RETRY_AFTER_MS` (15 minutes) and `list_bound` lets one poller back
+  through to ask again. One probe per quarter hour is nothing a rate limiter
+  could mistake for a lockout attempt, which is the only thing the no-retry rule
+  was protecting. The stamp is also **refreshed** on each fresh rejection
+  instead of being kept — a stamp that never moves is a window that never
+  closes.
+- **The in-memory half could not save the database half.** `auth_fatal_tenants`
+  already cleared itself when a client's counter went to zero, and that recovery
+  was unreachable in production: with the row filtered out there is no poller,
+  with no poller there is no client, and with no client there is no counter to
+  clear. `_readmit_expired_latches` makes the row the authority — a tenant
+  reappearing from `list_bound` *is* permission to try again — and forgets the
+  pooled client on the way, because the owner's likeliest response to "your key
+  was rejected" is a new key.
+
+Suspension deliberately has no such clock: `status` is an operator's decision
+and only another one should undo it, whereas a 401 is a remote server's opinion
+of a single request.
+
+**The live database was repaired by clearing both stamps**; polling resumed
+within five seconds, on the same keys, all 200s. Nothing else was touched.
+
+## The bot now tells you when it has stopped working (2026-08-14)
+
+`poll_silent` made the outage *visible*. It still needed somebody to open
+`/health` and look, which is the same failure with an extra step. The bot holds
+an open Telegram channel to the exact person who cares; `ctb.watchdog` is the
+service that finally uses it.
+
+**It does not live inside the supervisor.** The supervisor is a thing that can
+wedge, and a watchdog running on the wedged loop is not a watchdog. It is its
+own task in the `TaskGroup`, reads the database directly, builds its own
+`BotActionSink`, and holds no reference to the component it watches. It is an
+`OPTIONAL_SERVICE` for the mirror-image reason: a watchdog that could take the
+bot down with it would be worse than none.
+
+**Deduplication is a database key, not a flag in memory.** The alarm is keyed on
+when the silence *started* — the oldest silent session's `updated_at`, which by
+definition is not moving while the silence lasts — so every repeat collides on
+`deliveries`' primary key and PostgreSQL drops it. One message per episode,
+across restarts, with no state of ours to get wrong; a genuinely new episode has
+a different start and earns a new message. It is the same trick as the turn
+receipt and every `once_key`. The all-clear is the one piece of in-memory state,
+and deliberately so: a missed alarm is a bug, a missed reassurance is not.
+
+### Saying *why*, and knowing when to ask for a restart
+
+"Your workspace has gone quiet" is not actionable. `ctb.silence` attributes a
+cause from **durable evidence only** — never from the client pool, because when
+polling stops the pool is swept and there is no client left to interrogate,
+which is the same blindness that hid the outage:
+
+| observation | reading |
+|---|---|
+| `auth_failed_at` set | the key was rejected; `/key` fixes it, and the latch now expires anyway |
+| no API calls at all | nothing is even *trying* — this is the wedge |
+| calls made, none succeeded | the upstream is down; waiting is the fix |
+
+That attribution is also what makes the second half safe. `/health` gained its
+first new fatal condition since the database check: **unexplained** silence
+lasting `POLL_WEDGED_MS` (30 minutes) returns 503, so Railway recycles the
+process. The bar is deliberately not severity but *"would a restart plausibly
+fix this?"* — a rejected key and a dead Conductor are both worse for the user
+and neither is fatal, because restarting into them stacks a restart loop on top
+of the outage. Explained silence stays at 200 however long it lasts.
+
+Five new tests, three mutation-checked reversals: keying the alarm on the tenant
+instead of the episode silences every outage after the first; treating an
+unexplained wedge as explained never restarts; treating any silence as fatal
+restarts during somebody else's outage.
+
+## `/health` said `ok` for all four days (2026-08-14)
+
+The worst finding of the day is not either bug. It is that **the bot was 100%
+dark and its own health report was green**, so Railway never restarted it and
+nothing ever paged anybody. The outage ended because a human tried to use the
+product.
+
+Every signal in the report is computed from work the process is *observably
+doing*, and each one is therefore blind in exactly the case where it stops
+doing any:
+
+| signal | why it read clean |
+|---|---|
+| `polling.bound_sessions` / `overdue` | built from `sessions.list_bound` — the query whose `auth_failed_at` filter **was** the outage. Zero rows in, zero overdue out. |
+| `polling.unwatched` | requires `NOT is_bound`; these sessions stayed bound. |
+| `conductor.auth_failures` | iterates **live clients** in the pool. Every poller was cancelled, so the clients were swept and there was nothing left to carry the 401. |
+| `deliveries.*` | nothing polled means nothing queued, so no backlog, no stall, no stranded row. |
+
+A monitor assembled from live workers cannot see the case where there are no
+live workers. Zero pollers doing zero work is byte-for-byte "perfectly caught
+up".
+
+`sessions.list_silent` asks the inverse question — *what should be happening
+and isn't* — and it is deliberately built to survive every mechanism below it.
+It does **not** filter on `auth_failed_at`, and it does not care whether a
+poller exists; it joins `sessions` to `tenants` and asks whether any room
+somebody is waiting on has gone untouched for `POLL_SILENT_MS`. What it still
+excludes is work that is *meant* to be stopped, so the number stays honestly
+zero in normal use: a tenant with no key is unconfigured, a suspended tenant was
+stopped on purpose, and an archived or `DEAD` session has no poller by design.
+
+The threshold is 10 minutes, and that is measured rather than guessed. Against
+the live database: at 0s it sees all four bound sessions, at 60s it sees one —
+a session legitimately sitting on the decayed idle cadence — and at 600s it sees
+none. `CADENCE_IDLE_DECAY_MS` tops out at 120s, so 10 minutes is five times the
+slowest honest silence and a non-zero count is never a matter of interpretation.
+
+**Still open, and it is the one that matters most.** `poll_silent` is a
+degradation, so it reports at HTTP 200 and shows in `/health` — which still
+requires somebody to *look*. The bot holds an open channel to the exact person
+who cares, and does not use it to say it is broken. A watchdog that messages a
+tenant's owners once per episode ("nothing has polled *acme-api/main* for 30
+minutes — reason: …") is what turns four days into thirty minutes, and it is
+not built yet.
+
+## …and one voice note died of the same disease (2026-08-14)
+
+Reported separately, an hour later: *"Failed: HTTP Client says - Request timeout
+error."* One row explains it, and it is the only voice job in the table:
+
+```
+tg_message_id 1687 · 7s · 28,439 bytes · elevenlabs/scribe_v2
+created 01:15:29 · updated 01:16:30 · state failed · attempts 1
+last_error  HTTP Client says - Request timeout error
+```
+
+Sixty-one seconds between claim and death, on a 28 KB download, with an
+aiogram `TelegramNetworkError` — the file fetch from Telegram timed out. There
+is nothing wrong with that happening; networks do it. What was wrong is that it
+was **terminal on the first try**.
+
+`MAX_ATTEMPTS = 3` exists and is real, but it is enforced only by
+`recover_stale`, which rescues a job whose *process* died — state left at
+`transcribing`, older than the orphan window. A worker that catches its own
+exception went straight to `voice_repo.fail`, unconditionally. So the transient
+network blip and the verdict *"No clear speech detected"* produced the same
+outcome, and the only way back was for the owner to notice the card and tap
+Retry.
+
+The split is on the exception class, because that is where the meaning already
+lives: **`TranscriptionError` is the verdict class.** The provider wraps every
+one of its own failures in it — refused, rate-limited, unreachable, timed out —
+alongside "no speech", "over 20 MB" and "no speech key". All of those say the
+same thing on a second run, and the vendor ones have already been paid for.
+Anything *else* escaping `_process` is infrastructure between us and Telegram or
+the database, and gets `voice_inputs.retry_after_error` while attempts remain.
+
+Two properties keep a replay from billing the customer twice, and both are in
+that one statement rather than in a read followed by a write:
+
+- A job that already has its transcript returns to `transcribed`, not
+  `received`, so the retry resumes at dispatch and never calls the speech vendor
+  again. Replaying the dispatch itself is free — `POST /sessions/{id}/messages`
+  takes a caller-supplied idempotency key.
+- `attempts` counts *transcription* claims, and `claim_next` increments it only
+  on `received`. The requeue adds one for the `transcribed` case, which is what
+  stops a failing dispatch retrying forever on a counter that never moves.
+
+The user-visible change is that the first two blips are silent — the
+"Transcribing…" ack simply stays up — and the card appears only when the budget
+is spent. It still names the real error, and it still carries Retry.
+
 ## The pipe was clogged by design (2026-08-08)
 
 Measured on the live database, across 157 real deliveries: the time from a row

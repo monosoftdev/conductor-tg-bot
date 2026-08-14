@@ -37,8 +37,62 @@ from its first tagged release.
 - The completion receipt names the files a turn changed, up to five and then a
   count.
 
+### Added
+
+- **A watchdog that tells you the bot has stopped working.** `ctb.watchdog` is
+  a new optional service that messages a team's owners — once per episode, with
+  the reason and the fix — when sessions they are waiting on have gone
+  unwatched. It runs outside the supervisor on purpose, since a watchdog on a
+  wedged loop is not a watchdog, and dedupes on `deliveries`' primary key using
+  the moment the silence began, so one outage is one message even across a
+  redeploy. `ctb.silence` attributes the cause from durable evidence only —
+  `auth_failed_at`, and whether any API call was even attempted — because when
+  polling stops the client pool is swept and there is nothing live left to ask.
+- **Unexplained silence now fails the healthcheck.** `/health` gained its first
+  new fatal condition since the database check: 30 minutes of silence with
+  nothing to blame — no rejected key, no failing upstream, no calls attempted —
+  returns 503 so Railway recycles the process. The bar is "would a restart
+  plausibly fix this?", not severity, so a rejected key and a dead Conductor
+  both stay at 200 however long they last; restarting into either would stack a
+  restart loop on top of the outage.
+
 ### Fixed
 
+- **`/health` can finally see its own absence.** During the four-day polling
+  outage the report read `ok` at HTTP 200 the whole time, so Railway never
+  restarted anything and nothing paged anybody: `polling` is built from
+  `list_bound`, and that query's `auth_failed_at` filter *was* the outage;
+  `unwatched` needs `NOT is_bound`; the auth counter iterates live clients and
+  every client had been swept; nothing polled means nothing queued. Zero
+  pollers doing zero work is indistinguishable from perfect health to all of
+  them. `sessions.list_silent` counts the *work owed* instead of the workers —
+  bound, unarchived sessions of an active, keyed tenant that nothing has
+  touched in 10 minutes — with no `auth_failed_at` filter, and raises the new
+  `poll_silent` degradation. Deliberately still zero for a tenant with no key,
+  a suspended tenant or an archived session, so it cannot become the amber
+  light nobody reads.
+- **One transient 401 no longer takes a whole team off the air indefinitely.**
+  A single `401` — the only two in 2,246 live requests, arriving either side of
+  a `500 timeout exceeded when trying to connect` and a `ReadTimeout` — stamped
+  `tenants.auth_failed_at` for two unrelated teams sixty-nine seconds apart.
+  `sessions.list_bound` drops any tenant carrying that stamp, so both stopped
+  polling entirely; the process stayed up, every command kept working on the
+  same keys, and no background API call was made for four days. Only re-sending
+  `/key` cleared it, and nothing on screen said so. Now a 401 is corroborated
+  with one `GET /me` before a team is stopped at all, and the stamp expires
+  after 15 minutes so one poller is let back through to ask again — refreshed
+  on each fresh rejection, so a genuinely revoked key still waits. Suspension
+  keeps its permanence: that one is an operator's decision, not a proxy's.
+- **A voice note no longer dies of one network timeout.** `MAX_ATTEMPTS = 3`
+  was enforced only for a job whose *process* died; a worker that caught its own
+  exception failed the row on attempt 1 regardless of the error. Live, that
+  turned a 60-second `TelegramNetworkError` fetching a 28 KB file into a dead
+  note with a Retry button somebody had to notice and tap. Infrastructure
+  errors now requeue while attempts remain, while `TranscriptionError` — the
+  class the provider wraps every one of its own failures in, alongside "no
+  clear speech" and "over 20 MB" — stays terminal on the first try, because
+  those say the same thing twice and were already billed. A job holding its
+  transcript resumes at dispatch, so no retry pays the speech vendor twice.
 - **A database one migration behind now fails the boot, by name.** The gate
   only asked whether *any* schema was present, but the repo layer names its
   columns — so a deploy that skipped `ctb.db.bootstrap` came up, `/health`

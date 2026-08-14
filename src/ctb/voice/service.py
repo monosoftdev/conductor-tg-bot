@@ -315,6 +315,24 @@ class VoiceService:
                     await self._send_failure(row, error)
             except Exception as exc:
                 error = short_error(exc)
+                # `TranscriptionError` is the verdict class: no clear speech,
+                # over the size limit, no key, the vendor refused. Every one of
+                # those says the same thing on a second run, and the vendor ones
+                # were already paid for. Anything *else* reaching here is
+                # infrastructure between us and Telegram or the database — and
+                # the note that started this was killed by exactly that, a
+                # `TelegramNetworkError` sixty seconds into downloading 28 KB.
+                retryable = not isinstance(exc, TranscriptionError)
+                if retryable and await self._retry_later(row, error):
+                    log.warning(
+                        "voice.job_retrying",
+                        chat_id=row.chat_id,
+                        tg_message_id=row.tg_message_id,
+                        worker=index,
+                        attempts=row.attempts,
+                        error=error,
+                    )
+                    return
                 log.warning(
                     "voice.job_failed",
                     chat_id=row.chat_id,
@@ -326,6 +344,18 @@ class VoiceService:
                     await voice_repo.fail(self.db, row, error=error)
                 with suppress(Exception):
                     await self._send_failure(row, error)
+
+    async def _retry_later(self, row: VoiceInputRow, error: str) -> bool:
+        """Requeue, unless the write itself fails — then fail the job honestly.
+
+        A swallowed exception here would leave the row in ``transcribing`` with
+        nothing said in the chat, which is the one outcome worse than the card.
+        """
+        try:
+            return await voice_repo.retry_after_error(self.db, row, error=error)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("voice.retry_write_failed", error=short_error(exc))
+            return False
 
     async def _sweep(self) -> None:
         """Re-queue rows abandoned mid-flight, without waiting for a restart.

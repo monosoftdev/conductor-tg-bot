@@ -27,7 +27,7 @@ from ctb.bot.app import PostgresStorage, install_middleware
 from ctb.bot.middleware.tenancy import TenantContext
 from ctb.conductor.pool import ClientPool
 from ctb.crypto import SecretBox
-from ctb.db.connection import Database, tenant_scope
+from ctb.db.connection import Database, now_ms, tenant_scope
 from ctb.db.repo import chats as chats_repo
 from ctb.db.repo import deliveries as deliveries_repo
 from ctb.db.repo import sessions as sessions_repo
@@ -478,7 +478,7 @@ class TestPollingIsGatedByTheTenantRow:
     async def test_a_new_key_starts_it_again(
         self, db: Database, system_db: Database, two_tenants: None
     ) -> None:
-        """The only thing that clears the stamp, which is the intended flow."""
+        """The fast way to clear the stamp, and the intended flow."""
         await self._bind(db, BOOTSTRAP_TENANT_ID, "acme")
         await tenancy.mark_auth_failed(system_db, BOOTSTRAP_TENANT_ID, reason="401")
         assert await sessions_repo.list_bound(system_db) == []
@@ -493,3 +493,52 @@ class TestPollingIsGatedByTheTenantRow:
         assert [row.id for row in await sessions_repo.list_bound(system_db)] == [
             "sess-acme"
         ]
+
+    async def test_the_stamp_expires_so_a_false_latch_is_not_permanent(
+        self, db: Database, system_db: Database, two_tenants: None
+    ) -> None:
+        """The slow way, and the only one that works with nobody watching.
+
+        A 401 through a proxy wobble used to stop a team until a human noticed
+        and re-sent ``/key`` — which, live, meant four days of a bot that
+        accepted every command and never answered one.
+        """
+        await self._bind(db, BOOTSTRAP_TENANT_ID, "acme")
+        await tenancy.mark_auth_failed(
+            system_db,
+            BOOTSTRAP_TENANT_ID,
+            reason="401",
+            at=now_ms() - tenancy.AUTH_RETRY_AFTER_MS - 1,
+        )
+        assert [row.id for row in await sessions_repo.list_bound(system_db)] == [
+            "sess-acme"
+        ]
+
+    async def test_a_fresh_rejection_restarts_the_wait(
+        self, db: Database, system_db: Database, two_tenants: None
+    ) -> None:
+        """The stamp must move forward, or the window never closes again."""
+        await self._bind(db, BOOTSTRAP_TENANT_ID, "acme")
+        await tenancy.mark_auth_failed(
+            system_db,
+            BOOTSTRAP_TENANT_ID,
+            reason="401",
+            at=now_ms() - tenancy.AUTH_RETRY_AFTER_MS - 1,
+        )
+        # The retry went through and was rejected again.
+        await tenancy.mark_auth_failed(system_db, BOOTSTRAP_TENANT_ID, reason="401")
+        assert await sessions_repo.list_bound(system_db) == []
+
+    async def test_suspension_has_no_such_clock(
+        self, db: Database, system_db: Database, two_tenants: None
+    ) -> None:
+        """An operator's decision is not undone by waiting."""
+        await self._bind(db, BOOTSTRAP_TENANT_ID, "acme")
+        await tenancy.set_status(system_db, BOOTSTRAP_TENANT_ID, "suspended")
+        await tenancy.mark_auth_failed(
+            system_db,
+            BOOTSTRAP_TENANT_ID,
+            reason="401",
+            at=now_ms() - tenancy.AUTH_RETRY_AFTER_MS - 1,
+        )
+        assert await sessions_repo.list_bound(system_db) == []
