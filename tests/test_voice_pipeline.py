@@ -8,6 +8,8 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from aiogram.exceptions import TelegramNetworkError
+from aiogram.methods import GetFile
 
 from ctb.bot.handlers.common import MOBILE_REPLY_INSTRUCTION
 from ctb.bot.handlers.core import DM_COCKPIT_HINT
@@ -30,7 +32,7 @@ from ctb.db.repo import wizard as wizard_repo
 from ctb.db.repo import workspaces as workspaces_repo
 from ctb.settings import Settings
 from ctb.voice import service as voice_service_module
-from ctb.voice.provider import Transcription
+from ctb.voice.provider import Transcription, TranscriptionError
 from ctb.voice.service import VoiceEnqueueStatus, VoiceService
 from tests.pg import BOOTSTRAP_TENANT_ID
 
@@ -846,6 +848,110 @@ async def test_a_crash_looping_note_is_abandoned_and_reported(
     assert row.attempts == 3
     assert provider.calls == 0
     assert "🎙 Failed" in str(bot.messages[-1]["text"])
+
+
+async def test_a_network_blip_is_retried_instead_of_killing_the_note(
+    db: Database,
+    settings_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    system_db: Database,
+) -> None:
+    """The live failure: 28 KB, one 60s Telegram timeout, note dead on attempt 1.
+
+    ``MAX_ATTEMPTS`` was enforced only for a job whose *process* died. A worker
+    that caught its own exception went straight to ``fail``, so the transient
+    infrastructure error and the "no clear speech" verdict were the same
+    outcome — and the only way back was for the owner to spot the card and tap
+    Retry.
+    """
+    settings = settings_factory(voice_enabled=True)
+    bot = FakeBot()
+    provider = FakeProvider()
+    calls = 0
+
+    async def flaky(_file_id: str) -> object:
+        nonlocal calls
+        calls += 1
+        raise TelegramNetworkError(method=GetFile(file_id="f"), message="timeout")
+
+    monkeypatch.setattr(bot, "get_file", flaky)
+    service = make_service(settings, db, system_db, bot=bot, provider=provider)
+    await seed(db, tg_message_id=90)
+
+    await service._tick(0)
+    row = await voice_repo.get(db, 1001, 90)
+    assert row is not None
+    assert row.state == "received"  # queued again, not buried
+    assert row.attempts == 1
+    assert bot.messages == []  # and nothing shouted about it
+
+    # It keeps its budget, then reports honestly rather than looping on a bill.
+    await service._tick(0)
+    await service._tick(0)
+    row = await voice_repo.get(db, 1001, 90)
+    assert row is not None
+    assert row.state == "failed"
+    assert row.attempts == 3
+    assert calls == 3
+    assert provider.calls == 0
+    assert "🎙 Failed" in str(bot.messages[-1]["text"])
+
+
+async def test_a_verdict_about_the_note_is_not_retried(
+    db: Database,
+    settings_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    system_db: Database,
+) -> None:
+    """``TranscriptionError`` says the same thing on a second run, and was paid for.
+
+    Retrying it would bill the customer again to reach the identical answer,
+    which is why the split is on the exception class and not on a status code.
+    """
+    settings = settings_factory(voice_enabled=True)
+    bot = FakeBot()
+    provider = FakeProvider()
+
+    async def refused(*_args: Any, **_kwargs: Any) -> Any:
+        raise TranscriptionError("No clear speech detected.")
+
+    monkeypatch.setattr(provider, "transcribe", refused)
+    service = make_service(settings, db, system_db, bot=bot, provider=provider)
+    await seed(db, tg_message_id=91)
+
+    await service._tick(0)
+    row = await voice_repo.get(db, 1001, 91)
+    assert row is not None
+    assert row.state == "failed"
+    assert row.attempts == 1
+    assert "No clear speech detected." in str(bot.messages[-1]["text"])
+
+
+async def test_a_retry_after_transcription_never_pays_the_vendor_twice(
+    db: Database,
+    settings_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    system_db: Database,
+) -> None:
+    """A dispatch that blips resumes at dispatch, and its budget still moves."""
+    settings = settings_factory(voice_enabled=True)
+    bot = FakeBot()
+    provider = FakeProvider()
+    service = make_service(settings, db, system_db, bot=bot, provider=provider)
+    await seed(db, tg_message_id=92, state="transcribed", transcript="ship it")
+
+    # Fails on the step immediately before dispatch, which is what a blip
+    # anywhere past transcription looks like to this handler.
+    monkeypatch.setattr(voice_repo, "mark_dispatching", boom)
+    await service._tick(0)
+
+    row = await voice_repo.get(db, 1001, 92)
+    assert row is not None
+    assert row.state == "transcribed"  # not 'received' — the audio is spent
+    # `claim_next` does not count a 'transcribed' claim, so the requeue must,
+    # or a failing dispatch retries forever on a counter that never moves.
+    assert row.attempts == 1
+    assert provider.calls == 0
 
 
 async def test_retention_covers_failed_and_waiting_rows(db: Database) -> None:

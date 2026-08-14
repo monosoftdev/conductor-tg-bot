@@ -76,6 +76,53 @@ of a single request.
 **The live database was repaired by clearing both stamps**; polling resumed
 within five seconds, on the same keys, all 200s. Nothing else was touched.
 
+## …and one voice note died of the same disease (2026-08-14)
+
+Reported separately, an hour later: *"Failed: HTTP Client says - Request timeout
+error."* One row explains it, and it is the only voice job in the table:
+
+```
+tg_message_id 1687 · 7s · 28,439 bytes · elevenlabs/scribe_v2
+created 01:15:29 · updated 01:16:30 · state failed · attempts 1
+last_error  HTTP Client says - Request timeout error
+```
+
+Sixty-one seconds between claim and death, on a 28 KB download, with an
+aiogram `TelegramNetworkError` — the file fetch from Telegram timed out. There
+is nothing wrong with that happening; networks do it. What was wrong is that it
+was **terminal on the first try**.
+
+`MAX_ATTEMPTS = 3` exists and is real, but it is enforced only by
+`recover_stale`, which rescues a job whose *process* died — state left at
+`transcribing`, older than the orphan window. A worker that catches its own
+exception went straight to `voice_repo.fail`, unconditionally. So the transient
+network blip and the verdict *"No clear speech detected"* produced the same
+outcome, and the only way back was for the owner to notice the card and tap
+Retry.
+
+The split is on the exception class, because that is where the meaning already
+lives: **`TranscriptionError` is the verdict class.** The provider wraps every
+one of its own failures in it — refused, rate-limited, unreachable, timed out —
+alongside "no speech", "over 20 MB" and "no speech key". All of those say the
+same thing on a second run, and the vendor ones have already been paid for.
+Anything *else* escaping `_process` is infrastructure between us and Telegram or
+the database, and gets `voice_inputs.retry_after_error` while attempts remain.
+
+Two properties keep a replay from billing the customer twice, and both are in
+that one statement rather than in a read followed by a write:
+
+- A job that already has its transcript returns to `transcribed`, not
+  `received`, so the retry resumes at dispatch and never calls the speech vendor
+  again. Replaying the dispatch itself is free — `POST /sessions/{id}/messages`
+  takes a caller-supplied idempotency key.
+- `attempts` counts *transcription* claims, and `claim_next` increments it only
+  on `received`. The requeue adds one for the `transcribed` case, which is what
+  stops a failing dispatch retrying forever on a counter that never moves.
+
+The user-visible change is that the first two blips are silent — the
+"Transcribing…" ack simply stays up — and the card appears only when the budget
+is spent. It still names the real error, and it still carries Retry.
+
 ## The pipe was clogged by design (2026-08-08)
 
 Measured on the live database, across 157 real deliveries: the time from a row

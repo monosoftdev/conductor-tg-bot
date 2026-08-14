@@ -51,6 +51,16 @@ from its first tagged release.
   after 15 minutes so one poller is let back through to ask again — refreshed
   on each fresh rejection, so a genuinely revoked key still waits. Suspension
   keeps its permanence: that one is an operator's decision, not a proxy's.
+- **A voice note no longer dies of one network timeout.** `MAX_ATTEMPTS = 3`
+  was enforced only for a job whose *process* died; a worker that caught its own
+  exception failed the row on attempt 1 regardless of the error. Live, that
+  turned a 60-second `TelegramNetworkError` fetching a 28 KB file into a dead
+  note with a Retry button somebody had to notice and tap. Infrastructure
+  errors now requeue while attempts remain, while `TranscriptionError` — the
+  class the provider wraps every one of its own failures in, alongside "no
+  clear speech" and "over 20 MB" — stays terminal on the first try, because
+  those say the same thing twice and were already billed. A job holding its
+  transcript resumes at dispatch, so no retry pays the speech vendor twice.
 - **A database one migration behind now fails the boot, by name.** The gate
   only asked whether *any* schema was present, but the repo layer names its
   columns — so a deploy that skipped `ctb.db.bootstrap` came up, `/health`

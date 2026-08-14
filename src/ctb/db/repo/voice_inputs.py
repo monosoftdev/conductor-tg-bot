@@ -26,6 +26,7 @@ __all__ = [
     "prune_terminal",
     "recover_stale",
     "requeue",
+    "retry_after_error",
     "set_ack_message",
     "wait_for_user",
 ]
@@ -360,6 +361,55 @@ async def requeue(
            AND state IN ('failed', 'waiting_for_user')
         """,
         (stamp, chat_id, tg_message_id),
+    )
+    return changed == 1
+
+
+async def retry_after_error(
+    db: Database,
+    row: VoiceInputRow,
+    *,
+    error: str,
+    max_attempts: int = MAX_ATTEMPTS,
+    at: int | None = None,
+) -> bool:
+    """Put a job that failed *in a live worker* back on the queue.
+
+    :func:`recover_stale` already replays a job whose process died, but a worker
+    that catches its own exception went straight to :func:`fail` — one attempt,
+    whatever the error was. So a sixty-second Telegram network timeout on the
+    file download killed the note exactly as dead as "no clear speech detected",
+    and the only way back was for the owner to notice the card and tap Retry.
+
+    Returns ``False`` when the budget is spent or the row has moved on, which is
+    the caller's signal to fail it for real.
+
+    **Two properties keep a replay from costing the customer twice**, and both
+    are why this is one statement rather than a read and a write:
+
+    * A job that already has its transcript returns to ``transcribed``, not
+      ``received``, so the retry resumes at dispatch and never calls the speech
+      vendor again. (``POST /sessions/{id}/messages`` carries a caller-supplied
+      idempotency key, so replaying the dispatch itself is free.)
+    * ``attempts`` counts *transcription* claims, and ``claim_next`` increments
+      it only on ``received``. Adding one here for the ``transcribed`` case is
+      what stops a failing dispatch from retrying forever on a counter that
+      never moves.
+    """
+    stamp = now_ms() if at is None else at
+    changed = await db.execute(
+        """
+        UPDATE voice_inputs
+           SET state = CASE WHEN transcript IS NULL THEN 'received'
+                            ELSE 'transcribed' END,
+               attempts = attempts
+                          + CASE WHEN transcript IS NULL THEN 0 ELSE 1 END,
+               last_error = ?, updated_at = ?
+         WHERE chat_id = ? AND tg_message_id = ?
+           AND state IN ('transcribing', 'dispatching')
+           AND attempts < ?
+        """,
+        (error[:500], stamp, row.chat_id, row.tg_message_id, max_attempts),
     )
     return changed == 1
 
