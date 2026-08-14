@@ -42,6 +42,7 @@ from ctb.turn.state import (
     SetTopicMarker,
     TurnSummary,
 )
+from ctb.watchdog import Silence
 
 __all__ = ["BotActionSink", "changed_files_line", "finish_key", "finish_line"]
 
@@ -153,17 +154,66 @@ class BotActionSink:
         not "the bot", and names the fix the person reading it can actually
         perform.
         """
-        recipients = await tenancy.list_owner_ids(self._system_db, tenant_id)
-        primary = await tenancy.primary_chat(self._system_db, tenant_id)
-        targets: list[int] = list(recipients)
-        if primary is not None and primary.chat_id not in targets:
-            targets.append(primary.chat_id)
+        targets = await self._notice_targets(tenant_id)
         # The notice is a *tenant's* row. The supervisor calls this from its own
         # reconcile loop, outside any scope, so enter one — otherwise the
         # tenant_id default is NULL and the one message that explains the outage
         # is the one that fails to enqueue.
         async with tenant_scope(tenant_id):
             await self._enqueue_notices(session_id, tenant_id, targets)
+
+    async def silence_detected(self, silence: Silence, *, html: str) -> None:
+        """Tell this tenant's owners the bot has stopped watching their work.
+
+        The ``key`` is the watchdog's episode identity, so the *database* does
+        the deduplication: every tick of a continuing outage collides on
+        ``deliveries``' primary key and is dropped. That is what makes one
+        message per episode survive a redeploy without any state of our own.
+
+        Priority is ``ERROR`` and ``silent=False`` for the same reason the
+        auth-fatal notice is: this is the message whose whole purpose is to
+        interrupt somebody, and a card cannot ring a phone.
+        """
+        targets = await self._notice_targets(silence.tenant_id)
+        async with tenant_scope(silence.tenant_id):
+            for chat_id in targets:
+                await self._outbox.enqueue_notice(
+                    html,
+                    session_id=silence.sessions[0],
+                    key=silence.key,
+                    chat_id=chat_id,
+                    thread_id=NO_THREAD_ID,
+                    priority=Priority.ERROR,
+                    silent=False,
+                )
+
+    async def silence_cleared(self, tenant_id: uuid.UUID, *, html: str) -> None:
+        """Close the loop, quietly — nobody needs waking for good news."""
+        bound = await sessions.list_bound(self._system_db)
+        mine = [row for row in bound if row.tenant_id == tenant_id]
+        if not mine:
+            return
+        targets = await self._notice_targets(tenant_id)
+        async with tenant_scope(tenant_id):
+            for chat_id in targets:
+                await self._outbox.enqueue_notice(
+                    html,
+                    session_id=mine[0].id,
+                    key=f"silence-cleared:{tenant_id}:{mine[0].updated_at}",
+                    chat_id=chat_id,
+                    thread_id=NO_THREAD_ID,
+                    priority=Priority.NORMAL,
+                    silent=True,
+                )
+
+    async def _notice_targets(self, tenant_id: uuid.UUID) -> list[int]:
+        """Owners, plus the team's primary chat if it is not already one of them."""
+        recipients = await tenancy.list_owner_ids(self._system_db, tenant_id)
+        primary = await tenancy.primary_chat(self._system_db, tenant_id)
+        targets: list[int] = list(recipients)
+        if primary is not None and primary.chat_id not in targets:
+            targets.append(primary.chat_id)
+        return targets
 
     async def _enqueue_notices(
         self, session_id: str, tenant_id: uuid.UUID, targets: list[int]

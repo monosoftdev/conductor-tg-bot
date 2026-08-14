@@ -76,6 +76,55 @@ of a single request.
 **The live database was repaired by clearing both stamps**; polling resumed
 within five seconds, on the same keys, all 200s. Nothing else was touched.
 
+## The bot now tells you when it has stopped working (2026-08-14)
+
+`poll_silent` made the outage *visible*. It still needed somebody to open
+`/health` and look, which is the same failure with an extra step. The bot holds
+an open Telegram channel to the exact person who cares; `ctb.watchdog` is the
+service that finally uses it.
+
+**It does not live inside the supervisor.** The supervisor is a thing that can
+wedge, and a watchdog running on the wedged loop is not a watchdog. It is its
+own task in the `TaskGroup`, reads the database directly, builds its own
+`BotActionSink`, and holds no reference to the component it watches. It is an
+`OPTIONAL_SERVICE` for the mirror-image reason: a watchdog that could take the
+bot down with it would be worse than none.
+
+**Deduplication is a database key, not a flag in memory.** The alarm is keyed on
+when the silence *started* — the oldest silent session's `updated_at`, which by
+definition is not moving while the silence lasts — so every repeat collides on
+`deliveries`' primary key and PostgreSQL drops it. One message per episode,
+across restarts, with no state of ours to get wrong; a genuinely new episode has
+a different start and earns a new message. It is the same trick as the turn
+receipt and every `once_key`. The all-clear is the one piece of in-memory state,
+and deliberately so: a missed alarm is a bug, a missed reassurance is not.
+
+### Saying *why*, and knowing when to ask for a restart
+
+"Your workspace has gone quiet" is not actionable. `ctb.silence` attributes a
+cause from **durable evidence only** — never from the client pool, because when
+polling stops the pool is swept and there is no client left to interrogate,
+which is the same blindness that hid the outage:
+
+| observation | reading |
+|---|---|
+| `auth_failed_at` set | the key was rejected; `/key` fixes it, and the latch now expires anyway |
+| no API calls at all | nothing is even *trying* — this is the wedge |
+| calls made, none succeeded | the upstream is down; waiting is the fix |
+
+That attribution is also what makes the second half safe. `/health` gained its
+first new fatal condition since the database check: **unexplained** silence
+lasting `POLL_WEDGED_MS` (30 minutes) returns 503, so Railway recycles the
+process. The bar is deliberately not severity but *"would a restart plausibly
+fix this?"* — a rejected key and a dead Conductor are both worse for the user
+and neither is fatal, because restarting into them stacks a restart loop on top
+of the outage. Explained silence stays at 200 however long it lasts.
+
+Five new tests, three mutation-checked reversals: keying the alarm on the tenant
+instead of the episode silences every outage after the first; treating an
+unexplained wedge as explained never restarts; treating any silence as fatal
+restarts during somebody else's outage.
+
 ## `/health` said `ok` for all four days (2026-08-14)
 
 The worst finding of the day is not either bug. It is that **the bot was 100%

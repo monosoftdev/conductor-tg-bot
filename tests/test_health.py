@@ -40,6 +40,7 @@ from ctb.health import (
     DEGRADATION_LEASE_LOST,
     DEGRADATION_POLL_LAG,
     DEGRADATION_POLL_SILENT,
+    DEGRADATION_POLL_WEDGED,
     DEGRADATION_RATE_LIMITED,
     DEGRADATION_TELEGRAM,
     DELIVERY_BACKLOG,
@@ -48,6 +49,7 @@ from ctb.health import (
     DELIVERY_STRANDED_MS,
     HEALTH_PATH,
     MONITOR_KEY,
+    POLL_WEDGED_MS,
     TELEGRAM_FAILURE_THRESHOLD,
     Degradation,
     HealthMonitor,
@@ -666,6 +668,98 @@ async def test_silence_counts_work_owed_not_work_declined(
         report = await make_monitor(db=system_db).report()
         assert report.polling["silent"] == 0  # stopped on purpose
         assert not report.has(DEGRADATION_POLL_SILENT)
+
+
+async def test_unexplained_silence_eventually_fails_the_healthcheck(
+    system_db: Database,
+) -> None:
+    """The second — and only other — condition that recycles the process.
+
+    Nothing to blame means nothing else *can* fix it: no rejected key, no
+    failing upstream, and no API calls even being attempted. That is this
+    process having stopped doing its job while still answering 200, which is
+    precisely what went unnoticed for four days.
+    """
+    async with as_tenant():
+        await tenancy.set_conductor_key(
+            system_db,
+            BOOTSTRAP_TENANT_ID,
+            ciphertext=b"sealed",
+            kid="v1",
+            fingerprint="fp",
+        )
+        await sessions_repo.upsert(
+            system_db,
+            "wedged",
+            chat_id=-100123,
+            thread_id=7,
+            at=WALL - POLL_WEDGED_MS - 1,
+        )
+        report = await make_monitor(db=system_db).report()
+
+    assert report.polling["silent_reasons"] == {"unexplained": 1}
+    assert report.has(DEGRADATION_POLL_WEDGED)
+    assert report.status is HealthStatus.DOWN
+    assert report.http_status == 503
+
+
+async def test_explained_silence_never_fails_the_healthcheck(
+    system_db: Database,
+) -> None:
+    """A restart cannot conjure a key or revive Conductor, so it must not happen.
+
+    This is the guard against replacing an outage with a restart loop on top of
+    it, and it holds however long the silence lasts — the threshold is exceeded
+    ten times over here.
+    """
+    async with as_tenant():
+        await tenancy.set_conductor_key(
+            system_db,
+            BOOTSTRAP_TENANT_ID,
+            ciphertext=b"sealed",
+            kid="v1",
+            fingerprint="fp",
+        )
+        await sessions_repo.upsert(
+            system_db,
+            "latched",
+            chat_id=-100123,
+            thread_id=7,
+            at=WALL - 10 * POLL_WEDGED_MS,
+        )
+        await tenancy.mark_auth_failed(
+            system_db, BOOTSTRAP_TENANT_ID, reason="401", at=WALL
+        )
+        rejected = await make_monitor(db=system_db).report()
+
+        # …and the same for an upstream that is refusing every call.
+        await tenancy.set_conductor_key(
+            system_db,
+            BOOTSTRAP_TENANT_ID,
+            ciphertext=b"sealed",
+            kid="v2",
+            fingerprint="fp",
+        )
+        for index in range(3):
+            await events_repo.record_api_event(
+                system_db,
+                method="GET",
+                endpoint="/sessions/{id}/messages",
+                status_code=503,
+                ok=False,
+                error="conductor is down",
+                tenant_id=BOOTSTRAP_TENANT_ID,
+                at=WALL - (index + 1) * 60_000,
+            )
+        unreachable = await make_monitor(db=system_db).report()
+
+    assert rejected.polling["silent_reasons"] == {"auth_rejected": 1}
+    assert unreachable.polling["silent_reasons"] == {"conductor_unreachable": 1}
+    for report in (rejected, unreachable):
+        assert report.has(DEGRADATION_POLL_SILENT)
+        assert not report.has(DEGRADATION_POLL_WEDGED)
+        assert report.status is HealthStatus.DEGRADED
+        assert report.http_status == 200
 
 
 async def test_a_freshly_polled_session_is_not_silent(system_db: Database) -> None:

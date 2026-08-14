@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any, Final
 
@@ -12,9 +13,10 @@ from ctb.bot.actions import BotActionSink, finish_line
 from ctb.bot.handlers import topics
 from ctb.bot.handlers.core import status_icon
 from ctb.db.connection import Database, now_ms
-from ctb.db.repo import chats, prompts, sessions, workspaces
+from ctb.db.repo import chats, prompts, sessions, tenancy, workspaces
 from ctb.delivery.outbox import Outbox, Priority
 from ctb.delivery.status_card import CARD_EMOJI
+from ctb.silence import SilenceReason, notice_html
 from ctb.turn.state import (
     CardKind,
     Finalize,
@@ -24,6 +26,8 @@ from ctb.turn.state import (
     TopicMarker,
     TurnSummary,
 )
+from ctb.watchdog import Silence
+from tests.pg import BOOTSTRAP_TENANT_ID
 
 
 class Recorder:
@@ -736,3 +740,52 @@ def test_a_receipt_escapes_a_hostile_path() -> None:
 
     assert "<script>" not in line
     assert "&lt;script&gt;" in line
+
+
+async def test_a_silence_alarm_becomes_one_telegram_message_per_episode(
+    db: Database, system_db: Database
+) -> None:
+    """The whole point of the watchdog, proven through the real outbox.
+
+    Deduplication is not bookkeeping in the watchdog — it is ``deliveries``'
+    primary key. The alarm is keyed on when the silence *started*, which does
+    not move while the silence lasts, so every repeat collides in PostgreSQL
+    and is dropped. That is what makes "one message per episode" survive a
+    redeploy with no state of our own to lose.
+    """
+    await _bound(db)
+    await tenancy.add_member(system_db, BOOTSTRAP_TENANT_ID, 5001, role="owner")
+    bot = SendingBot()
+    outbox = Outbox(bot, db)  # type: ignore[arg-type]
+    sink = BotActionSink(bot, db, system_db, outbox, Recorder())  # type: ignore[arg-type]
+
+    episode = Silence(
+        tenant_id=BOOTSTRAP_TENANT_ID,
+        slug="test",
+        reason=SilenceReason.AUTH_REJECTED,
+        sessions=("sess-1",),
+        since=now_ms() - 1_800_000,
+        silent_for_ms=1_800_000,
+    )
+    for _ in range(3):  # the watchdog ticks once a minute for half an hour
+        await sink.silence_detected(
+            episode,
+            html=notice_html(
+                episode.reason, sessions=1, silent_for_ms=episode.silent_for_ms
+            ),
+        )
+    await outbox.flush()
+
+    # Owners *and* the team's primary chat are told — but each of them once,
+    # however many times the watchdog ticks.
+    assert sorted(call["chat_id"] for call in bot.sent) == [1001, 5001]
+    assert all("/key" in call["text"] for call in bot.sent)
+    # It has to actually ring: a card cannot wake anybody, and neither can a
+    # notification sent silently.
+    assert bot.sent[0].get("disable_notification") is not True
+
+    # A genuinely new episode is genuinely new news.
+    later = replace(episode, since=episode.since + 900_000)
+    await sink.silence_detected(later, html="⚠️ again")
+    await outbox.flush()
+    assert len(bot.sent) == 4

@@ -37,6 +37,25 @@ from its first tagged release.
 - The completion receipt names the files a turn changed, up to five and then a
   count.
 
+### Added
+
+- **A watchdog that tells you the bot has stopped working.** `ctb.watchdog` is
+  a new optional service that messages a team's owners — once per episode, with
+  the reason and the fix — when sessions they are waiting on have gone
+  unwatched. It runs outside the supervisor on purpose, since a watchdog on a
+  wedged loop is not a watchdog, and dedupes on `deliveries`' primary key using
+  the moment the silence began, so one outage is one message even across a
+  redeploy. `ctb.silence` attributes the cause from durable evidence only —
+  `auth_failed_at`, and whether any API call was even attempted — because when
+  polling stops the client pool is swept and there is nothing live left to ask.
+- **Unexplained silence now fails the healthcheck.** `/health` gained its first
+  new fatal condition since the database check: 30 minutes of silence with
+  nothing to blame — no rejected key, no failing upstream, no calls attempted —
+  returns 503 so Railway recycles the process. The bar is "would a restart
+  plausibly fix this?", not severity, so a rejected key and a dead Conductor
+  both stay at 200 however long they last; restarting into either would stack a
+  restart loop on top of the outage.
+
 ### Fixed
 
 - **`/health` can finally see its own absence.** During the four-day polling

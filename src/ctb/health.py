@@ -4,11 +4,12 @@
 whether a deploy is promoted and whether a running instance is restarted. That
 makes the definition of *unhealthy* a policy decision, not a formality:
 
-**Only a dead database fails the check.** A restart re-runs the boot path —
-open both pools, verify the schema, take the lease, spawn pollers — so
-a restart is a plausible fix for exactly one class of failure: the process
-cannot reach its own state. Everything else is reported in the body at HTTP
-200, because a restart loop would make it *worse*:
+**The test is not severity, it is "would a restart plausibly fix this?"** A
+restart re-runs the boot path — open both pools, verify the schema, take the
+lease, spawn pollers — so exactly two failures qualify: the process cannot
+reach its own state, and the process has stopped doing its job while still
+answering. Everything else is reported in the body at HTTP 200, because a
+restart loop would make it *worse*:
 
 * **auth fatal (401).** The supervisor stops *that tenant's* pollers and
   keeps the bot alive on purpose — everyone else is unaffected. Cycling the
@@ -21,6 +22,18 @@ cannot reach its own state. Everything else is reported in the body at HTTP
 * **poll lag, delivery backlog, lost lease.** All self-healing: the supervisor
   restarts crashed pollers, the outbox drains, the lease expires in 15s. A
   restart that races another instance is strictly worse. Reported, HTTP 200.
+
+The second fatal case is ``poll_wedged``, and it exists because of a live
+outage this file could not see: for four days every signal here read ``ok``
+while the bot did nothing at all. They are all computed from work the process
+is *observably doing*, so zero pollers doing zero work looked exactly like
+being perfectly caught up. ``polling.silent`` counts the work *owed* instead —
+see :data:`POLL_SILENT_MS` — and when that silence has lasted
+:data:`POLL_WEDGED_MS` with **nothing to blame for it** (no rejected key, no
+failing upstream, no API calls even attempted), the process is not degraded, it
+has stopped, and it asks to be recycled. Attributing the cause is what keeps
+this from becoming a restart loop during somebody else's outage; see
+:mod:`ctb.silence`.
 
 The body is the same data the admin ``/health`` command prints (PLAN.md
 §Commands): poll lag, circuit state, the last 20 ``api_events``, pending
@@ -48,7 +61,8 @@ import ipaddress
 import json
 import os
 import time
-from collections.abc import Callable, Mapping
+import uuid
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from secrets import compare_digest
@@ -65,10 +79,12 @@ from ctb.db.repo import deliveries as deliveries_repo
 from ctb.db.repo import events as events_repo
 from ctb.db.repo import lease as lease_repo
 from ctb.db.repo import sessions as sessions_repo
+from ctb.db.repo import tenancy as tenancy_repo
 from ctb.db.repo import voice_inputs as voice_repo
 from ctb.delivery.render.html import escape
 from ctb.logging import get_logger, scrub_secrets
 from ctb.runtime import client_pool, system_database
+from ctb.silence import SILENCE_LOOKBACK_MS, SilenceReason, attribute
 from ctb.turn.machine import format_duration
 
 log = get_logger(__name__)
@@ -114,6 +130,16 @@ POLL_LAG_GRACE_MS: Final[int] = 30_000
 #: Five times the slowest legitimate cadence (``CADENCE_IDLE_DECAY_MS`` tops out
 #: at 120s), so a non-zero count is never a matter of interpretation.
 POLL_SILENT_MS: Final[int] = 10 * 60_000
+#: How long *unexplained* silence may last before the healthcheck fails and
+#: Railway recycles the process.
+#:
+#: Three times the reporting threshold, because a 503 is a blunt instrument and
+#: this one must be sure. It fires only when nothing explains the silence — no
+#: rejected key, no failing upstream — which is the one shape a restart repairs:
+#: a task that stopped doing its job while the process stayed up. Explained
+#: silence stays at 200 no matter how long it lasts, so a Conductor outage can
+#: never turn into a restart loop.
+POLL_WEDGED_MS: Final[int] = 30 * 60_000
 #: Silent sessions named before the report just counts them.
 SILENT_LIMIT: Final[int] = 10
 #: Deliveries drain in seconds; a standing queue this deep means a stuck outbox.
@@ -161,6 +187,7 @@ DEGRADATION_CIRCUIT_OPEN: Final[str] = "circuit_open"
 DEGRADATION_RATE_LIMITED: Final[str] = "rate_limited"
 DEGRADATION_POLL_LAG: Final[str] = "poll_lag"
 DEGRADATION_POLL_SILENT: Final[str] = "poll_silent"
+DEGRADATION_POLL_WEDGED: Final[str] = "poll_wedged"
 DEGRADATION_DELIVERY_BACKLOG: Final[str] = "delivery_backlog"
 DEGRADATION_DELIVERY_FAILED: Final[str] = "delivery_failed"
 DEGRADATION_DELIVERY_STALLED: Final[str] = "delivery_stalled"
@@ -180,6 +207,13 @@ class Degradation:
 
     code: str
     detail: str = ""
+    #: Whether this alone should fail the healthcheck and recycle the process.
+    #:
+    #: Almost nothing qualifies, and the bar is not severity — it is *"would a
+    #: restart plausibly fix this?"*. A rejected key and a dead upstream are
+    #: both worse for the user than a wedged task and neither is fatal, because
+    #: restarting into them produces a restart loop on top of the outage.
+    fatal: bool = False
 
     def as_dict(self) -> dict[str, str]:
         return {"code": self.code, "detail": self.detail}
@@ -449,6 +483,7 @@ class HealthMonitor:
         status = (
             HealthStatus.DOWN
             if not db_section.get("ok", False)
+            or any(item.fatal for item in degradations)
             else HealthStatus.DEGRADED
             if degradations
             else HealthStatus.OK
@@ -646,16 +681,51 @@ class HealthMonitor:
         )
         polling["silent"] = len(silent)
         polling["silent_sessions"] = [row.id for row in silent[:SILENT_LIMIT]]
+        reasons = await self._silence_reasons(db, silent, at=at)
+        polling["silent_reasons"] = {
+            str(reason): sum(1 for value in reasons.values() if value is reason)
+            for reason in sorted(set(reasons.values()))
+        }
         if silent:
             oldest = (at - min(row.updated_at for row in silent)) // 1000
+            named = ", ".join(
+                f"{count}× {reason}"
+                for reason, count in polling["silent_reasons"].items()
+            )
             degradations.append(
                 Degradation(
                     DEGRADATION_POLL_SILENT,
                     f"{len(silent)} session(s) that should be polled have not "
                     f"been touched in over {POLL_SILENT_MS // 60_000} minutes "
-                    f"(oldest {oldest}s). Somebody is waiting on a room nothing "
-                    "is watching — this counts the work, not the workers, so it "
-                    "is raised even when no poller exists to report it.",
+                    f"(oldest {oldest}s; {named}). Somebody is waiting on a room "
+                    "nothing is watching — this counts the work, not the "
+                    "workers, so it is raised even when no poller exists to "
+                    "report it.",
+                )
+            )
+        # The only condition in this file that can recycle the process, and the
+        # bar is "would a restart plausibly fix it?" rather than severity. An
+        # explained silence never qualifies however long it runs: restarting
+        # into a rejected key or a dead Conductor is a restart loop stacked on
+        # top of the outage.
+        wedged = [
+            row
+            for row in silent
+            if row.tenant_id is not None
+            and not reasons[row.tenant_id].is_explained
+            and at - row.updated_at >= POLL_WEDGED_MS
+        ]
+        if wedged:
+            degradations.append(
+                Degradation(
+                    DEGRADATION_POLL_WEDGED,
+                    f"{len(wedged)} session(s) have been silent for over "
+                    f"{POLL_WEDGED_MS // 60_000} minutes with nothing to blame "
+                    "— no rejected key, no failing upstream, and no API calls "
+                    "even being attempted. That is this process having stopped "
+                    "doing its job while still answering, so it fails the "
+                    "healthcheck deliberately and asks to be recycled.",
+                    fatal=True,
                 )
             )
         if polling["overdue"]:
@@ -805,6 +875,29 @@ class HealthMonitor:
             "max_lag_session_id": worst,
             "sessions": rows,
         }
+
+    async def _silence_reasons(
+        self, db: Database, rows: Sequence[sessions_repo.SessionRow], *, at: int
+    ) -> dict[uuid.UUID, SilenceReason]:
+        """Why each silent tenant is silent, read from durable evidence only.
+
+        Deliberately not from the client pool. When polling stops the pool is
+        swept, so by the time anybody asks there is no client left to
+        interrogate — that is the same blindness that let the outage hide for
+        four days. ``api_events`` outlives the workers that wrote it.
+        """
+        reasons: dict[uuid.UUID, SilenceReason] = {}
+        for tenant_id in {row.tenant_id for row in rows if row.tenant_id}:
+            tenant = await tenancy_repo.get(db, tenant_id)
+            stats = await events_repo.stats(
+                db, since_ms=at - SILENCE_LOOKBACK_MS, tenant_id=tenant_id
+            )
+            reasons[tenant_id] = attribute(
+                auth_failed=tenant is not None and tenant.auth_failed_at is not None,
+                api_calls=stats.total,
+                api_ok=stats.ok,
+            )
+        return reasons
 
     async def _lease_section(
         self, db: Database, *, at: int, degradations: list[Degradation]
@@ -1262,6 +1355,7 @@ __all__ = [
     "DEGRADATION_DELIVERY_STRANDED",
     "DEGRADATION_LEASE_LOST",
     "DEGRADATION_POLL_SILENT",
+    "DEGRADATION_POLL_WEDGED",
     "DEGRADATION_POLL_LAG",
     "DEGRADATION_RATE_LIMITED",
     "DEGRADATION_TELEGRAM",
@@ -1271,6 +1365,7 @@ __all__ = [
     "DELIVERY_STRANDED_MS",
     "HEALTH_PATH",
     "POLL_LAG_FACTOR",
+    "POLL_WEDGED_MS",
     "POLL_LAG_GRACE_MS",
     "TELEGRAM_FAILURE_THRESHOLD",
     "PoolProvider",
