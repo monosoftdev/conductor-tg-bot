@@ -508,6 +508,28 @@ def thread_is_gone(exc: BaseException) -> bool:
     return any(marker in text for marker in THREAD_GONE_MARKERS)
 
 
+def rename_proves_deletion(chat_id: int) -> bool:
+    """Is a refused ``editForumTopic`` here evidence the topic was *deleted*?
+
+    Only in a supergroup. Probed against the live Bot API: a **private** chat
+    answers ``Bad Request: TOPIC_ID_INVALID`` for a thread it merely will not
+    let a bot rename, and that is byte-for-byte what a deleted one answers —
+    :func:`claim_topic` already refuses to read anything into it for exactly
+    that reason ("whether a bot may rename a thread a *user* created in a DM is
+    undocumented"). :func:`apply_marker` used to read it as proof and *detach
+    the room*, which is how a working DM topic went quiet mid-task: the session
+    landed back on the chat's linear seat, the room stopped routing, and the
+    next follow-up typed into it started a whole new workspace.
+
+    Nothing is lost by declining to guess. A DM ignores ``message_thread_id``
+    on a *send* (tdlib/telegram-bot-api#854), so a genuinely deleted DM topic
+    costs a stale title and nothing else; and ``/board`` in a DM always mints a
+    reopen button rather than a jump link (:func:`jump_url` has no syntax for a
+    DM thread), so reopening still self-heals through :func:`claim_topic`.
+    """
+    return chat_id < 0
+
+
 async def send_html(
     bot: Bot,
     chat_id: int,
@@ -1075,7 +1097,12 @@ async def apply_marker(
         # A rename refused because the *thread* is gone is the only signal
         # Telegram ever gives that a topic was deleted — there is no service
         # message for it (see :func:`room_gone`). Say it once, here.
-        if thread_is_gone(exc):
+        #
+        # And only where that refusal means anything: in a private chat the
+        # same words come back for a thread the bot simply may not rename, so
+        # believing them detaches a room somebody is still working in
+        # (:func:`rename_proves_deletion`).
+        if thread_is_gone(exc) and rename_proves_deletion(row.chat_id):
             await room_gone(bot, db, session_id)
         return False
     await sessions_repo.set_topic_marker(db, session_id, marker.value)
@@ -1165,6 +1192,14 @@ async def room_gone(bot: Bot, db: Database, session_id: str) -> bool:
     other side costs money and holds uncommitted work. Unbinding is free to
     undo; archiving on a Telegram gesture is not.
 
+    And a detach, not an *erasure*: the room keeps its ``workspace_id`` through
+    :func:`~ctb.db.repo.chats.detach_session`. Clearing both columns left the
+    row looking exactly like Telegram's *New Chat* composer seat to
+    :attr:`~ctb.bot.middleware.routing.Route.claimable_thread`, so if the
+    detach was ever wrong — and in a DM it was, on every refused rename — the
+    next line typed there offered to build a second workspace rather than
+    continuing the one the room belongs to.
+
     Idempotent — three racing discoveries cost one line, not three — and it
     returns whether this call was the one that did the work.
     """
@@ -1174,7 +1209,7 @@ async def room_gone(bot: Bot, db: Database, session_id: str) -> bool:
     chat_id, thread_id = row.chat_id, row.thread_id
     name = (row.topic_name or row.title or session_id[:8]).strip() or session_id[:8]
     await sessions_repo.unbind_topic(db, session_id)
-    await chats_repo.unbind(db, chat_id, thread_id)
+    await chats_repo.detach_session(db, chat_id, thread_id)
     # ``unbind_topic`` lands the session on the chat's *seat* (thread 0), which
     # is where its deliveries reroute to — and the seat is the one place the
     # uniqueness index deliberately does not cover. Two rooms deleted in one

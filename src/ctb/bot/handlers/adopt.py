@@ -716,7 +716,11 @@ async def adopt_callback(
             chat_type=chat_type,
             workspace_id=workspace_id,
             session_hint=session_hint or None,
-            claim_thread=route.claimable_thread,
+            # A detached room of *this* workspace is reclaimed rather than left
+            # behind: "reopen" tapped inside a room has to come back in that
+            # room, not open a sibling next to it.
+            claim_thread=route.claimable_thread
+            or route.reclaimable_thread(workspace_id),
         )
     except Exception as exc:
         await send_html(

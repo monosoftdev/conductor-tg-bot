@@ -24,11 +24,13 @@ from ctb.bot.handlers.common import (
     workspace_name,
 )
 from ctb.bot.handlers.core import (
+    DETACHED_ROOM_HINT,
     DM_COCKPIT_HINT,
     board_lines,
     board_rows,
     cockpit_markup,
     find_text,
+    reopen_markup,
     session_overview_lines,
 )
 from ctb.bot.handlers.topics import edit_html, send_html
@@ -588,6 +590,26 @@ class VoiceService:
             route = await self._route_for(row)
             if route.claimable_thread and await self._offer_task(row, text, conductor):
                 return True
+            # A room that kept its workspace and lost its session was detached,
+            # not never-started. The typed path offers to put it back; the two
+            # surfaces disagreeing about an unaddressed line is the divergence
+            # this whole branch exists to prevent.
+            if route.chat is not None and route.chat.workspace_id:
+                markup = await reopen_markup(
+                    self.db,
+                    route.chat.workspace_id,
+                    nonces=self.nonces,
+                    user_id=row.user_id,
+                    chat_id=row.chat_id,
+                    thread_id=row.thread_id,
+                )
+                if markup is not None:
+                    await self._send(
+                        row,
+                        f"🎙 {escape(self._audit(text))}\n{DETACHED_ROOM_HINT}",
+                        reply_markup=markup,
+                    )
+                    return True
             # The DM root once `/new` moved this chat's work into topics. The
             # typed path answers with one "Send to …" button rather than a dead
             # end, and the spoken path must answer identically — the two

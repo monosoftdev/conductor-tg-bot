@@ -23,7 +23,13 @@ from ctb.bot.handlers.common import (
     submit_prompt,
     tell,
 )
-from ctb.bot.handlers.core import DM_COCKPIT_HINT, cockpit_markup, run_find
+from ctb.bot.handlers.core import (
+    DETACHED_ROOM_HINT,
+    DM_COCKPIT_HINT,
+    cockpit_markup,
+    reopen_markup,
+    run_find,
+)
 from ctb.bot.handlers.topics import resolve_client, resolve_db, topic_title
 from ctb.bot.keyboards import (
     Action,
@@ -179,6 +185,23 @@ async def plain_text(
             return
 
     if not route.session_id:
+        # A room that still knows its workspace is a room that *lost* its
+        # session — `room_gone` detaches one on a topic Telegram refused, and
+        # in a DM it used to do that on a rename nobody could rename anyway.
+        # "No session here" is false of that thread and sends the owner looking
+        # for a session they never left; the reopen button is the whole repair.
+        if route.chat is not None and route.chat.workspace_id:
+            markup = await reopen_markup(
+                database,
+                route.chat.workspace_id,
+                nonces=nonces,
+                user_id=message.from_user.id if message.from_user else None,
+                chat_id=message.chat.id,
+                thread_id=message.message_thread_id or 0,
+            )
+            if markup is not None:
+                await tell(message, DETACHED_ROOM_HINT, reply_markup=markup)
+                return
         await tell(
             message, "No session here. Use <code>/new</code> or <code>/board</code>."
         )

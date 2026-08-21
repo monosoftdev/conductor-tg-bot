@@ -742,7 +742,8 @@ async def board_session_callback(
             chat_type=_callback_chat_type(query, chat_id),
             workspace_id=workspace_id,
             session_hint=session_id or None,
-            claim_thread=route.claimable_thread,
+            claim_thread=route.claimable_thread
+            or route.reclaimable_thread(workspace_id),
         )
     except Exception as exc:
         await send_html(
@@ -1073,6 +1074,64 @@ async def cockpit_target(db: Database) -> tuple[str, str] | None:
     """The single newest target. Kept for callers that only want the head."""
     targets = await cockpit_targets(db, limit=1)
     return targets[0] if targets else None
+
+
+#: What a room whose session was detached says instead of "No session here".
+DETACHED_ROOM_HINT: Final = (
+    "This room lost its session · tap to reopen it, or <code>/board</code> for another."
+)
+
+
+async def reopen_markup(
+    db: Database,
+    workspace_id: str,
+    *,
+    nonces: NonceStore,
+    user_id: int | None,
+    chat_id: int,
+    thread_id: int,
+) -> InlineKeyboardMarkup | None:
+    """One button that puts this room's own session back into this room.
+
+    A room detached by ``room_gone`` keeps its ``workspace_id`` and loses its
+    session, and the honest answer to a line typed there is neither "No session
+    here" — the room plainly *had* one — nor a new workspace, which is what
+    ``claimable_thread`` used to make of it. It is the workspace's name and one
+    tap, through the same ``ADOPT`` handler ``/attach`` and ``/board`` use.
+
+    Two things make it land where it says it does rather than beside it:
+    ``Route.reclaimable_thread`` hands adoption *this* thread, and the hint
+    names the session this room was last used to talk to
+    (``prompts.last_session_in_room``). Without the hint adoption falls back to
+    the workspace's newest session, which in a workspace with several is a coin
+    flip — and a room coming back addressed at somebody else's transcript is
+    the failure this whole seam exists to prevent.
+    """
+    workspace = await workspaces_repo.get(db, workspace_id)
+    if workspace is None:
+        return None
+    hint = await prompts_repo.last_session_in_room(db, chat_id, thread_id)
+    # Only if it is still this workspace's. A room reused across workspaces —
+    # or a session archived out from under it — must not resurrect the old one.
+    if hint is not None:
+        session = await sessions_repo.get(db, hint)
+        if session is None or session.workspace_id != workspace_id:
+            hint = None
+    return keyboard(
+        [
+            [
+                adopt_button(
+                    workspace_id=workspace_id,
+                    name=workspace_name(workspace),
+                    session_id=hint,
+                    store=nonces,
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                )
+            ]
+        ]
+    )
 
 
 async def cockpit_markup(

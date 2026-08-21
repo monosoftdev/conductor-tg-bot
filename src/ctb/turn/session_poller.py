@@ -540,8 +540,13 @@ class SessionPoller:
                     # The `chats` row too. Clearing only the session left the
                     # room still routing prompts to a session that is dead —
                     # a zombie room, answering nothing.
+                    #
+                    # The *workspace* pointer stays: a room stripped of both
+                    # reads as empty scratch space to `Route.claimable_thread`,
+                    # and the next line typed into it would offer to build a
+                    # second workspace instead of reopening this one.
                     if row is not None and row.chat_id is not None and row.has_room:
-                        await chats.unbind(self.db, row.chat_id, row.thread_id)
+                        await chats.detach_session(self.db, row.chat_id, row.thread_id)
                 case StopPolling():
                     self._stop_requested = True
                 case SetCadence():

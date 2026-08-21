@@ -29,7 +29,7 @@ from aiogram.methods import SendMessage
 
 from ctb.bot.app import PostgresStorage
 from ctb.bot.handlers import adopt as adopt_handlers
-from ctb.bot.handlers import common
+from ctb.bot.handlers import common, topics
 from ctb.bot.handlers import core as core_handlers
 from ctb.bot.handlers import prompts as prompt_handlers
 from ctb.bot.handlers.adopt import (
@@ -590,6 +590,66 @@ async def test_adopting_into_the_thread_it_was_asked_from_opens_nothing_new(
     assert room is not None and room.thread_id == 555
 
 
+async def test_reopening_a_detached_room_comes_back_in_that_room(
+    db: Database, client: ConductorClient, fake: FakeConductor
+) -> None:
+    """A room ``room_gone`` detached is re-entered, never duplicated.
+
+    ``Route.reclaimable_thread`` is what hands this thread to adoption:
+    ``claimable_thread`` deliberately refuses a room that names a workspace —
+    that refusal is what stops a follow-up becoming a second workspace — and
+    without a counterpart *reopen* had nowhere to land but a sibling topic
+    beside the room the owner was typing in.
+    """
+    session = _seeded(fake)
+    bot = _Bot()
+    first = await _adopt(bot, db, client, session, chat_type="private")
+    thread_id = first.thread_id
+    assert await topics.room_gone(bot, db, session.session_id) is True  # type: ignore[arg-type]
+    bot.sent.clear()
+
+    again = await _adopt(
+        bot,
+        db,
+        client,
+        session,
+        chat_type="private",
+        session_hint=session.session_id,
+        claim_thread=thread_id,
+    )
+
+    assert bot.topics == [thread_id], "reopen opened a second room beside the first"
+    assert again.thread_id == thread_id
+    chat = await chats_repo.get(db, CHAT_ID, thread_id)
+    assert chat is not None and chat.session_id == session.session_id
+    room = await sessions_repo.get(db, session.session_id)
+    assert room is not None and room.is_bound and room.thread_id == thread_id
+
+
+async def test_reopening_a_room_telegram_really_lost_still_opens_a_new_one(
+    db: Database, client: ConductorClient, fake: FakeConductor
+) -> None:
+    """Reclaiming is a proposal, not a promise — the rename is still the proof."""
+    session = _seeded(fake)
+    bot = _Bot()
+    first = await _adopt(bot, db, client, session, chat_type="private")
+    await topics.room_gone(bot, db, session.session_id)  # type: ignore[arg-type]
+    bot.invalid.add(first.thread_id)
+
+    again = await _adopt(
+        bot,
+        db,
+        client,
+        session,
+        chat_type="private",
+        session_hint=session.session_id,
+        claim_thread=first.thread_id,
+    )
+
+    assert again.thread_id != first.thread_id
+    assert len(bot.topics) == 2
+
+
 async def test_a_second_attach_in_a_dm_jumps_instead_of_opening_a_sibling(
     db: Database, client: ConductorClient, fake: FakeConductor
 ) -> None:
@@ -1114,6 +1174,44 @@ async def test_the_callback_opens_the_topic_and_answers_with_a_jump(
     ack = [item for item in bot.sent if not item.get("message_thread_id")][0]
     assert ack["text"] == "→ <b>fake session · checkout/main</b>"
     assert ack["reply_markup"].inline_keyboard[0][0].text == "Open topic"
+
+
+async def test_the_reopen_button_re_enters_the_room_it_was_tapped_in(
+    db: Database, client: ConductorClient, fake: FakeConductor
+) -> None:
+    """The wiring, not the rule: the callback must actually *ask* for it.
+
+    ``adopt_workspace`` moves into whatever ``claim_thread`` it is handed, and
+    the two callbacks that mint it had only ``claimable_thread`` to hand —
+    which refuses a detached room by design. So the button read "reopen" and
+    opened a sibling topic beside the room the owner tapped in.
+    """
+    session = _seeded(fake)
+    bot = _Bot()
+    first = await _adopt(bot, db, client, session, chat_type="private")
+    assert await topics.room_gone(bot, db, session.session_id) is True  # type: ignore[arg-type]
+    bot.sent.clear()
+    chat = await chats_repo.get(db, CHAT_ID, first.thread_id)
+    store = NonceStore()
+    ticket = store.issue(
+        "adopt",
+        f"{session.workspace_id}\n{session.session_id}",
+        user_id=1001,
+        chat_id=CHAT_ID,
+        thread_id=first.thread_id,
+    )
+
+    await adopt_handlers.adopt_callback(
+        _Query(bot, ticket.callback_data),  # type: ignore[arg-type]
+        Route(chat_id=CHAT_ID, thread_id=first.thread_id, kind="dm", chat=chat),
+        store,
+        fake_tenant(client),
+        db=db,
+    )
+
+    assert bot.topics == [first.thread_id], "reopen opened a sibling room"
+    room = await sessions_repo.get(db, session.session_id)
+    assert room is not None and room.is_bound and room.thread_id == first.thread_id
 
 
 async def test_a_refused_adoption_answers_in_the_chat_not_only_the_toast(

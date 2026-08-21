@@ -42,6 +42,7 @@ __all__ = [
     "ChatRow",
     "bind",
     "delete",
+    "detach_session",
     "ensure",
     "for_session",
     "for_workspace",
@@ -294,6 +295,27 @@ async def unbind(
     return await update(
         db, chat_id, thread_id, workspace_id=None, session_id=None, at=at
     )
+
+
+async def detach_session(
+    db: Database, chat_id: int, thread_id: int = NO_THREAD_ID, *, at: int | None = None
+) -> ChatRow | None:
+    """Stop routing this room to its session, but remember it *was* a room.
+
+    :func:`unbind` clears the workspace pointer too, and those two columns are
+    exactly what :attr:`ctb.bot.middleware.routing.Route.claimable_thread` reads
+    to decide a thread is empty scratch space. So a room detached by
+    :func:`~ctb.bot.handlers.topics.room_gone` became indistinguishable from
+    Telegram's *New Chat* composer seat, and the next line typed into a topic
+    somebody had been working in all week was answered with *create a new
+    workspace* — a second paid container and a second Conductor chat, instead of
+    the follow-up it was.
+
+    Keeping ``workspace_id`` is what makes the room recoverable rather than
+    scratch: ``chats.bind`` only refuses to repoint a *session*, so reopening
+    writes straight over this.
+    """
+    return await update(db, chat_id, thread_id, session_id=None, at=at)
 
 
 async def set_defaults(
