@@ -53,6 +53,7 @@ __all__ = [
     "created_since",
     "create_enrollment_token",
     "delete_tenant",
+    "demote_chat",
     "get",
     "get_by_slug",
     "list_active",
@@ -766,6 +767,31 @@ async def bind_chat(
 async def unbind_chat(db: Database, chat_id: int) -> bool:
     return (
         await db.execute("DELETE FROM tenant_chats WHERE chat_id = ?", (chat_id,)) > 0
+    )
+
+
+async def demote_chat(db: Database, chat_id: int) -> bool:
+    """Stop treating this chat as the team's, without forgetting it exists.
+
+    ``is_primary`` is read in exactly one place — :func:`primary_chat`, which
+    :meth:`~ctb.bot.actions.BotActionSink._notice_targets` adds to every alarm —
+    so a group the bot can no longer reach makes each of those a permanent
+    ``failed`` delivery. Nothing is lost (the owners' DMs are separate targets)
+    and nothing self-corrects: the same alarm fails again next episode, and
+    ``/health``'s failure digest reports a fault that no longer has a cure.
+
+    Deliberately not :func:`unbind_chat`. The tenancy of a chat is what
+    ``/setup`` established, and deleting it on a Telegram error would re-open
+    the group to being claimed by another team. This only withdraws the
+    *nomination*; ``/setup`` restores it in one command.
+    """
+    return (
+        await db.execute(
+            "UPDATE tenant_chats SET is_primary = false WHERE chat_id = ? "
+            "AND is_primary",
+            (chat_id,),
+        )
+        > 0
     )
 
 

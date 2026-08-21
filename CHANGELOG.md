@@ -73,6 +73,22 @@ from its first tagged release.
   keeps the workspace so a detached room stays recoverable; and a room that kept
   its workspace now answers a typed or dictated line with one **reopen** button
   rather than "No session here", which was false of a thread nobody had left.
+  That button lands in the room it was tapped in — `Route.reclaimable_thread`,
+  the narrow counterpart to the refusal above — and reopens the session that
+  room was last used to talk to (`prompts.last_session_in_room`) rather than the
+  workspace's newest, which is a coin flip once a workspace has several.
+  Migration `005_reclaim_detached_rooms` repairs the rooms already detached,
+  from the prompt ledger; it changes no schema and is optional to boot.
+
+- **A deleted group stops being the team's alarm bell.** Every silence alarm and
+  all-clear also goes to `tenant_chats.is_primary`, and a group deleted from
+  Telegram made each of those a permanent `failed` delivery — 17 in two days on
+  the live database, and every failed row in it. Nothing was lost, because the
+  owners' DMs are separate targets, and nothing corrected it either: `/health`'s
+  failure digest reported a fault with no cure, which is where a real delivery
+  failure can hide. A terminal send failure whose words mean *the chat is gone*
+  now withdraws that chat's nomination — never its tenancy, never a private
+  chat, and only on `CHAT_GONE_MARKERS`.
 
 - **`/health` can finally see its own absence.** During the four-day polling
   outage the report read `ok` at HTTP 200 the whole time, so Railway never

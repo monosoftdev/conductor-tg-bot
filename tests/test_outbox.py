@@ -60,6 +60,7 @@ from ctb.db.connection import Database, now_ms
 from ctb.db.repo import chats as chats_repo
 from ctb.db.repo import deliveries as deliveries_repo
 from ctb.db.repo import sessions as sessions_repo
+from ctb.db.repo import tenancy as tenancy_repo
 from ctb.delivery.outbox import (
     RECOVERY_RECHECK_S,
     FocusTracker,
@@ -93,6 +94,7 @@ from ctb.turn.state import (
     UpdateActivity,
 )
 from tests.conftest import FakeClock
+from tests.pg import BOOTSTRAP_TENANT_ID
 
 SESSION = "sess-1"
 #: Card payloads carry the session id, so the length that has to fit inside
@@ -243,8 +245,12 @@ def outbox_factory(
             # in production, and a test must not inherit another test's thumb.
             "focus": FocusTracker(clock=clock),
         }
+        # `db=` overrides the pool. Production hands the outbox the *worker*
+        # pool (`__main__._default_make_outbox` is called with
+        # `runtime.system_db`), which is the only role granted `tenant_chats`.
+        pool = overrides.pop("db", db)
         options.update(overrides)
-        return Outbox(bot, db, **options)
+        return Outbox(bot, pool, **options)
 
     return make
 
@@ -1165,6 +1171,100 @@ async def test_one_stuck_turn_cannot_hold_another_session_s_reply(
 
     assert await outbox.run_once() == 1
     assert bot.calls_to("send_message")[0]["chat_id"] == CHAT
+
+
+# ── a group that no longer exists stops being the team's alarm bell ──────────
+
+
+async def _primary_group(system_db: Database, chat_id: int) -> None:
+    """A team whose alarms also go to a group, written as a worker would.
+
+    ``tenant_chats`` carries no grant for ``ctb_app`` — it is the table that
+    *decides* scope, so the request-path role cannot read it at all. The outbox
+    runs on the worker pool in production (``__main__._default_make_outbox`` is
+    handed ``runtime.system_db``), and this is the fixture that says so.
+    """
+    await tenancy_repo.bind_chat(system_db, chat_id, BOOTSTRAP_TENANT_ID, kind="group")
+    await system_db.execute(
+        "UPDATE tenant_chats SET is_primary = true WHERE chat_id = ?", (chat_id,)
+    )
+
+
+async def test_a_deleted_group_stops_being_the_teams_primary_chat(
+    outbox_factory: Callable[..., Outbox],
+    bot: FakeBot,
+    db: Database,
+    system_db: Database,
+    session: str,
+) -> None:
+    """Otherwise every alarm fails there, forever, and hides a real one.
+
+    ``_notice_targets`` adds ``tenant_chats.is_primary`` to every silence alarm
+    and all-clear. Seen live: a group deleted from Telegram collected seventeen
+    permanent ``failed`` rows in two days, one per episode. Nothing was lost —
+    the owners' DMs are separate targets — and nothing corrected it either,
+    while ``/health``'s failure digest reported a fault with no cure.
+    """
+    await _primary_group(system_db, CHAT)
+    outbox = outbox_factory(db=system_db)
+    bot.queue("send_message", bad_request("Bad Request: chat not found"))
+    await enqueue(outbox)
+
+    await outbox.run_once()
+
+    row = await deliveries_repo.get(db, (SESSION, "msg-1", 0, CHAT))
+    assert row is not None and row.state == "failed"
+    assert await tenancy_repo.primary_chat(system_db, BOOTSTRAP_TENANT_ID) is None
+    # The tenancy itself is untouched: `/setup` puts the nomination back, and
+    # deleting the row would re-open the group to being claimed by another team.
+    assert await tenancy_repo.chat_for(system_db, CHAT) is not None
+
+
+async def test_a_private_chat_is_never_demoted_by_a_telegram_refusal(
+    outbox_factory: Callable[..., Outbox],
+    bot: FakeBot,
+    db: Database,
+    system_db: Database,
+) -> None:
+    """The owner's DM is the last channel that works when a group has gone.
+
+    "chat not found" in a private chat is a person who has not started the bot
+    or has blocked it — theirs to undo, often temporary, and never a reason to
+    take away the one address an alarm can still reach.
+    """
+    dm = 1132334
+    await tenancy_repo.bind_chat(system_db, dm, BOOTSTRAP_TENANT_ID, kind="dm")
+    await system_db.execute(
+        "UPDATE tenant_chats SET is_primary = true WHERE chat_id = ?", (dm,)
+    )
+    await sessions_repo.upsert(db, "sess-dm", chat_id=dm, thread_id=0)
+    outbox = outbox_factory(db=system_db)
+    bot.queue("send_message", bad_request("Bad Request: chat not found"))
+    await enqueue(outbox, chat_id=dm, session_id="sess-dm")
+
+    await outbox.run_once()
+
+    primary = await tenancy_repo.primary_chat(system_db, BOOTSTRAP_TENANT_ID)
+    assert primary is not None and primary.chat_id == dm
+
+
+async def test_a_transient_refusal_never_costs_a_group_its_nomination(
+    outbox_factory: Callable[..., Outbox],
+    bot: FakeBot,
+    db: Database,
+    system_db: Database,
+    session: str,
+) -> None:
+    """Only the words that mean *gone*. A blip must not disarm the alarm."""
+    await _primary_group(system_db, CHAT)
+    outbox = outbox_factory(db=system_db)
+    bot.queue("send_message", bad_request("Bad Request: message is too long"))
+    await enqueue(outbox)
+
+    await outbox.run_once()
+
+    primary = await tenancy_repo.primary_chat(system_db, BOOTSTRAP_TENANT_ID)
+    assert primary is not None and primary.chat_id == CHAT
 
 
 # ── the status card ──────────────────────────────────────────────────────────

@@ -4376,6 +4376,94 @@ async def test_a_detached_room_is_never_mistaken_for_an_empty_thread(
     ), "a room somebody worked in is being offered as scratch space for a new one"
 
 
+async def test_reopen_reclaims_this_room_rather_than_opening_one_beside_it(
+    db: Database,
+) -> None:
+    """The counterpart the first fix created the need for.
+
+    Refusing a detached room to ``claimable_thread`` is what stops it becoming
+    a new workspace — and it also took away the only thread adoption knew how
+    to move into, so *reopen* tapped inside a room came back in a sibling.
+    ``reclaimable_thread`` is the narrow exception: this thread, for the one
+    workspace whose room it already is.
+    """
+    await _room(db, chat_id=1132334, thread_id=1711456)
+    await topics.room_gone(_ForumBot(), db, "sess-1")  # type: ignore[arg-type]
+    chat = await chats_repo.get(db, 1132334, 1711456)
+    route = Route(chat_id=1132334, thread_id=1711456, kind="dm", chat=chat)
+
+    assert route.reclaimable_thread("ws-1") == 1711456
+    # And only ever for its own workspace: another one's reopen must not walk
+    # into this room and re-address it.
+    assert route.reclaimable_thread("ws-2") == 0
+    # A room still routing somewhere is not detached and is never reclaimed.
+    live = Route(
+        chat_id=1132334,
+        thread_id=1711456,
+        kind="dm",
+        chat=replace(chat, session_id="sess-1") if chat else None,
+    )
+    assert live.reclaimable_thread("ws-1") == 0
+
+
+async def test_reopen_offers_the_session_this_room_was_talking_to(
+    db: Database,
+) -> None:
+    """Not the workspace's newest — that is a coin flip once it has several.
+
+    ``outbound_prompts`` is the durable record of what was said *from this
+    room*, and unlike ``deliveries`` it is never pruned in bulk. Without the
+    hint adoption falls back to the listing's first session, and a room can
+    come back addressing somebody else's transcript.
+    """
+    await _room(db, chat_id=1132334, thread_id=1711456)
+    await sessions_repo.upsert(db, "sess-2", workspace_id="ws-1", title="newer")
+    await prompts_repo.create(
+        db, session_id="sess-1", body="carry on", chat_id=1132334, thread_id=1711456
+    )
+    # Another room of the same workspace, talking to the other session. The
+    # hint is per *room*; taking the workspace's latest prompt would be the
+    # same coin flip in a different disguise.
+    await prompts_repo.create(
+        db, session_id="sess-2", body="elsewhere", chat_id=1132334, thread_id=9
+    )
+    await topics.room_gone(_ForumBot(), db, "sess-1")  # type: ignore[arg-type]
+    store = NonceStore()
+
+    markup = await core_handlers.reopen_markup(
+        db, "ws-1", nonces=store, user_id=1, chat_id=1132334, thread_id=1711456
+    )
+
+    assert markup is not None
+    tap = markup.inline_keyboard[0][0]
+    assert tap.callback_data is not None
+    ticket = store.peek(tap.callback_data.rsplit(":", 1)[-1])
+    assert ticket is not None and ticket.action == Action.ADOPT.value
+    assert ticket.target == "ws-1\nsess-1"
+
+
+async def test_reopen_drops_a_hint_that_moved_workspace(db: Database) -> None:
+    """A stale ledger row must never resurrect a session from somewhere else."""
+    await _room(db, chat_id=1132334, thread_id=1711456)
+    await workspaces_repo.upsert(db, "ws-2", name="other")
+    await sessions_repo.upsert(db, "moved", workspace_id="ws-2", title="moved")
+    await prompts_repo.create(
+        db, session_id="moved", body="hello", chat_id=1132334, thread_id=1711456
+    )
+    await topics.room_gone(_ForumBot(), db, "sess-1")  # type: ignore[arg-type]
+    store = NonceStore()
+
+    markup = await core_handlers.reopen_markup(
+        db, "ws-1", nonces=store, user_id=1, chat_id=1132334, thread_id=1711456
+    )
+
+    assert markup is not None
+    tap = markup.inline_keyboard[0][0]
+    assert tap.callback_data is not None
+    ticket = store.peek(tap.callback_data.rsplit(":", 1)[-1])
+    assert ticket is not None and ticket.target == "ws-1\n"
+
+
 # ── /name -w renames the family, so every room of it ─────────────────────────
 
 

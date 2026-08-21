@@ -35,6 +35,7 @@ __all__ = [
     "create",
     "delete",
     "get",
+    "last_session_in_room",
     "list_for_session",
     "list_recoverable",
     "list_unsettled",
@@ -328,6 +329,36 @@ async def list_for_session(
         (session_id, max(1, limit)),
     )
     return [PromptRow.from_row(row) for row in rows]
+
+
+async def last_session_in_room(
+    db: Database, chat_id: int, thread_id: int
+) -> str | None:
+    """Which session this room was last used to talk to.
+
+    A room detached by :func:`~ctb.bot.handlers.topics.room_gone` loses its
+    ``chats.session_id``, and "reopen this room" then had nothing better to
+    offer than the workspace's *newest* session — which in a workspace with
+    several is a coin flip, and the one thing a room may never do is come back
+    addressing somebody else's transcript.
+
+    This ledger answers it exactly and durably: unlike ``deliveries``, which is
+    pruned at seven days, an ``outbound_prompts`` row is only ever deleted one
+    id at a time. ``None`` means nothing was ever *sent* from this room — a room
+    that only ever received, or one older than this column — and the caller
+    falls back to the listing.
+    """
+    return as_opt_str(
+        await db.fetch_val(
+            """
+            SELECT session_id FROM outbound_prompts
+             WHERE chat_id = ? AND thread_id = ?
+             ORDER BY created_at DESC
+             LIMIT 1
+            """,
+            (chat_id, thread_id),
+        )
+    )
 
 
 async def outstanding_count(db: Database, session_id: str) -> int:

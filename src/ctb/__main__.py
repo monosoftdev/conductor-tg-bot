@@ -61,9 +61,23 @@ _SIGNALS: Final[tuple[signal.Signals, ...]] = (signal.SIGINT, signal.SIGTERM)
 # Core Telegram/Conductor behavior remains available on schema 001.
 _CI_SCHEMA_VERSION: Final = 2
 
-#: Migrations the core can run *without*, because a runtime gate degrades the
-#: feature instead. Only 002 so far — see :data:`_CI_SCHEMA_VERSION`.
-OPTIONAL_SCHEMA_VERSIONS: Final[frozenset[int]] = frozenset({2})
+#: Migration 005 changes no schema at all: it gives detached rooms their
+#: ``chats.workspace_id`` back, so a room a wrong conclusion took away stops
+#: reading as Telegram's empty *New Chat* seat. Every column it touches has
+#: existed since 001.
+_ROOM_REPAIR_SCHEMA_VERSION: Final = 5
+
+#: Migrations the core can run *without*.
+#:
+#: 002 because a runtime gate degrades the feature it adds
+#: (:data:`_CI_SCHEMA_VERSION`). 005 for a different reason worth keeping
+#: separate: it is a **data repair**, not a schema change, so there is nothing
+#: for a query to fail on. Refusing to boot without it would take the bot down
+#: over rooms that are merely still wrong — which is strictly worse than the
+#: thing it repairs.
+OPTIONAL_SCHEMA_VERSIONS: Final[frozenset[int]] = frozenset(
+    {2, _ROOM_REPAIR_SCHEMA_VERSION}
+)
 
 #: The lowest schema this build's **core** reads can survive.
 #:

@@ -55,6 +55,7 @@ from aiogram.types import BufferedInputFile, InlineKeyboardMarkup, LinkPreviewOp
 from ctb.db import NO_THREAD_ID
 from ctb.db.connection import Database, now_ms
 from ctb.db.repo import deliveries as deliveries_repo
+from ctb.db.repo import tenancy as tenancy_repo
 from ctb.db.repo.deliveries import DeliveryRow
 from ctb.db.repo.transcript import DeliveryDraft
 from ctb.delivery.pacing import (
@@ -202,6 +203,26 @@ THREAD_GONE_MARKERS: Final[tuple[str, ...]] = (
 def _thread_is_gone(exc: BaseException) -> bool:
     text = str(exc).casefold()
     return any(marker in text for marker in THREAD_GONE_MARKERS)
+
+
+#: Substrings that identify a *chat* the bot will never reach again — the group
+#: was deleted, or the bot was removed from it. Distinct from
+#: :data:`THREAD_GONE_MARKERS`, where the chat is fine and only the topic is
+#: not, and deliberately short: anything ambiguous belongs in neither list.
+#:
+#: "bot is not a member" is **not** here. Being outside a group that still
+#: exists is a state somebody undoes by adding the bot back, and a re-add
+#: produces no update that could put the nomination back.
+CHAT_GONE_MARKERS: Final[tuple[str, ...]] = (
+    "chat not found",
+    "group chat was deleted",
+    "bot was kicked",
+)
+
+
+def _chat_is_gone(exc: BaseException) -> bool:
+    text = str(exc).casefold()
+    return any(marker in text for marker in CHAT_GONE_MARKERS)
 
 
 class _Outcome(Enum):
@@ -1330,6 +1351,8 @@ class Outbox:
         await deliveries_repo.mark_failed(
             self._db, row.key, error=repr(exc)[:500], retry=will_retry
         )
+        if not will_retry:
+            await self._retire_unreachable_chat(row, exc)
         self._counters["retried" if will_retry else "failed"] += 1
         _log.warning(
             "outbox.send_failed",
@@ -1342,6 +1365,43 @@ class Outbox:
             error=repr(exc)[:500],
         )
         return _Outcome.DEFERRED if will_retry else _Outcome.DROPPED
+
+    async def _retire_unreachable_chat(
+        self, row: DeliveryRow, exc: BaseException
+    ) -> None:
+        """A group that no longer exists must stop being the team's alarm bell.
+
+        Every silence alarm and every all-clear also goes to
+        ``tenant_chats.is_primary`` (``BotActionSink._notice_targets``). When
+        that group is deleted, each one becomes a permanent ``failed`` row: the
+        owners still get their copy, so nothing is lost and nothing complains —
+        while ``/health``'s failure digest reports a fault with no cure and a
+        real delivery failure has somewhere to hide.
+
+        **Only groups.** A private chat answering "chat not found" is a person
+        who has not started the bot or has blocked it, which is theirs to undo
+        and often temporary; and the owner's DM is the last channel that works
+        when a group has gone. Only the nomination is withdrawn — never the
+        tenancy — so ``/setup`` puts it back in one command.
+
+        Never fails a delivery: the row is already marked, and this is the
+        cleanup behind it.
+        """
+        if row.chat_id >= 0 or not _chat_is_gone(exc):
+            return
+        try:
+            if await tenancy_repo.demote_chat(self._db, row.chat_id):
+                _log.warning(
+                    "outbox.primary_chat_retired",
+                    chat_id=row.chat_id,
+                    error=repr(exc)[:200],
+                )
+        except Exception as failure:  # noqa: BLE001 - cleanup never fails a send
+            _log.warning(
+                "outbox.primary_chat_retire_failed",
+                chat_id=row.chat_id,
+                error=repr(failure)[:200],
+            )
 
 
 def _decode(row: DeliveryRow) -> _Job:

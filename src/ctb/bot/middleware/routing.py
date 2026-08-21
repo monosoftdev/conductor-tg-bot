@@ -192,6 +192,29 @@ class Route:
             return NO_THREAD_ID
         return self.thread_id
 
+    def reclaimable_thread(self, workspace_id: str) -> int:
+        """This thread when it is *this workspace's* room and lost its session.
+
+        :attr:`claimable_thread`'s counterpart for a room that has a history.
+        The two are deliberately exclusive: that one refuses any thread whose
+        ``chats`` row names a workspace, precisely so a detached room is never
+        spent on a *new* one — and without this, "reopen" then had nowhere to
+        land but a sibling topic beside the room the owner was typing in.
+
+        Unlike :attr:`claimable_thread` a group is not excluded. The exclusion
+        there is that a group topic is somebody's room rather than scratch
+        space; here the ``chats`` row says whose, and it is this workspace's.
+
+        Reclaiming is still only a *proposal*: ``adopt`` renames the thread
+        before it binds anything, and a thread that is really gone answers that
+        rename and gets a fresh room instead.
+        """
+        if not self.thread_id or self.session_id:
+            return NO_THREAD_ID
+        if self.chat is None or self.chat.workspace_id != workspace_id:
+            return NO_THREAD_ID
+        return self.thread_id
+
 
 class RoutingMiddleware(BaseMiddleware):
     """Put a :class:`Route` in the handler data for every update."""

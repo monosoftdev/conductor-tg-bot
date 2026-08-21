@@ -13,7 +13,7 @@ create a supergroup, enable Topics or grant admin rights.
 
 Verified offline, on every commit:
 
-- **2,402 tests pass** against a real PostgreSQL 16.
+- **2,415 tests pass** against a real PostgreSQL 16.
 - `ruff format --check`, `ruff check`, `pyright` — all clean.
 - The real runtime boots against a real database: all seven services start,
   `/health` returns `ok`, the lease is acquired, shutdown is clean.
@@ -68,9 +68,62 @@ Three changes, smallest blast radius first:
   **reopen** button through the existing `ADOPT` handler, instead of "No session
   here" — which was false of a thread the owner never left.
 
-**The two live rooms are still orphaned.** The fix stops it recurring; it does
-not re-home what already moved. Both sessions are reachable from `/board`,
-which opens a fresh room for them.
+Refusing a detached room to `claimable_thread` is what stops a follow-up
+becoming a workspace, and it also took away the only thread adoption knew how to
+move into — so *reopen* came back in a **sibling** topic beside the room it was
+tapped in. `Route.reclaimable_thread(workspace_id)` is the narrow counterpart:
+this thread, for the one workspace whose room it already is, in a group as well
+as a DM (`claimable_thread` excludes a group because a topic there is somebody's
+room — here the `chats` row says whose, and it is this workspace's). Reclaiming
+stays a *proposal*: adoption renames the thread before binding anything, so a
+room Telegram really has lost still gets a fresh one.
+
+Which session comes back is `outbound_prompts`, not the listing. Adoption falls
+back to the workspace's newest session, which in a workspace with several is a
+coin flip — and a room returning addressed at somebody else's transcript is the
+failure the whole seam exists to prevent. `prompts.last_session_in_room` answers
+it exactly, and durably: unlike `deliveries` that ledger is never pruned in bulk.
+
+**Migration `005` repairs the rooms already detached.** The code fix stops it
+recurring and does nothing for the two rooms whose `chats` row is already blank
+— they still read as scratch space, so the *reported* bug still reproduces in
+them. 005 gives such a room its `workspace_id` back from the prompt ledger
+(`deliveries` as a weaker second pass), skipping the linear seat, threads
+nothing ever used, archived workspaces and rooms still bound. It binds no
+session: that is a decision with a live poller behind it and belongs to the
+reopen tap. It changes no schema, so it is an `OPTIONAL_SCHEMA_VERSION` — a data
+repair is not something a query can fail on, and refusing to boot without it
+would be strictly worse than the rooms it fixes.
+
+## A deleted group kept ringing a bell nobody could hear (2026-08-20)
+
+Found in the same pass, in a different subsystem. `_notice_targets` adds the
+team's `tenant_chats.is_primary` chat to every silence alarm and all-clear.
+Tenant `reclaimly`'s is a group that no longer exists — `getChat` on it answers
+*chat not found* — so each of those became a permanent `failed` delivery: **17
+of them in two days, and every `failed` row in the database.**
+
+Nothing was lost (the owners' DMs are separate targets) and nothing corrected
+it either. The cost is that `/health`'s failure digest reports a fault with no
+cure, which is the state in which a real delivery failure has somewhere to hide.
+
+A terminal send failure whose words mean *the chat is gone* now withdraws that
+chat's nomination (`tenancy.demote_chat`). Three deliberate limits:
+
+- **Only the nomination, never the tenancy.** Deleting the `tenant_chats` row
+  would re-open the group to being claimed by another team; `/setup` restores a
+  nomination in one command.
+- **Only groups.** "chat not found" in a private chat is a person who has not
+  started the bot or has blocked it — theirs to undo, often temporary — and the
+  owner's DM is the last channel that works once a group has gone.
+- **Only unambiguous words.** `CHAT_GONE_MARKERS` is three phrases. *"bot is not
+  a member"* is deliberately absent: being outside a group that still exists is
+  something somebody undoes by adding the bot back, and a re-add produces no
+  update that could put the nomination back.
+
+It runs on the worker pool, which is the only role granted `tenant_chats`
+(`ctb_app` has no grant at all — that table decides scope). Production already
+builds the outbox that way; the test now says so out loud.
 
 ## One 401 took two teams off the air for four days (2026-08-14)
 
