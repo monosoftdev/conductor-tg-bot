@@ -1075,6 +1075,49 @@ async def cockpit_target(db: Database) -> tuple[str, str] | None:
     return targets[0] if targets else None
 
 
+#: What a room whose session was detached says instead of "No session here".
+DETACHED_ROOM_HINT: Final = (
+    "This room lost its session · tap to reopen it, or <code>/board</code> for another."
+)
+
+
+async def reopen_markup(
+    db: Database,
+    workspace_id: str,
+    *,
+    nonces: NonceStore,
+    user_id: int | None,
+    chat_id: int,
+    thread_id: int,
+) -> InlineKeyboardMarkup | None:
+    """One button that puts this room's workspace back into this room.
+
+    A room detached by ``room_gone`` keeps its ``workspace_id`` and loses its
+    session, and the honest answer to a line typed there is neither "No session
+    here" — the room plainly *had* one — nor a new workspace, which is what
+    ``claimable_thread`` used to make of it. It is the workspace's name and one
+    tap, through the same ``ADOPT`` handler ``/attach`` and ``/board`` use, so
+    reopening lands in *this* thread rather than opening a sibling beside it.
+    """
+    workspace = await workspaces_repo.get(db, workspace_id)
+    if workspace is None:
+        return None
+    return keyboard(
+        [
+            [
+                adopt_button(
+                    workspace_id=workspace_id,
+                    name=workspace_name(workspace),
+                    store=nonces,
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                )
+            ]
+        ]
+    )
+
+
 async def cockpit_markup(
     db: Database,
     text: str,

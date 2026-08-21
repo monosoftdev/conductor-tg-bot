@@ -58,6 +58,22 @@ from its first tagged release.
 
 ### Fixed
 
+- **A follow-up in a DM topic no longer offers to build a second workspace.**
+  `apply_marker` treated a refused `editForumTopic` as proof the topic was
+  deleted; in a *private* chat Telegram answers `TOPIC_ID_INVALID` for a thread
+  it merely will not let a bot rename, which is byte-for-byte what a deleted one
+  answers (`claim_topic` already declined to read anything into it). So a room
+  somebody was working in was detached mid-task — and because `chats.unbind`
+  cleared the workspace pointer as well as the session,
+  `Route.claimable_thread` then read that room as Telegram's empty *New Chat*
+  seat and answered the next line typed there with the new-workspace confirm
+  card: a second paid container and a second Conductor chat instead of the
+  follow-up it was. `rename_proves_deletion` limits the conclusion to
+  supergroups, where a dead topic refuses the send too; `chats.detach_session`
+  keeps the workspace so a detached room stays recoverable; and a room that kept
+  its workspace now answers a typed or dictated line with one **reopen** button
+  rather than "No session here", which was false of a thread nobody had left.
+
 - **`/health` can finally see its own absence.** During the four-day polling
   outage the report read `ok` at HTTP 200 the whole time, so Railway never
   restarted anything and nothing paged anybody: `polling` is built from

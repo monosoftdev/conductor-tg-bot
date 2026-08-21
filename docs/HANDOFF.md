@@ -13,10 +13,64 @@ create a supergroup, enable Topics or grant admin rights.
 
 Verified offline, on every commit:
 
-- **2,343 tests pass** against a real PostgreSQL 16.
+- **2,402 tests pass** against a real PostgreSQL 16.
 - `ruff format --check`, `ruff check`, `pyright` — all clean.
 - The real runtime boots against a real database: all seven services start,
   `/health` returns `ok`, the lease is acquired, shutdown is clean.
+
+## A rename nobody could make deleted two rooms (2026-08-20)
+
+Reported as *"I switch to a session and comment on it, and instead of following
+up it creates a new chat in Conductor."* Every word of that is what happened,
+and none of it starts where it looks like it starts.
+
+The live database says it plainly. Two rooms in the owner's DM — thread
+`1709527` (56 deliveries) and thread `1711456` (62) — stop mid-task and their
+sessions reappear on the chat's linear seat: `sessions.thread_id = 0`,
+`topic_name` and `topic_marker` NULL, `is_bound` still true. That column set is
+`room_gone`'s signature and nothing else's — the poller's `UnbindTopic` clears
+`is_bound` too, and `/done` sets `archived_at`. The `chats` rows survive as
+`kind='topic'` with **both** `workspace_id` and `session_id` NULL. No delivery
+was ever rerouted (no failed rows, no retries), which leaves exactly one of
+`room_gone`'s two callers: `apply_marker`'s refused rename.
+
+**`TOPIC_ID_INVALID` in a private chat is not evidence.** Probed against the
+live Bot API with the production token: `editForumTopic` on a private chat
+answers `Bad Request: TOPIC_ID_INVALID` for a thread it merely will not let a
+bot rename, and that is byte-for-byte what a deleted one answers. `claim_topic`
+already refused to read anything into it — *"whether a bot may rename a thread a
+user created in a DM is undocumented"* — while `apply_marker`, making the
+identical call, read it as proof and detached the room. Two functions, one
+Telegram call, opposite conclusions.
+
+**And the detach made the room look like scratch space.**
+`Route.claimable_thread` decides a thread is Telegram's *New Chat* composer seat
+by reading `session_id` and `chats.workspace_id`; `chats.unbind` cleared both.
+So a topic somebody had worked in all week became indistinguishable from an
+empty one, and the next line typed there was answered with the new-workspace
+confirm card — a second paid container and the second Conductor chat in the
+report. `room_gone`'s own docstring promises *"a detach, not an archive …
+unbinding is free to undo"*, and this is the sentence that was not true.
+
+Three changes, smallest blast radius first:
+
+- `rename_proves_deletion(chat_id)` — a refused rename detaches a room only in a
+  supergroup, where a dead topic refuses the *send* as well. Nothing is lost in
+  a DM: it ignores `message_thread_id` on a send (tdlib/telegram-bot-api#854),
+  so a genuinely deleted DM topic costs a stale title, and `/board` in a DM
+  always mints a reopen button rather than a jump link (`jump_url` has no syntax
+  for a DM thread), so reopening still self-heals through `claim_topic`.
+- `chats.detach_session` keeps `workspace_id`. A detached room is recoverable,
+  not scratch — `chats.bind` only ever refuses to repoint a *session*, so
+  reopening writes straight over it. The poller's `UnbindTopic` uses it too;
+  `/done` still forgets, because archiving is meant to.
+- A room that kept its workspace answers a typed *or dictated* line with one
+  **reopen** button through the existing `ADOPT` handler, instead of "No session
+  here" — which was false of a thread the owner never left.
+
+**The two live rooms are still orphaned.** The fix stops it recurring; it does
+not re-home what already moved. Both sessions are reachable from `/board`,
+which opens a fresh room for them.
 
 ## One 401 took two teams off the air for four days (2026-08-14)
 
@@ -304,7 +358,9 @@ Two changes, and the second is the one that matters:
 
 - `TOPIC_ID_INVALID` joins `THREAD_GONE_MARKERS`, so a deleted DM topic is
   detected wherever a group's is — the adoption probe, `apply_marker`'s
-  `room_gone`, the outbox reroute.
+  `room_gone`, the outbox reroute. (`apply_marker` no longer acts on it in a
+  DM; see *A rename nobody could make deleted two rooms* above for why that
+  half was a wrong reading.)
 - The probe is `claim_topic` now, shared with `/attach`, and it **cannot fail
   the open**. Gone → reopen the room; a refusal we cannot read → keep the room
   unnamed and leave `topic_marker` unwritten, so the next transition retries
@@ -357,8 +413,10 @@ What changed at the surface:
 - **A deleted topic stops being silent.** Telegram sends no update for one
   (`prompts._SERVICE_CONTENT` has no deleted member), and three places discovered
   it independently. `topics.room_gone` is the one seam: it unbinds the room,
-  clears the `chats` row, and says so once in the chat root. A detach, not an
-  archive — the gesture is one accidental tap and the thing behind it costs money.
+  drops the `chats` row's session (keeping its workspace, so the room stays
+  recoverable rather than becoming scratch space), and says so once in the chat
+  root. A detach, not an archive — the gesture is one accidental tap and the
+  thing behind it costs money.
 - **Per-session markers.** Two sessions of one workspace used to fight over a
   single `topic_marker`; whichever ticked last won, so a room could read
   `⚙️ working` for a session nobody was looking at.

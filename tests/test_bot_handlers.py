@@ -4281,6 +4281,101 @@ async def test_two_deleted_rooms_do_not_end_up_sharing_the_chat_root(
     assert older is not None and older.archived_at is None
 
 
+# ── a refused rename is not proof, and a detached room is not scratch ────────
+
+
+class _UnrenameableBot(_ForumBot):
+    """A chat that answers ``TOPIC_ID_INVALID`` to every ``editForumTopic``.
+
+    Probed against the live Bot API: this is what a **private** chat says for a
+    thread it merely will not let a bot rename, and it is byte-for-byte what a
+    deleted one says.
+    """
+
+    async def edit_forum_topic(self, **_: Any) -> None:
+        self.trace.append("rename_topic")
+        raise _refused("Bad Request: TOPIC_ID_INVALID")
+
+
+async def _room(db: Database, *, chat_id: int, thread_id: int) -> None:
+    await workspaces_repo.upsert(db, "ws-1", name="api", topic_name="api/main")
+    await sessions_repo.upsert(db, "sess-1", workspace_id="ws-1", title="fix login")
+    await sessions_repo.bind_topic(
+        db, "sess-1", chat_id=chat_id, topic_id=thread_id, topic_name="fix login"
+    )
+    await sessions_repo.bind(db, "sess-1", chat_id=chat_id, thread_id=thread_id)
+    await chats_repo.bind(
+        db, chat_id, thread_id, workspace_id="ws-1", session_id="sess-1"
+    )
+
+
+async def test_a_dm_rename_refusal_does_not_detach_the_room(db: Database) -> None:
+    """The bug the owner hit: a topic went quiet mid-task and never came back.
+
+    ``editForumTopic`` on a private chat answers ``TOPIC_ID_INVALID`` for a
+    thread it will not rename, and that is indistinguishable from a deleted
+    one. Reading it as proof detached a room somebody was working in: the
+    session landed back on the chat's linear seat, the room stopped routing,
+    and the next follow-up typed there was answered with *create a workspace*.
+    ``claim_topic`` already declines to read anything into the same refusal.
+    """
+    await _room(db, chat_id=1132334, thread_id=1711456)
+    bot = _UnrenameableBot()
+
+    assert await topics.apply_marker(bot, db, "sess-1", TopicMarker.WORKING) is False  # type: ignore[arg-type]
+
+    row = await sessions_repo.get(db, "sess-1")
+    assert row is not None and row.has_room and row.thread_id == 1711456
+    route = await chats_repo.get(db, 1132334, 1711456)
+    assert route is not None and route.session_id == "sess-1"
+    assert bot.sent == [], "the room was detached and the owner told it was gone"
+
+
+async def test_a_supergroup_rename_refusal_still_detaches_the_room(
+    db: Database,
+) -> None:
+    """Where the refusal *is* readable, nothing changes.
+
+    A group topic that no longer exists refuses the rename and refuses the
+    send, so the same words there really are the only signal Telegram gives.
+    """
+    await _room(db, chat_id=-1001, thread_id=7)
+    bot = _UnrenameableBot()
+
+    assert await topics.apply_marker(bot, db, "sess-1", TopicMarker.WORKING) is False  # type: ignore[arg-type]
+
+    row = await sessions_repo.get(db, "sess-1")
+    assert row is not None and not row.has_room
+    assert len(bot.sent) == 1 and "lost its topic" in bot.sent[0]["text"]
+
+
+async def test_a_detached_room_is_never_mistaken_for_an_empty_thread(
+    db: Database,
+) -> None:
+    """``room_gone`` keeps the workspace pointer, and that is load-bearing.
+
+    ``Route.claimable_thread`` reads ``session_id`` and ``chat.workspace_id``
+    to decide a thread is Telegram's *New Chat* composer seat — scratch space a
+    typed line may turn into a whole new workspace. Clearing both made every
+    detached room look exactly like one.
+    """
+    await _room(db, chat_id=1132334, thread_id=1711456)
+    bot = _ForumBot()
+
+    assert await topics.room_gone(bot, db, "sess-1") is True  # type: ignore[arg-type]
+
+    route = await chats_repo.get(db, 1132334, 1711456)
+    assert route is not None
+    assert route.session_id is None, "the room must stop routing to a dead thread"
+    assert route.workspace_id == "ws-1", "…but not forget which workspace it is"
+    assert (
+        Route(
+            chat_id=1132334, thread_id=1711456, kind="dm", chat=route
+        ).claimable_thread
+        == 0
+    ), "a room somebody worked in is being offered as scratch space for a new one"
+
+
 # ── /name -w renames the family, so every room of it ─────────────────────────
 
 
