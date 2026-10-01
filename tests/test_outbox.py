@@ -1626,6 +1626,46 @@ async def test_a_finished_card_lands_immediately_and_is_retired(
     assert row is not None and row.status_card_msg_id is None
 
 
+async def test_a_done_card_survives_the_deep_link_the_api_actually_returns(
+    cards: StatusCards, bot: FakeBot, clock: FakeClock, db: Database, session: str
+) -> None:
+    """End to end: the finished-turn edit must happen, button or no button.
+
+    The sibling test above passes ``https://conductor.build/w/1``, which the API
+    has never produced. The real value is a ``conductor://`` custom scheme, and
+    Telegram answers ``Unsupported URL protocol`` and discards the whole
+    ``editMessageText`` — so in production the turn finished, its answer arrived,
+    and the card above it went on saying "working" for ever.
+    """
+    await cards.apply(
+        PostStatusCard(CardKind.WORKING, "working 0s", (CardButton.STOP,)),
+        session_id=SESSION,
+        chat_id=CHAT,
+    )
+    clock.advance(4.0)
+    await cards.handle(
+        (
+            EditStatusCard(
+                CardKind.DONE,
+                "done in 1m32s",
+                (CardButton.TRANSCRIPT, CardButton.OPEN),
+            ),
+        ),
+        session_id=SESSION,
+        chat_id=CHAT,
+        deep_link="conductor://workspace?id=f0ce5c0b-68e2-459c-b774-88de7031dcd2",
+    )
+
+    edits = bot.calls_to("edit_message_text")
+    assert len(edits) == 1
+    assert "done in 1m32s" in edits[0]["text"]
+    # Transcript survives as a callback button; Open is dropped rather than
+    # taking the edit down with it.
+    buttons = [b for row in edits[0]["reply_markup"].inline_keyboard for b in row]
+    assert [b.url for b in buttons] == [None]
+    assert all(b.callback_data is not None for b in buttons)
+
+
 async def test_the_turn_price_waits_for_the_turn_to_finish(
     cards: StatusCards, bot: FakeBot, clock: FakeClock, session: str
 ) -> None:

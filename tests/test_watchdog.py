@@ -247,10 +247,14 @@ async def test_a_read_failure_does_not_kill_the_watchdog(
     watchdog = make(system_db, sink, at=now)
 
     async def boom(*_args: Any, **_kwargs: Any) -> Any:
+        # Ends the loop from inside the failure, so the `except` branch is
+        # genuinely reached. Stopping it *before* `run` would only prove that a
+        # stopped watchdog does nothing — `run` pauses before its first census,
+        # so a pre-set stop flag returns without ever calling the census at all.
+        await watchdog.stop()
         raise RuntimeError("database is unreachable")
 
     monkeypatch.setattr(sessions_repo, "list_silent", boom)
-    await watchdog.stop()
     await watchdog.run()  # returns rather than raising
 
     monkeypatch.undo()
@@ -277,3 +281,34 @@ async def test_a_failing_sink_leaves_the_episode_to_be_retried(
     # Tried both times, same key both times — nothing was swallowed.
     assert len(sink.alarms) == 2
     assert len({silence.key for silence, _ in sink.alarms}) == 1
+
+
+async def test_the_first_census_waits_one_interval_after_boot(
+    system_db: Database,
+) -> None:
+    """ "Nothing has been checking your tasks" is a claim about *this* process.
+
+    When it starts answering, the supervisor has not taken the lease yet, so
+    every session still carries the stale ``updated_at`` of whatever outage is
+    being recovered from — and a census run then is reading somebody else's
+    silence. Live, this fired in the same second as boot, for both tenants, on
+    the deploy that was fixing them, and the message it chose promised a recycle
+    that was not going to happen because the process had just started.
+    """
+    now = now_ms()
+    await seed(system_db, "abandoned", at=now - HOUR_MS)
+    sink = RecordingSink()
+    paused: list[float] = []
+    watchdog = Watchdog(system_db, sink=sink, interval_s=60.0, clock=lambda: now)
+
+    async def pause(seconds: float) -> None:
+        paused.append(seconds)
+        # One interval's worth of recovery is all the real poller needs; stop
+        # before the census so this asserts the *ordering*, not the census.
+        await watchdog.stop()
+
+    watchdog._pause = pause  # pyright: ignore[reportPrivateUsage]
+    await watchdog.run()
+
+    assert paused == [60.0]
+    assert sink.alarms == []

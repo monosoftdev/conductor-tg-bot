@@ -124,6 +124,28 @@ from its first tagged release.
   "Transcribing…" hang it exists to end went on ending only at the next
   redeploy.
 
+- **A note that runs out of attempts now tells its owner so.** Both recovery
+  passes are cross-tenant and have no tenant of their own, while `_send_failure`
+  reads the note's acknowledgement id off the tenant-scoped pool. `_recover`
+  wrapped that in a bare `suppress(Exception)`, so every "Transcription kept
+  failing" card died unseen; the sweep could not reach the call at all. Fixing the
+  pool made it reachable — and reachable unscoped it raises into the voice
+  `TaskGroup`. `_notify_abandoned` answers each row inside its own scope, and logs
+  a failure rather than swallowing it.
+
+- **The watchdog no longer alarms in the same second as boot.** `run` ran its
+  first census before its first pause, when the supervisor has not taken the lease
+  and every session still carries the stale `updated_at` of the outage being
+  recovered from. Live, it fired for both tenants on the deploy that was fixing
+  them. The first census now waits one interval — a minute against a ten-minute
+  threshold.
+
+- **`button_url` rejects what `is_safe_url` rejects.** It reuses the renderer's
+  check, which has always degraded an unsafe `href` to plain text, so a URL
+  carrying a newline, tab or space no longer reaches Telegram as the same 400 a
+  bare scheme test would have waved through. The two allowlists stay separate:
+  `mailto:` is legal in an `href` and not on a button.
+
 - **A sleeping workspace is no longer mistaken for a waking one.** Every live
   workspace reports `sleeping` between turns and `ready` may never be observed,
   but `is_waking` counted it — so an idle room was pushed into `WAKING`, which

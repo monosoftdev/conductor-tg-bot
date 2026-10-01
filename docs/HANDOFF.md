@@ -140,6 +140,49 @@ poller starts in thirteen minutes**, not one of them completing a tick. It now
 reads off the pool, which outlives the pollers, so the answer no longer changes
 by being used.
 
+### Simulating it again found three the first simulation had created
+
+Replaying the deploy minute by minute, rather than as a single snapshot, is what
+turned these up — all three are in code this PR had already touched.
+
+**The voice sweep's fix made a dead loop into a crashing one.** `_sweep` was on
+the wrong pool, so it raised one line before ever reaching `_send_failure`. Put it
+on the worker pool and that line becomes reachable — and `_send_failure` reads the
+note's acknowledgement id off the **tenant-scoped** pool, from a task that has no
+tenant. So the first note to exhaust its attempts raises `TenantScopeError`
+straight into the voice `TaskGroup`, which is worse than the silence it replaced.
+
+It had never worked anywhere: `_recover` wrapped the same call in a bare
+`suppress(Exception)`, so every "Transcription kept failing" card the boot pass
+tried to post died unseen. `_notify_abandoned` now answers each row inside its own
+tenant scope, the way a claimed job does, and *logs* a failure instead of
+swallowing it — a silent `suppress` is what hid this for as long as it existed.
+The card, with its Retry button, now actually arrives.
+
+**The watchdog alarmed in the same second as boot.** "Nothing has been checking
+your tasks" is a claim about *this* process, and `run` ran its first census before
+its first pause — at which point the supervisor has not taken the lease, so every
+session still carries the stale `updated_at` of the outage being recovered from.
+Live, that fired for both tenants on the deploy that was fixing them. With the new
+attribution it would have chosen the *unexplained* wording, which promises a
+recycle that the uptime grace correctly declines to perform. The first census now
+waits one interval: one minute against a ten-minute threshold, which buys the
+alarm the right to be believed.
+
+That change also quietly broke a test into a tautology —
+`test_a_read_failure_does_not_kill_the_watchdog` set the stop flag *before*
+calling `run`, so with the pause first the census was never reached at all and the
+`except` branch it exists to cover stopped being exercised while staying green. It
+now ends the loop from inside the failure.
+
+**And `button_url` was the cruder half of an idea the renderer already had.**
+`link_html` has always checked `is_safe_url` and degraded to `text (url)` rather
+than emit an `href` Telegram would refuse — which is why the *text* path was never
+affected by `conductor://`, only the keyboard. `button_url` now reuses that check,
+so it also rejects a URL carrying a newline, tab or space, which a bare scheme test
+waves through into the same 400. The two allowlists stay separate: `mailto:` is
+legal in an `href` and not on a button.
+
 ### Three more, found in the same pass
 
 - **Telegram refuses `conductor://`, and refuses the whole message with it.**

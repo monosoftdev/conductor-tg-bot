@@ -815,6 +815,39 @@ async def test_the_stale_sweep_runs_unscoped_like_the_task_it_lives_in(
     assert row is not None and row.state == "received"
 
 
+async def test_an_abandoned_note_reaches_its_owner_from_the_scopeless_sweep(
+    settings: Settings, db: Database, system_db: Database
+) -> None:
+    """A note out of attempts has to say so, and saying so needs a scope.
+
+    Both recovery passes are cross-tenant and so have no tenant of their own,
+    while `_send_failure` reads the note's ack id off the *tenant-scoped* pool.
+    `_recover` wrapped that in a bare `suppress(Exception)`, so every card it
+    tried to post died on `TenantScopeError` and said nothing — and the sweep
+    could not reach the call at all, being on the wrong pool one line earlier.
+
+    Which makes this the test that matters for the pool fix: putting the sweep on
+    the worker pool is what first made this line reachable, and reachable without
+    a scope it raises straight into the voice `TaskGroup`. The sibling test above
+    seeds a *recoverable* row, so `abandoned` is empty and it never gets here.
+    """
+    await seed(db, tg_message_id=91, state="transcribing", attempts=3)
+    bot = FakeBot()
+    service = make_service(settings, db, system_db, bot=bot)
+
+    async with unscoped():
+        await service._sweep_once()  # pyright: ignore[reportPrivateUsage]
+
+    row = await voice_repo.get(db, 1001, 91)
+    assert row is not None and row.state == "failed"
+    assert len(bot.messages) == 1
+    assert "Transcription kept failing." in bot.messages[0]["text"]
+    assert bot.messages[0]["reply_to_message_id"] == 91
+    # And it carries the way back in, which is the whole point of the card.
+    markup = bot.messages[0]["reply_markup"]
+    assert "Retry" in markup.inline_keyboard[0][0].text
+
+
 async def test_recover_stale_gives_up_after_three_attempts(db: Database) -> None:
     await seed(db, tg_message_id=72, state="transcribing", attempts=2)
     await seed(db, tg_message_id=73, state="transcribing", attempts=3)

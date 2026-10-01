@@ -1394,6 +1394,16 @@ def test_open_is_dropped_when_telegram_would_refuse_the_scheme() -> None:
         (LIVE_DEEP_LINK, None),
         ("conductor://workspace", None),
         ("javascript:alert(1)", None),
+        # Legal in an `href`, not on a button — the two allowlists differ.
+        ("mailto:nobody@example.test", None),
+        # `is_safe_url` rejects these, and a bare scheme test would not: each
+        # reaches Telegram as the same 400 that costs the whole message.
+        ("https://example.test/a\nb", None),
+        ("https://example.test/a b", None),
+        ("https://example.test/a\tb", None),
+        (" https://example.test/", None),
+        # Relative: no document base in a Telegram message.
+        ("/workspace/1", None),
         ("", None),
         (None, None),
     ],

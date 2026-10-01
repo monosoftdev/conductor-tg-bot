@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import io
 import uuid
+from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -259,9 +260,7 @@ class VoiceService:
             abandoned=len(recovery.abandoned),
             pruned=pruned,
         )
-        for row in recovery.abandoned:
-            with suppress(Exception):
-                await self._send_failure(row, "Transcription kept failing.")
+        await self._notify_abandoned(recovery.abandoned)
 
     async def _prune(self) -> int:
         cutoff = now_ms() - self.settings.voice_completed_retention_days * 86_400_000
@@ -400,8 +399,52 @@ class VoiceService:
                 requeued=recovery.requeued,
                 abandoned=len(recovery.abandoned),
             )
-        for row in recovery.abandoned:
-            await self._send_failure(row, "Transcription kept failing.")
+        await self._notify_abandoned(recovery.abandoned)
+
+    async def _notify_abandoned(self, rows: Sequence[VoiceInputRow]) -> None:
+        """Tell each owner their note is not coming back, from a scopeless task.
+
+        Both recovery passes are cross-tenant maintenance and so have no tenant
+        of their own, while ``_send_failure`` reads the note's acknowledgement id
+        off the **tenant-scoped** pool. So each row has to be answered inside its
+        own scope — exactly as a claimed job is, which is why the request path
+        never noticed this.
+
+        It had never worked. ``_recover`` wrapped the call in a bare
+        ``suppress(Exception)``, so every card it tried to post died on
+        ``TenantScopeError`` and said nothing about it; the sweep could not get
+        here at all, being on the wrong pool one line earlier. Fixing that pool
+        is what made this reachable — and reachable, unguarded, it raises into the
+        ``TaskGroup`` the first time a note exhausts its attempts, which is worse
+        than the silence it replaced.
+
+        One row's failure must not cost the others theirs, so each is guarded —
+        but it is *logged*, because a silent ``suppress`` is what hid this for as
+        long as it existed.
+        """
+        for row in rows:
+            if row.tenant_id is None:  # pragma: no cover - NOT NULL in the schema
+                # Typed optional for the same migration-compatibility reason the
+                # rest of the row is. There is no scope to enter and so nowhere
+                # to send from; say so rather than guess a tenant.
+                log.warning(
+                    "voice.abandon_notice_unscoped",
+                    chat_id=row.chat_id,
+                    tg_message_id=row.tg_message_id,
+                )
+                continue
+            try:
+                async with tenant_scope(row.tenant_id):
+                    await self._send_failure(row, "Transcription kept failing.")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning(
+                    "voice.abandon_notice_failed",
+                    chat_id=row.chat_id,
+                    tg_message_id=row.tg_message_id,
+                    error=short_error(exc),
+                )
 
     async def _maintenance(self) -> None:
         while not self._stop.is_set():
