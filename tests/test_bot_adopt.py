@@ -56,7 +56,7 @@ from ctb.db.repo import sessions as sessions_repo
 from ctb.db.repo import workspaces as workspaces_repo
 from ctb.db.repo.tenancy import TenantRow
 from ctb.settings import Settings
-from ctb.turn.state import TopicMarker
+from ctb.turn.state import TopicMarker, TurnState
 from tests.conftest import FAKE_API_KEY
 from tests.fakes.fake_conductor import (
     FakeConductor,
@@ -968,6 +968,59 @@ async def test_a_prompt_in_the_adopted_topic_reaches_the_adopted_session(
     assert body.startswith("now do the same for the cart test")
     # The adopted path is the normal path, so it is phone-shaped too.
     assert body.endswith(MOBILE_REPLY_INSTRUCTION)
+
+
+async def test_a_prompt_in_a_buried_room_is_answered_locally_not_by_conductor(
+    db: Database, client: ConductorClient, fake: FakeConductor
+) -> None:
+    """The commonest room in a long-lived chat, and it used to answer in stack.
+
+    On the live database 22 of one owner's 43 threads point at a DEAD session,
+    every one in a workspace since archived. Posting into those spent a Conductor
+    call to be refused and reported it as ``Prompt failed: …`` — a stack-shaped
+    answer to "why did nothing happen", for a room the bot had already buried.
+
+    The session row is the one already loaded for the receipt, so the check costs
+    no query: the comment beside it is right that a prompt must not pay for two.
+    """
+    session = _seeded(fake)
+    bot = _Bot()
+    await _adopt(bot, db, client, session)
+
+    chat = await chats_repo.get(db, CHAT_ID, FIRST_TOPIC)
+    await sessions_repo.update(db, session.session_id, turn_state=str(TurnState.DEAD))
+    row = await sessions_repo.get(db, session.session_id)
+    assert chat is not None and row is not None and row.state is TurnState.DEAD
+    before = tuple(session.posted_ids)
+    message = SimpleNamespace(
+        text="one more thing",
+        bot=bot,
+        chat=SimpleNamespace(id=CHAT_ID, type="supergroup"),
+        message_thread_id=FIRST_TOPIC,
+        message_id=52,
+        from_user=SimpleNamespace(id=1001),
+    )
+
+    await prompt_handlers.plain_text(
+        message,  # type: ignore[arg-type]
+        Route(
+            chat_id=CHAT_ID,
+            thread_id=FIRST_TOPIC,
+            kind="topic",
+            chat=chat,
+            session=row,
+        ),
+        fake_tenant(client),
+        NonceStore(),
+        _seat(db),
+        db=db,
+    )
+
+    assert tuple(session.posted_ids) == before, "no call to be told no"
+    said = bot.sent[-1]["text"]
+    assert "finished" in said and "archived" in said
+    # And it names what to do instead, which `Prompt failed:` never did.
+    assert "/new" in said and "/digest" in said
 
 
 # ── the surfaces ─────────────────────────────────────────────────────────────

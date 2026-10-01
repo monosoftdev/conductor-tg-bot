@@ -4516,3 +4516,222 @@ async def test_renaming_a_workspace_relabels_every_room_it_has(
     assert sorted(bot.renamed) == ["a · acme-api/main", "b · acme-api/main"]
     workspace = await workspaces_repo.get(db, "ws-1")
     assert workspace is not None and workspace.topic_name == "acme-api/main"
+
+
+# ── the Transcript button, which is the other half of a readable log ─────────
+
+
+class _TxBot:
+    """Just enough of ``Bot`` to see what the Transcript button answers with."""
+
+    def __init__(self) -> None:
+        self.sent: list[dict[str, Any]] = []
+        self.documents: list[str] = []
+
+    async def send_message(self, **kwargs: Any) -> Any:
+        self.sent.append(kwargs)
+        return SimpleNamespace(message_id=len(self.sent))
+
+    async def send_document(self, *args: Any, **kwargs: Any) -> Any:
+        self.documents.append("document")
+        return SimpleNamespace(message_id=0)
+
+
+class _TxQuery:
+    def __init__(self, bot: _TxBot, data: str) -> None:
+        self.bot = bot
+        self.data = data
+        self.from_user = SimpleNamespace(id=1001)
+        self.message = SimpleNamespace(
+            chat=SimpleNamespace(id=1132334, type="private"),
+            message_thread_id=None,
+        )
+        self.answers: list[str] = []
+
+    async def answer(self, text: str = "", **_: Any) -> None:
+        self.answers.append(text)
+
+
+def test_log_body_is_prose_and_names_the_raw_escape_hatch() -> None:
+    """One renderer, so the command and its button cannot disagree."""
+    body = power_handlers.log_body(
+        [
+            _stored(1, "userMessage", {"type": "userMessage", "text": "run tests"}),
+            _stored(2, "agentMessage", _said("All 12 passed.")),
+        ]
+    )
+
+    assert body is not None
+    assert "› run tests" in body
+    assert "· All 12 passed." in body
+    assert "/log raw" in body
+
+
+def test_log_body_is_none_when_there_is_nothing_to_say() -> None:
+    assert power_handlers.log_body([]) is None
+
+
+async def test_the_transcript_button_answers_in_prose_not_json(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B2 shipped for ``/log`` and left the button beside it behind.
+
+    ``Transcript`` is on the finished *and* errored cards — the two most-tapped
+    surfaces there are — and it answered with a ``.md`` of raw JSON envelopes,
+    which is the exact artefact the fix was about: "a phone cannot read JSON,
+    and it was the only command that answered that question at all". The handler
+    had no test of its own, only assertions that the button *exists*, which is
+    how a command and its own button came to disagree about the answer.
+    """
+    from ctb.bot.handlers import prompts as prompt_handlers
+
+    rows = [
+        _stored(1, "userMessage", {"type": "userMessage", "text": "run tests"}),
+        _stored(2, "agentMessage", _said("All 12 passed.")),
+    ]
+
+    async def recent(*_args: Any, **_kwargs: Any) -> list[StoredMessage]:
+        return list(reversed(rows))  # the repo answers newest-first
+
+    monkeypatch.setattr(prompt_handlers.transcript_repo, "recent", recent)
+    store = NonceStore()
+    ticket = store.issue("tx", "sess-tx", user_id=1001, chat_id=1132334, thread_id=0)
+    bot = _TxBot()
+    query = _TxQuery(bot, ticket.callback_data)
+
+    await prompt_handlers.transcript_callback(
+        query,  # type: ignore[arg-type]
+        store,
+        db=db,
+    )
+
+    assert bot.documents == [], "no JSON document on a phone"
+    assert len(bot.sent) == 1
+    text = bot.sent[0]["text"]
+    assert "› run tests" in text
+    assert "· All 12 passed." in text
+    assert "/log raw" in text
+
+
+# ── /log from the chat root, where there is no room to be in ─────────────────
+
+
+async def test_log_from_the_root_answers_for_the_one_task_rather_than_refusing(
+    db: Database, monkeypatch: Any
+) -> None:
+    """A DM has no link syntax for a topic, so "go to the room" is not advice.
+
+    Every session command answers "No session here. Use /new or /board" outside
+    a room, which is correct for ``/stop`` and useless for a *read*: there is no
+    tappable route to a DM room anywhere in the bot, so "read what this agent
+    did" was reachable only by finding the thread by hand — in a list the live
+    database shows holding 43 entries with 1 usable one.
+    """
+    sent: list[tuple[str, Any]] = []
+
+    async def fake_tell(_message: Any, text: str, **kwargs: Any) -> None:
+        sent.append((text, kwargs.get("reply_markup")))
+
+    monkeypatch.setattr(power_handlers, "tell", fake_tell)
+
+    async def one_target(*_: Any, **__: Any) -> list[tuple[str, str]]:
+        return [("sess-only", "fix login")]
+
+    monkeypatch.setattr(core_handlers, "cockpit_targets", one_target)
+
+    async def recent(*_args: Any, **_kwargs: Any) -> list[StoredMessage]:
+        return [_stored(1, "agentMessage", _said("Patched the redirect."))]
+
+    monkeypatch.setattr(power_handlers.transcript_repo, "recent", recent)
+    message = SimpleNamespace(
+        text="/log",
+        chat=SimpleNamespace(id=1132334),
+        message_thread_id=None,
+        message_id=3,
+        from_user=SimpleNamespace(id=1001),
+    )
+
+    await power_handlers.log_command(
+        message,  # type: ignore[arg-type]
+        Route(chat_id=1132334, kind="private"),
+        _NullState(),  # type: ignore[arg-type]
+        NonceStore(),
+        db=db,
+    )
+
+    # Answered, not refused — and asking "which one?" about a list of one is a
+    # tap that carries no information.
+    assert len(sent) == 1
+    assert "Patched the redirect." in sent[0][0]
+    assert sent[0][1] is None
+
+
+async def test_log_from_the_root_offers_a_choice_when_there_are_several(
+    db: Database, monkeypatch: Any
+) -> None:
+    """Showing you the wrong agent is a wasted tap, so several is a question."""
+    sent: list[tuple[str, Any]] = []
+
+    async def fake_tell(_message: Any, text: str, **kwargs: Any) -> None:
+        sent.append((text, kwargs.get("reply_markup")))
+
+    monkeypatch.setattr(power_handlers, "tell", fake_tell)
+
+    async def two_targets(*_: Any, **__: Any) -> list[tuple[str, str]]:
+        return [("sess-a", "fix login"), ("sess-b", "port billing")]
+
+    monkeypatch.setattr(core_handlers, "cockpit_targets", two_targets)
+    message = SimpleNamespace(
+        text="/log",
+        chat=SimpleNamespace(id=1132334),
+        message_thread_id=None,
+        message_id=3,
+        from_user=SimpleNamespace(id=1001),
+    )
+
+    await power_handlers.log_command(
+        message,  # type: ignore[arg-type]
+        Route(chat_id=1132334, kind="private"),
+        _NullState(),  # type: ignore[arg-type]
+        NonceStore(),
+        db=db,
+    )
+
+    text, markup = sent[0]
+    assert text == "Which task?"
+    assert markup is not None
+    labels = [row[0].text for row in markup.inline_keyboard]
+    assert labels == ["📄 fix login", "📄 port billing"]
+
+
+async def test_log_from_the_root_still_refuses_when_nothing_has_ever_run(
+    db: Database, monkeypatch: Any
+) -> None:
+    sent: list[tuple[str, Any]] = []
+
+    async def fake_tell(_message: Any, text: str, **kwargs: Any) -> None:
+        sent.append((text, kwargs.get("reply_markup")))
+
+    monkeypatch.setattr(power_handlers, "tell", fake_tell)
+
+    async def none_at_all(*_: Any, **__: Any) -> list[tuple[str, str]]:
+        return []
+
+    monkeypatch.setattr(core_handlers, "cockpit_targets", none_at_all)
+    message = SimpleNamespace(
+        text="/log",
+        chat=SimpleNamespace(id=1132334),
+        message_thread_id=None,
+        message_id=3,
+        from_user=SimpleNamespace(id=1001),
+    )
+
+    await power_handlers.log_command(
+        message,  # type: ignore[arg-type]
+        Route(chat_id=1132334, kind="private"),
+        _NullState(),  # type: ignore[arg-type]
+        NonceStore(),
+        db=db,
+    )
+
+    assert "No session here" in sent[0][0]

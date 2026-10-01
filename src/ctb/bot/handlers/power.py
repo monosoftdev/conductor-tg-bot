@@ -45,6 +45,8 @@ from ctb.bot.handlers.topics import (
 )
 from ctb.bot.keyboards import (
     CONTROL_TTL_S,
+    PLAIN_STYLE,
+    Action,
     Cb,
     NonceError,
     NonceStore,
@@ -58,6 +60,7 @@ from ctb.bot.middleware.routing import Route
 from ctb.bot.middleware.tenancy import TenantContext
 from ctb.conductor.client import ConductorClient
 from ctb.conductor.models import TranscriptMessage, validate_pairing
+from ctb.db import NO_THREAD_ID
 from ctb.db.connection import Database
 from ctb.db.repo import chats as chats_repo
 from ctb.db.repo import sessions as sessions_repo
@@ -501,11 +504,77 @@ def log_lines(rows: Sequence[StoredMessage]) -> list[str]:
     return lines
 
 
+async def _log_target(message: Message, nonces: NonceStore, db: Database) -> str | None:
+    """Which session ``/log`` means when it was not run inside a room.
+
+    One candidate is answered straight away — asking "which one?" about a list of
+    one is a tap that carries no information. Several put the choice on screen
+    through the same ``TRANSCRIPT`` button ``/digest`` and the status card use, so
+    there is exactly one way in the whole bot to say "show me that agent".
+    """
+    from ctb.bot.handlers.core import cockpit_targets
+
+    targets = await cockpit_targets(db)
+    if not targets:
+        await tell(
+            message, "No session here. Use <code>/new</code> or <code>/board</code>."
+        )
+        return None
+    if len(targets) == 1:
+        return targets[0][0]
+    await tell(
+        message,
+        "Which task?",
+        reply_markup=keyboard(
+            [
+                [
+                    button(
+                        f"📄 {label}",
+                        Action.TRANSCRIPT,
+                        session_id,
+                        store=nonces,
+                        user_id=message.from_user.id if message.from_user else None,
+                        chat_id=message.chat.id,
+                        thread_id=message.message_thread_id or NO_THREAD_ID,
+                        ttl=CONTROL_TTL_S,
+                        style=PLAIN_STYLE,
+                    )
+                ]
+                for session_id, label in targets
+            ]
+        ),
+    )
+    return None
+
+
+def log_body(rows: Sequence[StoredMessage]) -> str | None:
+    """The readable log as one message, or ``None`` when there is nothing to say.
+
+    Shared with the status card's **Transcript** button so the card and the
+    command cannot disagree about what a turn looked like — and because the
+    button was the half of B2 that never shipped. ``/log`` was fixed to render
+    prose; the button beside every finished and errored turn went on sending a
+    ``.md`` of raw JSON envelopes, which is the artefact the fix was *about*.
+    ``/log raw`` keeps that artefact for the debugging it is good at.
+    """
+    lines = log_lines(rows)
+    if not lines:
+        return None
+    # Trim from the *front*: the newest exchange is the one being asked about,
+    # and a message Telegram refuses is worse than a short one.
+    body = "\n".join(lines)
+    while len(body) > LOG_BODY_CHARS and len(lines) > 1:
+        lines.pop(0)
+        body = "\n".join(lines)
+    return f"<b>Last {len(lines)}</b> · <code>/log raw</code>\n{body}"
+
+
 @router.message(Command("log"))
 async def log_command(
     message: Message,
     route: Route,
     state: FSMContext,
+    nonces: NonceStore,
     db: Database | None = None,
 ) -> None:
     """The last few exchanges, readable — or the raw envelopes on request.
@@ -514,11 +583,26 @@ async def log_command(
     the right artefact for debugging a shape and the wrong one for the question
     people actually ask it ("what has this agent been doing?"). A phone cannot
     read JSON, and it was the only command that answered that question at all.
+
+    **Answerable from the chat root, unlike every other session command.** A DM
+    publishes no link syntax for a topic, so nothing in the bot can hand you a
+    tappable route to a room — which left "read what this agent did" reachable
+    only from inside a room you had to find by hand, in a thread list the live
+    database shows holding 43 entries with 1 usable one. So with no room in
+    scope this falls back to the seats the cockpit already offers for *sending*:
+    one head answers directly, several offer a choice.
+
+    Deliberately read-only. :func:`require_session` stays exactly as it is for
+    ``/stop``, ``/done`` and the rest: guessing which agent to show you is a
+    wasted tap when it is wrong, and guessing which agent to *stop* is somebody's
+    half-finished turn.
     """
     await abandon_wizard(state)
-    session_id = await require_session(message, route)
+    session_id = route.session_id
     if not session_id:
-        return
+        session_id = await _log_target(message, nonces, resolve_db(db))
+        if not session_id:
+            return
     argument = command_text(message).strip()
     raw = argument.split()[:1] == ["raw"]
     if raw:
@@ -535,17 +619,11 @@ async def log_command(
     if raw:
         await _send_raw_log(message, session_id, rows)
         return
-    lines = log_lines(rows)
-    if not lines:
+    body = log_body(rows)
+    if body is None:
         await tell(message, "Nothing cached for this task yet.")
         return
-    # Trim from the *front*: the newest exchange is the one being asked about,
-    # and a message Telegram refuses is worse than a short one.
-    body = "\n".join(lines)
-    while len(body) > LOG_BODY_CHARS and len(lines) > 1:
-        lines.pop(0)
-        body = "\n".join(lines)
-    await tell(message, f"<b>Last {len(lines)}</b> · <code>/log raw</code>\n{body}")
+    await tell(message, body)
 
 
 async def _send_raw_log(

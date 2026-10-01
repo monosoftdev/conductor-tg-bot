@@ -36,7 +36,16 @@ from ctb import signals
 from ctb.bot.app import register_router
 from ctb.bot.handlers.common import abandon_wizard, command_text, safe_title, tell
 from ctb.bot.handlers.topics import human_name, jump_url, resolve_db
-from ctb.bot.keyboards import keyboard, url_button
+from ctb.bot.keyboards import (
+    CONTROL_TTL_S,
+    PLAIN_STYLE,
+    Action,
+    NonceStore,
+    button,
+    keyboard,
+    url_button,
+)
+from ctb.db import NO_THREAD_ID
 from ctb.db.connection import Database, now_ms
 from ctb.db.repo import sessions as sessions_repo
 from ctb.db.repo import workspaces as workspaces_repo
@@ -292,14 +301,37 @@ def digest_lines(
 
 
 def digest_buttons(
-    entries: Sequence[DigestEntry], *, limit: int = DIGEST_BUTTONS
+    entries: Sequence[DigestEntry],
+    *,
+    store: NonceStore,
+    user_id: int | None,
+    chat_id: int,
+    thread_id: int,
+    limit: int = DIGEST_BUTTONS,
 ) -> list[list[InlineKeyboardButton]]:
-    """Jump buttons for the rows that have a room to jump to.
+    """One button per row: go to the room, or — where you cannot — read it here.
 
-    A private chat publishes no link syntax for a topic, so ``jump_url`` returns
-    ``None`` there and those rows are text only — which is correct rather than
-    degraded: in a DM the thread list is one swipe away and a dead button would
-    be worse than no button.
+    This used to emit a jump link and nothing else, on the reasoning that *"in a
+    DM the thread list is one swipe away and a dead button would be worse than no
+    button"*. The first half is true and the conclusion was not, because
+    :func:`jump_url` answers ``None`` for **every** private chat: a DM publishes
+    no link syntax for a topic. So in the default flow — ``/start``, ``/key``,
+    ``/new``, all in a DM — this card ranked the one task that wanted attention
+    and then offered no way to act on it at all.
+
+    And the swipe is not one swipe. Measured on the live database: one owner's DM
+    holds **43 threads, of which 1 routes to a usable session** — 24 point at
+    sessions whose workspace has since been archived and 18 have no session at
+    all — and Telegram orders them by last activity, which a notice in a dead
+    room is enough to disturb. Identifying the task that needs you and then
+    returning the reader to that list is most of the way to not having answered.
+
+    So the fallback is a *verb*, not a destination: ``📄`` renders the task's last
+    exchanges in place, through the same reducer as ``/log`` and the card's
+    Transcript button. The glyph differs from ``↗`` deliberately — ``board_stage1``
+    learned the hard way that two buttons which look alike must not behave
+    differently, and these two do behave differently: one moves you, one brings
+    it to you.
     """
     rows: list[list[InlineKeyboardButton]] = []
     for entry in entries:
@@ -308,9 +340,24 @@ def digest_buttons(
         if entry.chat_id is None:
             continue
         target = jump_url(entry.chat_id, entry.thread_id)
-        if target is None:
+        if target is not None:
+            rows.append([url_button(f"↗ {entry.button_label}", target)])
             continue
-        rows.append([url_button(entry.button_label, target)])
+        rows.append(
+            [
+                button(
+                    f"📄 {entry.button_label}",
+                    Action.TRANSCRIPT,
+                    entry.session_id,
+                    store=store,
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    ttl=CONTROL_TTL_S,
+                    style=PLAIN_STYLE,
+                )
+            ]
+        )
     return rows
 
 
@@ -318,6 +365,7 @@ def digest_buttons(
 async def digest(
     message: Message,
     state: FSMContext,
+    nonces: NonceStore,
     db: Database | None = None,
 ) -> None:
     await abandon_wizard(state)
@@ -336,7 +384,13 @@ async def digest(
         now=now_ms(),
         window_ms=window_ms,
     )
-    buttons = digest_buttons(entries)
+    buttons = digest_buttons(
+        entries,
+        store=nonces,
+        user_id=message.from_user.id if message.from_user else None,
+        chat_id=message.chat.id,
+        thread_id=message.message_thread_id or NO_THREAD_ID,
+    )
     await tell(
         message,
         "\n".join(digest_lines(entries, window_ms=window_ms)),
