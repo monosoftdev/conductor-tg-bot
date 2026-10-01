@@ -274,14 +274,23 @@ def default_keyboard(
     session_id: str,
     deep_link: str | None = None,
 ) -> InlineKeyboardMarkup | None:
-    """One row per button. ``OPEN`` becomes a URL button when a deepLink exists."""
+    """One row per button. ``OPEN`` becomes a URL button when a deepLink exists.
+
+    Imported late, as ``outbox`` already does for ``status_card_keyboard``:
+    ``bot`` may depend on ``delivery`` but not the other way about.
+    """
+    from ctb.bot.keyboards import button_url
+
     rows: list[list[InlineKeyboardButton]] = []
     for button in buttons:
         label = BUTTON_LABELS.get(button, button.value)
         if button is CardButton.OPEN:
-            if not deep_link:
+            # Not merely "is there a link" — Telegram refuses Conductor's
+            # ``conductor://`` scheme and fails the whole edit over it.
+            openable = button_url(deep_link)
+            if openable is None:
                 continue
-            rows.append([InlineKeyboardButton(text=label, url=deep_link)])
+            rows.append([InlineKeyboardButton(text=label, url=openable)])
             continue
         rows.append(
             [

@@ -1082,6 +1082,30 @@ def _on_ws(tick: _Tick, evidence: Ws, now: float) -> TransitionResult:
         # RULE 20 (workspace flavour) — archived or deleted is terminal.
         return _die(tick, now, f"workspace {evidence.status.value}")
 
+    if (
+        evidence.status is WorkspaceStatusValue.SLEEPING
+        and tick.ctx.outstanding == 0
+        and state in (TurnState.IDLE, TurnState.WAKING)
+    ):
+        # `sleeping` is where a healthy workspace *rests*, not a step on the way
+        # to `ready`. Nothing moves it until somebody prompts — and the live API
+        # reports it for every workspace that is not mid-turn, so `ready` is a
+        # state the bot may simply never observe between turns.
+        #
+        # Counting it as "waking" armed `WAKE_TIMEOUT_S` against a workspace with
+        # nothing wrong with it and nobody waiting on it: every room came back
+        # from a redeploy claiming to be waking up, held the fast cadence for ten
+        # minutes, and then said so out loud. With nothing outstanding there is
+        # nothing to wake *for*; say 💤 and stay still. A prompt arriving here
+        # takes the branch below, where the wait is real and the timeout earns
+        # its keep.
+        if state is TurnState.WAKING:
+            tick.enter(TurnState.IDLE, now, consecutive_idle=0, idle_decay_step=0)
+            tick.evolve(waking_notified=False)
+            tick.retune(now, "asleep")
+        tick.do(SetTopicMarker(TopicMarker.SLEEPING))
+        return tick.result(9, "workspace asleep, nothing outstanding")
+
     if evidence.status.is_waking:
         # RULE 9 — show the waking card, with the lifecycle step.
         if state in (TurnState.IDLE, TurnState.QUEUED, TurnState.SUBMIT_PENDING):

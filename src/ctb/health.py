@@ -65,6 +65,7 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
+from functools import cache
 from secrets import compare_digest
 from types import TracebackType
 from typing import Any, Final, Self
@@ -74,7 +75,7 @@ from aiohttp import web
 from ctb import __version__
 from ctb.conductor.pool import ClientPool
 from ctb.db.connection import Database, get_database, now_ms
-from ctb.db.migrate import current_schema_version
+from ctb.db.migrate import current_schema_version, discover_migrations
 from ctb.db.repo import deliveries as deliveries_repo
 from ctb.db.repo import events as events_repo
 from ctb.db.repo import lease as lease_repo
@@ -192,6 +193,7 @@ DEGRADATION_DELIVERY_BACKLOG: Final[str] = "delivery_backlog"
 DEGRADATION_DELIVERY_FAILED: Final[str] = "delivery_failed"
 DEGRADATION_DELIVERY_STALLED: Final[str] = "delivery_stalled"
 DEGRADATION_DELIVERY_STRANDED: Final[str] = "delivery_stranded"
+DEGRADATION_SCHEMA_BEHIND: Final[str] = "schema_behind"
 DEGRADATION_LEASE_LOST: Final[str] = "lease_lost"
 DEGRADATION_TELEGRAM: Final[str] = "telegram_polling"
 
@@ -345,6 +347,22 @@ def reset_telegram_health() -> None:
 type DatabaseProvider = Callable[[], Database | None]
 type PoolProvider = Callable[[], ClientPool | None]
 type TelegramProvider = Callable[[], TelegramHealth | None]
+
+
+@cache
+def _latest_shipped_schema_version() -> int | None:
+    """The highest migration in *this image*, or ``None`` if unreadable.
+
+    Cached: the answer is a property of the image, not of the request. ``None``
+    rather than a raise, because a broken migrations directory must not be the
+    reason the healthcheck stops answering — the report's job here is to say what
+    it can see.
+    """
+    try:
+        shipped = discover_migrations()
+    except Exception:  # pragma: no cover - a packaging fault, not a runtime one
+        return None
+    return shipped[-1].version if shipped else None
 
 
 def _pool_stats(db: Database) -> dict[str, Any]:
@@ -533,6 +551,7 @@ class HealthMonitor:
         requests_total = 0
         retries_total = 0
         open_circuits: list[str] = []
+        probes_abandoned = 0
         rejected: list[str] = []
         for slug, client in clients:
             try:
@@ -550,8 +569,10 @@ class HealthMonitor:
                 auth_failures += failures
                 rejected.append(slug)
             circuit = stats.get("circuit")
-            if isinstance(circuit, Mapping) and circuit.get("state") != "closed":
-                open_circuits.append(slug)
+            if isinstance(circuit, Mapping):
+                if circuit.get("state") != "closed":
+                    open_circuits.append(slug)
+                probes_abandoned += int(circuit.get("probes_abandoned", 0) or 0)
         section["rate_limited_recent"] = throttled
         section["auth_failures"] = auth_failures
         section["failures"] = failures_total
@@ -563,6 +584,13 @@ class HealthMonitor:
         section["circuit"] = {
             "state": "open" if open_circuits else "closed",
             "open_tenants": len(open_circuits),
+            # Non-zero means a half-open probe slot was claimed and never handed
+            # back, and the abandon window had to take it. `_request` returns it
+            # in a `finally`, so this should stay at zero for ever — if it does
+            # not, some path out of a request is skipping that `finally`, which
+            # is how two tenants once went dark for sixteen days. The canary for
+            # the bug, not the bug.
+            "probes_abandoned": probes_abandoned,
         }
 
         if auth_failures:
@@ -652,9 +680,32 @@ class HealthMonitor:
             )
             return {"ok": False, "error": _reason(exc), **_pool_stats(db)}, {}
 
+        # A migration this image ships and the database has not got. Reported,
+        # never fatal: the boot gate already refuses to start on a missing
+        # *required* one, so anything still outstanding here is optional by
+        # construction and refusing traffic over it would be strictly worse than
+        # the thing it repairs.
+        #
+        # It is reported at all because the alternative was measured. With no
+        # `ADMIN_DATABASE_URL` on the service, `preDeployCommand` is a documented
+        # no-op; the one line saying so scrolls past in a deploy log nobody reads
+        # twice, and `/health` said `ok`. A data-repair migration sat unapplied
+        # for six weeks while the bug it fixes went on reproducing.
+        latest = _latest_shipped_schema_version()
+        if latest is not None and schema_version < latest:
+            degradations.append(
+                Degradation(
+                    DEGRADATION_SCHEMA_BEHIND,
+                    f"Schema is at {schema_version}; this build ships {latest}. "
+                    "Set ADMIN_DATABASE_URL on the service and redeploy, or run "
+                    "`python -m ctb.db.upgrade` against it.",
+                )
+            )
+
         db_section = {
             "ok": True,
             "schema_version": schema_version,
+            "schema_latest": latest,
             "query_ms": int((self._clock() - started) * 1000),
             **_pool_stats(db),
         }
@@ -708,12 +759,28 @@ class HealthMonitor:
         # explained silence never qualifies however long it runs: restarting
         # into a rejected key or a dead Conductor is a restart loop stacked on
         # top of the outage.
+        #
+        # And not before this process has had the window to fix it itself. A
+        # silence that began while nothing was running is not evidence about the
+        # instance now booting: at the moment ``/health`` starts answering, the
+        # supervisor has not taken the lease yet, so every session legitimately
+        # still carries the stale ``updated_at`` of the outage being recovered
+        # from. Measured against the live rows, that read as a 2-session wedge
+        # for the eleven seconds between ``health.listening`` and the first
+        # poller tick — a 503 on the way *out* of an outage, which is the one
+        # moment a restart is guaranteed not to help.
+        #
+        # ``POLL_SILENT_MS`` is the right grace because it is the same number
+        # that makes a session count as silent at all: once this process has been
+        # up that long and a session is *still* untouched, the whole window
+        # belonged to this process and it did nothing with it.
         wedged = [
             row
             for row in silent
             if row.tenant_id is not None
             and not reasons[row.tenant_id].is_explained
             and at - row.updated_at >= POLL_WEDGED_MS
+            and self.uptime_s * 1000 >= POLL_SILENT_MS
         ]
         if wedged:
             degradations.append(
@@ -893,7 +960,8 @@ class HealthMonitor:
                 db, since_ms=at - SILENCE_LOOKBACK_MS, tenant_id=tenant_id
             )
             reasons[tenant_id] = attribute(
-                auth_failed=tenant is not None and tenant.auth_failed_at is not None,
+                auth_failed=tenant is not None
+                and tenancy_repo.auth_latched(tenant.auth_failed_at, at=at),
                 api_calls=stats.total,
                 api_ok=stats.ok,
             )

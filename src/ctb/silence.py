@@ -19,13 +19,15 @@ When polling stops the client pool is swept, so by the time anybody asks there
 is no client left to interrogate — the same blindness that let the outage hide.
 The event log survives the workers that wrote it:
 
-===========================  ===========================================
-observation                  reading
-===========================  ===========================================
-``auth_failed_at`` is set     the key was rejected; only a new one helps
-no API calls at all           nothing is even trying — *this* is the wedge
-calls made, none succeeded    the upstream is down; waiting is the fix
-===========================  ===========================================
+=============================  ===========================================
+observation                    reading
+=============================  ===========================================
+no API calls at all            nothing is even trying — *this* is the wedge
+calls fail, stamp set          the key was rejected; only a new one helps
+calls fail, no stamp           the upstream is down; waiting is the fix
+=============================  ===========================================
+
+The order matters and was once the other way round. See :func:`attribute`.
 """
 
 from __future__ import annotations
@@ -68,14 +70,29 @@ class SilenceReason(StrEnum):
 def attribute(*, auth_failed: bool, api_calls: int, api_ok: int) -> SilenceReason:
     """Read the cause off the tenant row and its recent API events.
 
-    ``auth_failed`` wins over the event counts because it is the more specific
-    claim: a latched tenant makes no calls *because* it was latched, so it would
-    otherwise be indistinguishable from the wedge.
+    **Zero calls outranks everything, including the tenant row.** ``auth_failed``
+    used to win outright, on the reasoning that a latched tenant makes no calls
+    *because* it was latched and so cannot be told apart from the wedge. That
+    reasoning stopped being true when the latch got a clock: ``list_bound``
+    readmits one poller every :data:`~ctb.db.repo.tenancy.AUTH_RETRY_AFTER_MS` to
+    ask again, and that poller's request lands in ``api_events`` whatever answer
+    it gets. A genuinely rejected key therefore shows up as *calls that all fail*
+    — never as no calls at all, not across a window twice the retry interval.
+
+    So "a stamp is set and nothing has been tried for half an hour" does not
+    describe a rejected key. It describes a process that has stopped polling,
+    which is the one thing a restart fixes — and reading it as *explained* is
+    precisely what let a wedged circuit breaker run for sixteen days behind a
+    rejection that had stopped happening weeks earlier.
     """
-    if auth_failed:
-        return SilenceReason.AUTH_REJECTED
-    if api_calls > 0 and api_ok == 0:
-        return SilenceReason.CONDUCTOR_UNREACHABLE
+    if api_calls == 0:
+        return SilenceReason.UNEXPLAINED
+    if api_ok == 0:
+        return (
+            SilenceReason.AUTH_REJECTED
+            if auth_failed
+            else SilenceReason.CONDUCTOR_UNREACHABLE
+        )
     return SilenceReason.UNEXPLAINED
 
 

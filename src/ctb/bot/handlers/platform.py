@@ -21,6 +21,7 @@ from ctb.bot.app import register_router
 from ctb.bot.handlers.common import abandon_wizard, command_text, tell
 from ctb.bot.handlers.registration import deauthorize
 from ctb.bot.middleware.tenancy import TenantContext, forget_cached
+from ctb.db.connection import now_ms
 from ctb.db.repo import tenancy
 from ctb.delivery.render.html import escape
 from ctb.logging import get_logger
@@ -67,7 +68,8 @@ async def platform(
         lines = [f"<b>{len(rows)}</b> active workspace(s)"]
         for row in rows[:_LIST_LIMIT]:
             key = "🔑" if row.has_conductor_key else "—"
-            stopped = " · auth failed" if row.auth_failed_at else ""
+            latched = tenancy.auth_latched(row.auth_failed_at, at=now_ms())
+            stopped = " · auth failed" if latched else ""
             lines.append(f"{key} <code>{escape(row.slug)}</code>{stopped}")
         if len(rows) > _LIST_LIMIT:
             lines.append(f"…and {len(rows) - _LIST_LIMIT} more")

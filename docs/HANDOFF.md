@@ -18,6 +18,212 @@ Verified offline, on every commit:
 - The real runtime boots against a real database: all seven services start,
   `/health` returns `ok`, the lease is acquired, shutdown is clean.
 
+## One leaked probe slot took two teams off the air for sixteen days (2026-09-30)
+
+Reported as *"the bot is not working"*. It had not been working since
+**2026-09-14 15:59 UTC**, and it started working again the moment the service was
+redeployed — which is the whole shape of the bug.
+
+`api_events` dates it to the second. At 15:58:51 the Conductor proxy wobbled:
+one `500 timeout exceeded when trying to connect`, then six consecutive
+`ReadTimeout`s, and on the fourth retry attempt a `401 Unauthorized`. **That 401
+is the last row in the table for sixteen days.** Not a failure every minute — no
+rows at all, because `CircuitOpen` is raised before a request is attempted and
+there is nothing to record. The dying instance's log says it outright: every
+poll, for both tenants, `error="CircuitOpen" event="poller.messages_unavailable"`.
+
+**The circuit breaker deadlocks in `half_open`.** `check` claims the single probe
+slot; only `record_ok` and `record_failure` gave it back, and both live inside the
+retry loop. Nothing released it when the request left by any other route — and
+the route it left by is the one the same 401 causes: `AuthFatal` makes
+`supervisor._cancel_tenant` cancel that tenant's *sibling* pollers, one of which
+was mid-request holding the slot. After that, `_probe_in_flight` is `True` for
+ever: the only reset on the read path is the `open` → `half_open` edge, and a
+breaker already in `half_open` never crosses it again. Every later call fails
+fast with `retry_after=1s`, for the life of the process. The client is pooled, and
+`clients.forget` is only reached for a tenant carrying a database latch — this one
+never got one, because `_key_still_rejected` could not corroborate through the
+circuit it was stuck behind. So it survived until the next deploy.
+
+`check` now hands out a claim and `_request` returns it in a `finally`. The claim
+is a generation counter, so a release arriving late from a cancelled request
+cannot free a slot somebody else has since taken, and one arriving after
+`record_ok` cannot re-open a circuit that call just closed. `PROBE_ABANDON_SECONDS`
+is the belt to that braces: a slot held longer than any single logical request
+could possibly run — derived from the timeouts and the backoff cap, not guessed —
+is reclaimed, so even a caller that never returns at all costs one window rather
+than the process. Replayed against the real event sequence, the old class never
+allows another request; the new one allows one after sixty seconds, and after
+eight minutes even with the `finally` itself bypassed.
+
+### And the machinery built to catch exactly this had been disarmed
+
+The watchdog worked. It fired twice, and told both owners *"Conductor rejected
+this team's API key — send `/key`"*. The keys were fine: 383 calls on the same
+keys after the redeploy, every one a 200.
+
+`auth_failed_at` is the stamp that claim comes from, and **nothing but `/key` ever
+cleared it**. `sessions.list_bound` has the clock — it readmits a tenant once the
+stamp is older than `AUTH_RETRY_AFTER_MS` — while `ctb.health`, `ctb.watchdog` and
+`/teams` each asked `auth_failed_at is not None`. The expiry was added in one
+place and not the other three. `reclaimly` carried a stamp from 2026-09-10 and
+`dteam` one from 2026-08-17, so `silence.attribute` returned `AUTH_REJECTED` for
+every silence either team would ever have.
+
+That is the load-bearing part. `AUTH_REJECTED.is_explained` is `True`, an explained
+silence never fails the healthcheck, and **a restart is precisely what fixed this
+outage.** One spurious 401 in September permanently disabled the only mechanism
+that recovers a wedged process, and `/health` reported `ok` with no degradations
+for all sixteen days — the third time this file has had to record that sentence.
+
+`tenancy.auth_latched` is now the single answer to "is this key being rejected
+*now*", and all four readers use it. The supervisor also clears a stamp the
+database has already judged spent, so the column stops being a permanent record
+of the worst thing that ever happened to a tenant.
+
+**But the stamp's age is the wrong discriminator, and simulating the deploy is
+what showed it.** `auth_latched` narrows a stale stamp's reach to fifteen
+minutes, which fixes the case production actually had — and leaves the case it
+nearly had. The 401 that latches and the wobble that wedges the circuit are the
+*same upstream event*, 67 seconds apart in the real log, so the stamp can easily
+be a minute old while the process is already dark. Judged on the stamp, that
+reads as explained and runs for ever, exactly as before.
+
+`silence.attribute` now puts **zero calls above everything, including the tenant
+row**. The old precedence had a reason — *"a latched tenant makes no calls
+because it was latched, so it cannot be told apart from the wedge"* — and that
+reason stopped being true the moment the latch got a clock. `list_bound` readmits
+one poller every `AUTH_RETRY_AFTER_MS` to ask again, and that poller's request
+lands in `api_events` whatever answer it gets. So a genuinely rejected key shows
+up as *calls that all fail*, never as no calls at all, and "a stamp is set and
+nothing has been tried for half an hour" does not describe a rejected key — it
+describes a process that stopped polling, which is the one thing a restart fixes.
+
+Three existing tests asserted the old precedence, and all three asserted it with
+the same unfaithful setup: a stamp written, and no API events recorded at all.
+That is a wedge wearing a stamp. They now model a rejected key with the
+quarter-hourly 401 it goes on producing, which is both what the system does and
+what makes the assertion mean anything.
+
+### A 503 on the way *out* of an outage
+
+The same simulation caught one the other way. At the moment `/health` starts
+answering, the supervisor has not taken the lease yet, so every session still
+carries the stale `updated_at` of the outage being recovered from — a textbook
+fatal wedge by every measure except whose fault it is. Against production's own
+rows that was a two-session `poll_wedged` for the eleven seconds between
+`health.listening` and the first poller tick, on the instance that was in the
+middle of fixing it. Railway's 120-second deploy budget would have absorbed it,
+but a 503 whose cure is already running is the one case where recycling is
+strictly harmful.
+
+The fatal wedge now also requires the process to have been up for
+`POLL_SILENT_MS` — the same number that makes a session count as silent at all.
+Once this process has been up that long and a session is *still* untouched, the
+whole window belonged to it. Before that, the silence predates it. The
+degradation itself still shows from the first report; it is only the recycle that
+waits.
+
+`/health` also reports `conductor.circuit.probes_abandoned`, which should stay
+zero for ever: non-zero means a probe slot was claimed and never handed back and
+the abandon window had to take it, i.e. some path out of a request is skipping
+the `finally`. The canary for this bug rather than the bug.
+
+### A latch that erased itself the moment it was acted on
+
+`auth_fatal_tenants` built its `rejecting` half out of `_tenant_of` — the map of
+sessions currently being polled — and the only use of that set is to cancel
+exactly those sessions. `_drop` pops `_tenant_of`, so by the time the spawn loop
+asked, three lines further down the same pass, whether the tenant was still
+latched, the answer was no. Everything just cancelled was started again: **304
+poller starts in thirteen minutes**, not one of them completing a tick. It now
+reads off the pool, which outlives the pollers, so the answer no longer changes
+by being used.
+
+### Simulating it again found three the first simulation had created
+
+Replaying the deploy minute by minute, rather than as a single snapshot, is what
+turned these up — all three are in code this PR had already touched.
+
+**The voice sweep's fix made a dead loop into a crashing one.** `_sweep` was on
+the wrong pool, so it raised one line before ever reaching `_send_failure`. Put it
+on the worker pool and that line becomes reachable — and `_send_failure` reads the
+note's acknowledgement id off the **tenant-scoped** pool, from a task that has no
+tenant. So the first note to exhaust its attempts raises `TenantScopeError`
+straight into the voice `TaskGroup`, which is worse than the silence it replaced.
+
+It had never worked anywhere: `_recover` wrapped the same call in a bare
+`suppress(Exception)`, so every "Transcription kept failing" card the boot pass
+tried to post died unseen. `_notify_abandoned` now answers each row inside its own
+tenant scope, the way a claimed job does, and *logs* a failure instead of
+swallowing it — a silent `suppress` is what hid this for as long as it existed.
+The card, with its Retry button, now actually arrives.
+
+**The watchdog alarmed in the same second as boot.** "Nothing has been checking
+your tasks" is a claim about *this* process, and `run` ran its first census before
+its first pause — at which point the supervisor has not taken the lease, so every
+session still carries the stale `updated_at` of the outage being recovered from.
+Live, that fired for both tenants on the deploy that was fixing them. With the new
+attribution it would have chosen the *unexplained* wording, which promises a
+recycle that the uptime grace correctly declines to perform. The first census now
+waits one interval: one minute against a ten-minute threshold, which buys the
+alarm the right to be believed.
+
+That change also quietly broke a test into a tautology —
+`test_a_read_failure_does_not_kill_the_watchdog` set the stop flag *before*
+calling `run`, so with the pause first the census was never reached at all and the
+`except` branch it exists to cover stopped being exercised while staying green. It
+now ends the loop from inside the failure.
+
+**And `button_url` was the cruder half of an idea the renderer already had.**
+`link_html` has always checked `is_safe_url` and degraded to `text (url)` rather
+than emit an `href` Telegram would refuse — which is why the *text* path was never
+affected by `conductor://`, only the keyboard. `button_url` now reuses that check,
+so it also rejects a URL carrying a newline, tab or space, which a bare scheme test
+waves through into the same 400. The two allowlists stay separate: `mailto:` is
+legal in an `href` and not on a button.
+
+### Three more, found in the same pass
+
+- **Telegram refuses `conductor://`, and refuses the whole message with it.**
+  The API returns `deepLink` as a custom scheme; `status_card_keyboard` put it
+  straight on an inline button and got `Unsupported URL protocol`, which 400s the
+  entire edit. `OPEN` is in `_DONE_BUTTONS` and `_ERROR_BUTTONS` — the
+  finished-turn and error cards — so a turn would complete, its answer would
+  arrive, and the card above it would still read "working". The test that covered
+  this asserted `https://conductor.build/w/1`, a URL the API has never returned.
+  `button_url` now admits only what Telegram takes, and the tests use the real
+  value verbatim.
+- **The voice recovery sweep never ran.** `_sweep` used `self.db` where the
+  boot-time `_recover` correctly uses `self.system_db`; it is a cross-tenant
+  query from a process-level task, so it raised on every pass —
+  `voice.recover_failed  no tenant in scope` every two minutes, for the life of
+  the process. The "Transcribing…" hang it was written to end went on ending only
+  at the next redeploy.
+- **`sleeping` was treated as transitional.** All sixteen live workspaces report
+  `sleeping`; `ready` is a state the bot may never observe between turns. Since
+  `is_waking` included it, a healthy idle workspace was pushed into `WAKING`,
+  which arms `WAKE_TIMEOUT_S` — so every room came back from a redeploy claiming
+  to be waking up, held the fast cadence for ten minutes, and then announced *"The
+  workspace did not become ready within 10 minutes."* With nothing outstanding
+  there is nothing to wake for.
+
+### Migration 005 had never run in production
+
+`schema_version` topped out at **4**. `ADMIN_DATABASE_URL` is not set on the
+service, so `railway.toml`'s `preDeployCommand` is the documented no-op — and the
+one deploy-log line saying so scrolls past. The room repair written on 2026-08-20
+sat unapplied for six weeks while the bug it fixes went on reproducing in the two
+rooms it was written for.
+
+`/health` now reports `schema_latest` beside `schema_version` and raises
+`schema_behind` when the image ships a migration the database lacks. Deliberately
+a degradation and not fatal: the boot gate already refuses to start on a missing
+*required* migration, so anything outstanding here is optional by construction,
+and a restart loop over it would be worse than the rows it has not fixed yet.
+**Setting `ADMIN_DATABASE_URL` on the Railway service is still an operator action
+this PR cannot do for you.**
+
 ## A rename nobody could make deleted two rooms (2026-08-20)
 
 Reported as *"I switch to a session and comment on it, and instead of following

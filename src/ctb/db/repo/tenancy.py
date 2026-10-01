@@ -46,8 +46,10 @@ __all__ = [
     "TenantRow",
     "TenantStatus",
     "add_member",
+    "auth_latched",
     "bind_chat",
     "chat_for",
+    "clear_auth_failure",
     "consume_enrollment_token",
     "create",
     "created_since",
@@ -95,6 +97,33 @@ ROLE_ORDER: Final[dict[str, int]] = {"member": 0, "admin": 1, "owner": 2}
 #: loop to any rate limiter, and it bounds a false latch to an outage a person
 #: waits out rather than one they have to diagnose.
 AUTH_RETRY_AFTER_MS: Final[int] = 15 * 60 * 1000
+
+
+def auth_latched(
+    auth_failed_at: int | None,
+    *,
+    at: int,
+    within_ms: int = AUTH_RETRY_AFTER_MS,
+) -> bool:
+    """Whether a rejection stamp is still inside the window it silences for.
+
+    The one place this question is answered, because answering it in two ways is
+    what turned a sixty-second circuit-breaker blip into a sixteen-day outage.
+    ``sessions.list_bound`` had the clock — it readmits a tenant once the stamp
+    is older than :data:`AUTH_RETRY_AFTER_MS` — while ``ctb.health``,
+    ``ctb.watchdog`` and ``/teams`` each asked ``auth_failed_at is not None``.
+    Nothing but ``/key`` ever clears the column, so those three read a stamp from
+    four weeks earlier as "the key is being rejected right now".
+
+    That mattered because ``silence.attribute`` puts ``auth_failed`` first:
+    every future silence, for the life of the row, was reported as *explained*.
+    An explained silence never fails the healthcheck, so the one mechanism that
+    would have fixed the outage — Railway recycling a wedged process — was held
+    off by a stamp describing a rejection that had stopped happening weeks
+    before. The owners were told to re-send a key that had never stopped working.
+    """
+    return auth_failed_at is not None and auth_failed_at > at - within_ms
+
 
 type TenantStatus = str  # 'pending' | 'active' | 'suspended' | 'deleted'
 
@@ -543,6 +572,31 @@ async def mark_auth_failed(
          WHERE id = ?
         """,
         (stamp, reason, stamp, tenant_id),
+    )
+
+
+async def clear_auth_failure(db: Database, tenant_id: uuid.UUID) -> bool:
+    """Forget a rejection stamp the key has since been shown to survive.
+
+    Housekeeping, not a decision: every reader already treats a stamp older than
+    :data:`AUTH_RETRY_AFTER_MS` as spent (:func:`auth_latched`), so dropping one
+    changes no behaviour. It stops the column being a permanent record of the
+    worst thing that ever happened to a tenant, which is what made
+    ``auth_failed_reason`` read as current in ``/health`` and in the owner's
+    silence notice long after the key was fine.
+
+    Returns whether a stamp was actually there, so a caller can log the once.
+    """
+    return (
+        await db.execute(
+            """
+            UPDATE tenants
+               SET auth_failed_at = NULL, auth_failed_reason = NULL, updated_at = ?
+             WHERE id = ? AND auth_failed_at IS NOT NULL
+            """,
+            (now_ms(), tenant_id),
+        )
+        > 0
     )
 
 

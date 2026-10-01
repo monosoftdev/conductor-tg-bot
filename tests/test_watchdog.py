@@ -73,6 +73,21 @@ async def test_a_silent_workspace_reaches_its_owner_with_the_reason(
     now = now_ms()
     await seed(system_db, "abandoned", at=now - HOUR_MS)
     await tenancy.mark_auth_failed(system_db, BOOTSTRAP_TENANT_ID, reason="401")
+    # A rejected key comes with its rejections: `list_bound` readmits one poller
+    # every AUTH_RETRY_AFTER_MS to ask again, and the 401 it gets lands here. A
+    # stamp with *no* attempts in the window is a wedge, not a rejected key, and
+    # telling its owner to re-send a working key is how this went unfixed.
+    for index in range(2):
+        await events_repo.record_api_event(
+            system_db,
+            method="GET",
+            endpoint="/sessions/{id}/messages",
+            status_code=401,
+            ok=False,
+            error="Unauthorized client request",
+            tenant_id=BOOTSTRAP_TENANT_ID,
+            at=now - (index + 1) * tenancy.AUTH_RETRY_AFTER_MS,
+        )
     sink = RecordingSink()
 
     episodes = await make(system_db, sink, at=now).check_once()
@@ -180,6 +195,33 @@ async def test_silence_with_nothing_to_blame_is_the_bots_own_fault(
     assert not episodes[0].reason.is_explained
 
 
+async def test_a_stale_rejection_does_not_blame_a_key_that_works(
+    system_db: Database,
+) -> None:
+    """What two owners were told for sixteen days, wrongly.
+
+    The stamp was weeks old and the key had gone on returning 200 to every
+    request the whole time. Telling somebody to re-send a working key is worse
+    than saying nothing: it moves the blame off the bot, and the real fault —
+    this process having stopped trying — goes unnamed and unrestarted.
+    """
+    now = now_ms()
+    await seed(system_db, "abandoned", at=now - HOUR_MS)
+    await tenancy.mark_auth_failed(
+        system_db,
+        BOOTSTRAP_TENANT_ID,
+        reason="401",
+        at=now - tenancy.AUTH_RETRY_AFTER_MS - 1,
+    )
+    sink = RecordingSink()
+
+    episodes = await make(system_db, sink, at=now).check_once()
+
+    assert episodes[0].reason is SilenceReason.UNEXPLAINED
+    assert not episodes[0].reason.is_explained
+    assert "/key" not in sink.alarms[0][1]
+
+
 async def test_one_tenants_outage_is_not_reported_to_another(
     system_db: Database,
 ) -> None:
@@ -205,10 +247,14 @@ async def test_a_read_failure_does_not_kill_the_watchdog(
     watchdog = make(system_db, sink, at=now)
 
     async def boom(*_args: Any, **_kwargs: Any) -> Any:
+        # Ends the loop from inside the failure, so the `except` branch is
+        # genuinely reached. Stopping it *before* `run` would only prove that a
+        # stopped watchdog does nothing — `run` pauses before its first census,
+        # so a pre-set stop flag returns without ever calling the census at all.
+        await watchdog.stop()
         raise RuntimeError("database is unreachable")
 
     monkeypatch.setattr(sessions_repo, "list_silent", boom)
-    await watchdog.stop()
     await watchdog.run()  # returns rather than raising
 
     monkeypatch.undo()
@@ -235,3 +281,34 @@ async def test_a_failing_sink_leaves_the_episode_to_be_retried(
     # Tried both times, same key both times — nothing was swallowed.
     assert len(sink.alarms) == 2
     assert len({silence.key for silence, _ in sink.alarms}) == 1
+
+
+async def test_the_first_census_waits_one_interval_after_boot(
+    system_db: Database,
+) -> None:
+    """ "Nothing has been checking your tasks" is a claim about *this* process.
+
+    When it starts answering, the supervisor has not taken the lease yet, so
+    every session still carries the stale ``updated_at`` of whatever outage is
+    being recovered from — and a census run then is reading somebody else's
+    silence. Live, this fired in the same second as boot, for both tenants, on
+    the deploy that was fixing them, and the message it chose promised a recycle
+    that was not going to happen because the process had just started.
+    """
+    now = now_ms()
+    await seed(system_db, "abandoned", at=now - HOUR_MS)
+    sink = RecordingSink()
+    paused: list[float] = []
+    watchdog = Watchdog(system_db, sink=sink, interval_s=60.0, clock=lambda: now)
+
+    async def pause(seconds: float) -> None:
+        paused.append(seconds)
+        # One interval's worth of recovery is all the real poller needs; stop
+        # before the census so this asserts the *ordering*, not the census.
+        await watchdog.stop()
+
+    watchdog._pause = pause  # pyright: ignore[reportPrivateUsage]
+    await watchdog.run()
+
+    assert paused == [60.0]
+    assert sink.alarms == []

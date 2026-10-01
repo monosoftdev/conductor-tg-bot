@@ -135,6 +135,9 @@ class PoolStub:
     def peek(self, _tenant_id: uuid.UUID) -> object:
         return self._client
 
+    def tenant_ids(self) -> frozenset[uuid.UUID]:
+        return frozenset({BOOTSTRAP_TENANT_ID})
+
     def pin(self, tenant_id: uuid.UUID) -> None:
         self.pinned.append(tenant_id)
 
@@ -413,4 +416,61 @@ async def test_a_corroborated_latch_expires_instead_of_waiting_for_a_human(
     # to "your key was rejected" is a new key, and a pooled client is a header
     # built from the old one.
     assert BOOTSTRAP_TENANT_ID in pool.forgotten
+    # And the stamp goes with the flag. A latch the database has already judged
+    # spent must stop describing the key as rejected, because `/health` and the
+    # watchdog both read that column to decide whether a silence is explained —
+    # and an explained silence is one Railway never recycles the process for.
+    readmitted = await tenancy.get(system_db, BOOTSTRAP_TENANT_ID)
+    assert readmitted is not None and readmitted.auth_failed_at is None
+    await supervisor.stop()
+
+
+async def test_a_rejecting_client_does_not_become_a_respawn_loop(
+    db: Database,
+    system_db: Database,
+) -> None:
+    """The latch must survive being acted on.
+
+    ``auth_fatal_tenants`` built its ``rejecting`` half out of ``_tenant_of`` —
+    the map of sessions it is *currently* polling — and the only use of that set
+    is to cancel exactly those sessions. ``_drop`` pops ``_tenant_of``, so by the
+    time the spawn loop asked, three lines further down the same pass, whether
+    the tenant was latched, the answer was no: everything just cancelled was
+    started again.
+
+    Live, with a client stuck carrying a 401 it could never clear, that was a
+    cancel/respawn pair every five seconds per session — 304 poller starts in
+    thirteen minutes of log — and not one of them ever completed a tick.
+    """
+    await seed_bound(db, "s1")
+    created: list[BlockingPoller] = []
+    client = ClientStub(me_rejects=False)
+    pool = PoolStub(client)
+    supervisor = Supervisor(
+        cast(ClientPool, pool),
+        db,
+        system_db,
+        holder="owner",
+        poller_factory=factory_of(created),
+    )
+
+    assert await supervisor.reconcile_once()
+    assert len(created) == 1
+
+    # A 401 the client absorbed and has had no successful call since to clear.
+    client.auth_failures = 1
+
+    for _ in range(10):
+        assert await supervisor.reconcile_once()
+
+    # One cancel, and then nothing: the tenant stays stopped while its key is
+    # being rejected. Before the fix this was a fresh poller on every pass.
+    assert len(created) == 1
+    assert supervisor.task_count == 0
+
+    # And it comes back on positive evidence — a live client that has since
+    # seen a 2xx — rather than on the mere absence of one.
+    client.auth_failures = 0
+    assert await supervisor.reconcile_once()
+    assert supervisor.task_count == 1
     await supervisor.stop()

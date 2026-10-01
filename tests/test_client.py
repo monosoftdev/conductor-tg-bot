@@ -21,9 +21,11 @@ from ctb.conductor.client import (
     BACKOFF_CAP_S,
     CONNECT_TIMEOUT_S,
     POST_MESSAGE_TIMEOUT_S,
+    PROBE_ABANDON_SECONDS,
     READ_TIMEOUT_S,
     SQL_TIMEOUT_S,
     ApiEvent,
+    CircuitBreaker,
     CircuitState,
     ConductorClient,
     TokenBucket,
@@ -390,6 +392,103 @@ async def test_a_recovered_resource_leaves_isolation(settings: Settings) -> None
         status = await client.get_workspace_status("ws-flaky")
         assert status.status is WorkspaceStatusValue.READY
         assert client.circuit.isolated == {}
+
+
+async def test_a_cancelled_probe_hands_its_slot_back(settings: Settings) -> None:
+    """The sixteen-day outage, in eleven lines.
+
+    A poller holding the half-open probe is cancelled mid-request — which is
+    exactly what an ``AuthFatal`` on a *sibling* poller does, via
+    ``supervisor._cancel_tenant``. The slot must come back, or the breaker is
+    wedged in ``half_open`` for the life of the process and every later call
+    fails fast without a request ever being attempted.
+    """
+    started = asyncio.Event()
+    hang = True
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if hang:
+            started.set()
+            await asyncio.Event().wait()  # never answers; waits to be cancelled
+        return httpx.Response(503, json={"userMessage": "down"})
+
+    recorder = always(503, {"userMessage": "down"})
+    client, clock, _ = make_client(recorder, settings, max_attempts=1)
+    async with client:
+        for _ in range(3):
+            with pytest.raises(ApiError):
+                await client.list_projects()
+        assert client.circuit.state is CircuitState.OPEN
+        clock.advance(client.circuit.retry_after() + 0.001)
+
+        # Swap in a transport that never answers, so the probe is still in
+        # flight when it is cancelled.
+        client._http = httpx.AsyncClient(  # pyright: ignore[reportPrivateUsage]
+            transport=httpx.MockTransport(handler),
+            base_url=settings.conductor_api_url,
+        )
+        probe = asyncio.create_task(client.list_projects())
+        await started.wait()
+        assert client.circuit.state is CircuitState.HALF_OPEN
+        probe.cancel()
+        # `gather` keeps the cancellation inside the task instead of re-raising
+        # it in this one, which is what a supervisor dropping a poller does.
+        assert probe.cancelled() or await asyncio.gather(probe, return_exceptions=True)
+
+        # The slot is free again: the next caller becomes the probe instead of
+        # being told to come back in a second, forever.
+        assert client.circuit.snapshot()["probe_in_flight"] is False
+        hang = False
+        with pytest.raises(ApiError):  # reaches the transport, 503s honestly
+            await client.list_projects()
+
+
+async def test_a_leaked_probe_slot_is_reclaimed_after_the_abandon_window(
+    settings: Settings,
+) -> None:
+    """Belt to the ``finally``'s braces: a caller that never returns at all."""
+    clock = FakeClock()
+    breaker = CircuitBreaker(clock=clock, rng=random.Random(1))
+    for _ in range(3):
+        breaker.check(None)
+        breaker.record_failure("GET /projects: 503", None)
+    assert breaker.state is CircuitState.OPEN
+
+    clock.advance(breaker.retry_after() + 0.001)
+    claim = breaker.check(None)
+    assert claim is not None  # claimed, and then simply never released
+
+    clock.advance(PROBE_ABANDON_SECONDS - 1.0)
+    with pytest.raises(CircuitOpen):
+        breaker.check(None)
+
+    clock.advance(2.0)
+    assert breaker.check(None) is not None
+    assert breaker.probes_abandoned == 1
+
+
+async def test_a_late_release_cannot_free_somebody_elses_probe(
+    settings: Settings,
+) -> None:
+    """``release`` is narrow on purpose, or it would loosen the breaker."""
+    clock = FakeClock()
+    breaker = CircuitBreaker(clock=clock, rng=random.Random(1))
+    for _ in range(3):
+        breaker.check(None)
+        breaker.record_failure("GET /projects: 503", None)
+    clock.advance(breaker.retry_after() + 0.001)
+
+    stale = breaker.check(None)
+    breaker.record_failure("GET /projects: 503", None)  # probe failed, re-opened
+    clock.advance(breaker.retry_after() + 0.001)
+    live = breaker.check(None)
+    assert live != stale
+
+    breaker.release(stale)  # the cancelled first probe, arriving late
+    with pytest.raises(CircuitOpen):
+        breaker.check(None)  # `live` still holds it
+    breaker.release(live)
+    assert breaker.check(None) is not None
 
 
 async def test_a_4xx_does_not_open_the_circuit(settings: Settings) -> None:

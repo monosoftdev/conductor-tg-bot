@@ -75,6 +75,7 @@ from aiogram.types import (
 )
 
 from ctb.db import NO_THREAD_ID
+from ctb.delivery.render.html import is_safe_url
 from ctb.logging import get_logger
 from ctb.turn.state import CardButton
 
@@ -97,6 +98,7 @@ __all__ = [
     "NonceStore",
     "Ticket",
     "button",
+    "button_url",
     "card_button_label",
     "choice_keyboard",
     "confirm_keyboard",
@@ -676,10 +678,52 @@ def button(
     )
 
 
+#: The only URL schemes Telegram will accept on an inline **button**.
+#:
+#: Narrower than :data:`~ctb.delivery.render.html.SAFE_URL_SCHEMES`, which also
+#: admits ``mailto:`` — legal in an ``href``, not on a button — so the two sets
+#: are deliberately separate rather than one shared constant.
+_BUTTON_URL_SCHEMES: Final[frozenset[str]] = frozenset({"http", "https", "tg"})
+
+
+def button_url(candidate: str | None) -> str | None:
+    """The URL if Telegram will take it on a button, otherwise ``None``.
+
+    Conductor's API hands out ``deepLink`` as ``conductor://workspace?id=…``, a
+    custom scheme that opens the desktop app. Telegram answers ``Unsupported URL
+    protocol`` and rejects the **entire message** along with it — so every
+    *finished-turn* and every *error* card (the two button sets that carry
+    ``OPEN``) failed to render, leaving the pinned card frozen on whatever it last
+    said. Observed in production: a turn completed, its answer was delivered, and
+    the card above it still read "working" because the edit that would have
+    corrected it 400'd.
+
+    Returning ``None`` puts the caller on the path it already has for "no deep
+    link is known", which drops the button and keeps the card. An "Open in
+    Conductor" that cannot open is worse than no button; a card that cannot
+    render is worse than both.
+
+    The *renderer* has had this idea all along — ``link_html`` checks
+    :func:`~ctb.delivery.render.html.is_safe_url` and degrades to ``text (url)``
+    rather than emit an ``href`` Telegram will refuse. This is the keyboard's
+    counterpart, and it reuses that check so the stricter half comes free:
+    ``is_safe_url`` also rejects a URL carrying a newline, tab or space, which a
+    bare scheme test would wave through into the same 400.
+    """
+    if not candidate or not is_safe_url(candidate):
+        return None
+    scheme = candidate.split(":", 1)[0].lower()
+    return candidate if scheme in _BUTTON_URL_SCHEMES else None
+
+
 def url_button(
     text: str, url: str, *, style: str | None = "primary"
 ) -> InlineKeyboardButton:
-    """A link button. No nonce: a deep link cannot go stale or do damage."""
+    """A link button. No nonce: a deep link cannot go stale or do damage.
+
+    Callers passing anything that did not come from Telegram itself must filter
+    it through :func:`button_url` first.
+    """
     return InlineKeyboardButton(text=truncate_label(text), url=url, style=style)
 
 
@@ -810,18 +854,20 @@ def status_card_keyboard(
 ) -> InlineKeyboardMarkup | None:
     """The pinned card's buttons, straight from ``EditStatusCard.buttons``.
 
-    ``CardButton.OPEN`` becomes a URL button when a ``deepLink`` is known and is
+    ``CardButton.OPEN`` becomes a URL button when a ``deepLink`` is known, is
     dropped when it is not — an "Open in Conductor" that cannot open is worse
-    than no button.
+    than no button — and is dropped just the same when the link is a scheme
+    Telegram refuses, because that refusal costs the whole card (:func:`button_url`).
     """
     registry = store if store is not None else get_nonce_store()
     row: list[InlineKeyboardButton] = []
     rows: list[list[InlineKeyboardButton]] = []
     for kind in buttons:
         if kind is CardButton.OPEN:
-            if not deep_link:
+            openable = button_url(deep_link)
+            if openable is None:
                 continue
-            item = url_button(card_button_label(kind), deep_link)
+            item = url_button(card_button_label(kind), openable)
         else:
             item = button(
                 card_button_label(kind),

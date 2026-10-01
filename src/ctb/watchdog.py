@@ -117,7 +117,21 @@ class Watchdog:
         self._alarmed: set[uuid.UUID] = set()
 
     async def run(self) -> None:
+        # One interval before the first census, not after it. "Nothing has been
+        # checking your tasks" is a claim about *this* process, and at the moment
+        # it starts answering, the supervisor has not taken the lease yet — so
+        # every session still carries the stale ``updated_at`` of whatever outage
+        # is being recovered from, and the census is reading somebody else's
+        # silence. Live, this fired in the same second as boot, for both tenants,
+        # on the deploy that was fixing them.
+        #
+        # One minute against a ten-minute threshold costs nothing in detection:
+        # the condition takes ten minutes to arise and this moves the first look
+        # to 11. It buys the alarm the right to be believed.
         while not self._stop.is_set():
+            await self._pause(self._interval_s)
+            if self._stop.is_set():
+                return
             try:
                 await self.check_once()
             except asyncio.CancelledError:
@@ -126,7 +140,6 @@ class Watchdog:
                 # A watchdog that dies on a transient read is the failure it
                 # exists to catch. Log and try again next tick.
                 log.warning("watchdog.check_failed", error=repr(exc))
-            await self._pause(self._interval_s)
 
     async def stop(self) -> None:
         self._stop.set()
@@ -173,7 +186,7 @@ class Watchdog:
                     tenant_id=tenant_id,
                     slug=tenant.slug,
                     reason=attribute(
-                        auth_failed=tenant.auth_failed_at is not None,
+                        auth_failed=tenancy.auth_latched(tenant.auth_failed_at, at=at),
                         api_calls=stats.total,
                         api_ok=stats.ok,
                     ),
