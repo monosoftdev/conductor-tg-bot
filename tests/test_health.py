@@ -18,11 +18,13 @@ from typing import Any, cast
 import httpx
 import pytest
 
+from ctb import health
 from ctb.conductor.client import ConductorClient
 from ctb.conductor.errors import ApiError, AuthFatal, RateLimited
 from ctb.conductor.pool import ClientPool
 from ctb.db.connection import Database, set_database
 from ctb.db.errors import DatabaseError
+from ctb.db.migrate import current_schema_version
 from ctb.db.repo import deliveries as deliveries_repo
 from ctb.db.repo import events as events_repo
 from ctb.db.repo import lease as lease_repo
@@ -42,6 +44,7 @@ from ctb.health import (
     DEGRADATION_POLL_SILENT,
     DEGRADATION_POLL_WEDGED,
     DEGRADATION_RATE_LIMITED,
+    DEGRADATION_SCHEMA_BEHIND,
     DEGRADATION_TELEGRAM,
     DELIVERY_BACKLOG,
     DELIVERY_FAILED_WINDOW_MS,
@@ -700,6 +703,49 @@ async def test_unexplained_silence_eventually_fails_the_healthcheck(
     assert report.polling["silent_reasons"] == {"unexplained": 1}
     assert report.has(DEGRADATION_POLL_WEDGED)
     assert report.status is HealthStatus.DOWN
+    assert report.http_status == 503
+
+
+async def test_an_expired_stamp_stops_explaining_the_silence(
+    system_db: Database,
+) -> None:
+    """The sixteen-day outage, reproduced.
+
+    Nothing but ``/key`` ever cleared ``auth_failed_at``, so a tenant that had
+    *once* been rejected carried the stamp for ever. ``attribute`` puts
+    ``auth_failed`` first and an explained silence never fails the healthcheck —
+    so one spurious 401 in September permanently disabled the only mechanism
+    that recovers a wedged process, and the next wedge ran for sixteen days
+    behind a stamp describing a key that had never stopped working.
+
+    A stamp older than ``AUTH_RETRY_AFTER_MS`` is one ``list_bound`` has already
+    readmitted the tenant on. It must not still be silencing the alarm.
+    """
+    async with as_tenant():
+        await tenancy.set_conductor_key(
+            system_db,
+            BOOTSTRAP_TENANT_ID,
+            ciphertext=b"sealed",
+            kid="v1",
+            fingerprint="fp",
+        )
+        await sessions_repo.upsert(
+            system_db,
+            "wedged-behind-a-stale-stamp",
+            chat_id=-100123,
+            thread_id=7,
+            at=WALL - POLL_WEDGED_MS - 1,
+        )
+        await tenancy.mark_auth_failed(
+            system_db,
+            BOOTSTRAP_TENANT_ID,
+            reason="401",
+            at=WALL - tenancy.AUTH_RETRY_AFTER_MS - 1,
+        )
+        report = await make_monitor(db=system_db).report()
+
+    assert report.polling["silent_reasons"] == {"unexplained": 1}
+    assert report.has(DEGRADATION_POLL_WEDGED)
     assert report.http_status == 503
 
 
@@ -1420,3 +1466,39 @@ class TestHealthTokenComparison:
         assert not detail_allowed(
             remote="8.8.8.8", expected_token=None, provided_token=None
         )
+
+
+async def test_a_migration_this_image_ships_but_the_database_lacks_is_reported(
+    system_db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Visible, and deliberately not fatal.
+
+    `preDeployCommand` is a documented no-op without `ADMIN_DATABASE_URL`, and
+    the single deploy-log line that says so scrolls away. Nothing else looked:
+    `/health` reported the applied version and never what the image expected, so
+    a data-repair migration sat unapplied in production for six weeks while the
+    bug it repairs went on reproducing in the rooms it was written for.
+
+    Not fatal because the boot gate already refuses to start on a missing
+    *required* migration — so whatever is still outstanding here is optional, and
+    a restart loop over it would be worse than the rows it has not fixed yet.
+    """
+    applied = await current_schema_version(system_db)
+    monkeypatch.setattr(health, "_latest_shipped_schema_version", lambda: applied + 1)
+
+    report = await make_monitor(db=system_db).report()
+
+    assert report.has(DEGRADATION_SCHEMA_BEHIND)
+    assert report.database["schema_version"] == applied
+    assert report.database["schema_latest"] == applied + 1
+    assert report.status is HealthStatus.DEGRADED
+    assert report.http_status == 200
+
+
+async def test_a_database_at_the_shipped_version_is_not_reported_behind(
+    system_db: Database,
+) -> None:
+    report = await make_monitor(db=system_db).report()
+
+    assert not report.has(DEGRADATION_SCHEMA_BEHIND)
+    assert report.database["schema_latest"] == report.database["schema_version"]

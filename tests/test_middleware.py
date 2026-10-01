@@ -85,6 +85,7 @@ from ctb.bot.keyboards import (
     NonceError,
     NonceStore,
     button,
+    button_url,
     choice_keyboard,
     confirm_keyboard,
     confirm_label,
@@ -1356,6 +1357,51 @@ def test_open_is_dropped_without_a_deep_link() -> None:
     store = NonceStore()
     markup = status_card_keyboard([CardButton.OPEN], "sess-1", store=store)
     assert markup is None
+
+
+#: Verbatim from `GET /v0/workspaces` against the live API. The test above this
+#: one asserts an https deep link that Conductor has never actually returned,
+#: which is why it stayed green while every finished-turn card in production
+#: 400'd on this one.
+LIVE_DEEP_LINK = "conductor://workspace?id=f0ce5c0b-68e2-459c-b774-88de7031dcd2"
+
+
+def test_open_is_dropped_when_telegram_would_refuse_the_scheme() -> None:
+    """A rejected button URL fails the whole card, not just the button."""
+    store = NonceStore()
+    markup = status_card_keyboard([CardButton.OPEN], "sess-1", deep_link=LIVE_DEEP_LINK)
+    assert markup is None
+
+    # And it must not take the rest of the card down with it.
+    markup = status_card_keyboard(
+        [CardButton.STOP, CardButton.OPEN],
+        "sess-1",
+        deep_link=LIVE_DEEP_LINK,
+        store=store,
+    )
+    assert markup is not None
+    flat = [b for row in markup.inline_keyboard for b in row]
+    assert len(flat) == 1
+    assert flat[0].callback_data is not None and flat[0].url is None
+
+
+@pytest.mark.parametrize(
+    ("candidate", "expected"),
+    [
+        ("https://t.me/c/123/456", "https://t.me/c/123/456"),
+        ("http://example.test/x", "http://example.test/x"),
+        ("tg://resolve?domain=conductor", "tg://resolve?domain=conductor"),
+        (LIVE_DEEP_LINK, None),
+        ("conductor://workspace", None),
+        ("javascript:alert(1)", None),
+        ("", None),
+        (None, None),
+    ],
+)
+def test_button_url_admits_only_what_telegram_takes(
+    candidate: str | None, expected: str | None
+) -> None:
+    assert button_url(candidate) == expected
 
 
 def test_status_card_archive_requires_confirmation_request() -> None:

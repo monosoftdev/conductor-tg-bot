@@ -65,6 +65,7 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
+from functools import cache
 from secrets import compare_digest
 from types import TracebackType
 from typing import Any, Final, Self
@@ -74,7 +75,7 @@ from aiohttp import web
 from ctb import __version__
 from ctb.conductor.pool import ClientPool
 from ctb.db.connection import Database, get_database, now_ms
-from ctb.db.migrate import current_schema_version
+from ctb.db.migrate import current_schema_version, discover_migrations
 from ctb.db.repo import deliveries as deliveries_repo
 from ctb.db.repo import events as events_repo
 from ctb.db.repo import lease as lease_repo
@@ -192,6 +193,7 @@ DEGRADATION_DELIVERY_BACKLOG: Final[str] = "delivery_backlog"
 DEGRADATION_DELIVERY_FAILED: Final[str] = "delivery_failed"
 DEGRADATION_DELIVERY_STALLED: Final[str] = "delivery_stalled"
 DEGRADATION_DELIVERY_STRANDED: Final[str] = "delivery_stranded"
+DEGRADATION_SCHEMA_BEHIND: Final[str] = "schema_behind"
 DEGRADATION_LEASE_LOST: Final[str] = "lease_lost"
 DEGRADATION_TELEGRAM: Final[str] = "telegram_polling"
 
@@ -345,6 +347,22 @@ def reset_telegram_health() -> None:
 type DatabaseProvider = Callable[[], Database | None]
 type PoolProvider = Callable[[], ClientPool | None]
 type TelegramProvider = Callable[[], TelegramHealth | None]
+
+
+@cache
+def _latest_shipped_schema_version() -> int | None:
+    """The highest migration in *this image*, or ``None`` if unreadable.
+
+    Cached: the answer is a property of the image, not of the request. ``None``
+    rather than a raise, because a broken migrations directory must not be the
+    reason the healthcheck stops answering — the report's job here is to say what
+    it can see.
+    """
+    try:
+        shipped = discover_migrations()
+    except Exception:  # pragma: no cover - a packaging fault, not a runtime one
+        return None
+    return shipped[-1].version if shipped else None
 
 
 def _pool_stats(db: Database) -> dict[str, Any]:
@@ -652,9 +670,32 @@ class HealthMonitor:
             )
             return {"ok": False, "error": _reason(exc), **_pool_stats(db)}, {}
 
+        # A migration this image ships and the database has not got. Reported,
+        # never fatal: the boot gate already refuses to start on a missing
+        # *required* one, so anything still outstanding here is optional by
+        # construction and refusing traffic over it would be strictly worse than
+        # the thing it repairs.
+        #
+        # It is reported at all because the alternative was measured. With no
+        # `ADMIN_DATABASE_URL` on the service, `preDeployCommand` is a documented
+        # no-op; the one line saying so scrolls past in a deploy log nobody reads
+        # twice, and `/health` said `ok`. A data-repair migration sat unapplied
+        # for six weeks while the bug it fixes went on reproducing.
+        latest = _latest_shipped_schema_version()
+        if latest is not None and schema_version < latest:
+            degradations.append(
+                Degradation(
+                    DEGRADATION_SCHEMA_BEHIND,
+                    f"Schema is at {schema_version}; this build ships {latest}. "
+                    "Set ADMIN_DATABASE_URL on the service and redeploy, or run "
+                    "`python -m ctb.db.upgrade` against it.",
+                )
+            )
+
         db_section = {
             "ok": True,
             "schema_version": schema_version,
+            "schema_latest": latest,
             "query_ms": int((self._clock() - started) * 1000),
             **_pool_stats(db),
         }
@@ -893,7 +934,8 @@ class HealthMonitor:
                 db, since_ms=at - SILENCE_LOOKBACK_MS, tenant_id=tenant_id
             )
             reasons[tenant_id] = attribute(
-                auth_failed=tenant is not None and tenant.auth_failed_at is not None,
+                auth_failed=tenant is not None
+                and tenancy_repo.auth_latched(tenant.auth_failed_at, at=at),
                 api_calls=stats.total,
                 api_ok=stats.ok,
             )

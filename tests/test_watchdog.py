@@ -180,6 +180,33 @@ async def test_silence_with_nothing_to_blame_is_the_bots_own_fault(
     assert not episodes[0].reason.is_explained
 
 
+async def test_a_stale_rejection_does_not_blame_a_key_that_works(
+    system_db: Database,
+) -> None:
+    """What two owners were told for sixteen days, wrongly.
+
+    The stamp was weeks old and the key had gone on returning 200 to every
+    request the whole time. Telling somebody to re-send a working key is worse
+    than saying nothing: it moves the blame off the bot, and the real fault —
+    this process having stopped trying — goes unnamed and unrestarted.
+    """
+    now = now_ms()
+    await seed(system_db, "abandoned", at=now - HOUR_MS)
+    await tenancy.mark_auth_failed(
+        system_db,
+        BOOTSTRAP_TENANT_ID,
+        reason="401",
+        at=now - tenancy.AUTH_RETRY_AFTER_MS - 1,
+    )
+    sink = RecordingSink()
+
+    episodes = await make(system_db, sink, at=now).check_once()
+
+    assert episodes[0].reason is SilenceReason.UNEXPLAINED
+    assert not episodes[0].reason.is_explained
+    assert "/key" not in sink.alarms[0][1]
+
+
 async def test_one_tenants_outage_is_not_reported_to_another(
     system_db: Database,
 ) -> None:

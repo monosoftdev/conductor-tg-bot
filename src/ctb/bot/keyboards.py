@@ -97,6 +97,7 @@ __all__ = [
     "NonceStore",
     "Ticket",
     "button",
+    "button_url",
     "card_button_label",
     "choice_keyboard",
     "confirm_keyboard",
@@ -676,10 +677,43 @@ def button(
     )
 
 
+#: The only URL schemes Telegram will accept on an inline button.
+#:
+#: Everything else answers ``Bad Request: inline keyboard button URL '...' is
+#: invalid: Unsupported URL protocol`` — and that 400 fails the **whole**
+#: ``sendMessage``/``editMessageText``, not just the offending button.
+_BUTTON_URL_SCHEMES: Final = ("http://", "https://", "tg://")
+
+
+def button_url(candidate: str | None) -> str | None:
+    """The URL if Telegram will take it on a button, otherwise ``None``.
+
+    Conductor's API hands out ``deepLink`` as ``conductor://workspace?id=…``, a
+    custom scheme that opens the desktop app. Telegram rejects it, and rejects
+    the entire message along with it — so every *finished-turn* and every *error*
+    card (the two button sets that carry ``OPEN``) failed to render, leaving the
+    pinned card frozen on whatever it last said. Observed in production: a turn
+    completed, its answer was delivered, and the card above it still read
+    "working" because the edit that would have corrected it 400'd.
+
+    Returning ``None`` puts the caller on the path it already has for "no deep
+    link is known", which drops the button and keeps the card. An "Open in
+    Conductor" that cannot open is worse than no button; a card that cannot
+    render is worse than both.
+    """
+    if not candidate:
+        return None
+    return candidate if candidate.startswith(_BUTTON_URL_SCHEMES) else None
+
+
 def url_button(
     text: str, url: str, *, style: str | None = "primary"
 ) -> InlineKeyboardButton:
-    """A link button. No nonce: a deep link cannot go stale or do damage."""
+    """A link button. No nonce: a deep link cannot go stale or do damage.
+
+    Callers passing anything that did not come from Telegram itself must filter
+    it through :func:`button_url` first.
+    """
     return InlineKeyboardButton(text=truncate_label(text), url=url, style=style)
 
 
@@ -810,18 +844,20 @@ def status_card_keyboard(
 ) -> InlineKeyboardMarkup | None:
     """The pinned card's buttons, straight from ``EditStatusCard.buttons``.
 
-    ``CardButton.OPEN`` becomes a URL button when a ``deepLink`` is known and is
+    ``CardButton.OPEN`` becomes a URL button when a ``deepLink`` is known, is
     dropped when it is not — an "Open in Conductor" that cannot open is worse
-    than no button.
+    than no button — and is dropped just the same when the link is a scheme
+    Telegram refuses, because that refusal costs the whole card (:func:`button_url`).
     """
     registry = store if store is not None else get_nonce_store()
     row: list[InlineKeyboardButton] = []
     rows: list[list[InlineKeyboardButton]] = []
     for kind in buttons:
         if kind is CardButton.OPEN:
-            if not deep_link:
+            openable = button_url(deep_link)
+            if openable is None:
                 continue
-            item = url_button(card_button_label(kind), deep_link)
+            item = url_button(card_button_label(kind), openable)
         else:
             item = button(
                 card_button_label(kind),

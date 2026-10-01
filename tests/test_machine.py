@@ -457,9 +457,39 @@ def test_rule_09_workspace_waking(
 
 
 def test_rule_09_says_asleep_only_when_nothing_is_waiting() -> None:
-    """💤 is "parked", not "starting up". With nothing outstanding it is true."""
+    """💤 is "parked", not "starting up". With nothing outstanding it is true.
+
+    And it stays *parked*: a workspace nobody is waiting on must not be pushed
+    into ``WAKING``, because ``WAKING`` arms ``WAKE_TIMEOUT_S``. The live API
+    reports ``sleeping`` for every workspace that is not mid-turn and never
+    reports ``ready`` in between, so counting it as transitional meant every
+    room came back from a redeploy, held the fast cadence for ten minutes and
+    then announced "The workspace did not become ready within 10 minutes" about
+    a workspace with nothing wrong with it.
+    """
     parked = step(ctx(TurnState.IDLE), Ws(WorkspaceStatusValue.SLEEPING), T0 + 1)
     assert actions_of(parked, SetTopicMarker)[0].marker is TopicMarker.SLEEPING
+    assert parked.state is TurnState.IDLE
+    assert cadence_set(parked) is None  # no retune: the idle cadence stands
+
+
+def test_a_sleeping_workspace_releases_a_room_already_stuck_in_waking() -> None:
+    """The other half: rooms the old rule had already parked in ``WAKING``.
+
+    Without this they sit there until the wake timeout fires and posts an error
+    card, once per redeploy, for a workspace that is merely asleep.
+    """
+    result = step(
+        # No pending prompt: `ctx(WAKING)` supplies one, and a room that *is*
+        # waiting on a prompt should still wait (the branch below this one).
+        ctx(TurnState.WAKING, waking_notified=True, pending_prompts=()),
+        Ws(WorkspaceStatusValue.SLEEPING),
+        T0 + 1,
+    )
+
+    assert result.state is TurnState.IDLE
+    assert result.context.waking_notified is False
+    assert actions_of(result, SetTopicMarker)[0].marker is TopicMarker.SLEEPING
 
 
 def test_a_prompt_marks_the_topic_waiting_before_anything_runs() -> None:

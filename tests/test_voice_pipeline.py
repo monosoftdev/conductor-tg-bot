@@ -34,7 +34,7 @@ from ctb.settings import Settings
 from ctb.voice import service as voice_service_module
 from ctb.voice.provider import Transcription, TranscriptionError
 from ctb.voice.service import VoiceEnqueueStatus, VoiceService
-from tests.pg import BOOTSTRAP_TENANT_ID
+from tests.pg import BOOTSTRAP_TENANT_ID, unscoped
 
 
 class FakeBot:
@@ -788,6 +788,31 @@ async def test_a_fresh_claim_is_left_for_the_peer_that_holds_it(
     assert recovery.requeued == 0 and recovery.abandoned == ()
     row = await voice_repo.get(db, 1001, 80)
     assert row is not None and row.state == "transcribing"
+
+
+async def test_the_stale_sweep_runs_unscoped_like_the_task_it_lives_in(
+    settings: Settings, db: Database, system_db: Database
+) -> None:
+    """The sweep is a process-level task, so it has no tenant to borrow.
+
+    ``recover_stale`` is cross-tenant and the boot-time pass always knew it —
+    ``_recover`` takes ``system_db``. ``_sweep`` was written with ``self.db``,
+    the RLS-enforcing pool, and so raised *every* pass: ``voice.recover_failed
+    no tenant in scope for a tenant-scoped query``, every two minutes, for the
+    whole life of the process. Caught only by the warning it logged about
+    itself, which is why it survived.
+
+    The surrounding tests all pass ``db`` directly and run inside the fixture's
+    scope, so none of them could see it. This one runs the way the task does.
+    """
+    await seed(db, tg_message_id=90, state="transcribing")
+    service = make_service(settings, db, system_db)
+
+    async with unscoped():
+        await service._sweep_once()  # pyright: ignore[reportPrivateUsage]
+
+    row = await voice_repo.get(db, 1001, 90)
+    assert row is not None and row.state == "received"
 
 
 async def test_recover_stale_gives_up_after_three_attempts(db: Database) -> None:

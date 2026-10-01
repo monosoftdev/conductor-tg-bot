@@ -59,6 +59,7 @@ from ctb.bot.keyboards import (
     NonceError,
     NonceStore,
     button,
+    button_url,
     keyboard,
     resolve,
     url_button,
@@ -741,7 +742,9 @@ async def adopt_callback(
         return
     target = jump_url(chat_id, result.thread_id)
     label = "Open topic" if target else "Open in Conductor"
-    link = target or result.deep_link
+    # `deep_link` is Conductor's `conductor://…`, which Telegram refuses on a
+    # button and 400s the whole send over. No button beats no acknowledgement.
+    link = target or button_url(result.deep_link)
     await send_html(
         query.bot,
         chat_id,

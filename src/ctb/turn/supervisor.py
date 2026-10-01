@@ -153,11 +153,20 @@ class Supervisor:
             self._auth_fatal -= recovered
             self._auth_notified -= recovered
             _log.info("supervisor.auth_recovered", tenants=len(recovered))
-        # A client whose counter is non-zero but that has not yet raised
-        # counts too: the poller may still be mid-tick.
+        # A client whose counter is non-zero but that has not yet raised counts
+        # too: the poller may still be mid-tick.
+        #
+        # Read off the **pool**, not off ``_tenant_of``. The only use of this set
+        # is to cancel the tenant's pollers, and `_drop` pops ``_tenant_of`` — so
+        # a set derived from it was empty again by the time the spawn loop asked,
+        # three lines further down the same pass, whether the tenant was still
+        # latched. It answered no and restarted everything it had just stopped.
+        # Live: a cancel/respawn pair every five seconds per session, 304 poller
+        # starts in thirteen minutes, not one of them completing a tick. The pool
+        # outlives the pollers, so the answer no longer changes by being used.
         rejecting = {
             tenant_id
-            for tenant_id in set(self._tenant_of.values())
+            for tenant_id in self.clients.tenant_ids()
             if self._auth_failures(tenant_id) > 0
         }
         return frozenset(self._auth_fatal | rejecting)
@@ -373,14 +382,27 @@ class Supervisor:
         response to "your key was rejected" is to set a new one, and a cached
         client is a header built from the old ciphertext.
         """
-        returning = self._auth_fatal & {
-            row.tenant_id for row in rows if row.tenant_id is not None
-        }
-        for tenant_id in returning:
+        admitted = {row.tenant_id for row in rows if row.tenant_id is not None}
+        for tenant_id in self._auth_fatal & admitted:
             self._auth_fatal.discard(tenant_id)
             self._auth_notified.discard(tenant_id)
             await self.clients.forget(tenant_id)
             _log.info("supervisor.auth_retry_admitted", tenant=str(tenant_id))
+
+        # And drop the stamp itself, which nothing but ``/key`` used to clear.
+        # Appearing in ``rows`` means the database already judged this latch
+        # spent, and every reader now agrees (``tenancy.auth_latched``), so this
+        # decides nothing — it only stops a four-week-old rejection being
+        # reported as the current state of a key that works. Leaving it set is
+        # what kept ``/health`` calling every later silence *explained*, and so
+        # kept Railway from recycling a process a restart would have fixed.
+        for tenant_id in admitted:
+            tenant = await self._tenant(tenant_id)
+            if tenant is None or tenant.auth_failed_at is None:
+                continue
+            if await tenancy.clear_auth_failure(self.system_db, tenant_id):
+                self._tenant_rows.pop(tenant_id, None)
+                _log.info("supervisor.auth_latch_expired", tenant=str(tenant_id))
 
     async def _key_still_rejected(self, tenant_id: uuid.UUID) -> bool:
         """Corroborate one 401 with a second question before stopping a team.
@@ -562,6 +584,10 @@ class Supervisor:
             )
             self._auth_fatal.discard(tenant_id)
             self._auth_notified.discard(tenant_id)
+            # ``GET /me`` just answered on this key, so any stamp it still
+            # carries describes a rejection that has demonstrably stopped.
+            if await tenancy.clear_auth_failure(self.system_db, tenant_id):
+                self._tenant_rows.pop(tenant_id, None)
             # Fall through: this poller restarts on the ordinary backoff.
 
         restart = self._restart.setdefault(session_id, _Restart())

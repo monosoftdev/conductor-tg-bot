@@ -118,6 +118,19 @@ READ_TIMEOUT_S: Final = 20.0
 POST_MESSAGE_TIMEOUT_S: Final = 30.0
 SQL_TIMEOUT_S: Final = 60.0
 
+#: When to read a held half-open probe slot as leaked rather than slow.
+#:
+#: ``_request`` hands its slot back in a ``finally``, so the only way to keep one
+#: past this is an ``await`` that never returns at all. Derived, not guessed: the
+#: longest a single logical request can legitimately run — every attempt timing
+#: out on the slowest endpoint, with a capped backoff between each and one
+#: ``Retry-After`` slept through. Anything beyond that is nobody's request.
+PROBE_ABANDON_SECONDS: Final = (
+    MAX_ATTEMPTS * (CONNECT_TIMEOUT_S + SQL_TIMEOUT_S)
+    + (MAX_ATTEMPTS - 1) * BACKOFF_CAP_S
+    + MAX_RETRY_AFTER_SLEEP_S
+)
+
 #: ``POST /v0/sql`` limits, enforced client-side so a bad query fails locally
 #: instead of burning a request.
 SQL_MAX_QUERY_CHARS: Final = 10_000
@@ -348,6 +361,22 @@ class CircuitBreaker:
     slot, so the window can never close and every user action fails fast behind
     it. Failures that span two targets (or any collection call) still open the
     whole circuit — that is a real outage.
+
+    **The probe slot is a loan, and every loan is called in.** ``check`` hands
+    out a claim and ``release`` takes it back; ``_request`` pairs them across a
+    ``finally`` so the slot returns however the request ends, including the
+    cancellation that an :class:`AuthFatal` on a sibling poller causes. A slot
+    that is claimed and never returned is not a slow probe, it is a dead circuit:
+    the only reset of ``_probe_in_flight`` on the read path is the
+    ``open`` -> ``half_open`` edge, and a breaker already in ``half_open`` never
+    crosses it again, so *every* later call fails fast with ``retry_after=1s``
+    forever. Live cost, before this was paired: a transient Conductor wobble on
+    2026-09-14 took two tenants off the air for sixteen days, with zero requests
+    attempted and therefore no ``api_events`` row to show for it.
+
+    ``PROBE_ABANDON_SECONDS`` is the belt to that braces — a slot held longer
+    than any request could possibly run is reclaimed, so even a caller that
+    never returns at all costs one window rather than the process.
     """
 
     def __init__(
@@ -369,6 +398,13 @@ class CircuitBreaker:
         self._opened_until = 0.0
         self._opened_by: str | None = None
         self._probe_in_flight = False
+        #: Bumped on every claim, so a ``release`` arriving late from a request
+        #: that was cancelled cannot free a slot somebody else now holds.
+        self._probe_claim = 0
+        self._probe_claimed_at = 0.0
+        #: Slots reclaimed from a caller that never came back. Non-zero means a
+        #: release went missing, which is a bug worth seeing in ``/health``.
+        self.probes_abandoned = 0
         #: The targets of the current failure streak, capped at the threshold so
         #: an endlessly-failing resource cannot make one unrelated 5xx look like
         #: a two-target outage.
@@ -394,8 +430,12 @@ class CircuitBreaker:
     def retry_after(self) -> float:
         return max(0.0, self._opened_until - self._clock())
 
-    def check(self, target: str | None = None) -> None:
+    def check(self, target: str | None = None) -> int | None:
         """Gate one logical request. Raises :class:`CircuitOpen` to fail fast.
+
+        Returns the probe claim this call now holds — hand it to :meth:`release`
+        when the request ends, by any route at all — or ``None`` when this call
+        is an ordinary one with no slot to give back.
 
         Synchronous on purpose: it must not yield between the state test and the
         probe claim, or two tasks would both become the probe.
@@ -417,10 +457,31 @@ class CircuitBreaker:
             self._probe_in_flight = False
         if self._state is CircuitState.HALF_OPEN:
             if self._probe_in_flight:
-                raise CircuitOpen(
-                    retry_after=HALF_OPEN_PROBE_RETRY_S, opened_by=self._opened_by
-                )
+                held = self._clock() - self._probe_claimed_at
+                if held < PROBE_ABANDON_SECONDS:
+                    raise CircuitOpen(
+                        retry_after=HALF_OPEN_PROBE_RETRY_S, opened_by=self._opened_by
+                    )
+                # Nobody is coming back for this one. Take it rather than stay
+                # wedged behind a request that has already outlived every
+                # timeout it could have been waiting on.
+                self.probes_abandoned += 1
+            self._probe_claim += 1
             self._probe_in_flight = True
+            self._probe_claimed_at = self._clock()
+            return self._probe_claim
+        return None
+
+    def release(self, claim: int | None) -> None:
+        """Give back a probe slot that no outcome was ever recorded against.
+
+        Idempotent, and deliberately narrow: a no-op unless this exact claim is
+        still the live one. So a release from a request that was cancelled cannot
+        free a probe a later caller has since claimed, and a release that follows
+        :meth:`record_ok` cannot re-open a circuit that call just closed.
+        """
+        if claim is not None and self._probe_in_flight and claim == self._probe_claim:
+            self._probe_in_flight = False
 
     def record_ok(self, target: str | None = None) -> None:
         """A healthy round trip — any response the server actually produced."""
@@ -491,6 +552,8 @@ class CircuitBreaker:
             "consecutive_failures": self._consecutive_failures,
             "retry_after": round(self.retry_after(), 3),
             "opened_by": self._opened_by,
+            "probe_in_flight": self._probe_in_flight,
+            "probes_abandoned": self.probes_abandoned,
             "isolated": {
                 target: round(held.until - self._clock(), 3)
                 for target, held in self._isolated.items()
@@ -679,192 +742,204 @@ class ConductorClient:
             # Gated once per logical request: an in-flight retry has already been
             # budgeted, and re-checking would turn a 5xx on a write into
             # CircuitOpen, destroying the "this may have landed" information.
-            self._circuit.check(target)
-            attempt = 0
-            while True:
-                attempt += 1
-                await self._bucket.acquire()
-                started = self._clock()
-                error: ApiError | None = None
-                payload: Any = None
-                status: int | None = None
-                request_id: str | None = None
-                try:
-                    response = await self._http.request(
-                        method,
-                        path,
-                        params=query or None,
-                        json=dict(json_body) if json_body is not None else None,
-                        timeout=_timeout(read_timeout),
-                    )
-                except httpx.HTTPError as exc:
+            # Claimed here, handed back in the ``finally``. A slot that is
+            # claimed and never recorded wedges the breaker in ``half_open``
+            # for the life of the process, because ``check`` only resets the
+            # flag on the ``open`` -> ``half_open`` edge a wedged breaker
+            # never crosses again. Sixteen days of silence began exactly so.
+            claim = self._circuit.check(target)
+            try:
+                attempt = 0
+                while True:
+                    attempt += 1
+                    await self._bucket.acquire()
+                    started = self._clock()
+                    error: ApiError | None = None
+                    payload: Any = None
+                    status: int | None = None
+                    request_id: str | None = None
+                    try:
+                        response = await self._http.request(
+                            method,
+                            path,
+                            params=query or None,
+                            json=dict(json_body) if json_body is not None else None,
+                            timeout=_timeout(read_timeout),
+                        )
+                    except httpx.HTTPError as exc:
+                        self._finish(
+                            endpoint=endpoint,
+                            method=method,
+                            status=None,
+                            started=started,
+                            attempt=attempt,
+                            ok=False,
+                            error=f"{type(exc).__name__}: {exc}",
+                            request_id=None,
+                            session_id=session_id,
+                        )
+                        self._circuit.record_failure(
+                            f"{method} {endpoint}: transport", target
+                        )
+                        never_sent = isinstance(
+                            exc, (httpx.ConnectError, httpx.ConnectTimeout)
+                        )
+                        if (idempotent or never_sent) and attempt < limit:
+                            self._retries += 1
+                            await self._backoff(attempt)
+                            continue
+                        if is_write and not never_sent:
+                            raise Ambiguous(
+                                f"{method} {endpoint} failed without a response "
+                                f"after {attempt} attempt(s); the write may "
+                                "have landed",
+                                method=method,
+                                path=endpoint,
+                                message_id=message_id,
+                                idempotent=idempotent,
+                                cause=exc,
+                            ) from exc
+                        raise TransportFailure(
+                            f"{method} {endpoint} failed without a response "
+                            f"after {attempt} attempt(s): {type(exc).__name__}",
+                            method=method,
+                            path=endpoint,
+                            attempts=attempt,
+                            cause=exc,
+                        ) from exc
+
+                    status = response.status_code
+                    request_id = _request_id_of(response)
+                    if status < 400:
+                        try:
+                            payload = _decode(response)
+                        except ValueError:
+                            # A 2xx that is not JSON is a proxy error page, not an
+                            # answer. Treat it as retryable rather than crashing a
+                            # poller on a decode error.
+                            error = ApiError(
+                                status,
+                                {
+                                    "userMessage": "response body was not JSON",
+                                    "retryable": True,
+                                },
+                                method=method,
+                                path=endpoint,
+                                request_id=request_id,
+                            )
+                        if error is None:
+                            self._circuit.record_ok(target)
+                            # A 2xx proves the key works, so an earlier 401 raced
+                            # with a successful request rather than proving the key
+                            # is dead. Clear the latch before the supervisor stops
+                            # this tenant's pollers for the life of the process.
+                            if self._auth_failures:
+                                self._log.info(
+                                    "conductor.auth_recovered",
+                                    endpoint=endpoint,
+                                    method=method,
+                                    auth_failures=self._auth_failures,
+                                )
+                                self._auth_failures = 0
+                            self._finish(
+                                endpoint=endpoint,
+                                method=method,
+                                status=status,
+                                started=started,
+                                attempt=attempt,
+                                ok=True,
+                                error=None,
+                                request_id=request_id,
+                                session_id=session_id,
+                            )
+                            return payload
+                    else:
+                        error = api_error_for_status(
+                            status,
+                            _decode_safely(response),
+                            method=method,
+                            path=endpoint,
+                            retry_after=_parse_retry_after(
+                                response.headers.get("retry-after")
+                            ),
+                            request_id=request_id,
+                        )
+
                     self._finish(
                         endpoint=endpoint,
                         method=method,
-                        status=None,
+                        status=status,
                         started=started,
                         attempt=attempt,
                         ok=False,
-                        error=f"{type(exc).__name__}: {exc}",
-                        request_id=None,
+                        error=str(error),
+                        request_id=request_id,
                         session_id=session_id,
                     )
-                    self._circuit.record_failure(
-                        f"{method} {endpoint}: transport", target
-                    )
-                    never_sent = isinstance(
-                        exc, (httpx.ConnectError, httpx.ConnectTimeout)
-                    )
-                    if (idempotent or never_sent) and attempt < limit:
+
+                    if isinstance(error, RateLimited):
+                        # Honour Retry-After *and* open the circuit: every other
+                        # caller backs off too, not just this one.
+                        self._circuit.trip(
+                            error.retry_after, f"{method} {endpoint}: 429 rate limited"
+                        )
+                    elif error.status >= 500:
+                        self._circuit.record_failure(
+                            f"{method} {endpoint}: {error.status}", target
+                        )
+                    else:
+                        self._circuit.record_ok(target)
+
+                    if isinstance(error, AuthFatal):
+                        self._auth_failures += 1
+                        self._log.error(
+                            "conductor.auth_fatal",
+                            endpoint=endpoint,
+                            method=method,
+                            status_code=error.status,
+                            detail=error.user_message,
+                        )
+                        raise error
+                    if isinstance(error, NotFound):
+                        raise error
+
+                    # A 4xx (429 included) was rejected without a side effect, so it
+                    # is safe to replay even for a non-idempotent write. A 5xx is not.
+                    safe_to_retry = idempotent or error.status < 500
+                    if error.retryable and safe_to_retry and attempt < limit:
+                        delay = self._backoff_delay(attempt)
+                        if (
+                            isinstance(error, RateLimited)
+                            and error.retry_after is not None
+                        ):
+                            if error.retry_after > MAX_RETRY_AFTER_SLEEP_S:
+                                raise error
+                            delay = error.retry_after
                         self._retries += 1
-                        await self._backoff(attempt)
+                        self._log.warning(
+                            "conductor.retry",
+                            endpoint=endpoint,
+                            method=method,
+                            status_code=error.status,
+                            attempt=attempt,
+                            delay_s=round(delay, 3),
+                        )
+                        await self._sleep(delay)
                         continue
-                    if is_write and not never_sent:
+
+                    if is_write and error.status >= 500:
                         raise Ambiguous(
-                            f"{method} {endpoint} failed without a response "
+                            f"{method} {endpoint} -> {error.status} "
                             f"after {attempt} attempt(s); the write may have landed",
                             method=method,
                             path=endpoint,
                             message_id=message_id,
                             idempotent=idempotent,
-                            cause=exc,
-                        ) from exc
-                    raise TransportFailure(
-                        f"{method} {endpoint} failed without a response "
-                        f"after {attempt} attempt(s): {type(exc).__name__}",
-                        method=method,
-                        path=endpoint,
-                        attempts=attempt,
-                        cause=exc,
-                    ) from exc
-
-                status = response.status_code
-                request_id = _request_id_of(response)
-                if status < 400:
-                    try:
-                        payload = _decode(response)
-                    except ValueError:
-                        # A 2xx that is not JSON is a proxy error page, not an
-                        # answer. Treat it as retryable rather than crashing a
-                        # poller on a decode error.
-                        error = ApiError(
-                            status,
-                            {
-                                "userMessage": "response body was not JSON",
-                                "retryable": True,
-                            },
-                            method=method,
-                            path=endpoint,
-                            request_id=request_id,
-                        )
-                    if error is None:
-                        self._circuit.record_ok(target)
-                        # A 2xx proves the key works, so an earlier 401 raced
-                        # with a successful request rather than proving the key
-                        # is dead. Clear the latch before the supervisor stops
-                        # this tenant's pollers for the life of the process.
-                        if self._auth_failures:
-                            self._log.info(
-                                "conductor.auth_recovered",
-                                endpoint=endpoint,
-                                method=method,
-                                auth_failures=self._auth_failures,
-                            )
-                            self._auth_failures = 0
-                        self._finish(
-                            endpoint=endpoint,
-                            method=method,
-                            status=status,
-                            started=started,
-                            attempt=attempt,
-                            ok=True,
-                            error=None,
-                            request_id=request_id,
-                            session_id=session_id,
-                        )
-                        return payload
-                else:
-                    error = api_error_for_status(
-                        status,
-                        _decode_safely(response),
-                        method=method,
-                        path=endpoint,
-                        retry_after=_parse_retry_after(
-                            response.headers.get("retry-after")
-                        ),
-                        request_id=request_id,
-                    )
-
-                self._finish(
-                    endpoint=endpoint,
-                    method=method,
-                    status=status,
-                    started=started,
-                    attempt=attempt,
-                    ok=False,
-                    error=str(error),
-                    request_id=request_id,
-                    session_id=session_id,
-                )
-
-                if isinstance(error, RateLimited):
-                    # Honour Retry-After *and* open the circuit: every other
-                    # caller backs off too, not just this one.
-                    self._circuit.trip(
-                        error.retry_after, f"{method} {endpoint}: 429 rate limited"
-                    )
-                elif error.status >= 500:
-                    self._circuit.record_failure(
-                        f"{method} {endpoint}: {error.status}", target
-                    )
-                else:
-                    self._circuit.record_ok(target)
-
-                if isinstance(error, AuthFatal):
-                    self._auth_failures += 1
-                    self._log.error(
-                        "conductor.auth_fatal",
-                        endpoint=endpoint,
-                        method=method,
-                        status_code=error.status,
-                        detail=error.user_message,
-                    )
+                            cause=error,
+                        ) from error
                     raise error
-                if isinstance(error, NotFound):
-                    raise error
-
-                # A 4xx (429 included) was rejected without a side effect, so it
-                # is safe to replay even for a non-idempotent write. A 5xx is not.
-                safe_to_retry = idempotent or error.status < 500
-                if error.retryable and safe_to_retry and attempt < limit:
-                    delay = self._backoff_delay(attempt)
-                    if isinstance(error, RateLimited) and error.retry_after is not None:
-                        if error.retry_after > MAX_RETRY_AFTER_SLEEP_S:
-                            raise error
-                        delay = error.retry_after
-                    self._retries += 1
-                    self._log.warning(
-                        "conductor.retry",
-                        endpoint=endpoint,
-                        method=method,
-                        status_code=error.status,
-                        attempt=attempt,
-                        delay_s=round(delay, 3),
-                    )
-                    await self._sleep(delay)
-                    continue
-
-                if is_write and error.status >= 500:
-                    raise Ambiguous(
-                        f"{method} {endpoint} -> {error.status} "
-                        f"after {attempt} attempt(s); the write may have landed",
-                        method=method,
-                        path=endpoint,
-                        message_id=message_id,
-                        idempotent=idempotent,
-                        cause=error,
-                    ) from error
-                raise error
+            finally:
+                self._circuit.release(claim)
 
     def _backoff_delay(self, attempt: int) -> float:
         """Full jitter: ``uniform(0, min(cap, base * 2**(attempt-1)))``."""

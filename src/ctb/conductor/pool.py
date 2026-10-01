@@ -242,6 +242,16 @@ class ClientPool:
             (str(key.tenant_id), entry.client) for key, entry in self._entries.items()
         )
 
+    def tenant_ids(self) -> frozenset[uuid.UUID]:
+        """Every tenant holding a live client.
+
+        For asking a question about *clients* without going through the set of
+        sessions currently being polled. The supervisor's "whose key is being
+        rejected" used the latter, and cancelling a tenant's pollers is what
+        empties it — so the answer changed as a result of being acted on.
+        """
+        return frozenset(key.tenant_id for key in self._entries)
+
     def health(self) -> dict[str, object]:
         return {
             "clients": len(self._entries),

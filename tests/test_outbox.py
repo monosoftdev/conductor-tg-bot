@@ -1374,6 +1374,25 @@ def test_default_keyboard_drops_open_without_a_deep_link() -> None:
     assert default_keyboard((CardButton.OPEN,), session_id="s1") is None
 
 
+def test_default_keyboard_drops_open_for_a_scheme_telegram_refuses() -> None:
+    """The deep link Conductor actually returns, not the https one we invented.
+
+    The test above asserts ``https://conductor.build/w/1``, which the API has
+    never produced. The real value is a ``conductor://`` custom scheme, and
+    Telegram answers ``Unsupported URL protocol`` and discards the whole edit.
+    """
+    live = "conductor://workspace?id=f0ce5c0b-68e2-459c-b774-88de7031dcd2"
+    assert default_keyboard((CardButton.OPEN,), session_id="s1", deep_link=live) is None
+
+    markup = default_keyboard(
+        (CardButton.STOP, CardButton.OPEN), session_id="s1", deep_link=live
+    )
+    assert markup is not None
+    assert [b.callback_data for row in markup.inline_keyboard for b in row] == [
+        "card:stop:s1"
+    ]
+
+
 async def test_the_card_is_posted_once_then_edited(
     cards: StatusCards, bot: FakeBot, clock: FakeClock, db: Database, session: str
 ) -> None:

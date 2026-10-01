@@ -365,26 +365,43 @@ class VoiceService:
         ``recover_stale`` ran only at boot, so a note that died between claim
         and completion held "Transcribing…" until the next redeploy. On its own
         that is a hang the owner cannot tell from a slow provider.
+
+        On the **worker** pool, like the boot-time pass above it and for the same
+        reason: this is a cross-tenant sweep, so there is no tenant in scope and
+        ``ctb_app`` refuses the query outright. Written with ``self.db``, it
+        raised on every single pass — ``voice.recover_failed  no tenant in scope
+        for a tenant-scoped query`` every two minutes for the life of the
+        process — so the hang this method exists to end went on ending only at
+        the next redeploy, exactly as before it was written.
         """
         while not self._stop.is_set():
             await self._pause(_RECOVERY_SECONDS)
             if self._stop.is_set():
                 return
-            try:
-                recovery = await voice_repo.recover_stale(self.db)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                log.warning("voice.recover_failed", error=short_error(exc))
-                continue
-            if recovery.requeued or recovery.abandoned:
-                log.info(
-                    "voice.stale_recovered",
-                    requeued=recovery.requeued,
-                    abandoned=len(recovery.abandoned),
-                )
-            for row in recovery.abandoned:
-                await self._send_failure(row, "Transcription kept failing.")
+            await self._sweep_once()
+
+    async def _sweep_once(self) -> None:
+        """One pass of :meth:`_sweep`, so a test can take the loop out of it.
+
+        The pool this picks is the whole behaviour, and a loop that only ever
+        reports its own failure into a log line is the shape of bug that hid the
+        wrong one for as long as it existed.
+        """
+        try:
+            recovery = await voice_repo.recover_stale(self.system_db)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("voice.recover_failed", error=short_error(exc))
+            return
+        if recovery.requeued or recovery.abandoned:
+            log.info(
+                "voice.stale_recovered",
+                requeued=recovery.requeued,
+                abandoned=len(recovery.abandoned),
+            )
+        for row in recovery.abandoned:
+            await self._send_failure(row, "Transcription kept failing.")
 
     async def _maintenance(self) -> None:
         while not self._stop.is_set():

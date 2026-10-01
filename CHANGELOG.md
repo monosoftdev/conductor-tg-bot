@@ -58,6 +58,60 @@ from its first tagged release.
 
 ### Fixed
 
+- **A transient Conductor wobble no longer takes a team dark for ever.** The
+  circuit breaker's half-open probe slot was claimed in `check` and handed back
+  only by `record_ok`/`record_failure`, both inside the retry loop — so a request
+  that left by any other route leaked it. The route it leaves by is the one a
+  spurious 401 causes: `AuthFatal` cancels the tenant's sibling pollers, one of
+  them mid-request. After that `_probe_in_flight` stays set for the life of the
+  process, because the only reset on the read path is the `open` → `half_open`
+  edge a wedged breaker never crosses again, and every later call fails fast with
+  `retry_after=1s` without a request being attempted. Live: zero Conductor calls
+  for **sixteen days** for two tenants, with no `api_events` row to show for it,
+  ended only by a redeploy. `_request` now returns the claim in a `finally`, the
+  claim is generation-checked so a late release cannot free somebody else's
+  probe, and `PROBE_ABANDON_SECONDS` reclaims a slot held longer than any single
+  request could run.
+
+- **A four-week-old rejection no longer reports itself as current.** Nothing but
+  `/key` ever cleared `auth_failed_at`. `sessions.list_bound` had the clock,
+  while `/health`, the watchdog and `/teams` each asked `auth_failed_at is not
+  None` — so `silence.attribute` returned `auth_rejected` for every silence a
+  once-rejected tenant would ever have. An explained silence never fails the
+  healthcheck, so the stamp permanently disabled the one thing that recovers a
+  wedged process, and both owners were told to re-send a key that was returning
+  200 to every call. `tenancy.auth_latched` is now the single answer, used by all
+  four readers, and the supervisor clears a stamp the database has judged spent.
+
+- **A rejected tenant is no longer cancelled and restarted every five seconds.**
+  `auth_fatal_tenants` derived its `rejecting` half from `_tenant_of`, and the
+  only use of that set is to cancel exactly those sessions — `_drop` pops
+  `_tenant_of`, so the latch read empty again by the time the spawn loop asked in
+  the same pass. 304 poller starts in thirteen minutes, none completing a tick.
+  It reads off the client pool now, which outlives the pollers.
+
+- **The finished-turn and error cards render again.** Conductor returns
+  `deepLink` as `conductor://workspace?id=…`; Telegram answers `Unsupported URL
+  protocol` on an inline button and discards the *whole* `editMessageText`. Since
+  `OPEN` is in both `_DONE_BUTTONS` and `_ERROR_BUTTONS`, a turn would finish,
+  its answer would arrive, and the card above it would still read "working".
+  `button_url` admits only `http`/`https`/`tg` and drops the button otherwise —
+  the path already taken when no deep link is known.
+
+- **The voice recovery sweep runs at all.** `_sweep` polled the tenant-scoped
+  pool from a process-level task where the boot-time `_recover` beside it
+  correctly uses the worker pool, so it raised on every pass
+  (`voice.recover_failed  no tenant in scope`, every two minutes) and the
+  "Transcribing…" hang it exists to end went on ending only at the next
+  redeploy.
+
+- **A sleeping workspace is no longer mistaken for a waking one.** Every live
+  workspace reports `sleeping` between turns and `ready` may never be observed,
+  but `is_waking` counted it — so an idle room was pushed into `WAKING`, which
+  arms `WAKE_TIMEOUT_S`, and ten minutes later announced "The workspace did not
+  become ready within 10 minutes" about a workspace with nothing wrong with it.
+  With nothing outstanding it now stays put and says 💤.
+
 - **A follow-up in a DM topic no longer offers to build a second workspace.**
   `apply_marker` treated a refused `editForumTopic` as proof the topic was
   deleted; in a *private* chat Telegram answers `TOPIC_ID_INVALID` for a thread

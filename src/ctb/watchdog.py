@@ -173,7 +173,7 @@ class Watchdog:
                     tenant_id=tenant_id,
                     slug=tenant.slug,
                     reason=attribute(
-                        auth_failed=tenant.auth_failed_at is not None,
+                        auth_failed=tenancy.auth_latched(tenant.auth_failed_at, at=at),
                         api_calls=stats.total,
                         api_ok=stats.ok,
                     ),
