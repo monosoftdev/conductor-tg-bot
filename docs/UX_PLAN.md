@@ -12,6 +12,97 @@ it touches and what it costs.
 > cockpit offers three destinations. **A1 turned out to be impossible as
 > written** — Telegram gives a bot no read event — and the correction is
 > recorded in place rather than deleted.
+>
+> **D1–D4 (2026-10-01)** close the hole underneath all of it: *a DM can be
+> written to from anywhere and could only be read from inside a room it is
+> impossible to link to*. See §D.
+
+---
+
+## D · Write from anywhere, read only from inside — the asymmetry nobody named
+
+Measured against the live database rather than reasoned about, because the
+numbers are what make this a hole rather than a preference. One owner's private
+chat holds **43 threads**. Of those, **1 routes to a usable session**: 22 point at
+a `DEAD` session whose workspace has since been archived, 2 at an `IDLE` session
+in an archived workspace, and 18 have no session at all. Three carry a state
+prefix; **40 carry none**, because a marker is only written once a rename
+succeeds and these died before one did.
+
+The structural fact underneath it is one line of `topics.jump_url`:
+
+> Only supergroups (`-100…`) have the `/c/` form; a DM has nothing to jump to —
+> not even a DM *topic*, which Telegram publishes no link syntax for.
+
+So **every "go and look over there" affordance in the bot silently evaporates in
+a private chat**, which is the default and recommended flow: `/start`, `/key`,
+`/new` all happen there. The result was an asymmetry no document had stated:
+
+| what the owner wants | before |
+|---|---|
+| "what needs me?" | `/digest` — good ranking, **no buttons at all in a DM** |
+| "take me to it" | **impossible**, and nothing said so |
+| "send a follow-up" | ✅ type in the root; the cockpit offers three seats |
+| "read the last answer" | **only from inside the room** |
+| "stop it" | **only from inside the room** |
+
+Writing had a cockpit. Reading had a dead end — in the surface `§B` already calls
+*"the result is the product, and it is the weakest surface"*.
+
+### D1 · A digest row carries a verb where it cannot carry a destination · **shipped**
+
+`digest_buttons` emitted a jump link or nothing, documented as *"correct rather
+than degraded: in a DM the thread list is one swipe away and a dead button would
+be worse than no button"*. The premise is right and the conclusion was not: the
+card ranked the one task that wanted attention and then handed the reader a
+43-entry list to find it in.
+
+Rows now fall back to `📄` — render this task's last exchanges *here* — through
+the same reducer as `/log`. A supergroup keeps `↗` and jumps, because there the
+link works. The glyphs differ deliberately: `board_stage1` already learned that
+two buttons which look alike must not behave differently, and these two do
+differ — one moves you, one brings it to you.
+
+### D2 · The `Transcript` button was the half of B2 that never shipped · **shipped**
+
+B2 made `/log` readable and left the button beside it sending a `.md` of raw JSON
+envelopes — the exact artefact the fix was about (*"a phone cannot read JSON"*) —
+on the finished **and** errored cards, the two most-tapped surfaces there are.
+The handler had no test of its own, only assertions that the button *exists*,
+which is how a command and its own button came to disagree about the answer.
+Both now go through `power.log_body`; `/log raw` keeps the envelopes.
+
+### D3 · `/log` answers from the chat root · **shipped**
+
+Every session command answers *"No session here. Use /new or /board"* outside a
+room. That is right for `/stop` and useless for a read, because there is no
+tappable route to a DM room to take the advice with. With no room in scope `/log`
+now falls back to the seats the cockpit already offers for sending: one head is
+answered directly, several put the choice on screen through the same `📄` button.
+`require_session` is untouched for mutations — guessing which agent to *show* you
+costs a tap when it is wrong; guessing which to *stop* costs somebody's turn.
+
+### D4 · A buried room says so instead of asking Conductor · **shipped**
+
+22 of those 43 threads point at a `DEAD` session. Typing in one spent a Conductor
+call to be refused and reported it as `Prompt failed: …` — a stack-shaped answer
+to "why did nothing happen", about a room the bot had already buried. The session
+row is the one already loaded for the receipt, so the check costs no query.
+
+### Considered and deliberately not done
+
+- **A status button on the home keyboard.** `handlers/home.py` records that a
+  `/board` button was drafted there and cut, because *"in a threaded DM the topic
+  list already is the board — with live state icons the bot could not draw in a
+  message"*. Tested against the live rows: the three marked rooms are live and do
+  sort near the top, so the claim mostly holds; what it misses is that the 18
+  unbound rooms are interleaved with them by date, so about half of the recent
+  list is dead and unmarked. Noisy, not broken — not enough to overturn a
+  reasoned decision, and a third entry on a chat-wide keyboard is not free.
+- **Auto-retiring finished rooms (A2).** Still the right idea, still unshipped,
+  and worth re-costing first: Telegram keeps a *closed* topic in the list, so
+  "close, never delete" may not reduce the scroll it is meant to reduce. That
+  wants measuring before it is built, not after.
 
 ---
 

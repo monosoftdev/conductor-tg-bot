@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from aiogram.types import InlineKeyboardButton
+
 from ctb.bot.handlers.digest import (
     ASLEEP,
     DEFAULT_WINDOW_MS,
@@ -24,6 +26,7 @@ from ctb.bot.handlers.digest import (
     parse_window,
     window_label,
 )
+from ctb.bot.keyboards import NonceStore
 from ctb.db.repo.sessions import SessionRow
 from ctb.db.repo.workspaces import WorkspaceRow
 
@@ -49,6 +52,13 @@ def session(session_id: str, **overrides: Any) -> SessionRow:
     }
     base |= overrides
     return SessionRow(**base)
+
+
+def _buttons(entries: Any) -> list[list[InlineKeyboardButton]]:
+    """``digest_buttons`` with the ticket plumbing a handler supplies."""
+    return digest_buttons(
+        entries, store=NonceStore(), user_id=1001, chat_id=CHAT, thread_id=0
+    )
 
 
 def workspace(workspace_id: str = "ws-1", **overrides: Any) -> WorkspaceRow:
@@ -268,25 +278,52 @@ def test_buttons_jump_to_the_rooms_that_have_one() -> None:
     ]
     entries = digest_entries(rows, [workspace()], now=NOW)
 
-    buttons = digest_buttons(entries)
+    buttons = _buttons(entries)
 
     assert [row[0].url for row in buttons] == [
         "https://t.me/c/1234567890/7",
         "https://t.me/c/1234567890/9",
     ]
     # Worst first here too — the button order is the line order.
-    assert buttons[0][0].text.startswith("⚠️")
+    assert buttons[0][0].text.startswith("↗ \u26a0\ufe0f")
 
 
-def test_a_dm_gets_no_dead_buttons() -> None:
-    """Telegram publishes no link syntax for a topic in a private chat.
+def test_a_dm_gets_a_verb_because_it_can_never_get_a_destination() -> None:
+    """``jump_url`` answers ``None`` for *every* private chat.
 
-    A button that cannot work is worse than the thread list one swipe away.
+    This used to assert no buttons at all, reasoning that "a button that cannot
+    work is worse than the thread list one swipe away". The premise holds — a DM
+    publishes no link syntax for a topic — and the conclusion did not, because a
+    DM is the **default** flow: ``/start``, ``/key``, ``/new`` all happen there,
+    so the card that ranks what needs you offered no way to act on any of it.
+
+    Nor is it one swipe. On the live database one owner's DM holds 43 threads of
+    which exactly 1 routes to a usable session. Ranking the task that wants
+    attention and then returning the reader to that list is most of the way to
+    not having answered, so the fallback is a verb — read it here — rather than
+    nothing.
     """
     rows = [session("only", chat_id=DM, thread_id=4)]
     entries = digest_entries(rows, [workspace()], now=NOW)
 
-    assert digest_buttons(entries) == []
+    buttons = _buttons(entries)
+
+    assert len(buttons) == 1
+    item = buttons[0][0]
+    assert item.url is None, "a DM link would be a dead button"
+    assert item.callback_data is not None
+    assert item.text.startswith("📄")
+
+
+def test_the_two_verbs_never_wear_the_same_face() -> None:
+    """One moves you, one brings it to you. ``board_stage1`` learned this."""
+    group = digest_entries(
+        [session("a", chat_id=CHAT, thread_id=7)], [workspace()], now=NOW
+    )
+    dm = digest_entries([session("b", chat_id=DM, thread_id=7)], [workspace()], now=NOW)
+
+    assert _buttons(group)[0][0].text.startswith("↗")
+    assert _buttons(dm)[0][0].text.startswith("📄")
 
 
 # ── the window argument ──────────────────────────────────────────────────────

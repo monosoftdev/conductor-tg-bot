@@ -13,7 +13,7 @@ from aiogram import F, Router
 from aiogram.enums import ContentType
 from aiogram.exceptions import TelegramAPIError
 from aiogram.fsm.context import FSMContext
-from aiogram.types import BufferedInputFile, CallbackQuery, Message
+from aiogram.types import CallbackQuery, Message
 
 from ctb.bot.app import register_router
 from ctb.bot.handlers.common import (
@@ -30,7 +30,12 @@ from ctb.bot.handlers.core import (
     reopen_markup,
     run_find,
 )
-from ctb.bot.handlers.topics import resolve_client, resolve_db, topic_title
+from ctb.bot.handlers.topics import (
+    resolve_client,
+    resolve_db,
+    send_html,
+    topic_title,
+)
 from ctb.bot.keyboards import (
     Action,
     Cb,
@@ -48,7 +53,7 @@ from ctb.db.repo import sessions as sessions_repo
 from ctb.db.repo import transcript as transcript_repo
 from ctb.delivery.render.html import escape
 from ctb.logging import get_logger
-from ctb.turn.state import TopicMarker
+from ctb.turn.state import TopicMarker, TurnState
 from ctb.turn.supervisor import Supervisor
 
 log = get_logger(__name__)
@@ -204,6 +209,24 @@ async def plain_text(
                 return
         await tell(
             message, "No session here. Use <code>/new</code> or <code>/board</code>."
+        )
+        return
+    # A room whose session the machine has already buried. Answered from the row
+    # that is in hand for the receipt below, so this costs no query — the comment
+    # above is right that a prompt must not pay for two.
+    #
+    # Worth saying at all because it is the *commonest* room in a long-lived
+    # chat: on the live database 22 of one owner's 43 threads point at a DEAD
+    # session, every one of them in a workspace that has since been archived.
+    # Posting to those spends a Conductor call to be told no, and reports it as
+    # ``Prompt failed: …`` — a stack-shaped answer to "why did nothing happen",
+    # for a room the bot already knew was finished before it typed a word.
+    if route.session is not None and route.session.state is TurnState.DEAD:
+        await tell(
+            message,
+            "This task is finished — its workspace has been archived.\n"
+            "<code>/new</code> starts a fresh one · <code>/digest</code> shows "
+            "what is still live.",
         )
         return
     try:
@@ -430,27 +453,34 @@ async def transcript_callback(
     except NonceError as exc:
         await query.answer(exc.user_message, show_alert=True)
         return
-    rows = reversed(
-        await transcript_repo.recent(resolve_db(db), ticket.target, limit=200)
+    # Prose, through the same reducer ``/log`` uses. This button sits on the
+    # finished *and* errored cards — the two most-tapped surfaces in the bot —
+    # and it used to answer with a ``.md`` of raw JSON envelopes, which is
+    # precisely the artefact ``/log`` was fixed away from: "a phone cannot read
+    # JSON, and it was the only command that answered that question at all". The
+    # command shipped the fix; the button kept the bug. ``/log raw`` still has
+    # the envelopes for the debugging they are genuinely good at.
+    from ctb.bot.handlers.power import LOG_LINES_MAX, log_body
+
+    rows = list(
+        reversed(
+            await transcript_repo.recent(
+                resolve_db(db), ticket.target, limit=LOG_LINES_MAX
+            )
+        )
     )
-    body = "\n\n".join(
-        f"## {row.session_index} · {row.type}\n\n```json\n"
-        f"{row.content_json or '{}'}\n```"
-        for row in rows
-    )
-    await query.answer("Sending transcript…")
+    await query.answer()
     if query.bot is None or query.message is None:
         return
-    await query.bot.send_document(
-        chat_id=query.message.chat.id,
-        document=BufferedInputFile(
-            (body or "No cached messages.").encode(),
-            filename=f"session-{ticket.target[:8]}.md",
-        ),
-        message_thread_id=(
-            query.message.message_thread_id
+    body = log_body(rows)
+    await send_html(
+        query.bot,
+        query.message.chat.id,
+        body if body is not None else "Nothing cached for this task yet.",
+        thread_id=(
+            (query.message.message_thread_id or NO_THREAD_ID)
             if isinstance(query.message, Message)
-            else None
+            else NO_THREAD_ID
         ),
     )
 

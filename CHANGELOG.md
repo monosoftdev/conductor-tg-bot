@@ -56,6 +56,32 @@ from its first tagged release.
   both stay at 200 however long they last; restarting into either would stack a
   restart loop on top of the outage.
 
+### Changed
+
+- **A `/digest` row is now actionable in a private chat.** `jump_url` answers
+  `None` for *every* DM — Telegram publishes no link syntax for a topic — so the
+  card that ranks what needs you emitted no buttons at all in the default flow,
+  documented as "the thread list is one swipe away". Measured on the live
+  database, that swipe lands in 43 threads of which 1 routes to a usable session.
+  Rows now fall back to `📄`, which renders the task's last exchanges in place;
+  a supergroup keeps `↗` and jumps, because there the link works.
+
+- **The status card's `Transcript` button answers in prose.** B2 made `/log`
+  readable and left the button beside it sending a `.md` of raw JSON envelopes —
+  the exact artefact that fix was about — on the finished *and* errored cards.
+  Both now share `power.log_body`; `/log raw` keeps the envelopes.
+
+- **`/log` answers from the chat root.** Every session command refuses outside a
+  room with "use /new or /board", which is right for `/stop` and useless for a
+  read when no tappable route to a DM room exists. With no room in scope it falls
+  back to the cockpit's seats: one is answered, several offer a choice.
+  `require_session` is unchanged for mutations.
+
+- **A room whose session is `DEAD` says so instead of asking Conductor.** 22 of
+  those 43 threads point at one; typing in them spent an API call to be refused
+  and reported `Prompt failed: …`. Read off the session row already loaded for
+  the receipt, so it costs no query.
+
 ### Fixed
 
 - **A transient Conductor wobble no longer takes a team dark for ever.** The
