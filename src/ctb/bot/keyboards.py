@@ -199,6 +199,10 @@ class Action(StrEnum):
     #: cascades from it. Distinct from ARCHIVE, which retires one Conductor
     #: workspace: sharing that value would put two handlers on one payload.
     FORGET = "forget"
+    #: Seat a member, after the id has been resolved to a person and confirmed.
+    #: Its own value rather than ``CONFIRM``: a shared one would put two handlers
+    #: on one payload, and this one grants access to a whole organisation.
+    MEMBER_ADD = "madd"
     DIFF = "diff"
     CHANGE = "change"
     #: A step of the bare ``/new`` wizard. See the module docstring.

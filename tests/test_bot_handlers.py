@@ -4799,3 +4799,190 @@ async def test_a_failed_reply_record_never_costs_the_answer(
         1132334,
         SimpleNamespace(message_id=7),  # type: ignore[arg-type]
     )  # returns rather than raising
+
+
+# ── typing at a button-only wizard step ──────────────────────────────────────
+
+
+def test_match_option_resolves_to_something_already_on_screen() -> None:
+    """Typed, but never free: the answer is one of the buttons or nothing.
+
+    Four of the wizard's seven steps draw buttons and had no text handler, so a
+    line typed at "Project?" fell through to ``plain_text`` — which declines to
+    start a task while a wizard is open and replies with the chat-root cockpit
+    hint. The typed word was discarded, the answer was about something else, and
+    the wizard sat waiting to be tapped.
+    """
+    options = ["p-1", "p-2"]
+    labels = ["acme-api", "acme-web"]
+
+    # The label is what the button shows, so it is what a person types.
+    assert new_workspace.match_option("acme-api", options, labels) == "p-1"
+    assert new_workspace.match_option("  ACME-WEB ", options, labels) == "p-2"
+    # A unique fragment is enough; `opus` should find `opus-5-1m`.
+    assert new_workspace.match_option("api", options, labels) == "p-1"
+    # The value too, for the steps where it is typeable.
+    assert new_workspace.match_option("p-2", options, labels) == "p-2"
+    # Ambiguity is refused rather than guessed — picking the wrong repository
+    # costs a paid container against it.
+    assert new_workspace.match_option("acme", options, labels) is None
+    assert new_workspace.match_option("nothing like it", options, labels) is None
+    assert new_workspace.match_option("   ", options, labels) is None
+
+
+async def test_typing_a_project_name_answers_the_step(monkeypatch: Any) -> None:
+    """The gesture the composer invites now advances the wizard."""
+    asked: list[str] = []
+
+    async def fake_ask_branch(*_a: Any, **_k: Any) -> None:
+        asked.append("branch")
+
+    async def no_card(message: Any, _route: Any) -> Any:
+        return message
+
+    monkeypatch.setattr(new_workspace, "_ask_branch", fake_ask_branch)
+    monkeypatch.setattr(new_workspace, "_card_for", no_card)
+    state = _WizardState(
+        {
+            "wid": "w1",
+            "step": "project",
+            "options": ["p-1", "p-2"],
+            "labels": ["acme-api", "acme-web"],
+        }
+    )
+    message = SimpleNamespace(
+        text="acme-web",
+        chat=SimpleNamespace(id=-1001),
+        message_thread_id=None,
+        message_id=9,
+        from_user=SimpleNamespace(id=1001),
+    )
+
+    await new_workspace.typed_option(
+        message,  # type: ignore[arg-type]
+        Route(chat_id=-1001, kind="supergroup"),
+        state,  # type: ignore[arg-type]
+        NonceStore(),
+        fake_tenant(_CountingClient()),
+    )
+
+    assert asked == ["branch"], "the step advanced"
+    assert (await state.get_data())["project_id"] == "p-2"
+
+
+async def test_an_unmatched_line_redraws_the_step_instead_of_dead_ending(
+    monkeypatch: Any,
+) -> None:
+    """The card may have scrolled away; "not one of them" with no list is a wall."""
+    redrawn: list[str] = []
+
+    async def fake_reask(step: str, *_a: Any, **_k: Any) -> bool:
+        redrawn.append(step)
+        return True
+
+    async def no_card(message: Any, _route: Any) -> Any:
+        return message
+
+    monkeypatch.setattr(new_workspace, "_reask", fake_reask)
+    monkeypatch.setattr(new_workspace, "_card_for", no_card)
+    state = _WizardState(
+        {"wid": "w1", "step": "model", "options": ["opus", "sonnet"], "labels": []}
+    )
+    message = SimpleNamespace(
+        text="gpt-4",
+        chat=SimpleNamespace(id=-1001),
+        message_thread_id=None,
+        message_id=9,
+        from_user=SimpleNamespace(id=1001),
+    )
+
+    await new_workspace.typed_option(
+        message,  # type: ignore[arg-type]
+        Route(chat_id=-1001, kind="supergroup"),
+        state,  # type: ignore[arg-type]
+        NonceStore(),
+        fake_tenant(_CountingClient()),
+    )
+
+    assert redrawn == ["model"]
+    # And it did not quietly accept a model the agent would 400 on.
+    assert (
+        "model" not in await state.get_data()
+        or (await state.get_data()).get("model") is None
+    )
+
+
+async def test_an_empty_board_names_the_way_out_of_it(
+    db: Database, monkeypatch: Any
+) -> None:
+    """The first command a new team runs, and it used to be a full stop.
+
+    ``/digest`` has always named the two ways out of its empty state. ``/board``
+    answered "No live workspaces." — three words, in the command whose entire
+    purpose is getting you somewhere — which is also what an owner sees right
+    after archiving the last one.
+    """
+    sent: list[tuple[str, Any]] = []
+
+    async def fake_tell(_message: Any, text: str, **kwargs: Any) -> None:
+        sent.append((text, kwargs.get("reply_markup")))
+
+    monkeypatch.setattr(core_handlers, "tell", fake_tell)
+
+    async def no_rows(*_: Any, **__: Any) -> list[dict[str, object]]:
+        return []
+
+    monkeypatch.setattr(core_handlers, "board_rows", no_rows)
+    message = SimpleNamespace(
+        text="/board",
+        chat=SimpleNamespace(id=-1001),
+        message_thread_id=None,
+        message_id=3,
+        from_user=SimpleNamespace(id=1001),
+    )
+
+    await core_handlers.board(
+        message,  # type: ignore[arg-type]
+        fake_tenant(_CountingClient()),
+        _NullState(),  # type: ignore[arg-type]
+        NonceStore(),
+        db=db,
+    )
+
+    assert sent[0][0] == core_handlers.BOARD_EMPTY
+    assert "/new" in sent[0][0]
+
+
+async def test_a_board_filter_that_matches_nothing_says_what_to_try(
+    db: Database, monkeypatch: Any
+) -> None:
+    sent: list[tuple[str, Any]] = []
+
+    async def fake_tell(_message: Any, text: str, **kwargs: Any) -> None:
+        sent.append((text, kwargs.get("reply_markup")))
+
+    monkeypatch.setattr(core_handlers, "tell", fake_tell)
+
+    async def one_row(*_: Any, **__: Any) -> list[dict[str, object]]:
+        return [{"workspace_id": "w-1", "workspace_name": "acme-api"}]
+
+    monkeypatch.setattr(core_handlers, "board_rows", one_row)
+    message = SimpleNamespace(
+        text="/board nothing-like-it",
+        chat=SimpleNamespace(id=-1001),
+        message_thread_id=None,
+        message_id=3,
+        from_user=SimpleNamespace(id=1001),
+    )
+
+    await core_handlers.board(
+        message,  # type: ignore[arg-type]
+        fake_tenant(_CountingClient()),
+        _NullState(),  # type: ignore[arg-type]
+        NonceStore(),
+        db=db,
+    )
+
+    # Names the thing that failed, then two things that will not.
+    assert "nothing-like-it" in sent[0][0]
+    assert "/board" in sent[0][0] and "/digest" in sent[0][0]

@@ -103,6 +103,28 @@ from its first tagged release.
   and reported `Prompt failed: …`. Read off the session row already loaded for
   the receipt, so it costs no query.
 
+- **Typing at a button-only `/new` step now answers it.** Four of the wizard's
+  seven steps draw buttons and had no text handler, so a line typed at "Project?"
+  fell through to `plain_text` — which declines to start a task while a wizard is
+  open and replied with the chat-root cockpit hint. The word was discarded, the
+  answer was about something else, and the wizard sat waiting to be tapped.
+  `match_option` resolves typed text against the options already on screen (exact,
+  then a unique substring), so `opus` finds `opus-5-1m` and an ambiguous `acme` is
+  refused rather than guessed — picking the wrong repository costs a paid container
+  against it.
+
+- **`/board` names a way out of its empty state.** "No live workspaces." was three
+  words in the command whose whole purpose is getting you somewhere — the first
+  thing a new team sees, and the last thing an owner sees after archiving
+  everything. A filter matching nothing now repeats what failed.
+
+- **`/invite` confirms a person, not a number.** A mistyped-but-real Telegram id
+  seated a stranger in the organisation — its workspaces, transcripts and Conductor
+  key behind it — and the bot said "Added 12345 as member." either way. The id is
+  resolved with `get_chat` and the owner confirms the name. That resolution also
+  enforces the precondition the command only mentioned in its usage line: a user
+  the bot cannot see is a seat that could not be used.
+
 ### Fixed
 
 - **A transient Conductor wobble no longer takes a team dark for ever.** The

@@ -133,6 +133,62 @@ destructive confirm, 15min for a safe control), and not a wider grant than the
 team already has, since row-level security is per *team* and any member can read
 these transcripts by command.
 
+## E · Dead ends, dead loops, and a number nobody can proof-read
+
+A pass with one question: *where can this bot leave somebody with nothing to do
+next, or let them make a mistake it could have caught?* Built from an inventory —
+every `Usage:` line, every bare refusal, every step that accepts free text — rather
+than from intuition.
+
+### E1 · Typing at a button-only wizard step was swallowed · **shipped**
+
+The `/new` wizard draws buttons for four of its seven steps (project, agent, model,
+effort) and registered a text handler for **none** of them. A phone composer invites
+typing — the launcher's placeholder reads *"Describe a task…"* — so a line typed
+at *"Project?"* fell through to `plain_text`, which declines to start a task
+while a wizard is open and answers with the **chat-root cockpit hint** instead. The
+typed word was discarded, the reply was about something else, and the wizard was
+still sitting there waiting to be tapped. A dead loop in the one flow that spends
+money.
+
+`match_option` resolves the text against the options already on screen: exact first,
+then a unique substring, so `opus` finds `opus-5-1m` and an ambiguous `acme` is
+**refused rather than guessed** — picking the wrong repository costs a paid container
+against it. Labels as well as values, because the project step's values are Conductor
+ids and the label is what the reader is looking at.
+
+This is free entry becoming a *choice*, not the other way about: the outcome is always
+one of the buttons. Unmatched text redraws the step rather than answering "that is not
+one of them" with no list, which on a phone is a wall.
+
+`_advance` is now shared by the tap and typed paths, so the two cannot drift about what
+choosing means — the agent step also has to reset the model, and a second copy of that
+is a second place to forget it.
+
+### E2 · `/board` had no way out of its own empty state · **shipped**
+
+`No live workspaces.` — three words, in the command whose whole purpose is
+getting you somewhere. It is the first thing a new team sees, and the last thing
+an owner sees after archiving everything. `/digest` has always named the two ways
+out of its empty state; this did not. A filter matching nothing said `No match.`
+without repeating what failed.
+
+### E3 · `/invite <id>` could seat a stranger on a typo · **shipped**
+
+The one input in this bot where a mistake does not fail. A mistyped-but-real Telegram
+id was a stranger seated in the organisation — its workspaces, transcripts and
+Conductor key behind it — and the bot answered `Added 12345 as member.` either way.
+Nobody can proof-read a number they have never seen.
+
+The digits are now resolved with `get_chat` and the owner confirms a **name**:
+*"Add Dana Scully (@dscully) to acme as admin? They will see every workspace and
+transcript in it."* A two-tap confirm on the existing 60-second tier.
+
+That resolution is also the honest way to enforce the precondition the command only
+ever mentioned in its usage line — *"they must send the bot a message once before this
+works"*. A user the bot cannot see is a seat that could not be used, so refusing names
+the fix instead of reporting a silent half-success.
+
 ### Considered and deliberately not done
 
 - **A status button on the home keyboard.** `handlers/home.py` records that a
@@ -143,6 +199,18 @@ these transcripts by command.
   unbound rooms are interleaved with them by date, so about half of the recent
   list is dead and unmarked. Noisy, not broken — not enough to overturn a
   reasoned decision, and a third entry on a chat-wide keyboard is not free.
+- **A `/stop` chooser for the chat root.** The same shape as `/log`'s, and wrong:
+  the chooser bubble is static, so fifteen minutes later its button stops whatever
+  is running *by then* — the precise hazard that keeps `Stop` off a receipt bubble.
+  A 60-second TTL would bound it, but a destructive control offered against a list
+  the reader did not ask to act on is a mistake generator, which is what this pass
+  was supposed to remove.
+- **A contact picker for `/invite`.** `KeyboardButtonRequestUsers` is the native
+  answer and would remove the number entirely — but it is a *reply* keyboard, and
+  this bot already spends that one surface on the launcher, which `handlers/home.py`
+  curates deliberately ("anything on it has to make sense in every room at once").
+  Swapping it out mid-flow and restoring it afterwards is more moving parts than
+  resolving the id and showing the name. Worth revisiting if the launcher ever goes.
 - **`Stop` / `Retry` buttons under rendered output.** The obvious next step after
   "read it here", and wrong for a reason this codebase had already written down: a
   static button outlives the state it was drawn for. D5's reply target does the
