@@ -551,6 +551,7 @@ class HealthMonitor:
         requests_total = 0
         retries_total = 0
         open_circuits: list[str] = []
+        probes_abandoned = 0
         rejected: list[str] = []
         for slug, client in clients:
             try:
@@ -568,8 +569,10 @@ class HealthMonitor:
                 auth_failures += failures
                 rejected.append(slug)
             circuit = stats.get("circuit")
-            if isinstance(circuit, Mapping) and circuit.get("state") != "closed":
-                open_circuits.append(slug)
+            if isinstance(circuit, Mapping):
+                if circuit.get("state") != "closed":
+                    open_circuits.append(slug)
+                probes_abandoned += int(circuit.get("probes_abandoned", 0) or 0)
         section["rate_limited_recent"] = throttled
         section["auth_failures"] = auth_failures
         section["failures"] = failures_total
@@ -581,6 +584,13 @@ class HealthMonitor:
         section["circuit"] = {
             "state": "open" if open_circuits else "closed",
             "open_tenants": len(open_circuits),
+            # Non-zero means a half-open probe slot was claimed and never handed
+            # back, and the abandon window had to take it. `_request` returns it
+            # in a `finally`, so this should stay at zero for ever — if it does
+            # not, some path out of a request is skipping that `finally`, which
+            # is how two tenants once went dark for sixteen days. The canary for
+            # the bug, not the bug.
+            "probes_abandoned": probes_abandoned,
         }
 
         if auth_failures:
@@ -749,12 +759,28 @@ class HealthMonitor:
         # explained silence never qualifies however long it runs: restarting
         # into a rejected key or a dead Conductor is a restart loop stacked on
         # top of the outage.
+        #
+        # And not before this process has had the window to fix it itself. A
+        # silence that began while nothing was running is not evidence about the
+        # instance now booting: at the moment ``/health`` starts answering, the
+        # supervisor has not taken the lease yet, so every session legitimately
+        # still carries the stale ``updated_at`` of the outage being recovered
+        # from. Measured against the live rows, that read as a 2-session wedge
+        # for the eleven seconds between ``health.listening`` and the first
+        # poller tick — a 503 on the way *out* of an outage, which is the one
+        # moment a restart is guaranteed not to help.
+        #
+        # ``POLL_SILENT_MS`` is the right grace because it is the same number
+        # that makes a session count as silent at all: once this process has been
+        # up that long and a session is *still* untouched, the whole window
+        # belonged to this process and it did nothing with it.
         wedged = [
             row
             for row in silent
             if row.tenant_id is not None
             and not reasons[row.tenant_id].is_explained
             and at - row.updated_at >= POLL_WEDGED_MS
+            and self.uptime_s * 1000 >= POLL_SILENT_MS
         ]
         if wedged:
             degradations.append(

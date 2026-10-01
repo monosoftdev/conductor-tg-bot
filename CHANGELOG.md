@@ -71,7 +71,9 @@ from its first tagged release.
   ended only by a redeploy. `_request` now returns the claim in a `finally`, the
   claim is generation-checked so a late release cannot free somebody else's
   probe, and `PROBE_ABANDON_SECONDS` reclaims a slot held longer than any single
-  request could run.
+  request could run. `/health` reports `conductor.circuit.probes_abandoned`,
+  which should stay zero for ever: non-zero means some path out of a request is
+  skipping that `finally`.
 
 - **A four-week-old rejection no longer reports itself as current.** Nothing but
   `/key` ever cleared `auth_failed_at`. `sessions.list_bound` had the clock,
@@ -82,6 +84,23 @@ from its first tagged release.
   wedged process, and both owners were told to re-send a key that was returning
   200 to every call. `tenancy.auth_latched` is now the single answer, used by all
   four readers, and the supervisor clears a stamp the database has judged spent.
+
+- **A wedge is a wedge whatever the tenant row says.** `silence.attribute` put
+  `auth_failed` first, on the reasoning that a latched tenant makes no calls
+  *because* it was latched. That stopped being true when the latch got a clock:
+  `list_bound` readmits one poller every `AUTH_RETRY_AFTER_MS`, so a genuinely
+  rejected key shows up as calls that all *fail*, never as no calls at all. Zero
+  calls now outranks the row — otherwise a circuit that wedges within fifteen
+  minutes of a fresh 401 (the live wobble latched and wedged 67 seconds apart)
+  still reads as explained and still runs for ever.
+
+- **`/health` no longer asks to be recycled on the way out of an outage.** When
+  it starts answering, the supervisor has not taken the lease yet, so every
+  session still carries the stale `updated_at` of the outage being recovered
+  from — which is a textbook fatal wedge except for whose fault it is. The fatal
+  wedge now also requires the process to have been up `POLL_SILENT_MS`, the same
+  number that makes a session count as silent at all. The degradation still shows
+  from the first report; only the recycle waits.
 
 - **A rejected tenant is no longer cancelled and restarted every five seconds.**
   `auth_fatal_tenants` derived its `rejecting` half from `_tenant_of`, and the

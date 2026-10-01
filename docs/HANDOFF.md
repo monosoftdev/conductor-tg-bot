@@ -81,6 +81,54 @@ for all sixteen days — the third time this file has had to record that sentenc
 database has already judged spent, so the column stops being a permanent record
 of the worst thing that ever happened to a tenant.
 
+**But the stamp's age is the wrong discriminator, and simulating the deploy is
+what showed it.** `auth_latched` narrows a stale stamp's reach to fifteen
+minutes, which fixes the case production actually had — and leaves the case it
+nearly had. The 401 that latches and the wobble that wedges the circuit are the
+*same upstream event*, 67 seconds apart in the real log, so the stamp can easily
+be a minute old while the process is already dark. Judged on the stamp, that
+reads as explained and runs for ever, exactly as before.
+
+`silence.attribute` now puts **zero calls above everything, including the tenant
+row**. The old precedence had a reason — *"a latched tenant makes no calls
+because it was latched, so it cannot be told apart from the wedge"* — and that
+reason stopped being true the moment the latch got a clock. `list_bound` readmits
+one poller every `AUTH_RETRY_AFTER_MS` to ask again, and that poller's request
+lands in `api_events` whatever answer it gets. So a genuinely rejected key shows
+up as *calls that all fail*, never as no calls at all, and "a stamp is set and
+nothing has been tried for half an hour" does not describe a rejected key — it
+describes a process that stopped polling, which is the one thing a restart fixes.
+
+Three existing tests asserted the old precedence, and all three asserted it with
+the same unfaithful setup: a stamp written, and no API events recorded at all.
+That is a wedge wearing a stamp. They now model a rejected key with the
+quarter-hourly 401 it goes on producing, which is both what the system does and
+what makes the assertion mean anything.
+
+### A 503 on the way *out* of an outage
+
+The same simulation caught one the other way. At the moment `/health` starts
+answering, the supervisor has not taken the lease yet, so every session still
+carries the stale `updated_at` of the outage being recovered from — a textbook
+fatal wedge by every measure except whose fault it is. Against production's own
+rows that was a two-session `poll_wedged` for the eleven seconds between
+`health.listening` and the first poller tick, on the instance that was in the
+middle of fixing it. Railway's 120-second deploy budget would have absorbed it,
+but a 503 whose cure is already running is the one case where recycling is
+strictly harmful.
+
+The fatal wedge now also requires the process to have been up for
+`POLL_SILENT_MS` — the same number that makes a session count as silent at all.
+Once this process has been up that long and a session is *still* untouched, the
+whole window belonged to it. Before that, the silence predates it. The
+degradation itself still shows from the first report; it is only the recycle that
+waits.
+
+`/health` also reports `conductor.circuit.probes_abandoned`, which should stay
+zero for ever: non-zero means a probe slot was claimed and never handed back and
+the abandon window had to take it, i.e. some path out of a request is skipping
+the `finally`. The canary for this bug rather than the bug.
+
 ### A latch that erased itself the moment it was acted on
 
 `auth_fatal_tenants` built its `rejecting` half out of `_tenant_of` — the map of

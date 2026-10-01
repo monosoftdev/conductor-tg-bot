@@ -73,6 +73,21 @@ async def test_a_silent_workspace_reaches_its_owner_with_the_reason(
     now = now_ms()
     await seed(system_db, "abandoned", at=now - HOUR_MS)
     await tenancy.mark_auth_failed(system_db, BOOTSTRAP_TENANT_ID, reason="401")
+    # A rejected key comes with its rejections: `list_bound` readmits one poller
+    # every AUTH_RETRY_AFTER_MS to ask again, and the 401 it gets lands here. A
+    # stamp with *no* attempts in the window is a wedge, not a rejected key, and
+    # telling its owner to re-send a working key is how this went unfixed.
+    for index in range(2):
+        await events_repo.record_api_event(
+            system_db,
+            method="GET",
+            endpoint="/sessions/{id}/messages",
+            status_code=401,
+            ok=False,
+            error="Unauthorized client request",
+            tenant_id=BOOTSTRAP_TENANT_ID,
+            at=now - (index + 1) * tenancy.AUTH_RETRY_AFTER_MS,
+        )
     sink = RecordingSink()
 
     episodes = await make(system_db, sink, at=now).check_once()

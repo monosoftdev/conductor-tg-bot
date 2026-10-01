@@ -19,7 +19,11 @@ import httpx
 import pytest
 
 from ctb import health
-from ctb.conductor.client import ConductorClient
+from ctb.conductor.client import (
+    PROBE_ABANDON_SECONDS,
+    CircuitState,
+    ConductorClient,
+)
 from ctb.conductor.errors import ApiError, AuthFatal, RateLimited
 from ctb.conductor.pool import ClientPool
 from ctb.db.connection import Database, set_database
@@ -52,6 +56,7 @@ from ctb.health import (
     DELIVERY_STRANDED_MS,
     HEALTH_PATH,
     MONITOR_KEY,
+    POLL_SILENT_MS,
     POLL_WEDGED_MS,
     TELEGRAM_FAILURE_THRESHOLD,
     Degradation,
@@ -105,14 +110,23 @@ def make_monitor(
     clock: Callable[[], float] | None = None,
     **kwargs: Any,
 ) -> HealthMonitor:
-    """A monitor wired to explicit providers and a frozen wall clock."""
+    """A monitor wired to explicit providers and a frozen wall clock.
+
+    The default clock puts uptime past ``POLL_SILENT_MS``, because that is what
+    almost every test here means by "the bot": a process that has been running a
+    while. The fatal wedge is deliberately withheld below that (a silence older
+    than the process says nothing about the process), so a monitor left at
+    uptime 0 would quietly answer 200 to every wedge assertion in the file.
+    Tests about the boot window pass their own clock — see
+    :func:`test_a_wedge_is_not_blamed_on_a_process_that_has_only_just_started`.
+    """
     record = telegram if telegram is not None else TelegramHealth()
     return HealthMonitor(
         database=lambda: db,
         clients=lambda: None if client is None else cast(ClientPool, OnePool(client)),
         telegram=lambda: record,
         wall_clock=lambda: at,
-        clock=clock or FakeClock(1_000.0),
+        clock=clock or FakeClock(1_000.0 + POLL_SILENT_MS / 1_000 + 1),
         started_at=1_000.0,
         cache_ttl_s=0.0,
         **kwargs,
@@ -605,6 +619,22 @@ async def test_a_latched_tenant_is_reported_silent_not_healthy(
         # clock, and a stamp older than the retry window would be readmitted —
         # which is the other half of this fix and not what is under test here.
         await tenancy.mark_auth_failed(system_db, BOOTSTRAP_TENANT_ID, reason="401")
+        # With the quarter-hourly retry that produced the stamp. A rejected key
+        # is only distinguishable from a wedge by the requests it goes on making
+        # and having refused, so a test that records none is asserting the wedge
+        # while claiming to assert the rejection. The status below depends on
+        # which of the two this is: a rejection is somebody else's problem and
+        # stays at 200, a wedge asks to be recycled.
+        await events_repo.record_api_event(
+            system_db,
+            method="GET",
+            endpoint="/sessions/{id}/messages",
+            status_code=401,
+            ok=False,
+            error="Unauthorized client request",
+            tenant_id=BOOTSTRAP_TENANT_ID,
+            at=WALL - 60_000,
+        )
 
         report = await make_monitor(db=system_db).report()
 
@@ -757,6 +787,13 @@ async def test_explained_silence_never_fails_the_healthcheck(
     This is the guard against replacing an outage with a restart loop on top of
     it, and it holds however long the silence lasts — the threshold is exceeded
     ten times over here.
+
+    **A rejected key has to be modelled with its rejections.** This test used to
+    set the stamp and record no API events at all, which is not what a rejected
+    key looks like: ``list_bound`` readmits one poller every
+    ``AUTH_RETRY_AFTER_MS``, so the window always contains that poller's 401.
+    "Stamp set, nothing attempted" is a *wedge* wearing a stamp, and asserting it
+    was explained is the exact blind spot that let one run for sixteen days.
     """
     async with as_tenant():
         await tenancy.set_conductor_key(
@@ -776,6 +813,18 @@ async def test_explained_silence_never_fails_the_healthcheck(
         await tenancy.mark_auth_failed(
             system_db, BOOTSTRAP_TENANT_ID, reason="401", at=WALL
         )
+        # The quarter-hourly retry, answered 401 each time.
+        for index in range(2):
+            await events_repo.record_api_event(
+                system_db,
+                method="GET",
+                endpoint="/sessions/{id}/messages",
+                status_code=401,
+                ok=False,
+                error="Unauthorized client request",
+                tenant_id=BOOTSTRAP_TENANT_ID,
+                at=WALL - (index + 1) * tenancy.AUTH_RETRY_AFTER_MS,
+            )
         rejected = await make_monitor(db=system_db).report()
 
         # …and the same for an upstream that is refusing every call.
@@ -1502,3 +1551,128 @@ async def test_a_database_at_the_shipped_version_is_not_reported_behind(
 
     assert not report.has(DEGRADATION_SCHEMA_BEHIND)
     assert report.database["schema_latest"] == report.database["schema_version"]
+
+
+async def test_a_stamp_with_nothing_attempted_is_a_wedge_not_a_rejection(
+    system_db: Database,
+) -> None:
+    """The sixteen-day outage, at the age the stamp could have had.
+
+    `auth_latched` narrows a stale stamp's reach to the retry window, which fixes
+    the case production actually had — but not this one. The 401 that latches and
+    the wobble that wedges the circuit are the *same upstream event*, 67 seconds
+    apart in the real log, so the stamp can easily be minutes old while the
+    process is already dark. Judged on the stamp alone, that reads as explained
+    and runs for ever.
+
+    Zero calls is the discriminator, because the retry has a clock: a genuinely
+    rejected key is re-probed every ``AUTH_RETRY_AFTER_MS`` and every probe lands
+    in ``api_events``. Nothing attempted at all means no poller ran.
+    """
+    async with as_tenant():
+        await tenancy.set_conductor_key(
+            system_db,
+            BOOTSTRAP_TENANT_ID,
+            ciphertext=b"sealed",
+            kid="v1",
+            fingerprint="fp",
+        )
+        await sessions_repo.upsert(
+            system_db,
+            "wedged",
+            chat_id=-100123,
+            thread_id=7,
+            at=WALL - 10 * POLL_WEDGED_MS,
+        )
+        for age_ms in (1 * 60_000, tenancy.AUTH_RETRY_AFTER_MS - 1, 44 * 86_400_000):
+            await tenancy.mark_auth_failed(
+                system_db, BOOTSTRAP_TENANT_ID, reason="401", at=WALL - age_ms
+            )
+            report = await make_monitor(db=system_db).report()
+
+            assert report.polling["silent_reasons"] == {"unexplained": 1}
+            assert report.has(DEGRADATION_POLL_WEDGED)
+            assert report.http_status == 503
+
+
+async def test_a_wedge_is_not_blamed_on_a_process_that_has_only_just_started(
+    system_db: Database,
+) -> None:
+    """A 503 on the way *out* of an outage is the one that cannot help.
+
+    When `/health` starts answering, the supervisor has not taken the lease yet,
+    so every session still carries the stale `updated_at` of the outage being
+    recovered from — which is a textbook wedge by every measure except whose
+    fault it is. Simulated against production's rows, that was a two-session
+    fatal wedge for the eleven seconds between `health.listening` and the first
+    poller tick, on an instance that was in the middle of fixing it.
+    """
+    async with as_tenant():
+        await tenancy.set_conductor_key(
+            system_db,
+            BOOTSTRAP_TENANT_ID,
+            ciphertext=b"sealed",
+            kid="v1",
+            fingerprint="fp",
+        )
+        await sessions_repo.upsert(
+            system_db,
+            "recovering",
+            chat_id=-100123,
+            thread_id=7,
+            at=WALL - 16 * 86_400_000,
+        )
+
+        booting = await make_monitor(db=system_db, clock=FakeClock(1_011.0)).report()
+        settled = await make_monitor(db=system_db).report()
+
+    # Visible either way — it is only the recycle that waits.
+    for report in (booting, settled):
+        assert report.has(DEGRADATION_POLL_SILENT)
+    assert booting.uptime_s == pytest.approx(11.0)
+    assert not booting.has(DEGRADATION_POLL_WEDGED)
+    assert booting.http_status == 200
+    assert settled.has(DEGRADATION_POLL_WEDGED)
+    assert settled.http_status == 503
+
+
+async def test_an_abandoned_probe_slot_is_visible_in_the_report(
+    system_db: Database, settings: Settings
+) -> None:
+    """The canary for the sixteen-day outage, not the outage.
+
+    ``_request`` hands its probe slot back in a ``finally``, so this counter
+    should stay at zero for ever. If it does not, some path out of a request is
+    skipping that ``finally`` — and the symptom of that, unreported, is a tenant
+    that simply stops making requests with nothing anywhere saying why.
+    """
+    clock = FakeClock()
+    client = ConductorClient(
+        api_key=FAKE_API_KEY,
+        api_url=settings.conductor_api_url,
+        transport=transport_returning(503),
+        clock=clock,
+        sleep=_no_sleep,
+        max_attempts=1,
+    )
+    # A *collection* call, deliberately: a path that addresses one resource
+    # carries a `target`, and three failures on one target isolate that path
+    # instead of opening the circuit — so `get_session_status` would never put
+    # the breaker in `half_open` and there would be no probe slot to leak.
+    for _ in range(3):
+        with pytest.raises(ApiError):
+            await client.list_projects()
+    assert client.circuit.state is CircuitState.OPEN
+
+    # A probe claimed and then lost — which is what a cancelled poller leaves,
+    # by definition on a path that never reaches `_request`'s `finally`.
+    clock.advance(client.circuit.retry_after() + 0.001)
+    client.circuit.check(None)
+    clock.advance(PROBE_ABANDON_SECONDS + 1)
+    client.circuit.check(None)  # the abandon window takes it back
+    await client.aclose()
+    assert client.circuit.probes_abandoned == 1
+
+    report = await make_monitor(db=system_db, client=client).report()
+
+    assert report.conductor["circuit"]["probes_abandoned"] == 1
