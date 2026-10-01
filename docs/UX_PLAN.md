@@ -189,6 +189,88 @@ ever mentioned in its usage line — *"they must send the bot a message once bef
 works"*. A user the bot cannot see is a seat that could not be used, so refusing names
 the fix instead of reporting a silent half-success.
 
+## F · One glyph per fact, and rows that fit the screen
+
+A pass on legibility alone: every message, button and notice rendered and read as a
+phone shows it, rather than inspected as source. Three of the four findings were
+only visible that way.
+
+### F1 · A stalled task looked exactly like a healthy one · **shipped**
+
+`signals` exists so that "what is this session doing" has one answer across the
+topic title, the pinned card and `/digest`, and its docstring says each surface
+renders from that table. The card did not — it held the same characters as literals,
+so nothing was *wrong* yet and one state had already drifted:
+
+| | ranked list | pinned card |
+|---|---|---|
+| stalled | `⏳` | `⚙️` — and the word "stalled?" appended after the tool call |
+
+So the same session was `⏳` in `/digest` and `⚙️` on its own card, and on the card it
+was **indistinguishable at a glance from a healthy one** — for the state `A4` calls
+*"the state nothing else in the UI can show … the most common reason somebody picks
+the phone up"*.
+
+Neither surface could adopt the other's glyph, because on a card `⏳` already means
+queued. So stalled gets its own: `🐌`, which reads as *slow* without reading as
+*broken*, which is the distinction the state is about. `CARD_EMOJI` now reads from
+`signals` throughout, so this cannot drift again, and the qualifier moved beside the
+duration it qualifies instead of trailing a file path a narrow screen wraps away.
+
+```
+⚙️ working 1m32s · Bash · pytest -q
+🐌 working 14m02s · stalled? · Read · src/ctb/delivery/outbox.py
+```
+
+### F2 · A cancellation was dressed as a fault · **shipped**
+
+`/stop` is something the owner *does*. Its receipt said `⚠️ Stopped` — a warning
+face — directly beneath a card reading `🛑 stopped`. Two glyphs for one event, which
+`finish_line`'s own docstring forbids ("two surfaces describing one event must not
+word it differently"), and over-alarming about a deliberate act is how a real warning
+stops counting.
+
+A cancellation and a failure were both `ok=False`, so the receipt could not tell them
+apart. `TurnSummary.cancelled` is derived in `_finalize` from the card kind already
+being passed in — no second place to disagree — and there are now three faces for
+three outcomes: `✅ Done`, `🛑 Stopped`, `⚠️ Failed`. "Stopped" was also the wrong word
+for a failure, where it said nothing about why the turn was over.
+
+### F3 · A ranked row shouted an enum name · **shipped**
+
+```
+⚙️ port billing to the new ledger · acme-api/main · WORKING · 12m03s
+```
+
+`WORKING` is the enum's own name in its own capitals, beside neighbours that read as
+prose — "no output", "model overloaded", "sleeping" — and redundant with the `⚙️` two
+fields to its left. Only a running state that is *not* the ordinary one earns a word
+now (draining, cancelling), and it earns it in lower case.
+
+### F4 · A long task name pushed the answer off the row · **shipped**
+
+A row is *title · where · detail · age*. `safe_title` allows 80 characters, which is
+right when the title is the whole message and wrong here: 80 characters of name wraps
+the thing you came for — the error, the duration — onto a third line. `TITLE_CHARS`
+is 44, through `textwrap.shorten` rather than a slice, because a hard cut lands
+mid-word and leaves a dangling letter (`--dry-run is c`) that reads as corruption
+rather than elision.
+
+### Checked and left alone
+
+- **`⏳` against `⌛`.** Two hourglasses, and not a bug: `⏳` is the title *prefix* and
+  `⌛` is the first choice for `icon_custom_emoji_id`, a separate channel with its own
+  fallback list, because Telegram serves bots a fixed icon pack.
+- **`✓` against `✅`.** Different jobs — a selected option in a keyboard against a
+  finished turn — and conflating them would lose the distinction.
+- **`MAX_BUTTON_TEXT = 48`.** Probably still long for a narrow screen, where Telegram
+  clips without an ellipsis while `truncate_label` would mark the cut. But the right
+  number is a measurement on real devices, not a guess, and guessing it shorter costs
+  labels that currently fit. Left with the reasoning recorded instead.
+- **`24h00m` for a day-old row.** `format_duration` is the shared vocabulary for *how
+  long something took*, deliberately distinct from `window_label`. Changing it for one
+  surface would split a vocabulary to save four characters.
+
 ### Considered and deliberately not done
 
 - **A status button on the home keyboard.** `handlers/home.py` records that a

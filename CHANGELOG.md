@@ -125,6 +125,30 @@ from its first tagged release.
   enforces the precondition the command only mentioned in its usage line: a user
   the bot cannot see is a seat that could not be used.
 
+- **A stalled task no longer looks like a healthy one.** `signals` exists so one
+  fact has one glyph across the topic title, the card and `/digest`; the card held
+  the same characters as literals, and one state had already drifted — stalled was
+  `⏳` in the ranked list and `⚙️` on its own card, where it was indistinguishable
+  at a glance from running. It gets its own `🐌` (slow, not broken), `CARD_EMOJI`
+  now reads from `signals` throughout, and the "stalled?" qualifier sits beside the
+  duration instead of trailing a file path a narrow screen wraps away.
+
+- **A cancellation is no longer dressed as a fault.** `/stop` is something the
+  owner does, and its receipt said `⚠️ Stopped` beneath a card reading
+  `🛑 stopped` — two glyphs for one event, which `finish_line`'s docstring forbids.
+  `TurnSummary.cancelled`, derived from the card kind so the two cannot disagree,
+  gives three faces for three outcomes: `✅ Done`, `🛑 Stopped`, `⚠️ Failed`.
+
+- **A ranked row no longer shouts an enum name.** `· WORKING ·` was the enum's own
+  capitals beside neighbours reading as prose, and redundant with the `⚙️` two
+  fields left of it. Only a running state that is not the ordinary one is named now,
+  in lower case.
+
+- **A long task name no longer pushes the answer off the row.** A digest row is
+  *title · where · detail · age*; 80 characters of name wrapped the error or the
+  duration onto a third line. Capped at 44 through `textwrap.shorten`, because a
+  hard slice lands mid-word and reads as corruption rather than elision.
+
 ### Fixed
 
 - **A transient Conductor wobble no longer takes a team dark for ever.** The

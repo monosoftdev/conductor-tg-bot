@@ -15,7 +15,7 @@ from ctb.bot.handlers.core import status_icon
 from ctb.db.connection import Database, now_ms
 from ctb.db.repo import chats, prompts, sessions, tenancy, workspaces
 from ctb.delivery.outbox import Outbox, Priority
-from ctb.delivery.status_card import CARD_EMOJI
+from ctb.delivery.status_card import CARD_EMOJI, CardState, render_card
 from ctb.silence import SilenceReason, notice_html
 from ctb.turn.state import (
     CardKind,
@@ -321,8 +321,10 @@ async def test_notify_off_gets_no_completion_buzz_either(
 async def test_a_failed_turn_leads_with_the_reason(
     db: Database, system_db: Database
 ) -> None:
+    # "Failed", not "Stopped": the latter is what the owner does, and saying it
+    # here said nothing about why the turn is over.
     assert finish_line(TurnSummary(ok=False, error="rate limited")) == (
-        "⚠️ <b>Stopped</b> · rate limited"
+        "⚠️ <b>Failed</b> · rate limited"
     )
     # One file is a file, not "1 files".
     assert finish_line(TurnSummary(files_changed=1)) == "✅ <b>Done</b> · 1 file"
@@ -565,6 +567,65 @@ def test_every_surface_uses_one_glyph_per_state() -> None:
     assert CARD_EMOJI[CardKind.ERROR] == signals.ERROR
 
 
+def test_the_card_draws_every_state_from_the_shared_vocabulary() -> None:
+    """The three assertions above were true and the table was still a literal.
+
+    ``signals`` exists so one fact has one glyph, and the card was the surface
+    not consulting it. Spot-checking three kinds left the rest free to drift —
+    and ``STALLED`` had, to ``⚙️`` here against ``⏳`` in the ranked list.
+    """
+    expected = {
+        CardKind.QUEUED: signals.WAITING,
+        CardKind.WAKING: signals.WAITING,
+        CardKind.WORKING: signals.WORKING,
+        CardKind.STALLED: signals.STALLED,
+        CardKind.DONE: signals.DONE,
+        CardKind.ERROR: signals.ERROR,
+        CardKind.CANCELLING: signals.CANCELLED,
+        CardKind.CANCELLED: signals.CANCELLED,
+        CardKind.DEAD: signals.UNREACHABLE,
+    }
+    assert {kind: CARD_EMOJI[kind] for kind in expected} == expected
+    # Every kind has a face, and STARTED is the only one with no signal: it is
+    # not a state a topic or a digest can be in.
+    assert set(CARD_EMOJI) == set(CardKind)
+    assert set(CardKind) - set(expected) == {CardKind.STARTED}
+
+
+def test_a_stalled_card_does_not_look_like_a_healthy_one() -> None:
+    """The state ``UX_PLAN`` calls the commonest reason to pick the phone up.
+
+    It wore ``⚙️`` — the working glyph — and said so only in a word appended
+    after the tool call, which is the part a narrow screen wraps out of sight. So
+    at a glance a stalled task and a healthy one were the same card.
+    """
+    assert CARD_EMOJI[CardKind.STALLED] != CARD_EMOJI[CardKind.WORKING]
+
+    now = 1_000.0
+    stalled = render_card(
+        CardState(
+            kind=CardKind.STALLED,
+            text="working 14m02s",
+            buttons=(),
+            started_at=now - 842,
+            activity="Read · src/ctb/delivery/outbox.py",
+        ),
+        now=now,
+    )
+
+    assert stalled.startswith(f"<b>{signals.STALLED}")
+    # The qualifier sits beside the duration it qualifies, ahead of the activity.
+    assert stalled.index("stalled?") < stalled.index("Read ·")
+
+
+def test_the_ranked_list_names_stalled_with_the_same_glyph() -> None:
+    """Two surfaces, one fact. This is the pair that had actually drifted."""
+    from ctb.bot.handlers.digest import _BUCKETS
+    from ctb.bot.handlers.digest import STALLED as STALLED_RANK
+
+    assert _BUCKETS[STALLED_RANK][0] == signals.STALLED == CARD_EMOJI[CardKind.STALLED]
+
+
 def test_the_reaction_vocabulary_is_one_telegram_accepts() -> None:
     """✅ and ⏳ are not valid reactions; reusing the card glyphs would 400."""
     assert signals.DONE not in signals.REACTION_SAFE
@@ -727,11 +788,29 @@ def test_a_receipt_counts_the_files_it_does_not_name() -> None:
 def test_a_stopped_turn_never_lists_files() -> None:
     """A half-finished edit list under a failure reads as "the work landed"."""
     line = finish_line(
-        TurnSummary(ok=False, error="cancelled", files_changed=2, files=("a.py",))
+        TurnSummary(ok=False, error="rate limited", files_changed=2, files=("a.py",))
     )
 
     assert "\n" not in line
-    assert line.startswith("⚠️ <b>Stopped</b>")
+    assert line.startswith("⚠️ <b>Failed</b>")
+
+
+def test_a_cancellation_is_not_dressed_as_a_fault() -> None:
+    """``/stop`` is something the owner did, so it must not wear ⚠️.
+
+    A cancellation is ``ok=False`` like a failure, and both used to render
+    "⚠️ Stopped" — a warning face, directly beneath a card reading "🛑 stopped".
+    Two glyphs for one event is the thing ``finish_line``'s own docstring forbids,
+    and over-alarming about a deliberate act is how a real warning stops counting.
+    """
+    stopped = finish_line(TurnSummary(ok=False, cancelled=True, duration_ms=92_000))
+
+    assert stopped.startswith(f"{signals.CANCELLED} <b>Stopped</b>")
+    assert signals.ERROR not in stopped
+    # And a real failure keeps the warning it has earned.
+    assert finish_line(TurnSummary(ok=False, error="boom")).startswith(
+        f"{signals.ERROR} <b>Failed</b>"
+    )
 
 
 def test_a_receipt_escapes_a_hostile_path() -> None:

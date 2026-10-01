@@ -456,6 +456,9 @@ class TurnSummary:
     prompts: int = 1
     ok: bool = True
     error: str | None = None
+    #: Stopped on request, as opposed to having failed. Both are ``ok=False`` and
+    #: they are not the same event: one is something the owner did.
+    cancelled: bool = False
     canceled_queued_messages: int = 0
 
 
