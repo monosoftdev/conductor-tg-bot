@@ -22,6 +22,7 @@ from ctb.bot.handlers.common import (
     abandon_wizard,
     command_text,
     created_card,
+    echo_is_repliable,
     new_session_id,
     note_linear_seat,
     open_room,
@@ -46,6 +47,7 @@ from ctb.bot.handlers.topics import (
 from ctb.bot.keyboards import (
     CONTROL_TTL_S,
     PLAIN_STYLE,
+    READ_TTL_S,
     Action,
     Cb,
     NonceError,
@@ -536,8 +538,9 @@ async def _log_target(message: Message, nonces: NonceStore, db: Database) -> str
                         user_id=message.from_user.id if message.from_user else None,
                         chat_id=message.chat.id,
                         thread_id=message.message_thread_id or NO_THREAD_ID,
-                        ttl=CONTROL_TTL_S,
+                        ttl=READ_TTL_S,
                         style=PLAIN_STYLE,
+                        restartable=True,
                     )
                 ]
                 for session_id, label in targets
@@ -623,7 +626,16 @@ async def log_command(
     if body is None:
         await tell(message, "Nothing cached for this task yet.")
         return
-    await tell(message, body)
+    # Repliable, which matters most for the case this command just learned to
+    # serve: read from the chat root, the room is not where the answer landed, so
+    # a swipe-reply is the only "about this one" gesture available.
+    await echo_is_repliable(
+        resolve_db(db),
+        session_id,
+        message.chat.id,
+        await tell(message, body),
+        thread_id=message.message_thread_id or NO_THREAD_ID,
+    )
 
 
 async def _send_raw_log(

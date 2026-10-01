@@ -66,6 +66,27 @@ from its first tagged release.
   Rows now fall back to `📄`, which renders the task's last exchanges in place;
   a supergroup keeps `↗` and jumps, because there the link works.
 
+- **Replying to a rendered answer reaches the task it is about.** PLAN §Safety
+  rails promises "replying to any bot message routes to that message's session",
+  implemented by `deliveries.session_for_telegram_message` — which reads the
+  delivery ledger, so output rendered *outside* the outbox (`/log`, the card's
+  Transcript button, a `📄` tap) was not the bot's as far as a reply was concerned.
+  `deliveries.record_sent` writes that row in one statement rather than `enqueue`
+  + `mark_sent`, because a `pending` row is one the outbox may claim and send a
+  second time. This is a reply target rather than a row of `Stop`/`Retry` buttons
+  for the same reason `Stop` is kept off a receipt bubble: a static button
+  outlives the state it was drawn for, and a reply is evaluated when it is sent.
+
+- **The console's verb survives a redeploy, and a coffee.** `NonceStore` is in
+  memory and `button(restartable=…)` defaults to `False`, so the `📄` button minted
+  a single-use handle that died with the process — on a service that redeploys
+  often, a card whose only verb answers "expired" for reasons the reader cannot
+  see. `Action.TRANSCRIPT` was already in `RESTARTABLE_ACTIONS`, so it now gets the
+  signed self-describing payload that mechanism exists for. And a new `READ_TTL_S`
+  (6h) sits beside the two tiers already there — 60s for a destructive confirm,
+  15min for a safe control — because fifteen minutes is sized for `Stop`, whose
+  target may have moved on, and a transcript has no such hazard.
+
 - **The status card's `Transcript` button answers in prose.** B2 made `/log`
   readable and left the button beside it sending a `.md` of raw JSON envelopes —
   the exact artefact that fix was about — on the finished *and* errored cards.

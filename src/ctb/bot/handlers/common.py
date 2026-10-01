@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 import uuid
 from collections.abc import Awaitable
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Final, Protocol
 
@@ -40,6 +41,7 @@ from ctb.conductor.models import Project, validate_pairing
 from ctb.db import NO_THREAD_ID
 from ctb.db.connection import Database
 from ctb.db.repo import chats as chats_repo
+from ctb.db.repo import deliveries as deliveries_repo
 from ctb.db.repo import prompts as prompts_repo
 from ctb.db.repo import sessions as sessions_repo
 from ctb.db.repo import workspaces as workspaces_repo
@@ -883,6 +885,48 @@ def created_card(
     if created.thread_id:
         text += "\n<i>Opened as its own topic · it is in this chat's topic list.</i>"
     return text, None
+
+
+async def echo_is_repliable(
+    db: Database,
+    session_id: str,
+    chat_id: int,
+    sent: Message | None,
+    *,
+    thread_id: int = NO_THREAD_ID,
+) -> None:
+    """Make a reply to this message reach the task it is about.
+
+    *"Replying to any bot message routes to that message's session"* (PLAN
+    §Safety rails) is implemented by ``deliveries.session_for_telegram_message``,
+    which reads the delivery ledger. So a task's output rendered **outside** the
+    outbox — ``/log``, the card's Transcript button, a ``📄`` tap on ``/digest`` —
+    is, to that lookup, not the bot's: the one gesture a Telegram user already
+    knows for "about this" answered nothing.
+
+    That gesture is also the *right* control here, and the reason is the same one
+    that keeps ``Stop`` off a receipt bubble: a static button outlives the state
+    it was drawn for, still tappable a quarter of an hour later. A reply is
+    evaluated when it is sent, so it cannot go stale — which is why this is a
+    reply target rather than a row of buttons under the output.
+
+    Never raises. Failing to record a reply target must not cost the answer that
+    was already delivered.
+    """
+    if sent is None:
+        return
+    with suppress(Exception):
+        await deliveries_repo.record_sent(
+            db,
+            session_id=session_id,
+            # The Telegram message id is already unique per chat, and it is what
+            # the lookup will arrive with — so the key cannot collide and a
+            # re-render of the same output keeps its own reply target.
+            message_id=f"echo:{sent.message_id}",
+            chat_id=chat_id,
+            tg_message_id=sent.message_id,
+            thread_id=thread_id,
+        )
 
 
 async def require_session(message: Message, route: Route) -> str | None:

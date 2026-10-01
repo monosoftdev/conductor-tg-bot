@@ -80,6 +80,7 @@ __all__ = [
     "prune_terminal",
     "pending_destinations",
     "queue_age",
+    "record_sent",
     "recover_orphaned",
     "release",
     "requeue",
@@ -241,6 +242,56 @@ async def enqueue(
             priority,
             digest,
             payload_json,
+            stamp,
+            stamp,
+        ),
+    )
+    return inserted > 0
+
+
+async def record_sent(
+    db: Database,
+    *,
+    session_id: str,
+    message_id: str,
+    chat_id: int,
+    tg_message_id: int,
+    thread_id: int = NO_THREAD_ID,
+    at: int | None = None,
+) -> bool:
+    """Record a message the bot has **already** put on screen.
+
+    So that replying to it routes home. ``session_for_telegram_message`` is how
+    *"replying to any bot message routes to that message's session"* (PLAN
+    §Safety rails) is implemented, and it reads this table — so a message the
+    bot sent outside the outbox is, to that lookup, not the bot's. Rendering a
+    task's output into the chat root and then having a reply to it addressed at
+    nothing is the shape of that gap.
+
+    Written ``sent`` in **one** statement rather than :func:`enqueue` then
+    :func:`mark_sent`: a ``pending`` row is a row the outbox is entitled to
+    claim, and the window between the two writes is wide enough for it to send
+    the message a second time.
+
+    ``ON CONFLICT DO NOTHING``, so re-rendering the same output is idempotent and
+    the first Telegram message to carry it keeps the reply target.
+    """
+    stamp = now_ms() if at is None else at
+    inserted = await db.execute(
+        """
+        INSERT INTO deliveries
+            (session_id, message_id, part_index, chat_id, thread_id,
+             kind, state, tg_message_id, created_at, updated_at, sent_at)
+        VALUES (?, ?, 0, ?, ?, 'text', 'sent', ?, ?, ?, ?)
+        ON CONFLICT DO NOTHING
+        """,
+        (
+            session_id,
+            message_id,
+            chat_id,
+            thread_id,
+            tg_message_id,
+            stamp,
             stamp,
             stamp,
         ),

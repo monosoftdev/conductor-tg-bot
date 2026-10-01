@@ -37,8 +37,8 @@ from ctb.bot.app import register_router
 from ctb.bot.handlers.common import abandon_wizard, command_text, safe_title, tell
 from ctb.bot.handlers.topics import human_name, jump_url, resolve_db
 from ctb.bot.keyboards import (
-    CONTROL_TTL_S,
     PLAIN_STYLE,
+    READ_TTL_S,
     Action,
     NonceStore,
     button,
@@ -353,8 +353,9 @@ def digest_buttons(
                     user_id=user_id,
                     chat_id=chat_id,
                     thread_id=thread_id,
-                    ttl=CONTROL_TTL_S,
+                    ttl=READ_TTL_S,
                     style=PLAIN_STYLE,
+                    restartable=True,
                 )
             ]
         )

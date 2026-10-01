@@ -73,7 +73,7 @@ from ctb.bot.keyboards import (
     confirm_keyboard,
     read_stateless,
 )
-from ctb.bot.middleware.routing import Route, RoutingMiddleware
+from ctb.bot.middleware.routing import Route, RoutingMiddleware, default_reply_resolver
 from ctb.bot.middleware.tenancy import TenantContext, TenantSettings
 from ctb.bot.wizards import new_workspace
 from ctb.conductor.models import (
@@ -4735,3 +4735,67 @@ async def test_log_from_the_root_still_refuses_when_nothing_has_ever_run(
     )
 
     assert "No session here" in sent[0][0]
+
+
+async def test_output_rendered_outside_its_room_can_be_replied_to(
+    db: Database, monkeypatch: Any
+) -> None:
+    """The loop this whole surface exists to close: read it, then answer it.
+
+    ``/digest`` ranks the task that wants attention, ``📄`` renders it in the chat
+    root — and then the one gesture a Telegram user already knows for "about
+    this" has to land somewhere. ``session_for_telegram_message`` is how PLAN
+    §Safety rails implements "replying to any bot message routes to that
+    message's session", and it reads the delivery ledger, so a message sent
+    outside the outbox was not the bot's as far as a reply was concerned.
+
+    A reply is the right control here rather than a row of buttons, for the same
+    reason ``Stop`` is kept off a receipt bubble: a static button outlives the
+    state it was drawn for. A reply is evaluated when it is sent.
+    """
+    from ctb.bot.handlers import prompts as prompt_handlers
+
+    session_id = "sess-echo"
+    chat_id = 1132334
+    await workspaces_repo.upsert(db, "ws-echo", name="billing")
+    await sessions_repo.upsert(db, session_id, workspace_id="ws-echo", chat_id=chat_id)
+
+    async def recent(*_a: Any, **_k: Any) -> list[StoredMessage]:
+        return [_stored(1, "agentMessage", _said("Rewrote the seed."))]
+
+    monkeypatch.setattr(prompt_handlers.transcript_repo, "recent", recent)
+    store = NonceStore()
+    ticket = store.issue("tx", session_id, user_id=1001, chat_id=chat_id, thread_id=0)
+    bot = _TxBot()
+    await prompt_handlers.transcript_callback(
+        _TxQuery(bot, ticket.callback_data),  # type: ignore[arg-type]
+        store,
+        db=db,
+    )
+
+    assert len(bot.sent) == 1
+    rendered_id = 1  # _TxBot numbers what it sends
+
+    # Exactly the lookup the routing middleware performs for a reply.
+    resolved = await default_reply_resolver(db, chat_id, rendered_id)
+
+    assert resolved == session_id
+
+
+async def test_a_failed_reply_record_never_costs_the_answer(
+    db: Database, monkeypatch: Any
+) -> None:
+    """The output is already on screen; bookkeeping must not undo that."""
+    from ctb.bot.handlers import common as common_handlers
+
+    async def boom(*_a: Any, **_k: Any) -> bool:
+        raise RuntimeError("deliveries is unreachable")
+
+    monkeypatch.setattr(common_handlers.deliveries_repo, "record_sent", boom)
+
+    await common_handlers.echo_is_repliable(
+        db,
+        "sess-x",
+        1132334,
+        SimpleNamespace(message_id=7),  # type: ignore[arg-type]
+    )  # returns rather than raising

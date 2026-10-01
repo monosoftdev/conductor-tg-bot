@@ -89,6 +89,50 @@ call to be refused and reported it as `Prompt failed: …` — a stack-shaped an
 to "why did nothing happen", about a room the bot had already buried. The session
 row is the one already loaded for the receipt, so the check costs no query.
 
+### D5 · Replying to a rendered answer reaches the task · **shipped**
+
+Found by walking the loop rather than the code: `/digest` ranks the task that
+wants attention, `📄` renders it in the chat root — and then *what*? The gesture a
+Telegram user already knows for "about this one" is a swipe-reply, and PLAN
+§Safety rails already promises it works: *"replying to any bot message routes to
+that message's session"*. It is implemented by
+`deliveries.session_for_telegram_message`, which reads the delivery ledger — so a
+task's output rendered **outside** the outbox was, to that lookup, not the bot's.
+Reading from the root and replying addressed nothing.
+
+`deliveries.record_sent` writes the one row that closes it, in a single statement
+rather than `enqueue` + `mark_sent`: a `pending` row is a row the outbox is
+entitled to claim, and the window between two writes is wide enough for it to
+send the message a second time.
+
+**And a reply is the right control here, not a row of buttons.** The same
+reasoning that keeps `Stop` off a receipt bubble applies — *"a bubble is a static
+message, so its Stop was still on screen, still tappable, fifteen minutes after
+the turn ended"*. A reply is evaluated when it is sent, so it cannot go stale.
+That is why this surface gained a reply target instead of the `Stop`/`Retry` pair
+that first suggested itself.
+
+### D6 · The console's verb survived neither a redeploy nor a coffee · **shipped**
+
+Two defects in one button, both invisible until the payload was decoded.
+
+`NonceStore` is **in memory**, and `button(..., restartable=…)` defaults to
+`False` — so the `📄` added in D1 minted a random single-use handle and died with
+the process. On a service that redeploys as often as this one, the ranked card's
+only verb would answer *expired* for reasons no reader could see. `TRANSCRIPT` was
+already in `RESTARTABLE_ACTIONS` ("Stop, Retry, Transcript and Check are all safe
+to repeat"), so the fix is one keyword and the signed self-describing payload the
+mechanism was built for.
+
+The second is the window. `CONTROL_TTL_S` is fifteen minutes, sized for *"the
+phone was locked"* — correct for `Stop`, whose target may not be the same turn by
+the time a stale tap lands. A transcript carries no such hazard, and a ranked card
+is exactly what somebody scrolls back to twenty minutes later. `READ_TTL_S` is six
+hours: a third tier beside the two the file already distinguishes (60s for a
+destructive confirm, 15min for a safe control), and not a wider grant than the
+team already has, since row-level security is per *team* and any member can read
+these transcripts by command.
+
 ### Considered and deliberately not done
 
 - **A status button on the home keyboard.** `handlers/home.py` records that a
@@ -99,6 +143,10 @@ row is the one already loaded for the receipt, so the check costs no query.
   unbound rooms are interleaved with them by date, so about half of the recent
   list is dead and unmarked. Noisy, not broken — not enough to overturn a
   reasoned decision, and a third entry on a chat-wide keyboard is not free.
+- **`Stop` / `Retry` buttons under rendered output.** The obvious next step after
+  "read it here", and wrong for a reason this codebase had already written down: a
+  static button outlives the state it was drawn for. D5's reply target does the
+  same job without that failure mode.
 - **Auto-retiring finished rooms (A2).** Still the right idea, still unshipped,
   and worth re-costing first: Telegram keeps a *closed* topic in the list, so
   "close, never delete" may not reduce the scroll it is meant to reduce. That

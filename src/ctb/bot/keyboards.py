@@ -90,6 +90,7 @@ __all__ = [
     "MAX_BUTTON_TEXT",
     "NONCE_TTL_S",
     "PLAIN_STYLE",
+    "READ_TTL_S",
     "RESTARTABLE_ACTIONS",
     "Action",
     "CardAction",
@@ -126,6 +127,21 @@ NONCE_TTL_S: Final = 60.0
 #: Safe controls stay useful when the phone was locked or Telegram was in the
 #: background. Destructive confirmation still uses ``NONCE_TTL_S``.
 CONTROL_TTL_S: Final = 15 * 60.0
+#: A *read* outlives a control, because nothing it does needs bounding.
+#:
+#: Fifteen minutes is sized for "the phone was locked" — right for ``Stop``,
+#: whose target may not be the same turn by the time a stale tap lands. Showing
+#: somebody their own transcript has no such hazard: it is idempotent, and the
+#: ranked card it hangs under is precisely the thing a person scrolls back to
+#: after a coffee. Answering *expired* to the only verb that card offers is the
+#: card not working, for a reason the reader cannot see.
+#:
+#: Six hours covers a working day's worth of coming back to it. The payload is
+#: signed and carries its own wall-clock expiry (:func:`stateless_payload`), so
+#: this is a real bound rather than an unbounded handle, and it is not a wider
+#: grant than the tenant already has: row-level security is per *team*, so every
+#: member can read these transcripts by command anyway.
+READ_TTL_S: Final = 6 * 60 * 60.0
 
 log = get_logger(__name__)
 
