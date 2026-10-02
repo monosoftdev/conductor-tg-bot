@@ -84,6 +84,19 @@ router = Router(name=__name__)
 register_router(router, order=20)
 
 _FIND_ALLOWED: Final = re.compile(r"[^\w\s./:@+#-]+", re.UNICODE)
+#: What ``/board`` says when there is nothing to list, and when a filter matched
+#: nothing. Both were a bare full stop — "No live workspaces." — which is the
+#: first thing a new team sees and the last thing an owner who has just archived
+#: everything sees, in a command whose whole purpose is to get you somewhere.
+BOARD_EMPTY: Final = (
+    "<b>No live workspaces.</b>\n"
+    "Describe a task to start one, or <code>/new</code> for the full form."
+)
+BOARD_NO_MATCH: Final = (
+    "<code>/board</code> with no filter lists them all · "
+    "<code>/digest</code> ranks what needs you."
+)
+
 BOARD_VISIBLE: Final = 10
 #: Five one-line hits fit one phone screen; anything past that is scrolling
 #: past the answer you already found.
@@ -270,7 +283,16 @@ async def board(
         needle = query.casefold()
         rows = [row for row in rows if needle in row_name(row).casefold()]
     if not rows:
-        await tell(message, "No live workspaces." if not query else "No match.")
+        # Both of these used to be a full stop. ``/digest`` has always named the
+        # two ways out of its empty state and this did not, so the first command
+        # a new team runs — and the one an owner who has archived everything runs
+        # — answered with three words and nothing to do next.
+        await tell(
+            message,
+            BOARD_EMPTY
+            if not query
+            else f"No workspace matches <b>{escape(query)}</b>.\n{BOARD_NO_MATCH}",
+        )
         return
     text, markup = board_stage1(
         rows,

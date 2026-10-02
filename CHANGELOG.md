@@ -66,6 +66,27 @@ from its first tagged release.
   Rows now fall back to `📄`, which renders the task's last exchanges in place;
   a supergroup keeps `↗` and jumps, because there the link works.
 
+- **Replying to a rendered answer reaches the task it is about.** PLAN §Safety
+  rails promises "replying to any bot message routes to that message's session",
+  implemented by `deliveries.session_for_telegram_message` — which reads the
+  delivery ledger, so output rendered *outside* the outbox (`/log`, the card's
+  Transcript button, a `📄` tap) was not the bot's as far as a reply was concerned.
+  `deliveries.record_sent` writes that row in one statement rather than `enqueue`
+  + `mark_sent`, because a `pending` row is one the outbox may claim and send a
+  second time. This is a reply target rather than a row of `Stop`/`Retry` buttons
+  for the same reason `Stop` is kept off a receipt bubble: a static button
+  outlives the state it was drawn for, and a reply is evaluated when it is sent.
+
+- **The console's verb survives a redeploy, and a coffee.** `NonceStore` is in
+  memory and `button(restartable=…)` defaults to `False`, so the `📄` button minted
+  a single-use handle that died with the process — on a service that redeploys
+  often, a card whose only verb answers "expired" for reasons the reader cannot
+  see. `Action.TRANSCRIPT` was already in `RESTARTABLE_ACTIONS`, so it now gets the
+  signed self-describing payload that mechanism exists for. And a new `READ_TTL_S`
+  (6h) sits beside the two tiers already there — 60s for a destructive confirm,
+  15min for a safe control — because fifteen minutes is sized for `Stop`, whose
+  target may have moved on, and a transcript has no such hazard.
+
 - **The status card's `Transcript` button answers in prose.** B2 made `/log`
   readable and left the button beside it sending a `.md` of raw JSON envelopes —
   the exact artefact that fix was about — on the finished *and* errored cards.
@@ -81,6 +102,52 @@ from its first tagged release.
   those 43 threads point at one; typing in them spent an API call to be refused
   and reported `Prompt failed: …`. Read off the session row already loaded for
   the receipt, so it costs no query.
+
+- **Typing at a button-only `/new` step now answers it.** Four of the wizard's
+  seven steps draw buttons and had no text handler, so a line typed at "Project?"
+  fell through to `plain_text` — which declines to start a task while a wizard is
+  open and replied with the chat-root cockpit hint. The word was discarded, the
+  answer was about something else, and the wizard sat waiting to be tapped.
+  `match_option` resolves typed text against the options already on screen (exact,
+  then a unique substring), so `opus` finds `opus-5-1m` and an ambiguous `acme` is
+  refused rather than guessed — picking the wrong repository costs a paid container
+  against it.
+
+- **`/board` names a way out of its empty state.** "No live workspaces." was three
+  words in the command whose whole purpose is getting you somewhere — the first
+  thing a new team sees, and the last thing an owner sees after archiving
+  everything. A filter matching nothing now repeats what failed.
+
+- **`/invite` confirms a person, not a number.** A mistyped-but-real Telegram id
+  seated a stranger in the organisation — its workspaces, transcripts and Conductor
+  key behind it — and the bot said "Added 12345 as member." either way. The id is
+  resolved with `get_chat` and the owner confirms the name. That resolution also
+  enforces the precondition the command only mentioned in its usage line: a user
+  the bot cannot see is a seat that could not be used.
+
+- **A stalled task no longer looks like a healthy one.** `signals` exists so one
+  fact has one glyph across the topic title, the card and `/digest`; the card held
+  the same characters as literals, and one state had already drifted — stalled was
+  `⏳` in the ranked list and `⚙️` on its own card, where it was indistinguishable
+  at a glance from running. It gets its own `🐌` (slow, not broken), `CARD_EMOJI`
+  now reads from `signals` throughout, and the "stalled?" qualifier sits beside the
+  duration instead of trailing a file path a narrow screen wraps away.
+
+- **A cancellation is no longer dressed as a fault.** `/stop` is something the
+  owner does, and its receipt said `⚠️ Stopped` beneath a card reading
+  `🛑 stopped` — two glyphs for one event, which `finish_line`'s docstring forbids.
+  `TurnSummary.cancelled`, derived from the card kind so the two cannot disagree,
+  gives three faces for three outcomes: `✅ Done`, `🛑 Stopped`, `⚠️ Failed`.
+
+- **A ranked row no longer shouts an enum name.** `· WORKING ·` was the enum's own
+  capitals beside neighbours reading as prose, and redundant with the `⚙️` two
+  fields left of it. Only a running state that is not the ordinary one is named now,
+  in lower case.
+
+- **A long task name no longer pushes the answer off the row.** A digest row is
+  *title · where · detail · age*; 80 characters of name wrapped the error or the
+  duration onto a third line. Capped at 44 through `textwrap.shorten`, because a
+  hard slice lands mid-word and reads as corruption rather than elision.
 
 ### Fixed
 

@@ -32,6 +32,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any, Final
 
 from aiogram import F, Router
+from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -301,7 +302,16 @@ async def _offer(
     offered = _unique(options)
     await state.set_state(fsm_state)
     await state.update_data(
-        {"wid": wid, "step": step, "options": [value for _label, value in offered]}
+        {
+            "wid": wid,
+            "step": step,
+            "options": [value for _label, value in offered],
+            # The labels as well, because a value is not always something a
+            # person could type: the project step's values are Conductor ids and
+            # its labels are the repository names. :func:`match_option` reads
+            # these so a typed answer can name what the button says.
+            "labels": [label for label, _value in offered],
+        }
     )
     return _wizard_keyboard(
         offered,
@@ -788,6 +798,46 @@ async def _reask(
     return True
 
 
+def match_option(
+    text: str, options: Sequence[str], labels: Sequence[str]
+) -> str | None:
+    """The one offered option this text names, or ``None``.
+
+    The wizard draws buttons for four of its seven steps and, until this existed,
+    registered no text handler for any of them. A phone composer invites typing —
+    the launcher's placeholder literally says *"Describe a task…"* — so a line
+    typed at *"Project?"* fell through to ``plain_text``, which declines to start
+    a task while a wizard is open and answered with the chat-root cockpit hint
+    instead. The typed word was discarded, the reply was about something else,
+    and the wizard was still sitting there waiting to be tapped.
+
+    Matching rather than free entry is the point: the result is always one of the
+    options already on screen, so a typed answer cannot name a project that does
+    not exist or a model the agent will 400 on. Exact match first, then a unique
+    substring, so ``opus`` finds ``opus-5-1m`` while an ambiguous fragment is
+    refused rather than guessed.
+
+    Labels and values are both searched. A value is not always typeable — the
+    project step's values are Conductor ids — and the label is what the button
+    shows, so it is the thing a person is reading when they decide to type.
+    """
+    needle = " ".join(text.split()).casefold()
+    if not needle:
+        return None
+    pairs = list(zip(options, labels, strict=False))
+    for candidates in (
+        [
+            value
+            for value, label in pairs
+            if needle in (value.casefold(), label.casefold())
+        ],
+        [value for value, label in pairs if needle in f"{value} {label}".casefold()],
+    ):
+        if len(set(candidates)) == 1:
+            return candidates[0]
+    return None
+
+
 def _pick(code: str, data: Mapping[str, Any]) -> tuple[str, str] | str:
     """``(step, value)`` for a tapped option, or the line to answer with.
 
@@ -874,21 +924,39 @@ async def wizard_callback(
         await query.answer(picked, show_alert=True)
         return
     step, selected = picked
-    await state.update_data({"project_id" if step == "project" else step: selected})
     await query.answer()
+    await _advance(_card(query), state, nonces, tenant, step=step, selected=selected)
+
+
+async def _advance(
+    card: Message,
+    state: FSMContext,
+    nonces: NonceStore,
+    tenant: TenantContext,
+    *,
+    step: str,
+    selected: str,
+) -> None:
+    """Record one answer and ask the next question, however it was answered.
+
+    Shared by the tap and the typed paths so the two cannot drift about what
+    choosing an option *means* — the agent step, for instance, also has to reset
+    the model, and a second copy of that is a second place to forget it.
+    """
+    await state.update_data({"project_id" if step == "project" else step: selected})
     if step == "project":
-        await _ask_branch(_card(query), state, nonces, tenant.settings)
+        await _ask_branch(card, state, nonces, tenant.settings)
     elif step == "branch":
-        await _ask_agent(_card(query), state, nonces)
+        await _ask_agent(card, state, nonces)
     elif step == "agent":
         await state.update_data({"model": default_model_for(selected)})
-        await _ask_model(_card(query), state, nonces)
+        await _ask_model(card, state, nonces)
     elif step == "model":
-        await _ask_effort(_card(query), state, nonces)
+        await _ask_effort(card, state, nonces)
     else:
         if selected == "default":
             await state.update_data({"effort": None})
-        await _ask_prompt(_card(query), state, nonces)
+        await _ask_prompt(card, state, nonces)
 
 
 async def _create_from_card(
@@ -991,22 +1059,69 @@ async def typed_branch(
     if not branch:
         return
     await state.update_data({"branch": branch})
-    # `route.thread_id`, never the raw `message_thread_id`: `start_wizard` wrote
-    # this row under the seat the router resolved, which folds a forum's
-    # General back to 0 and reads a DM topic Telegram does not tag. Reading it
-    # back by a second rule is how the card is "not found" and the wizard
-    # answers by posting a fresh message instead of editing the one on screen.
+    await _ask_agent(await _card_for(message, route), state, nonces)
+
+
+async def _card_for(message: Message, route: Route) -> Message:
+    """The one wizard card, addressed for editing rather than the typed line.
+
+    ``route.thread_id``, never the raw ``message_thread_id``: ``start_wizard``
+    wrote this row under the seat the router resolved, which folds a forum's
+    General back to 0 and reads a DM topic Telegram does not tag. Reading it back
+    by a second rule is how the card is "not found" and the wizard answers by
+    posting a fresh message instead of editing the one on screen.
+
+    Falls back to the typed message, which makes ``_edit`` fail and the wizard
+    redraw — degraded, never wrong.
+    """
     row = await wizard_repo.get(
         resolve_db(None),
         message.chat.id,
         route.thread_id,
         user_id=message.from_user.id if message.from_user else 0,
     )
-    # Continue by editing the one wizard card, not the user's branch message.
-    target = message
-    if row and row.tg_message_id:
-        target = message.model_copy(update={"message_id": row.tg_message_id})
-    await _ask_agent(target, state, nonces)
+    if row is not None and row.tg_message_id:
+        return message.model_copy(update={"message_id": row.tg_message_id})
+    return message
+
+
+@router.message(
+    StateFilter(
+        NewWorkspace.project,
+        NewWorkspace.agent,
+        NewWorkspace.model,
+        NewWorkspace.effort,
+    ),
+    F.text & ~F.text.startswith("/"),
+)
+async def typed_option(
+    message: Message,
+    route: Route,
+    state: FSMContext,
+    nonces: NonceStore,
+    tenant: TenantContext,
+) -> None:
+    """Answer a button-only step by typing what the button says.
+
+    These four steps had no text handler at all, so the natural phone gesture was
+    silently discarded and answered off-topic by the chat-root cockpit while the
+    wizard sat waiting. Resolving the text against the options already on screen
+    accepts the gesture without widening what can be chosen: the outcome is one
+    of the buttons, or a redraw saying so.
+    """
+    data = await state.get_data()
+    step = str(data.get("step") or "")
+    options = [str(item) for item in (data.get("options") or [])]
+    labels = [str(item) for item in (data.get("labels") or [])]
+    chosen = match_option(message.text or "", options, labels)
+    card = await _card_for(message, route)
+    if chosen is None or not step:
+        # Re-ask rather than refuse: the card above may have scrolled away, and
+        # "that is not one of them" with no list is a dead end on a phone.
+        if not await _reask(step, card, state, nonces, tenant.settings):
+            await tell(message, "Wizard closed · <code>/new</code> to start again.")
+        return
+    await _advance(card, state, nonces, tenant, step=step, selected=chosen)
 
 
 @router.message(NewWorkspace.prompt, F.text & ~F.text.startswith("/"))

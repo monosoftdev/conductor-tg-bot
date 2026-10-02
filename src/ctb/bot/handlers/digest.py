@@ -10,7 +10,7 @@ ask after being away from the phone for an hour.
 So this is not a second `/board`. `/board` lists workspaces to pick one from;
 this ranks **tasks by how much they want you**, worst first:
 
-    ⚠️ errored · ⏳ stalled · ⚙️ running · ✅ finished · 💤 asleep
+    ⚠️ errored · 🐌 stalled · ⚙️ running · ✅ finished · 💤 asleep
 
 Everything here is read from rows the bot already writes — ``sessions`` and
 ``workspaces``, no Conductor call — so it answers at the same speed whether or
@@ -25,6 +25,7 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
+from textwrap import shorten
 from typing import Final
 
 from aiogram import Router
@@ -37,8 +38,8 @@ from ctb.bot.app import register_router
 from ctb.bot.handlers.common import abandon_wizard, command_text, safe_title, tell
 from ctb.bot.handlers.topics import human_name, jump_url, resolve_db
 from ctb.bot.keyboards import (
-    CONTROL_TTL_S,
     PLAIN_STYLE,
+    READ_TTL_S,
     Action,
     NonceStore,
     button,
@@ -85,6 +86,15 @@ DIGEST_BUTTONS: Final = 5
 #: uses to warn about no output. One vocabulary, one threshold — a digest that
 #: called something stalled while the room said nothing would be a third opinion.
 STALLED_AFTER_MS: Final = int(NO_OUTPUT_WARN_S * 1000)
+
+#: How much of a task's name a ranked row carries.
+#:
+#: ``safe_title`` allows 80, which is right where the title is the whole message
+#: and wrong here: a row is *title · where · detail · age*, so 80 characters of
+#: name pushes the thing you came for — the error, or the duration — onto a third
+#: wrapped line on a phone. You recognise your own task from its first few words;
+#: nobody reads to the end of one to identify it.
+TITLE_CHARS: Final = 44
 #: How much of an error message survives onto a phone line.
 ERROR_CHARS: Final = 90
 
@@ -111,7 +121,7 @@ _RUNNING: Final[frozenset[TurnState]] = frozenset(
 #: thing you have to do something about is never below the thing you do not.
 _BUCKETS: Final[tuple[tuple[str, str], ...]] = (
     (signals.ERROR, "errored"),
-    (signals.WAITING, "stalled"),
+    (signals.STALLED, "stalled"),
     (signals.WORKING, "running"),
     (signals.DONE, "finished"),
     (signals.SLEEPING, "asleep"),
@@ -208,7 +218,14 @@ def _classify(
     state = session.state
     if state is TurnState.DEAD or not session.is_bound:
         return None
-    title = safe_title(session.title, session.id[:8])
+    # ``shorten``, not a slice: a hard cut lands mid-word and leaves a dangling
+    # letter ("--dry-run is c"), which reads as corruption rather than as elision.
+    # This cuts at a space and says so with an ellipsis.
+    title = shorten(
+        safe_title(session.title, session.id[:8]),
+        width=TITLE_CHARS,
+        placeholder="…",
+    )
     where = _where(workspace)
     seat = (session.chat_id, session.thread_id)
     updated = session.updated_at or session.created_at
@@ -231,8 +248,14 @@ def _classify(
                 "no output",
                 *seat,
             )
+        # The glyph already says "running", and ``str(state)`` says it again in
+        # the enum's own shouting capitals, beside neighbours that read as prose
+        # ("no output", "model overloaded", "sleeping"). Only a running state that
+        # is *not* the ordinary one earns a word — draining, cancelling — and it
+        # earns it in lower case.
+        detail = "" if state is TurnState.WORKING else str(state).casefold()
         return DigestEntry(
-            session.id, title, where, RUNNING, max(0, now - started), str(state), *seat
+            session.id, title, where, RUNNING, max(0, now - started), detail, *seat
         )
 
     if workspace is not None and workspace.status_value.is_waking:
@@ -353,8 +376,9 @@ def digest_buttons(
                     user_id=user_id,
                     chat_id=chat_id,
                     thread_id=thread_id,
-                    ttl=CONTROL_TTL_S,
+                    ttl=READ_TTL_S,
                     style=PLAIN_STYLE,
+                    restartable=True,
                 )
             ]
         )

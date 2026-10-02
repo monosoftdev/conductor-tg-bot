@@ -883,9 +883,24 @@ def test_rule_19_cancelling_finalizes_after_two_idles() -> None:
     assert last.state is TurnState.IDLE
     summary = actions_of(last, Finalize)[0].summary
     assert summary.ok is False
+    # ...and *why* it is not ok, which the receipt needs to avoid printing a
+    # warning face over something the owner asked for. `ok=False` alone cannot
+    # tell a cancellation from a failure.
+    assert summary.cancelled is True
     assert summary.canceled_queued_messages == 2
     assert actions_of(last, EditStatusCard)[0].kind is CardKind.CANCELLED
     assert actions_of(last, EditStatusCard)[0].text == "stopped · 2 queued dropped"
+
+
+def test_a_finished_turn_is_never_marked_cancelled() -> None:
+    """The flag is derived from the card kind, so the two cannot disagree."""
+    context = ctx(TurnState.DRAINING, consecutive_idle=2)
+    result = step(context, IDLE_STATUS, T0 + 30)
+
+    finalize = actions_of(result, Finalize)
+    assert finalize, "a drained turn finalizes"
+    assert finalize[0].summary.cancelled is False
+    assert actions_of(result, EditStatusCard)[0].kind is CardKind.DONE
 
 
 def test_rule_19_cancel_still_drains_trailing_content_first() -> None:

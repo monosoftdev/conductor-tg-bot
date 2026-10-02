@@ -34,6 +34,7 @@ __all__ = [
     "IDLE",
     "REACTION_SAFE",
     "SLEEPING",
+    "STALLED",
     "UNREACHABLE",
     "WORKING",
     "WAITING",
@@ -43,6 +44,22 @@ __all__ = [
 WAITING: Final = "⏳"
 #: A turn is running right now.
 WORKING: Final = "⚙️"
+#: Running, but it has said nothing for a while. Not an error — and not healthy
+#: either, which is exactly why it needs a face of its own.
+#:
+#: It had none, and the two surfaces that show it disagreed: ``/digest`` ranked it
+#: second-worst and drew :data:`WAITING`, while the pinned card drew
+#: :data:`WORKING` and appended the word "stalled?" to the end of the line — so
+#: the same session was ``⏳`` in the ranked list and ``⚙️`` on its own card, and
+#: on the card it was indistinguishable at a glance from a healthy one. ``UX_PLAN``
+#: calls this "the state nothing else in the UI can show … the most common reason
+#: somebody picks the phone up".
+#:
+#: Neither surface could simply adopt the other's glyph: on a card ``⏳`` already
+#: means queued. So it gets its own, and ``🐌`` is chosen because it reads as
+#: *slow* at a glance without reading as *broken* — the distinction the state is
+#: about.
+STALLED: Final = "🐌"
 #: A turn finished and produced something you have not acted on yet.
 DONE: Final = "✅"
 #: Bound and quiet: nothing running, nothing new to read.

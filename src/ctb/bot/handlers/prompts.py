@@ -17,6 +17,7 @@ from aiogram.types import CallbackQuery, Message
 
 from ctb.bot.app import register_router
 from ctb.bot.handlers.common import (
+    echo_is_repliable,
     react_received,
     request_cancel,
     short_error,
@@ -473,15 +474,20 @@ async def transcript_callback(
     if query.bot is None or query.message is None:
         return
     body = log_body(rows)
-    await send_html(
+    chat_id = query.message.chat.id
+    thread_id = (
+        (query.message.message_thread_id or NO_THREAD_ID)
+        if isinstance(query.message, Message)
+        else NO_THREAD_ID
+    )
+    sent = await send_html(
         query.bot,
-        query.message.chat.id,
+        chat_id,
         body if body is not None else "Nothing cached for this task yet.",
-        thread_id=(
-            (query.message.message_thread_id or NO_THREAD_ID)
-            if isinstance(query.message, Message)
-            else NO_THREAD_ID
-        ),
+        thread_id=thread_id,
+    )
+    await echo_is_repliable(
+        resolve_db(db), ticket.target, chat_id, sent, thread_id=thread_id
     )
 
 

@@ -20,6 +20,7 @@ from typing import Any
 import pytest
 
 from ctb.bot.handlers import admin, power, registration
+from ctb.bot.keyboards import NonceStore
 from ctb.bot.middleware.tenancy import TenantContext, TenantSettings
 from ctb.db.connection import Database
 from ctb.db.repo import tenancy
@@ -65,6 +66,21 @@ def message(text: str, *, private: bool = False) -> Any:
     )
 
 
+def owner_context(row: TenantRow) -> TenantContext:
+    """The role every command in this file refuses without."""
+    return TenantContext(
+        tenant_id=row.id,
+        slug=row.slug,
+        status=row.status,
+        role="owner",
+        user_id=1,
+        owner_ids=(1,),
+        primary_chat_id=None,
+        settings=TenantSettings(),
+        row=row,
+    )
+
+
 def member_context(row: TenantRow) -> TenantContext:
     """A seated user with the lowest role. Not an owner, not a stranger."""
     return TenantContext(
@@ -103,7 +119,9 @@ def said(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 #: be able to run. The *observable* assertion is shared: it answers with a
 #: refusal, and nothing it would have changed was changed.
 GATED: dict[str, Any] = {
-    "invite": lambda t, db: admin.invite(message("/invite 99"), t, NullState()),
+    "invite": lambda t, db: admin.invite(
+        message("/invite 99"), t, NullState(), NonceStore()
+    ),
     "remove": lambda t, db: admin.remove(message("/remove 99"), t, NullState()),
     "members": lambda t, db: admin.members(message("/members"), t, NullState()),
     "health": lambda t, db: admin.health(
@@ -162,7 +180,9 @@ async def test_revoke_by_a_member_leaves_the_key_in_place(
 async def test_invite_by_a_member_seats_nobody(
     db: Database, system_db: Database, tenant_row: TenantRow, said: list[str]
 ) -> None:
-    await admin.invite(message("/invite 99"), member_context(tenant_row), NullState())
+    await admin.invite(
+        message("/invite 99"), member_context(tenant_row), NullState(), NonceStore()
+    )
 
     assert await tenancy.member(system_db, BOOTSTRAP_TENANT_ID, 99) is None
 
@@ -245,3 +265,56 @@ class TestUseRebinding:
             await tenancy.rebind_chat(
                 system_db, CHAT, BOOTSTRAP_TENANT_ID, kind="group"
             )
+
+
+class TestInviteVerifiesThePerson:
+    """A bare id is the one input here where a typo does not fail.
+
+    A mistyped-but-real Telegram id used to be a stranger seated in the
+    organisation — its workspaces, transcripts and Conductor key behind it — and
+    the bot said "Added 12345 as member." either way. Nobody can proof-read a
+    number they have never seen, so the digits are resolved to a name and the
+    owner confirms the name.
+    """
+
+    async def test_an_unknown_id_seats_nobody_and_says_why(
+        self, system_db: Database, tenant_row: TenantRow, said: list[str]
+    ) -> None:
+        msg = message("/invite 999777")
+        msg.bot = _BotWithoutUsers()  # type: ignore[attr-defined]
+
+        await admin.invite(msg, owner_context(tenant_row), NullState(), NonceStore())
+
+        assert await tenancy.member(system_db, BOOTSTRAP_TENANT_ID, 999777) is None
+        # And it names the precondition that was only ever in the usage line.
+        assert "/start" in said[-1]
+
+    async def test_a_known_id_is_confirmed_by_name_before_it_is_seated(
+        self, system_db: Database, tenant_row: TenantRow, said: list[str]
+    ) -> None:
+        msg = message("/invite 4242 admin")
+        msg.bot = _BotWithUser("Dana Scully", "dscully")  # type: ignore[attr-defined]
+
+        await admin.invite(msg, owner_context(tenant_row), NullState(), NonceStore())
+
+        # Nothing seated yet: the owner has to read the name first.
+        assert await tenancy.member(system_db, BOOTSTRAP_TENANT_ID, 4242) is None
+        assert "Dana Scully" in said[-1] and "@dscully" in said[-1]
+        assert "admin" in said[-1]
+
+
+class _BotWithoutUsers:
+    async def get_chat(self, _user_id: int) -> object:
+        raise RuntimeError("Bad Request: chat not found")
+
+
+class _BotWithUser:
+    def __init__(self, name: str, username: str) -> None:
+        self._name = name
+        self._username = username
+
+    async def get_chat(self, _user_id: int) -> object:
+        first, _, last = self._name.partition(" ")
+        return SimpleNamespace(
+            first_name=first, last_name=last, username=self._username
+        )

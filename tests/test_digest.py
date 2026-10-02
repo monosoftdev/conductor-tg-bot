@@ -8,8 +8,10 @@ digest: it looks like an answer.
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
+import pytest
 from aiogram.types import InlineKeyboardButton
 
 from ctb.bot.handlers.digest import (
@@ -20,13 +22,22 @@ from ctb.bot.handlers.digest import (
     RUNNING,
     STALLED,
     STALLED_AFTER_MS,
+    TITLE_CHARS,
     digest_buttons,
     digest_entries,
     digest_lines,
     parse_window,
     window_label,
 )
-from ctb.bot.keyboards import NonceStore
+from ctb.bot.keyboards import (
+    CONTROL_TTL_S,
+    READ_TTL_S,
+    Action,
+    NonceError,
+    NonceStore,
+    parse,
+    read_stateless,
+)
 from ctb.db.repo.sessions import SessionRow
 from ctb.db.repo.workspaces import WorkspaceRow
 
@@ -351,3 +362,92 @@ def test_a_window_is_named_as_a_window_and_not_as_a_duration() -> None:
     assert window_label(30 * MINUTE) == "30m"
     # Not a whole unit of anything: fall back rather than lie about it.
     assert window_label(90 * 1000) == "1m30s"
+
+
+def test_a_read_button_outlives_a_control_and_a_redeploy() -> None:
+    """Two properties the ranked card is useless without.
+
+    *Stateless*, because ``NonceStore`` is in-memory: a digest whose only verb
+    answered "expired" after every deploy would be a card that works until the
+    next release. ``Action.TRANSCRIPT`` is already in ``RESTARTABLE_ACTIONS`` —
+    "Stop, Retry, Transcript and Check are all safe to repeat" — so the payload
+    is self-describing and signed.
+
+    *Long-lived*, because 15 minutes is sized for ``Stop``, whose target may not
+    be the same turn when a stale tap lands. A transcript has no such hazard, and
+    a ranked card is exactly what somebody scrolls back to after a coffee.
+    """
+    entries = digest_entries(
+        [session("only", chat_id=DM, thread_id=4)], [workspace()], now=NOW
+    )
+
+    item = _buttons(entries)[0][0]
+    data = item.callback_data
+    assert data is not None
+
+    # Readable by a process that never minted it — no store consulted.
+    ticket = read_stateless(parse(data).nonce, Action.TRANSCRIPT.value)
+    assert ticket.target == "only"
+
+    # And still readable well past the window a control gets.
+    later = read_stateless(
+        parse(data).nonce,
+        Action.TRANSCRIPT.value,
+        now=time.time() + CONTROL_TTL_S + 60,
+    )
+    assert later.target == "only"
+    with pytest.raises(NonceError):
+        read_stateless(
+            parse(data).nonce,
+            Action.TRANSCRIPT.value,
+            now=time.time() + READ_TTL_S + 3600,
+        )
+
+
+# ── how a row reads ──────────────────────────────────────────────────────────
+
+
+def test_an_ordinary_running_row_does_not_shout_its_enum() -> None:
+    """``WORKING`` was the enum's own name, in capitals, beside lower-case prose.
+
+    Every other bucket's detail reads as something a person wrote — "no output",
+    "model overloaded", "sleeping" — and the ⚙️ already says running, so the word
+    was both louder than its neighbours and redundant with the glyph.
+    """
+    rows = [session("a", turn_state="WORKING", turn_started_at=NOW - 2 * MINUTE)]
+
+    entry = digest_entries(rows, [workspace()], now=NOW)[0]
+
+    assert entry.rank == RUNNING
+    assert entry.detail == ""
+    assert "WORKING" not in entry.line
+    # The duration still says how long it has been running.
+    assert "2m00s" in entry.line
+
+
+def test_a_running_state_worth_naming_is_still_named_in_lower_case() -> None:
+    """``draining`` and ``cancelling`` do carry information. ``working`` does not."""
+    rows = [session("a", turn_state="CANCELLING", turn_started_at=NOW - MINUTE)]
+
+    entry = digest_entries(rows, [workspace()], now=NOW)[0]
+
+    assert entry.detail == "cancelling"
+
+
+def test_a_long_task_name_is_cut_so_the_rest_of_the_row_survives() -> None:
+    """A row is *title · where · detail · age*, and the title is the least of it.
+
+    ``safe_title`` allows 80, which is right when the title is the whole message.
+    Here it pushed the thing you came for — the error, the duration — onto a third
+    wrapped line on a phone.
+    """
+    name = "rename every CLI flag so that --dry-run is consistent across the suite"
+    rows = [session("a", title=name, turn_state="ERROR", error_message="boom")]
+
+    entry = digest_entries(rows, [workspace()], now=NOW)[0]
+
+    assert len(entry.title) <= TITLE_CHARS
+    # Cut at a space and marked, not sliced mid-word into a dangling letter.
+    assert entry.title == "rename every CLI flag so that --dry-run is…"
+    # And what the row is for is still in it.
+    assert "boom" in entry.line

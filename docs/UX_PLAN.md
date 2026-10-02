@@ -89,6 +89,188 @@ call to be refused and reported it as `Prompt failed: …` — a stack-shaped an
 to "why did nothing happen", about a room the bot had already buried. The session
 row is the one already loaded for the receipt, so the check costs no query.
 
+### D5 · Replying to a rendered answer reaches the task · **shipped**
+
+Found by walking the loop rather than the code: `/digest` ranks the task that
+wants attention, `📄` renders it in the chat root — and then *what*? The gesture a
+Telegram user already knows for "about this one" is a swipe-reply, and PLAN
+§Safety rails already promises it works: *"replying to any bot message routes to
+that message's session"*. It is implemented by
+`deliveries.session_for_telegram_message`, which reads the delivery ledger — so a
+task's output rendered **outside** the outbox was, to that lookup, not the bot's.
+Reading from the root and replying addressed nothing.
+
+`deliveries.record_sent` writes the one row that closes it, in a single statement
+rather than `enqueue` + `mark_sent`: a `pending` row is a row the outbox is
+entitled to claim, and the window between two writes is wide enough for it to
+send the message a second time.
+
+**And a reply is the right control here, not a row of buttons.** The same
+reasoning that keeps `Stop` off a receipt bubble applies — *"a bubble is a static
+message, so its Stop was still on screen, still tappable, fifteen minutes after
+the turn ended"*. A reply is evaluated when it is sent, so it cannot go stale.
+That is why this surface gained a reply target instead of the `Stop`/`Retry` pair
+that first suggested itself.
+
+### D6 · The console's verb survived neither a redeploy nor a coffee · **shipped**
+
+Two defects in one button, both invisible until the payload was decoded.
+
+`NonceStore` is **in memory**, and `button(..., restartable=…)` defaults to
+`False` — so the `📄` added in D1 minted a random single-use handle and died with
+the process. On a service that redeploys as often as this one, the ranked card's
+only verb would answer *expired* for reasons no reader could see. `TRANSCRIPT` was
+already in `RESTARTABLE_ACTIONS` ("Stop, Retry, Transcript and Check are all safe
+to repeat"), so the fix is one keyword and the signed self-describing payload the
+mechanism was built for.
+
+The second is the window. `CONTROL_TTL_S` is fifteen minutes, sized for *"the
+phone was locked"* — correct for `Stop`, whose target may not be the same turn by
+the time a stale tap lands. A transcript carries no such hazard, and a ranked card
+is exactly what somebody scrolls back to twenty minutes later. `READ_TTL_S` is six
+hours: a third tier beside the two the file already distinguishes (60s for a
+destructive confirm, 15min for a safe control), and not a wider grant than the
+team already has, since row-level security is per *team* and any member can read
+these transcripts by command.
+
+## E · Dead ends, dead loops, and a number nobody can proof-read
+
+A pass with one question: *where can this bot leave somebody with nothing to do
+next, or let them make a mistake it could have caught?* Built from an inventory —
+every `Usage:` line, every bare refusal, every step that accepts free text — rather
+than from intuition.
+
+### E1 · Typing at a button-only wizard step was swallowed · **shipped**
+
+The `/new` wizard draws buttons for four of its seven steps (project, agent, model,
+effort) and registered a text handler for **none** of them. A phone composer invites
+typing — the launcher's placeholder reads *"Describe a task…"* — so a line typed
+at *"Project?"* fell through to `plain_text`, which declines to start a task
+while a wizard is open and answers with the **chat-root cockpit hint** instead. The
+typed word was discarded, the reply was about something else, and the wizard was
+still sitting there waiting to be tapped. A dead loop in the one flow that spends
+money.
+
+`match_option` resolves the text against the options already on screen: exact first,
+then a unique substring, so `opus` finds `opus-5-1m` and an ambiguous `acme` is
+**refused rather than guessed** — picking the wrong repository costs a paid container
+against it. Labels as well as values, because the project step's values are Conductor
+ids and the label is what the reader is looking at.
+
+This is free entry becoming a *choice*, not the other way about: the outcome is always
+one of the buttons. Unmatched text redraws the step rather than answering "that is not
+one of them" with no list, which on a phone is a wall.
+
+`_advance` is now shared by the tap and typed paths, so the two cannot drift about what
+choosing means — the agent step also has to reset the model, and a second copy of that
+is a second place to forget it.
+
+### E2 · `/board` had no way out of its own empty state · **shipped**
+
+`No live workspaces.` — three words, in the command whose whole purpose is
+getting you somewhere. It is the first thing a new team sees, and the last thing
+an owner sees after archiving everything. `/digest` has always named the two ways
+out of its empty state; this did not. A filter matching nothing said `No match.`
+without repeating what failed.
+
+### E3 · `/invite <id>` could seat a stranger on a typo · **shipped**
+
+The one input in this bot where a mistake does not fail. A mistyped-but-real Telegram
+id was a stranger seated in the organisation — its workspaces, transcripts and
+Conductor key behind it — and the bot answered `Added 12345 as member.` either way.
+Nobody can proof-read a number they have never seen.
+
+The digits are now resolved with `get_chat` and the owner confirms a **name**:
+*"Add Dana Scully (@dscully) to acme as admin? They will see every workspace and
+transcript in it."* A two-tap confirm on the existing 60-second tier.
+
+That resolution is also the honest way to enforce the precondition the command only
+ever mentioned in its usage line — *"they must send the bot a message once before this
+works"*. A user the bot cannot see is a seat that could not be used, so refusing names
+the fix instead of reporting a silent half-success.
+
+## F · One glyph per fact, and rows that fit the screen
+
+A pass on legibility alone: every message, button and notice rendered and read as a
+phone shows it, rather than inspected as source. Three of the four findings were
+only visible that way.
+
+### F1 · A stalled task looked exactly like a healthy one · **shipped**
+
+`signals` exists so that "what is this session doing" has one answer across the
+topic title, the pinned card and `/digest`, and its docstring says each surface
+renders from that table. The card did not — it held the same characters as literals,
+so nothing was *wrong* yet and one state had already drifted:
+
+| | ranked list | pinned card |
+|---|---|---|
+| stalled | `⏳` | `⚙️` — and the word "stalled?" appended after the tool call |
+
+So the same session was `⏳` in `/digest` and `⚙️` on its own card, and on the card it
+was **indistinguishable at a glance from a healthy one** — for the state `A4` calls
+*"the state nothing else in the UI can show … the most common reason somebody picks
+the phone up"*.
+
+Neither surface could adopt the other's glyph, because on a card `⏳` already means
+queued. So stalled gets its own: `🐌`, which reads as *slow* without reading as
+*broken*, which is the distinction the state is about. `CARD_EMOJI` now reads from
+`signals` throughout, so this cannot drift again, and the qualifier moved beside the
+duration it qualifies instead of trailing a file path a narrow screen wraps away.
+
+```
+⚙️ working 1m32s · Bash · pytest -q
+🐌 working 14m02s · stalled? · Read · src/ctb/delivery/outbox.py
+```
+
+### F2 · A cancellation was dressed as a fault · **shipped**
+
+`/stop` is something the owner *does*. Its receipt said `⚠️ Stopped` — a warning
+face — directly beneath a card reading `🛑 stopped`. Two glyphs for one event, which
+`finish_line`'s own docstring forbids ("two surfaces describing one event must not
+word it differently"), and over-alarming about a deliberate act is how a real warning
+stops counting.
+
+A cancellation and a failure were both `ok=False`, so the receipt could not tell them
+apart. `TurnSummary.cancelled` is derived in `_finalize` from the card kind already
+being passed in — no second place to disagree — and there are now three faces for
+three outcomes: `✅ Done`, `🛑 Stopped`, `⚠️ Failed`. "Stopped" was also the wrong word
+for a failure, where it said nothing about why the turn was over.
+
+### F3 · A ranked row shouted an enum name · **shipped**
+
+```
+⚙️ port billing to the new ledger · acme-api/main · WORKING · 12m03s
+```
+
+`WORKING` is the enum's own name in its own capitals, beside neighbours that read as
+prose — "no output", "model overloaded", "sleeping" — and redundant with the `⚙️` two
+fields to its left. Only a running state that is *not* the ordinary one earns a word
+now (draining, cancelling), and it earns it in lower case.
+
+### F4 · A long task name pushed the answer off the row · **shipped**
+
+A row is *title · where · detail · age*. `safe_title` allows 80 characters, which is
+right when the title is the whole message and wrong here: 80 characters of name wraps
+the thing you came for — the error, the duration — onto a third line. `TITLE_CHARS`
+is 44, through `textwrap.shorten` rather than a slice, because a hard cut lands
+mid-word and leaves a dangling letter (`--dry-run is c`) that reads as corruption
+rather than elision.
+
+### Checked and left alone
+
+- **`⏳` against `⌛`.** Two hourglasses, and not a bug: `⏳` is the title *prefix* and
+  `⌛` is the first choice for `icon_custom_emoji_id`, a separate channel with its own
+  fallback list, because Telegram serves bots a fixed icon pack.
+- **`✓` against `✅`.** Different jobs — a selected option in a keyboard against a
+  finished turn — and conflating them would lose the distinction.
+- **`MAX_BUTTON_TEXT = 48`.** Probably still long for a narrow screen, where Telegram
+  clips without an ellipsis while `truncate_label` would mark the cut. But the right
+  number is a measurement on real devices, not a guess, and guessing it shorter costs
+  labels that currently fit. Left with the reasoning recorded instead.
+- **`24h00m` for a day-old row.** `format_duration` is the shared vocabulary for *how
+  long something took*, deliberately distinct from `window_label`. Changing it for one
+  surface would split a vocabulary to save four characters.
+
 ### Considered and deliberately not done
 
 - **A status button on the home keyboard.** `handlers/home.py` records that a
@@ -99,6 +281,22 @@ row is the one already loaded for the receipt, so the check costs no query.
   unbound rooms are interleaved with them by date, so about half of the recent
   list is dead and unmarked. Noisy, not broken — not enough to overturn a
   reasoned decision, and a third entry on a chat-wide keyboard is not free.
+- **A `/stop` chooser for the chat root.** The same shape as `/log`'s, and wrong:
+  the chooser bubble is static, so fifteen minutes later its button stops whatever
+  is running *by then* — the precise hazard that keeps `Stop` off a receipt bubble.
+  A 60-second TTL would bound it, but a destructive control offered against a list
+  the reader did not ask to act on is a mistake generator, which is what this pass
+  was supposed to remove.
+- **A contact picker for `/invite`.** `KeyboardButtonRequestUsers` is the native
+  answer and would remove the number entirely — but it is a *reply* keyboard, and
+  this bot already spends that one surface on the launcher, which `handlers/home.py`
+  curates deliberately ("anything on it has to make sense in every room at once").
+  Swapping it out mid-flow and restoring it afterwards is more moving parts than
+  resolving the id and showing the name. Worth revisiting if the launcher ever goes.
+- **`Stop` / `Retry` buttons under rendered output.** The obvious next step after
+  "read it here", and wrong for a reason this codebase had already written down: a
+  static button outlives the state it was drawn for. D5's reply target does the
+  same job without that failure mode.
 - **Auto-retiring finished rooms (A2).** Still the right idea, still unshipped,
   and worth re-costing first: Telegram keeps a *closed* topic in the list, so
   "close, never delete" may not reduce the scroll it is meant to reduce. That

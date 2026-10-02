@@ -17,15 +17,24 @@ import json
 from dataclasses import asdict
 from typing import Any
 
-from aiogram import Router
+from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
-from aiogram.types import BufferedInputFile, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
 from ctb.bot.app import register_router
 from ctb.bot.handlers.common import abandon_wizard, command_text, short_error, tell
-from ctb.bot.handlers.topics import resolve_db
+from ctb.bot.handlers.topics import edit_html, resolve_db
+from ctb.bot.keyboards import (
+    Action,
+    Cb,
+    NonceError,
+    NonceStore,
+    confirm_keyboard,
+    resolve,
+)
 from ctb.bot.middleware.tenancy import TenantContext, forget_cached
+from ctb.db import NO_THREAD_ID
 from ctb.db.connection import Database, now_ms
 from ctb.db.repo import chats as chats_repo
 from ctb.db.repo import deliveries, events, lease, tenancy
@@ -65,6 +74,7 @@ async def invite(
     message: Message,
     tenant: TenantContext,
     state: FSMContext,
+    nonces: NonceStore,
 ) -> None:
     """Seat another Telegram user in this team.
 
@@ -92,19 +102,111 @@ async def invite(
     if role not in ("member", "admin"):
         await tell(message, "Role must be <code>member</code> or <code>admin</code>.")
         return
+    # Resolve the number to a person **before** seating them, and make the owner
+    # confirm the name rather than the digits.
+    #
+    # A bare id is the one input in this bot where a typo does not fail: a
+    # mistyped-but-real Telegram id is a stranger added to the organisation, with
+    # its workspaces, transcripts and Conductor key behind it, and the old
+    # version said "Added 12345 as member." either way. Nobody can proof-read a
+    # number they have never seen.
+    #
+    # ``get_chat`` is also the honest way to enforce the precondition this
+    # command only ever mentioned in its usage line — *"they must send the bot a
+    # message once before this works"*. A user the bot cannot see is a seat that
+    # could not be used, so refusing here replaces a silent half-success.
+    who = await describe_user(message.bot, user_id)
+    if who is None:
+        await tell(
+            message,
+            f"I have never met <code>{user_id}</code>.\n"
+            "Ask them to send me <code>/start</code> in a private chat first — "
+            "until they do, I cannot reach them and the seat would do nothing.",
+        )
+        return
+    await tell(
+        message,
+        f"Add <b>{escape(who)}</b> to <b>{escape(tenant.slug)}</b> as "
+        f"{escape(role)}?\nThey will see every workspace and transcript in it.",
+        reply_markup=confirm_keyboard(
+            Action.MEMBER_ADD,
+            f"{user_id}:{role}",
+            who,
+            verb="Add",
+            store=nonces,
+            user_id=tenant.user_id,
+            chat_id=message.chat.id,
+            thread_id=message.message_thread_id or NO_THREAD_ID,
+        ),
+    )
+
+
+async def describe_user(bot: Any, user_id: int) -> str | None:
+    """What to call this id to a person, or ``None`` if the bot cannot see them.
+
+    ``get_chat`` on a user the bot has never exchanged a message with fails, and
+    that failure is information: it is exactly the precondition ``/invite``
+    documents, so the caller can refuse instead of seating somebody unreachable.
+    """
+    if bot is None:
+        return None
+    try:
+        chat = await bot.get_chat(user_id)
+    except Exception:
+        return None
+    name = " ".join(
+        part
+        for part in (getattr(chat, "first_name", ""), getattr(chat, "last_name", ""))
+        if part
+    ).strip()
+    username = getattr(chat, "username", "") or ""
+    if name and username:
+        return f"{name} (@{username})"
+    return name or (f"@{username}" if username else None)
+
+
+@router.callback_query(Cb.filter(F.action == Action.MEMBER_ADD.value))
+async def confirm_member_add(
+    query: CallbackQuery,
+    tenant: TenantContext,
+    nonces: NonceStore,
+) -> None:
+    """Seat the member the owner just read a name for."""
+    try:
+        ticket = resolve(query, expect=Action.MEMBER_ADD, store=nonces)
+    except NonceError as exc:
+        await query.answer(exc.user_message, show_alert=True)
+        return
+    if not tenant.is_owner:
+        await query.answer("Owners only.", show_alert=True)
+        return
+    raw_id, _, role = ticket.target.partition(":")
+    try:
+        user_id = _user_id(raw_id)
+    except ValueError:  # pragma: no cover - the payload is ours
+        await query.answer("That invite is no longer valid.", show_alert=True)
+        return
     try:
         await tenancy.add_member(
             system_database(),
             tenant.tenant_id,
             user_id,
-            role=role,
+            role=role or "member",
             added_by=tenant.user_id,
         )
     except tenancy.RoleError as exc:
-        await tell(message, escape(str(exc)))
+        await query.answer(str(exc), show_alert=True)
         return
     forget_cached(tenant.tenant_id)
-    await tell(message, f"Added <code>{user_id}</code> as {escape(role)}.")
+    await query.answer("Added")
+    if isinstance(query.message, Message) and query.message.bot is not None:
+        await edit_html(
+            query.message.bot,
+            query.message.chat.id,
+            query.message.message_id,
+            f"Added <b>{escape(ticket.label or raw_id)}</b> as {escape(role)}.",
+            reply_markup=None,
+        )
 
 
 @router.message(Command("remove"))

@@ -74,8 +74,18 @@ def finish_line(summary: TurnSummary) -> str:
     the agent went where you expected, and they are the one thing the chat no
     longer prints per edit under the default verbosity.
     """
-    marker = signals.DONE if summary.ok else signals.ERROR
-    head = "Done" if summary.ok else "Stopped"
+    # Three faces, because there are three outcomes. A cancellation used to wear
+    # the error marker and the word "Stopped": a ⚠️ for something the owner had
+    # just asked for, directly under a card reading "🛑 stopped" — two glyphs for
+    # one event, which is what the paragraph above says must not happen. And
+    # "Stopped" was then also the word for a genuine failure, where it says
+    # nothing about why the turn is over.
+    if summary.cancelled:
+        marker, head = signals.CANCELLED, "Stopped"
+    elif summary.ok:
+        marker, head = signals.DONE, "Done"
+    else:
+        marker, head = signals.ERROR, "Failed"
     parts: list[str] = []
     if summary.duration_ms > 0:
         parts.append(format_duration(summary.duration_ms))

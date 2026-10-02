@@ -485,6 +485,9 @@ def _finalize(
         prompts=max(1, len(context.turn_ids)),
         ok=ok,
         error=error,
+        # Derived from the card kind rather than passed in, so there is no second
+        # place for a caller to disagree with the face it just asked for.
+        cancelled=kind is CardKind.CANCELLED,
         canceled_queued_messages=canceled_queued_messages,
     )
     tick.card(kind, text, buttons)

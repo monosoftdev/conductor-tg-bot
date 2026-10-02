@@ -73,7 +73,7 @@ from ctb.bot.keyboards import (
     confirm_keyboard,
     read_stateless,
 )
-from ctb.bot.middleware.routing import Route, RoutingMiddleware
+from ctb.bot.middleware.routing import Route, RoutingMiddleware, default_reply_resolver
 from ctb.bot.middleware.tenancy import TenantContext, TenantSettings
 from ctb.bot.wizards import new_workspace
 from ctb.conductor.models import (
@@ -4735,3 +4735,254 @@ async def test_log_from_the_root_still_refuses_when_nothing_has_ever_run(
     )
 
     assert "No session here" in sent[0][0]
+
+
+async def test_output_rendered_outside_its_room_can_be_replied_to(
+    db: Database, monkeypatch: Any
+) -> None:
+    """The loop this whole surface exists to close: read it, then answer it.
+
+    ``/digest`` ranks the task that wants attention, ``📄`` renders it in the chat
+    root — and then the one gesture a Telegram user already knows for "about
+    this" has to land somewhere. ``session_for_telegram_message`` is how PLAN
+    §Safety rails implements "replying to any bot message routes to that
+    message's session", and it reads the delivery ledger, so a message sent
+    outside the outbox was not the bot's as far as a reply was concerned.
+
+    A reply is the right control here rather than a row of buttons, for the same
+    reason ``Stop`` is kept off a receipt bubble: a static button outlives the
+    state it was drawn for. A reply is evaluated when it is sent.
+    """
+    from ctb.bot.handlers import prompts as prompt_handlers
+
+    session_id = "sess-echo"
+    chat_id = 1132334
+    await workspaces_repo.upsert(db, "ws-echo", name="billing")
+    await sessions_repo.upsert(db, session_id, workspace_id="ws-echo", chat_id=chat_id)
+
+    async def recent(*_a: Any, **_k: Any) -> list[StoredMessage]:
+        return [_stored(1, "agentMessage", _said("Rewrote the seed."))]
+
+    monkeypatch.setattr(prompt_handlers.transcript_repo, "recent", recent)
+    store = NonceStore()
+    ticket = store.issue("tx", session_id, user_id=1001, chat_id=chat_id, thread_id=0)
+    bot = _TxBot()
+    await prompt_handlers.transcript_callback(
+        _TxQuery(bot, ticket.callback_data),  # type: ignore[arg-type]
+        store,
+        db=db,
+    )
+
+    assert len(bot.sent) == 1
+    rendered_id = 1  # _TxBot numbers what it sends
+
+    # Exactly the lookup the routing middleware performs for a reply.
+    resolved = await default_reply_resolver(db, chat_id, rendered_id)
+
+    assert resolved == session_id
+
+
+async def test_a_failed_reply_record_never_costs_the_answer(
+    db: Database, monkeypatch: Any
+) -> None:
+    """The output is already on screen; bookkeeping must not undo that."""
+    from ctb.bot.handlers import common as common_handlers
+
+    async def boom(*_a: Any, **_k: Any) -> bool:
+        raise RuntimeError("deliveries is unreachable")
+
+    monkeypatch.setattr(common_handlers.deliveries_repo, "record_sent", boom)
+
+    await common_handlers.echo_is_repliable(
+        db,
+        "sess-x",
+        1132334,
+        SimpleNamespace(message_id=7),  # type: ignore[arg-type]
+    )  # returns rather than raising
+
+
+# ── typing at a button-only wizard step ──────────────────────────────────────
+
+
+def test_match_option_resolves_to_something_already_on_screen() -> None:
+    """Typed, but never free: the answer is one of the buttons or nothing.
+
+    Four of the wizard's seven steps draw buttons and had no text handler, so a
+    line typed at "Project?" fell through to ``plain_text`` — which declines to
+    start a task while a wizard is open and replies with the chat-root cockpit
+    hint. The typed word was discarded, the answer was about something else, and
+    the wizard sat waiting to be tapped.
+    """
+    options = ["p-1", "p-2"]
+    labels = ["acme-api", "acme-web"]
+
+    # The label is what the button shows, so it is what a person types.
+    assert new_workspace.match_option("acme-api", options, labels) == "p-1"
+    assert new_workspace.match_option("  ACME-WEB ", options, labels) == "p-2"
+    # A unique fragment is enough; `opus` should find `opus-5-1m`.
+    assert new_workspace.match_option("api", options, labels) == "p-1"
+    # The value too, for the steps where it is typeable.
+    assert new_workspace.match_option("p-2", options, labels) == "p-2"
+    # Ambiguity is refused rather than guessed — picking the wrong repository
+    # costs a paid container against it.
+    assert new_workspace.match_option("acme", options, labels) is None
+    assert new_workspace.match_option("nothing like it", options, labels) is None
+    assert new_workspace.match_option("   ", options, labels) is None
+
+
+async def test_typing_a_project_name_answers_the_step(monkeypatch: Any) -> None:
+    """The gesture the composer invites now advances the wizard."""
+    asked: list[str] = []
+
+    async def fake_ask_branch(*_a: Any, **_k: Any) -> None:
+        asked.append("branch")
+
+    async def no_card(message: Any, _route: Any) -> Any:
+        return message
+
+    monkeypatch.setattr(new_workspace, "_ask_branch", fake_ask_branch)
+    monkeypatch.setattr(new_workspace, "_card_for", no_card)
+    state = _WizardState(
+        {
+            "wid": "w1",
+            "step": "project",
+            "options": ["p-1", "p-2"],
+            "labels": ["acme-api", "acme-web"],
+        }
+    )
+    message = SimpleNamespace(
+        text="acme-web",
+        chat=SimpleNamespace(id=-1001),
+        message_thread_id=None,
+        message_id=9,
+        from_user=SimpleNamespace(id=1001),
+    )
+
+    await new_workspace.typed_option(
+        message,  # type: ignore[arg-type]
+        Route(chat_id=-1001, kind="supergroup"),
+        state,  # type: ignore[arg-type]
+        NonceStore(),
+        fake_tenant(_CountingClient()),
+    )
+
+    assert asked == ["branch"], "the step advanced"
+    assert (await state.get_data())["project_id"] == "p-2"
+
+
+async def test_an_unmatched_line_redraws_the_step_instead_of_dead_ending(
+    monkeypatch: Any,
+) -> None:
+    """The card may have scrolled away; "not one of them" with no list is a wall."""
+    redrawn: list[str] = []
+
+    async def fake_reask(step: str, *_a: Any, **_k: Any) -> bool:
+        redrawn.append(step)
+        return True
+
+    async def no_card(message: Any, _route: Any) -> Any:
+        return message
+
+    monkeypatch.setattr(new_workspace, "_reask", fake_reask)
+    monkeypatch.setattr(new_workspace, "_card_for", no_card)
+    state = _WizardState(
+        {"wid": "w1", "step": "model", "options": ["opus", "sonnet"], "labels": []}
+    )
+    message = SimpleNamespace(
+        text="gpt-4",
+        chat=SimpleNamespace(id=-1001),
+        message_thread_id=None,
+        message_id=9,
+        from_user=SimpleNamespace(id=1001),
+    )
+
+    await new_workspace.typed_option(
+        message,  # type: ignore[arg-type]
+        Route(chat_id=-1001, kind="supergroup"),
+        state,  # type: ignore[arg-type]
+        NonceStore(),
+        fake_tenant(_CountingClient()),
+    )
+
+    assert redrawn == ["model"]
+    # And it did not quietly accept a model the agent would 400 on.
+    assert (
+        "model" not in await state.get_data()
+        or (await state.get_data()).get("model") is None
+    )
+
+
+async def test_an_empty_board_names_the_way_out_of_it(
+    db: Database, monkeypatch: Any
+) -> None:
+    """The first command a new team runs, and it used to be a full stop.
+
+    ``/digest`` has always named the two ways out of its empty state. ``/board``
+    answered "No live workspaces." — three words, in the command whose entire
+    purpose is getting you somewhere — which is also what an owner sees right
+    after archiving the last one.
+    """
+    sent: list[tuple[str, Any]] = []
+
+    async def fake_tell(_message: Any, text: str, **kwargs: Any) -> None:
+        sent.append((text, kwargs.get("reply_markup")))
+
+    monkeypatch.setattr(core_handlers, "tell", fake_tell)
+
+    async def no_rows(*_: Any, **__: Any) -> list[dict[str, object]]:
+        return []
+
+    monkeypatch.setattr(core_handlers, "board_rows", no_rows)
+    message = SimpleNamespace(
+        text="/board",
+        chat=SimpleNamespace(id=-1001),
+        message_thread_id=None,
+        message_id=3,
+        from_user=SimpleNamespace(id=1001),
+    )
+
+    await core_handlers.board(
+        message,  # type: ignore[arg-type]
+        fake_tenant(_CountingClient()),
+        _NullState(),  # type: ignore[arg-type]
+        NonceStore(),
+        db=db,
+    )
+
+    assert sent[0][0] == core_handlers.BOARD_EMPTY
+    assert "/new" in sent[0][0]
+
+
+async def test_a_board_filter_that_matches_nothing_says_what_to_try(
+    db: Database, monkeypatch: Any
+) -> None:
+    sent: list[tuple[str, Any]] = []
+
+    async def fake_tell(_message: Any, text: str, **kwargs: Any) -> None:
+        sent.append((text, kwargs.get("reply_markup")))
+
+    monkeypatch.setattr(core_handlers, "tell", fake_tell)
+
+    async def one_row(*_: Any, **__: Any) -> list[dict[str, object]]:
+        return [{"workspace_id": "w-1", "workspace_name": "acme-api"}]
+
+    monkeypatch.setattr(core_handlers, "board_rows", one_row)
+    message = SimpleNamespace(
+        text="/board nothing-like-it",
+        chat=SimpleNamespace(id=-1001),
+        message_thread_id=None,
+        message_id=3,
+        from_user=SimpleNamespace(id=1001),
+    )
+
+    await core_handlers.board(
+        message,  # type: ignore[arg-type]
+        fake_tenant(_CountingClient()),
+        _NullState(),  # type: ignore[arg-type]
+        NonceStore(),
+        db=db,
+    )
+
+    # Names the thing that failed, then two things that will not.
+    assert "nothing-like-it" in sent[0][0]
+    assert "/board" in sent[0][0] and "/digest" in sent[0][0]

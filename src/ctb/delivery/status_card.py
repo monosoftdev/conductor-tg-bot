@@ -63,6 +63,7 @@ from typing import Any, Final, Protocol
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
 
+from ctb import signals
 from ctb.db import NO_THREAD_ID
 from ctb.db.connection import Database, current_tenant, tenant_scope
 from ctb.db.repo import sessions as sessions_repo
@@ -137,17 +138,27 @@ _LIVE_KINDS: Final[frozenset[CardKind]] = frozenset(
     {CardKind.WORKING, CardKind.STALLED}
 )
 
+#: Read from :mod:`ctb.signals`, which exists so that "what is this session
+#: doing" has one answer across the topic title, this card and ``/digest``. These
+#: glyphs used to be written out here as literals — the same characters, so
+#: nothing was wrong yet, but the module whose whole purpose is to stop two
+#: surfaces drifting was being consulted by only one of them. ``STALLED`` is what
+#: that costs: it was ``⚙️`` here and ``⏳`` in the ranked list, for one fact.
+#:
+#: ``STARTED`` is the one kind with no signal, because it is not a state a topic
+#: or a digest can be in — it is the half-second between accepting a prompt and
+#: the first byte of output.
 CARD_EMOJI: Final[dict[CardKind, str]] = {
-    CardKind.QUEUED: "⏳",
+    CardKind.QUEUED: signals.WAITING,
     CardKind.STARTED: "▶️",
-    CardKind.WORKING: "⚙️",
-    CardKind.WAKING: "⏳",
-    CardKind.STALLED: "⚙️",
-    CardKind.DONE: "✅",
-    CardKind.ERROR: "⚠️",
-    CardKind.CANCELLING: "🛑",
-    CardKind.CANCELLED: "🛑",
-    CardKind.DEAD: "🚫",
+    CardKind.WORKING: signals.WORKING,
+    CardKind.WAKING: signals.WAITING,
+    CardKind.STALLED: signals.STALLED,
+    CardKind.DONE: signals.DONE,
+    CardKind.ERROR: signals.ERROR,
+    CardKind.CANCELLING: signals.CANCELLED,
+    CardKind.CANCELLED: signals.CANCELLED,
+    CardKind.DEAD: signals.UNREACHABLE,
 }
 
 #: Fallback copy when the state machine supplies no text for a kind.
@@ -361,11 +372,14 @@ def _segments(state: CardState, *, now: float) -> list[str]:
             segments[0] = elapsed
         else:
             segments.insert(0, elapsed)
+    if state.kind is CardKind.STALLED:
+        # Beside the duration it qualifies, not after the tool call. The glyph
+        # already says it; this says how long, and both belong at the front where
+        # a narrow screen cannot wrap them out of sight.
+        segments.append(_STALLED_SEGMENT)
     if state.activity and state.kind not in TERMINAL_KINDS:
         # "What it is doing right now" only makes sense while there is a now.
         segments.append(state.activity)
-    if state.kind is CardKind.STALLED:
-        segments.append(_STALLED_SEGMENT)
     summary = state.summary
     if summary is not None and state.kind is CardKind.DONE and summary.files_changed:
         segments.append(f"{summary.files_changed} files")
