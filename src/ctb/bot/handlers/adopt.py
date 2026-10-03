@@ -34,7 +34,7 @@ from aiogram import Bot, F, Router
 from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
 
 from ctb.bot.app import register_router
-from ctb.bot.handlers.common import note_linear_seat, short_error
+from ctb.bot.handlers.common import human_error, note_linear_seat, short_error
 from ctb.bot.handlers.topics import (
     Claim,
     TopicCreateError,
@@ -727,7 +727,7 @@ async def adopt_callback(
         await send_html(
             query.bot,
             chat_id,
-            f"Open failed · {escape(short_error(exc))}",
+            f"Open failed · {human_error(exc)}",
             thread_id=ticket.thread_id,
             silent=False,
         )

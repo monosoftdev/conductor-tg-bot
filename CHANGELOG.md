@@ -149,6 +149,28 @@ from its first tagged release.
   duration onto a third line. Capped at 44 through `textwrap.shorten`, because a
   hard slice lands mid-word and reads as corruption rather than elision.
 
+- **A retired Conductor endpoint no longer takes down unrelated commands.**
+  `POST /v0/sql` answers 503 "The SQL search API endpoint is temporarily
+  disabled" while everything else answers 200. A collection call carries no
+  breaker target, so three of those opened the **tenant-wide** circuit and `/new`
+  — which never touches SQL — failed fast behind it, repeatedly, because a
+  disabled endpoint does not recover between attempts the way an outage does.
+  `_request(isolated=True)` lets such an endpoint be its own target, so a retired
+  capability costs that capability.
+
+- **A failure no longer hands the reader a tappable command.** Every Telegram
+  client linkifies a bare `/word`, and "conductor circuit open … (opened by POST
+  /sql: 503)" shipped with `/sql` rendered as a blue link — a one-tap route into
+  the raw SQL console as the apparent remedy. `human_error` renders failures for
+  people (Conductor's own `userMessage` where there is one, a sentence instead of
+  the word "circuit", paths wrapped in code spans); `short_error` is unchanged for
+  logs, where the method, path and status are what an operator needs.
+
+- **A `/board` row keeps the session count it exists to show.** `truncate_label`
+  keeps the front of a label, which is wrong when the label is two fields: a long
+  workspace name ate the count, so one row read "· 3 sessions" and the next
+  "· conductor…". `labelled` shortens the head so the tail survives.
+
 ### Fixed
 
 - **A transient Conductor wobble no longer takes a team dark for ever.** The

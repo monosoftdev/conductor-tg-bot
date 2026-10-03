@@ -25,11 +25,11 @@ from aiogram.types import Update as TgUpdate
 
 from ctb.bot import keyboards
 from ctb.bot.app import PostgresStorage
+from ctb.bot.handlers import common, topics
 from ctb.bot.handlers import core as core_handlers
 from ctb.bot.handlers import home as home_handlers
 from ctb.bot.handlers import power as power_handlers
 from ctb.bot.handlers import prompts as prompt_handlers
-from ctb.bot.handlers import topics
 from ctb.bot.handlers.common import _LINEAR_TOLD as LINEAR_TOLD
 from ctb.bot.handlers.common import (
     LINEAR_DM_NOTICE,
@@ -76,6 +76,7 @@ from ctb.bot.keyboards import (
 from ctb.bot.middleware.routing import Route, RoutingMiddleware, default_reply_resolver
 from ctb.bot.middleware.tenancy import TenantContext, TenantSettings
 from ctb.bot.wizards import new_workspace
+from ctb.conductor.errors import CircuitOpen, api_error_for_status
 from ctb.conductor.models import (
     PostMessageResult,
     PostState,
@@ -4986,3 +4987,80 @@ async def test_a_board_filter_that_matches_nothing_says_what_to_try(
     # Names the thing that failed, then two things that will not.
     assert "nothing-like-it" in sent[0][0]
     assert "/board" in sent[0][0] and "/digest" in sent[0][0]
+
+
+# ── what a failure says to a person ──────────────────────────────────────────
+
+
+def test_an_error_never_hands_the_reader_a_tappable_command() -> None:
+    """Shipped to production as a blue ``/sql`` link inside a failure.
+
+    Every Telegram client turns a bare ``/word`` into a tappable command, and
+    error prose is full of them. The screenshot that prompted this read
+    "conductor circuit open, retry in 38.1s (opened by POST /sql: 503)" with
+    ``/sql`` rendered as a link — offering a one-tap route into the raw SQL
+    console as the apparent remedy for a failure the reader could not parse.
+    """
+    said = common.human_error(RuntimeError("opened by POST /sql: 503"))
+
+    assert "<code>/sql</code>" in said
+    assert ">/sql<" in said, "inside a code span, so no client linkifies it"
+
+    # The whole path, not each segment: wrapping them one at a time read worse
+    # than the thing it was defusing.
+    path = common.human_error(RuntimeError("boom in GET /sessions/{id}/messages"))
+    assert "<code>/sessions/{id}/messages</code>" in path
+    # And a ratio is not a command.
+    assert common.human_error(RuntimeError("ratio 1/2")) == "ratio 1/2"
+
+
+def test_a_failure_says_conductors_own_words_rather_than_ours() -> None:
+    """``userMessage`` is written for a reader and was buried behind a prefix."""
+    exc = api_error_for_status(
+        503,
+        {"userMessage": "The SQL search API endpoint is temporarily disabled"},
+        method="POST",
+        path="/sql",
+    )
+
+    assert (
+        common.human_error(exc) == "The SQL search API endpoint is temporarily disabled"
+    )
+    # The operator's version keeps the method, path and status.
+    assert "503" in common.short_error(exc)
+
+
+def test_the_breaker_explains_itself_without_the_word_circuit() -> None:
+    """ "conductor circuit open, retry in 38.1s" asks the reader to know what a
+    circuit breaker is in order to learn that waiting is the fix."""
+    said = common.human_error(CircuitOpen(retry_after=38.1, opened_by="POST /sql"))
+
+    assert "circuit" not in said.casefold()
+    assert "retries by itself" in said
+    assert "/sql" not in said
+
+
+def test_a_board_row_keeps_the_session_count_it_exists_to_show() -> None:
+    """From a production screenshot, two rows of one list:
+
+    * ``✅ Analyze CMD balance ingestion · 3 sessions``
+    * ``⏳ Railway instance does not respond · conductor…``
+
+    ``truncate_label`` keeps the *front*, which is right for one string and wrong
+    for two fields — so a long workspace name ate the session count, which is the
+    entire reason stage 1 exists. Only one of those rows answers the question the
+    card asks.
+    """
+    long_name = "Railway instance does not respond · conductor-tg-bot/main"
+
+    label = keyboards.labelled(f"⏳ {long_name}", "1 session")
+
+    assert label.endswith("· 1 session")
+    assert len(label) <= keyboards.MAX_BUTTON_TEXT
+    # The name is cut, and says so, rather than being cut silently from the end.
+    assert "…" in label
+    # A short name is left entirely alone.
+    assert (
+        keyboards.labelled("✅ Analyze CMD balance ingestion", "3 sessions")
+        == "✅ Analyze CMD balance ingestion · 3 sessions"
+    )

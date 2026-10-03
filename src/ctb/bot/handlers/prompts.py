@@ -18,6 +18,7 @@ from aiogram.types import CallbackQuery, Message
 from ctb.bot.app import register_router
 from ctb.bot.handlers.common import (
     echo_is_repliable,
+    human_error,
     react_received,
     request_cancel,
     short_error,
@@ -241,7 +242,7 @@ async def plain_text(
             tg_message_id=message.message_id,
         )
     except Exception as exc:
-        await tell(message, f"Prompt failed: {escape(short_error(exc))}", silent=False)
+        await tell(message, f"Prompt failed: {human_error(exc)}", silent=False)
         return
     if await react_received(message):
         return

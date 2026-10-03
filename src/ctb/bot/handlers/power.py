@@ -23,12 +23,12 @@ from ctb.bot.handlers.common import (
     command_text,
     created_card,
     echo_is_repliable,
+    human_error,
     new_session_id,
     note_linear_seat,
     open_room,
     react_ok,
     require_session,
-    short_error,
     tell,
     workspace_name,
 )
@@ -318,7 +318,7 @@ async def fork(
         # meant to host.
         if seat.fresh_topic is not None and message.bot is not None:
             await discard_topic(message.bot, message.chat.id, seat.fresh_topic)
-        await tell(message, f"Fork failed: {escape(short_error(exc))}", silent=False)
+        await tell(message, f"Fork failed: {human_error(exc)}", silent=False)
         return
     if seat.refusal is not None:
         # A DM that cannot host topics has one seat, and the fork has just taken
@@ -407,7 +407,7 @@ async def rename(
                     label=room_label(workspace_family(workspace), name),
                 )
     except Exception as exc:
-        await tell(message, f"Rename failed: {escape(short_error(exc))}", silent=False)
+        await tell(message, f"Rename failed: {human_error(exc)}", silent=False)
         return
     # The new name is already visible in the topic title (or the /s list).
     if not await react_ok(message):
@@ -780,9 +780,7 @@ async def defaults(
         try:
             agent, model, effort = validate_pairing(*fields)
         except Exception as exc:
-            await tell(
-                message, f"Invalid defaults: {escape(short_error(exc))}", silent=False
-            )
+            await tell(message, f"Invalid defaults: {human_error(exc)}", silent=False)
             return
         await chats_repo.set_defaults(
             database,
@@ -835,7 +833,7 @@ async def sql_command(
     try:
         result = await resolve_client(client, tenant).sql(query)
     except Exception as exc:
-        await tell(message, f"SQL failed: {escape(short_error(exc))}", silent=False)
+        await tell(message, f"SQL failed: {human_error(exc)}", silent=False)
         return
     payload = json.dumps(result.rows[:20], ensure_ascii=False, indent=2, default=str)
     suffix = " · truncated" if result.truncated else ""

@@ -49,8 +49,8 @@ from ctb.bot.handlers.common import (
     all_projects,
     create_and_bind,
     created_card,
+    human_error,
     quota_error,
-    short_error,
     tell,
 )
 from ctb.bot.handlers.topics import edit_html, resolve_client, resolve_db
@@ -342,9 +342,7 @@ async def start_wizard(
     try:
         projects = await all_projects(resolve_client(client, tenant))
     except Exception as exc:
-        await tell(
-            message, f"Projects failed: {escape(short_error(exc))}", silent=False
-        )
+        await tell(message, f"Projects failed: {human_error(exc)}", silent=False)
         return
     if not projects:
         await tell(message, "No Conductor projects found.")
@@ -423,9 +421,7 @@ async def start_task(
     try:
         projects = await all_projects(resolve_client(client, tenant))
     except Exception as exc:
-        await tell(
-            message, f"Projects failed: {escape(short_error(exc))}", silent=False
-        )
+        await tell(message, f"Projects failed: {human_error(exc)}", silent=False)
         return
     if not projects:
         await tell(message, "No Conductor projects found.")
@@ -996,7 +992,7 @@ async def _create_from_card(
         await state.clear()
         await _edit(
             card,
-            f"New failed: {escape(short_error(exc))}\n"
+            f"New failed: {human_error(exc)}\n"
             "Nothing was created. Run <code>/new</code> to try again.",
             None,
         )
@@ -1173,7 +1169,7 @@ async def typed_prompt(
         await state.clear()
         await tell(
             message,
-            f"New failed: {escape(short_error(exc))}\n"
+            f"New failed: {human_error(exc)}\n"
             "Nothing was created. Run <code>/new</code> to try again.",
             silent=False,
         )

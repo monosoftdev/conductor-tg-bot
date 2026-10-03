@@ -722,12 +722,16 @@ class ConductorClient:
         message_id: str | None = None,
         session_id: str | None = None,
         max_attempts: int | None = None,
+        isolated: bool = False,
     ) -> Any:
         """Issue one logical request, retries included, and return parsed JSON.
 
         ``idempotent`` means "replaying this cannot create a second side effect".
         ``write`` (default: any non-GET) decides whether an unknown outcome is
         reported as :class:`Ambiguous` rather than :class:`TransportFailure`.
+        ``isolated`` marks a collection endpoint whose failures are news about
+        *it* and not about the API, so they cost that endpoint rather than the
+        tenant's whole circuit.
         """
         method = method.upper()
         is_write = (method in _WRITE_METHODS) if write is None else write
@@ -736,7 +740,19 @@ class ConductorClient:
         # A path that differs from its template addresses one resource; a path
         # that is its own template addresses a collection, and its failures are
         # news about the whole API. See :class:`CircuitBreaker`.
+        #
+        # ``isolated`` is the exception the rule needed: a *capability* that can
+        # be switched off on its own. Conductor disabled ``POST /v0/sql`` —
+        # "The SQL search API endpoint is temporarily disabled", 503, while every
+        # other endpoint answered 200 — and because a collection call carries no
+        # target, three of those opened the **tenant-wide** circuit. So one
+        # retired endpoint took down ``/new``, which has nothing to do with SQL,
+        # and the owner was told "conductor circuit open … opened by POST /sql".
+        # Observed in production, repeatedly, because a disabled endpoint does
+        # not recover between attempts the way an outage does.
         target = f"{method} {path}" if path != endpoint else None
+        if target is None and isolated:
+            target = f"{method} {endpoint}"
 
         async with self._gate or _NULL_GATE, self._semaphore:
             # Gated once per logical request: an in-flight retry has already been
@@ -1397,6 +1413,9 @@ class ConductorClient:
             "POST",
             "/sql",
             endpoint="/sql",
+            # A capability, not a health signal: it can be retired on its own
+            # while everything else answers, and it has been.
+            isolated=True,
             json_body={"query": text},
             read_timeout=SQL_TIMEOUT_S,
             idempotent=True,
