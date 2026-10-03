@@ -23,7 +23,12 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
 from ctb.bot.app import register_router
-from ctb.bot.handlers.common import abandon_wizard, command_text, short_error, tell
+from ctb.bot.handlers.common import (
+    abandon_wizard,
+    command_text,
+    human_error,
+    tell,
+)
 from ctb.bot.handlers.topics import edit_html, resolve_db
 from ctb.bot.keyboards import (
     Action,
@@ -439,7 +444,7 @@ async def health(
         if delivery:
             problems.append(delivery)
     except Exception as exc:
-        await tell(message, f"Health failed: {escape(short_error(exc))}", silent=False)
+        await tell(message, f"Health failed: {human_error(exc)}", silent=False)
         return
     circuit = str((api.get("circuit") or {}).get("state", "?")) if api else "no key"
     failures = [event for event in recent if not event.ok]
@@ -510,7 +515,7 @@ async def export(
             caption="Workspace export · transcripts are not included",
         )
     except Exception as exc:
-        await tell(message, f"Export failed: {escape(short_error(exc))}", silent=False)
+        await tell(message, f"Export failed: {human_error(exc)}", silent=False)
 
 
 def _asdict(row: Any) -> dict[str, Any]:

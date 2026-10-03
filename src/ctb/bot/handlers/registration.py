@@ -51,7 +51,13 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message, User
 
 from ctb.bot.app import register_router
-from ctb.bot.handlers.common import abandon_wizard, command_text, short_error, tell
+from ctb.bot.handlers.common import (
+    abandon_wizard,
+    command_text,
+    human_error,
+    short_error,
+    tell,
+)
 from ctb.bot.handlers.topics import (
     TopicCreateError,
     discard_topic,
@@ -496,7 +502,7 @@ async def _create_team(
             conductor_api_url=settings.conductor_api_url,
         )
     except Exception as exc:
-        await tell(message, f"Could not register: {escape(short_error(exc))}")
+        await tell(message, f"Could not register: {human_error(exc)}")
         return None
 
     log.info("registration.created", tenant=created.slug)

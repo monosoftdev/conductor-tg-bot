@@ -30,12 +30,12 @@ from ctb.bot.handlers.common import (
     command_text,
     create_and_bind,
     created_card,
+    human_error,
     react_received,
     request_cancel,
     require_session,
     resolve_new_request,
     safe_title,
-    short_error,
     tell,
     workspace_name,
 )
@@ -59,7 +59,9 @@ from ctb.bot.keyboards import (
     button,
     confirm_keyboard,
     keyboard,
+    labelled,
     resolve,
+    truncate_label,
     url_button,
 )
 from ctb.bot.middleware.routing import Route
@@ -247,7 +249,7 @@ async def new_workspace(
             client=conductor,
         )
     except Exception as exc:
-        await tell(message, f"New failed: {escape(short_error(exc))}", silent=False)
+        await tell(message, f"New failed: {human_error(exc)}", silent=False)
         return
     # The topic's own card repeats "queued" two seconds later; this bubble only
     # has to say where that topic is — and nothing at all when it is right here.
@@ -332,7 +334,7 @@ def board_stage1(
         buttons.append(
             [
                 button(
-                    f"{icon} {row_name(row)} · {_sessions_suffix(count)}",
+                    labelled(f"{icon} {row_name(row)}", _sessions_suffix(count)),
                     Action.BOARD_WS,
                     workspace_id,
                     store=store,
@@ -589,7 +591,9 @@ def board_stage2(
     buttons: list[list[InlineKeyboardButton]] = []
     for item in sessions[:BOARD_SESSIONS_VISIBLE]:
         icon = status_icon(item.state or (workspace.status if workspace else None))
-        label = f"{icon} {item.title}" + (f" · {item.model}" if item.model else "")
+        head = f"{icon} {item.title}"
+        # Same shape as stage 1: the model is a field, not a tail to sacrifice.
+        label = labelled(head, item.model) if item.model else truncate_label(head)
         target = jump_url(chat_id, item.thread_id) if item.thread_id else None
         if target:
             buttons.append([url_button(label, target)])
@@ -771,7 +775,7 @@ async def board_session_callback(
         await send_html(
             query.bot,
             chat_id,
-            f"Open failed · {escape(short_error(exc))}",
+            f"Open failed · {human_error(exc)}",
             thread_id=ticket.thread_id,
             silent=False,
         )
@@ -934,7 +938,7 @@ async def attach_workspace(
         # inside the guard, because the launcher button puts this one tap away
         # from somebody who has not run `/key` yet — and an unguarded raise
         # answers "⚠️ Request failed" instead of naming the missing step.
-        await tell(message, f"Cannot look: {escape(short_error(exc))}", silent=False)
+        await tell(message, f"Cannot look: {human_error(exc)}", silent=False)
         return
     # One fetch of each source, shared by the list and by the empty-state line.
     # `nothing_to_attach` used to re-run `board_rows` — a second `POST /v0/sql`
@@ -1033,7 +1037,7 @@ async def stop(
             requested_by=message.from_user.id if message.from_user else None,
         )
     except Exception as exc:
-        await tell(message, f"Stop failed: {escape(short_error(exc))}", silent=False)
+        await tell(message, f"Stop failed: {human_error(exc)}", silent=False)
         return
     if not accepted:
         await tell(message, "Stop unavailable — retry.", silent=False)
@@ -1211,7 +1215,7 @@ async def run_find(
     try:
         rendered = await find_text(client, text)
     except Exception as exc:
-        await tell(message, f"Find failed: {escape(short_error(exc))}", silent=False)
+        await tell(message, f"Find failed: {human_error(exc)}", silent=False)
         return
     await tell(message, rendered, reply_markup=reply_markup)
 
@@ -1520,12 +1524,12 @@ async def confirm_archive(
                 query.bot,
                 query.message.chat.id,
                 query.message.message_id,
-                f"⚠️ Archive failed · {escape(short_error(exc))}",
+                f"⚠️ Archive failed · {human_error(exc)}",
                 reply_markup=None,
             )
             if not changed:
                 await _reply_beside(
-                    query.message, f"Archive failed: {escape(short_error(exc))}"
+                    query.message, f"Archive failed: {human_error(exc)}"
                 )
         return
     if retirement is TopicRetirement.DELETED:

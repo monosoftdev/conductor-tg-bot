@@ -107,6 +107,7 @@ __all__ = [
     "get_nonce_store",
     "home_keyboard",
     "keyboard",
+    "labelled",
     "parse",
     "quick_reply_keyboard",
     "quick_reply_label",
@@ -626,6 +627,25 @@ def truncate_label(text: str, limit: int = MAX_BUTTON_TEXT) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 1].rstrip() + "…"
+
+
+def labelled(head: str, tail: str, *, limit: int = MAX_BUTTON_TEXT) -> str:
+    """``head · tail``, shortening the **head** so the tail always survives.
+
+    :func:`truncate_label` keeps the front of a label, which is right when the
+    label is one string and wrong when it is two fields. ``/board`` builds
+    *name · N sessions*, and the session count is the entire reason stage 1
+    exists — so cutting from the end removed the answer and kept the question.
+    Seen in production:
+
+    * ``✅ Analyze CMD balance ingestion · 3 sessions``
+    * ``⏳ Railway instance does not respond · conductor…``
+
+    Two rows of one list, and only one of them says what it is for. The same
+    reasoning :func:`confirm_label` already applies to *verb + name*.
+    """
+    room = max(1, limit - len(tail) - 3)
+    return f"{truncate_label(head, room)} · {tail}"
 
 
 def confirm_label(verb: str, name: str, limit: int = MAX_BUTTON_TEXT) -> str:

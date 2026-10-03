@@ -1061,3 +1061,40 @@ async def test_a_client_is_bound_to_the_key_it_was_given(
         await client.list_projects()
 
     assert seen == ["Bearer tenant-a-key-0001"]
+
+
+async def test_a_retired_endpoint_does_not_take_down_the_rest_of_the_api(
+    settings: Settings,
+) -> None:
+    """Live, and the reason a screenshot of `/new` said "opened by POST /sql".
+
+    Conductor disabled one endpoint — ``POST /v0/sql`` answering 503 "The SQL
+    search API endpoint is temporarily disabled" while every other endpoint
+    answered 200. A collection call carries no ``target``, so three of those
+    opened the **tenant-wide** circuit, and ``/new`` — which never touches SQL —
+    failed fast behind it. A disabled endpoint does not recover between attempts
+    the way an outage does, so this repeated for as long as it stayed off.
+
+    One sick capability is news about that capability.
+    """
+
+    def respond(request: httpx.Request, _n: int) -> httpx.Response:
+        if request.url.path.endswith("/sql"):
+            return httpx.Response(
+                503, json={"userMessage": "The SQL search API endpoint is disabled"}
+            )
+        return httpx.Response(200, json={"data": [], "hasMore": False})
+
+    client, _, _ = make_client(Recorder(respond), settings, max_attempts=1)
+    async with client:
+        for _ in range(3):
+            with pytest.raises(ApiError):
+                await client.sql("SELECT 1")
+
+        # The capability is held out of service...
+        assert "POST /sql" in client.circuit.isolated
+        with pytest.raises(CircuitOpen):
+            await client.sql("SELECT 1")
+        # ...and the circuit itself never opened, so everything else still runs.
+        assert client.circuit.state is CircuitState.CLOSED
+        assert (await client.list_projects()).data == []

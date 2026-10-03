@@ -37,6 +37,7 @@ from ctb.bot.keyboards import keyboard, url_button
 from ctb.bot.middleware.routing import Route
 from ctb.bot.middleware.tenancy import TenantSettings
 from ctb.conductor.client import ConductorClient
+from ctb.conductor.errors import CircuitOpen
 from ctb.conductor.models import Project, validate_pairing
 from ctb.db import NO_THREAD_ID
 from ctb.db.connection import Database
@@ -885,6 +886,47 @@ def created_card(
     if created.thread_id:
         text += "\n<i>Opened as its own topic · it is in this chat's topic list.</i>"
     return text, None
+
+
+#: A bare ``/word`` in message text is a **tappable command** in every Telegram
+#: client. Error prose is full of them — ``POST /sql``, ``GET /sessions`` — and
+#: one shipped to production as a blue ``/sql`` link inside "conductor circuit
+#: open … (opened by POST /sql: 503)", offering the reader a one-tap route into
+#: the raw SQL console as the remedy for a failure they did not understand.
+#: The whole path, not each segment: wrapping them one at a time turned
+#: ``GET /sessions/{id}/messages`` into three code spans with slashes loose
+#: between them, which is harder to read than the thing it was defusing.
+_SLASH_COMMAND_RE: Final = re.compile(
+    r"(?<![\w/])(/[a-z][a-z0-9_]{0,31}(?:/[A-Za-z0-9_{}.\-]+)*)"
+)
+
+
+def human_error(exc: BaseException) -> str:
+    """What to show a person when something failed. Escaped, Telegram-safe HTML.
+
+    Distinct from :func:`short_error`, which stays exactly as it is for logs: an
+    operator reading ``conductor.call`` wants the method, the path and the status,
+    and that is the string this one exists to stop showing to everybody else.
+
+    Three rules, in order:
+
+    * **Conductor's own words, where it supplied any.** ``userMessage`` is written
+      for a reader — *"The SQL search API endpoint is temporarily disabled"* — and
+      it was being buried behind our ``GET /projects -> 503:`` prefix.
+    * **A sentence for the breaker.** ``CircuitOpen`` is an internal mechanism and
+      "conductor circuit open, retry in 38.1s" asks the reader to know what a
+      circuit breaker is in order to learn that waiting is the fix.
+    * **Everything else, with its slash-commands defused**, because an error that
+      hands you a tappable ``/sql`` is worse than one you merely cannot read.
+    """
+    if isinstance(exc, CircuitOpen):
+        return (
+            "Conductor is not answering, so this was not sent. "
+            "It retries by itself — try again shortly."
+        )
+    detail = getattr(exc, "user_message", None)
+    text = short_error(exc) if not isinstance(detail, str) or not detail else detail
+    return _SLASH_COMMAND_RE.sub(r"<code>\1</code>", escape(text))
 
 
 async def echo_is_repliable(

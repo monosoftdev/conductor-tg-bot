@@ -271,6 +271,61 @@ rather than elision.
   long something took*, deliberately distinct from `window_label`. Changing it for one
   surface would split a vocabulary to save four characters.
 
+## G · What a screenshot of the real thing showed
+
+One screenshot of `/board` and `/new` in production, 2026-10-03. Three defects in
+it, and the first is not a UI problem at all.
+
+### G1 · One retired endpoint took down unrelated commands · **shipped**
+
+```
+/new
+Conductor: Projects failed: conductor circuit open, retry in 38.1s (opened by POST /sql: 503)
+```
+
+Conductor had **disabled one endpoint**. Probed live: `POST /v0/sql` answers 503
+*"The SQL search API endpoint is temporarily disabled"* while `GET /v0/projects`
+answers 200.
+
+`/sql` is a *collection* call — its path is its own template — so it carries no
+`target`, and the breaker's rule is that a targetless failure is "news about the
+whole API". Three of them opened the **tenant-wide** circuit, and `/new`, which
+never touches SQL, failed fast behind it. Worse, a disabled endpoint does not
+recover between attempts the way an outage does, so every `/board` re-opened it.
+
+The per-target isolation the breaker already has was built for exactly this and
+could not apply. `_request(isolated=True)` lets a collection endpoint be its own
+target, so a retired *capability* costs that capability. `/find` degrades;
+everything else keeps working.
+
+### G2 · A failure handed the reader a tappable `/sql` · **shipped**
+
+In the screenshot that `/sql` is **blue**: every Telegram client turns a bare
+`/word` into a command link, so the apparent remedy for an unreadable failure was
+a one-tap route into the raw SQL console.
+
+`human_error` is now the one place a failure is rendered for a person, and
+`short_error` stays exactly as it is for logs — an operator reading
+`conductor.call` wants the method, path and status, and that is the string this
+exists to stop showing to everyone else. Three rules: Conductor's own
+`userMessage` where it supplied one (it writes better prose than our wrapper and
+we were burying it behind `POST /sql -> 503:`), a sentence instead of the word
+"circuit", and every remaining path wrapped in a code span so no client linkifies
+it — the whole path, because wrapping each segment read worse than the hazard.
+
+### G3 · A board row lost the one thing the card is for · **shipped**
+
+```
+✅ Analyze CMD balance ingestion · 3 sessions
+⏳ Railway instance does not respond · conductor…
+```
+
+Two rows of one list and only one of them answers the question. `truncate_label`
+keeps the front, which is right for a single string and wrong for two fields: the
+session count is at the tail, and stage 1 exists to show it. `labelled` shortens
+the *head* so the tail survives — the same reasoning `confirm_label` already
+applied to *verb + name*.
+
 ### Considered and deliberately not done
 
 - **A status button on the home keyboard.** `handlers/home.py` records that a
