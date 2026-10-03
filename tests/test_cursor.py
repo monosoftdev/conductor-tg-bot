@@ -1427,7 +1427,7 @@ async def test_create_session_supplies_the_idempotency_key(
     workspace = fake.add_workspace("api/fix-flaky")
 
     created = await cursor.create_session(
-        client, db, workspace_id=workspace.id, agent="claude", model="sonnet"
+        client, db, workspace_id=workspace.id, agent="claude", model="sonnet-4-6"
     )
 
     body = fake.calls_to("/sessions", method="POST")[0].body

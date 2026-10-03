@@ -499,7 +499,7 @@ class FakeSession:
         seed: Sequence[Msg] = (),
         title: str = "fake session",
         agent: str = "claude",
-        model: str = "sonnet",
+        model: str = "sonnet-4-6",
         effort: str = "high",
         model_full: str = "claude-sonnet-4-6",
         auto_echo: bool = True,

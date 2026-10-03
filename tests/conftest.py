@@ -183,7 +183,7 @@ def message_factory() -> Callable[..., TranscriptMessage]:
                 "turnId": turn_id,
                 "config": {
                     "collaborationMode": "default",
-                    "model": "sonnet",
+                    "model": "sonnet-4-6",
                     "thinkingLevel": "none",
                 },
             }

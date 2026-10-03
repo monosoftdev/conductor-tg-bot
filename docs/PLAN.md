@@ -53,7 +53,7 @@ text `set_config` anywhere is rejected. **This view is also the only cross-org w
 use it for `/board`, not N per-project calls.
 
 Model ↔ agent pairing (a mismatch is a 400):
-- `claude`: fable-5, opus-5-1m, opus-4-8-1m, opus-4-8, opus-4-7-1m, opus-4-7, opus-1m, opus,
+- `claude`: opus-5-5-1m, opus-5-1m, opus-4-8-1m, opus-4-8, opus-4-7-1m, opus-4-7,
   opus-4-6-1m, sonnet-5-1m, sonnet-4-6-1m, sonnet, haiku — effort `low…max`
 - `codex`: gpt-5.5, gpt-5.4, gpt-5.6-{sol,terra,luna}, gpt-5.3-codex-spark, gpt-5.3-codex,
   gpt-5.2-codex — effort `none…ultra` (`max` needs a 5.6 model, `ultra` needs Sol/Terra)
@@ -74,7 +74,7 @@ finish between polls, so if `idle` persists, check the transcript for the reply 
 | Hosting | One Railway service, Dockerfile builder, `numReplicas = 1`, volume at `/data`, Telegram **long polling** (no public webhook URL to manage) |
 | Chat layout | Telegram **Forum Topics**, in a private chat or a supergroup. One topic per **session** (a workspace is a group of them — see `docs/TOPIC_PER_SESSION.md`). `General` = cockpit. Linear DM = degraded fallback mode |
 | Storage | SQLite (WAL) on the Railway volume |
-| Defaults | `claude` + `opus-5-1m` + `high` |
+| Defaults | `claude` + `opus-5-5-1m` + `high` |
 | Step 0 | Read-only probe of a real transcript, using a `CONDUCTOR_API_KEY` you add to Conductor's Environment settings |
 
 ---
@@ -430,7 +430,7 @@ silently rather than trapping you in a modal.
 
 **Defaults memory:** per-project `(project_id) -> {branch, agent, model, effort}` written on every
 successful create (repo A is a codex repo, repo B is a claude repo — stop asking), plus a global
-last-used project. Cold start: `claude` / `opus-5-1m` / `high`.
+last-used project. Cold start: `claude` / `opus-5-5-1m` / `high`.
 
 **The 30–90s init wait:** the prompt is captured *before* the wait, so it's dead time you never spend
 staring. Topic created instantly; one **pinned status card** edited in place every 5s with elapsed
@@ -488,7 +488,7 @@ Outbound throttle: one global send queue ~15 msg/min prioritizing (1) the topic 
   single-use nonces: destructive confirmation expires in 60 seconds, while
   safe phone controls remain usable for 15 minutes. A stale button fails closed.
 - `/stop` is never confirmed — friction on cancel is worse than an accidental cancel.
-- Since `opus-5-1m/high` is your default, the heavy-cost confirm fires only on `effort ∈ {max, ultra}`.
+- Since `opus-5-5-1m/high` is your default, the heavy-cost confirm fires only on `effort ∈ {max, ultra}`.
   `/board` carries a running today's-turn counter instead of a hard budget.
 - Allowlist checked on **every** update type (messages, callbacks, inline, edits). Non-allowlisted
   users get **silence** (a rejection reply just confirms the bot exists); owner gets one DM per

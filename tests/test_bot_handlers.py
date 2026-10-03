@@ -305,7 +305,7 @@ _REQUEST = CreateRequest(
     project_name="api",
     branch="main",
     agent="claude",
-    model="sonnet",
+    model="sonnet-4-6",
     effort="high",
     prompt="Fix it",
 )
@@ -560,7 +560,7 @@ def test_mobile_board_is_compact_and_scannable() -> None:
             "workspace_id": f"w-{index}",
             "workspace_name": f"workspace-{index}",
             "workspace_state": "working" if index == 0 else "ready",
-            "model": "sonnet",
+            "model": "sonnet-4-6",
         }
         for index in range(BOARD_VISIBLE + 3)
     ]
@@ -577,7 +577,7 @@ def test_session_overview_is_a_concise_control_summary() -> None:
         workspace_id="workspace-123",
         title="Fix checkout",
         agent="claude",
-        model="sonnet",
+        model="sonnet-4-6",
         effort="high",
         turn_state=str(TurnState.WORKING),
     )
@@ -591,11 +591,11 @@ def test_session_overview_is_a_concise_control_summary() -> None:
     # title bar, and the queue depth rides on the model line.
     assert lines == [
         "⚙️ <b>Fix checkout</b> · working",
-        "claude · sonnet/high · 2 pending",
+        "claude · sonnet-4-6/high · 2 pending",
     ]
     assert session_overview_lines(session, workspace) == [
         "⚙️ <b>Fix checkout</b> · working",
-        "claude · sonnet/high",
+        "claude · sonnet-4-6/high",
     ]
     assert status_icon("error") == "⚠️"
 
@@ -850,7 +850,7 @@ async def test_new_session_is_seeded_before_first_prompt(
             project_name="api",
             branch="main",
             agent="claude",
-            model="sonnet",
+            model="sonnet-4-6",
             effort="high",
             prompt="Fix it",
         ),
@@ -930,7 +930,7 @@ async def test_board_sends_one_line_and_buttons_never_both_lists(
             db,
             f"workspace-{index}",
             name=f"api/fix-{index}",
-            model="sonnet",
+            model="sonnet-4-6",
             chat_id=-1001,
             topic_id=100 + index,
         )
@@ -941,7 +941,7 @@ async def test_board_sends_one_line_and_buttons_never_both_lists(
                 "workspace_id": f"workspace-{index}",
                 "workspace_name": f"api/fix-{index}",
                 "display_state": "working",
-                "model": "sonnet",
+                "model": "sonnet-4-6",
             }
             for index in range(3)
         ]
@@ -1044,7 +1044,7 @@ async def test_board_treats_a_laptop_workspace_like_every_other_row(
                 "session_id": "session-orphan",
                 "workspace_name": "api/orphan",
                 "display_state": "working",
-                "model": "sonnet",
+                "model": "sonnet-4-6",
             }
         ]
 
@@ -2947,7 +2947,7 @@ async def test_defaults_can_set_and_show_the_branch(
     chat = await chats_repo.get(db, -1001, 99)
     assert chat is not None and chat.default_branch == "dev"
     assert sent[0] == "Default branch: <b>dev</b>."
-    assert sent[1].startswith("Defaults: <b>claude</b> · opus-5-1m/high · <b>dev</b>")
+    assert sent[1].startswith("Defaults: <b>claude</b> · opus-5-5-1m/high · <b>dev</b>")
 
 
 async def _run_setup(bot: Any, db: Database, monkeypatch: Any) -> list[str]:

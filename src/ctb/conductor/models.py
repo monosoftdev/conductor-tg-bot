@@ -477,35 +477,53 @@ class Agent(StrEnum):
     CURSOR = "cursor"
 
 
+#: Read off the live OpenAPI document (``GET /v0/openapi.json``), newest first
+#: within each family, and partitioned by agent here because the spec publishes
+#: one flat union while the server still 400s a mismatched pair.
+#:
+#: It had drifted both ways. Missing: ``opus-5-5-1m`` and ``sonnet-5-5-1m``
+#: (the 5.5 generation), ``fable-5-1``, ``sonnet-4-6`` and ``haiku-4-5`` — all
+#: of which the API accepts and this table refused, two of them in sessions the
+#: owner is running right now. Retired but still offered: ``opus-1m``, ``opus``,
+#: ``sonnet`` and ``haiku``, which the API no longer lists, so choosing one from
+#: ``/new`` bought a 400 from the server instead of a sentence from us.
 AGENT_MODELS: dict[Agent, tuple[str, ...]] = {
     Agent.CLAUDE: (
-        "fable-5",
+        "opus-5-5-1m",
         "opus-5-1m",
         "opus-4-8-1m",
         "opus-4-8",
         "opus-4-7-1m",
         "opus-4-7",
-        "opus-1m",
-        "opus",
         "opus-4-6-1m",
+        "sonnet-5-5-1m",
         "sonnet-5-1m",
         "sonnet-4-6-1m",
-        "sonnet",
-        "haiku",
+        "sonnet-4-6",
+        "fable-5-1",
+        "fable-5",
+        "haiku-4-5",
     ),
     Agent.CODEX: (
-        "gpt-5.5",
-        "gpt-5.4",
+        "gpt-6.1-sol",
+        "gpt-6-astra",
+        "gpt-6-sol",
+        "gpt-6-luna",
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.4",
         "gpt-5.3-codex-spark",
         "gpt-5.3-codex",
         "gpt-5.2-codex",
+        "gpt-daybreak-blue-latest",
     ),
     Agent.CURSOR: (
         "auto",
         "composer-2.5",
+        "grok-4.7",
+        "grok-4.6",
         "grok-4.5",
     ),
 }
@@ -525,9 +543,12 @@ _CODEX_EFFORT_MODELS: dict[str, tuple[str, ...]] = {
     "ultra": ("gpt-5.6-sol", "gpt-5.6-terra"),
 }
 
+#: The newest of each family, because a default nobody chose should be the best
+#: thing on offer. ``opus-5-5-1m`` is Opus 5.5 with the 1M-token context; the
+#: plain ``opus-5-5`` the Anthropic API uses is not a slug Conductor publishes.
 DEFAULT_MODEL_BY_AGENT: dict[Agent, str] = {
-    Agent.CLAUDE: "opus-5-1m",
-    Agent.CODEX: "gpt-5.5",
+    Agent.CLAUDE: "opus-5-5-1m",
+    Agent.CODEX: "gpt-6.1-sol",
     Agent.CURSOR: "auto",
 }
 
