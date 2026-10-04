@@ -60,7 +60,7 @@ async def seeded(db: Database) -> AsyncIterator[Database]:
         SESSION,
         workspace_id=WORKSPACE,
         agent="claude",
-        model="sonnet",
+        model="sonnet-4-6",
         chat_id=CHAT,
         thread_id=TOPIC,
     )

@@ -145,7 +145,7 @@ class TenantSettings:
     """Per-tenant knobs that used to be environment variables."""
 
     default_agent: str = "claude"
-    default_model: str = "opus-5-1m"
+    default_model: str = "opus-5-5-1m"
     default_effort: str = "high"
     default_branch: str = "main"
     voice_enabled: bool = False

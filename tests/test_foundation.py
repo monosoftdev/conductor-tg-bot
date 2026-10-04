@@ -29,6 +29,8 @@ from ctb.conductor.errors import (
     is_github_connection_required,
 )
 from ctb.conductor.models import (
+    AGENT_MODELS,
+    DEFAULT_MODEL_BY_AGENT,
     Agent,
     MessagesPage,
     PostMessageResult,
@@ -37,6 +39,7 @@ from ctb.conductor.models import (
     SessionStatusValue,
     TranscriptMessage,
     WorkspaceStatusValue,
+    default_model_for,
     validate_pairing,
 )
 from ctb.db.connection import Database, now_ms
@@ -284,6 +287,76 @@ class TestScrubber:
             validate_pairing("gemini")
         # cursor has no documented effort levels: pass through, do not guess.
         assert validate_pairing("cursor", "auto", "high")[2] == "high"
+
+    def test_the_default_is_the_newest_model_on_offer(self) -> None:
+        """A default nobody chose should be the best thing available.
+
+        ``opus-5-5-1m`` is Opus 5.5 with the 1M context. The plain ``opus-5-5``
+        the Anthropic API uses is **not** a slug Conductor publishes, which is
+        why this is pinned rather than inferred from a version number.
+        """
+        assert default_model_for("claude") == "opus-5-5-1m"
+        assert validate_pairing("claude", default_model_for("claude"), "high")[1] == (
+            "opus-5-5-1m"
+        )
+        # Newest first, so the head of the list is the default.
+        assert AGENT_MODELS[Agent.CLAUDE][0] == default_model_for("claude")
+
+    def test_every_model_offered_is_one_the_api_still_lists(self) -> None:
+        """The table had drifted in both directions at once.
+
+        Read off ``GET /v0/openapi.json`` on 2026-10-03. It was missing
+        ``opus-5-5-1m`` and ``sonnet-5-5-1m`` — the whole 5.5 generation — plus
+        ``fable-5-1``, ``sonnet-4-6`` and ``haiku-4-5``, two of which were in
+        sessions the owner was running at the time; and it still offered
+        ``opus``, ``opus-1m``, ``sonnet`` and ``haiku``, which the API had
+        retired, so picking one from ``/new`` bought a 400 from the server
+        instead of a sentence from us.
+
+        Pinned as a literal because there is no models endpoint to ask at
+        runtime — ``/v0/models`` is a 404 — so the only alternative to a list is
+        a guess.
+        """
+        published = {
+            "fable-5-1",
+            "fable-5",
+            "opus-5-5-1m",
+            "opus-5-1m",
+            "opus-4-8-1m",
+            "opus-4-8",
+            "opus-4-7-1m",
+            "opus-4-7",
+            "opus-4-6-1m",
+            "sonnet-5-5-1m",
+            "sonnet-5-1m",
+            "sonnet-4-6-1m",
+            "sonnet-4-6",
+            "haiku-4-5",
+            "gpt-5.5",
+            "gpt-5.4",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.3-codex-spark",
+            "gpt-5.3-codex",
+            "gpt-5.2-codex",
+            "gpt-6-astra",
+            "gpt-6.1-sol",
+            "gpt-6-sol",
+            "gpt-6-luna",
+            "gpt-daybreak-blue-latest",
+            "auto",
+            "composer-2.5",
+            "grok-4.7",
+            "grok-4.6",
+            "grok-4.5",
+        }
+        offered = {m for models in AGENT_MODELS.values() for m in models}
+
+        assert offered <= published, f"retired: {sorted(offered - published)}"
+        # And every default is itself still on offer.
+        for agent, model in DEFAULT_MODEL_BY_AGENT.items():
+            assert model in AGENT_MODELS[agent]
 
 
 class TestErrors:
